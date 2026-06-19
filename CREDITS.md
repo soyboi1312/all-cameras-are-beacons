@@ -10,6 +10,7 @@ lineage stays visible.
 - **Flock Safety + Raven detection** (`firmware/lib/acab_core/flock_detect.*`):
   the MAC OUI, the `Flock-` SSID, advertised-name patterns, and the BT
   manufacturer ID are re-derived from public data, the IEEE OUI registry, the
+  community `nite-oui-collection` (@NitekryDPaul) for the Flock-specific OUI set, the
   Bluetooth SIG assigned numbers, independent Flock research (ryanohoro, CEHRP,
   GainSec), and the **deflock.me** community. Each entry's source is documented in
   `docs/signatures.md`.
@@ -23,7 +24,7 @@ lineage stays visible.
 
 This project grew out of the **OUI-Spy** ecosystem: it runs on Colonel Panic's
 OUI-Spy and Mesh-Detect hardware, and earlier releases of these detectors began as
-ports of `colonelpanichacks/oui-spy` and `lukeswitz/oui-spy-unified-blue` before the
+ports of `colonelpanichacks/oui-spy` and `colonelpanichacks/oui-spy-unified-blue` before the
 signatures were re-sourced and the classifiers re-derived from the public references
 above.
 
@@ -41,7 +42,7 @@ directory). Everything else, the detection signatures, the classifiers, the
 `acab_core` engine, the BLE GATT protocol, the apps, the Meshtastic uplink, and the
 web flasher, is this project's own work, built from the public references in
 `docs/signatures.md`. Earlier releases ported detection code from the unlicensed
-`colonelpanichacks/oui-spy`, `flock-you`, and `lukeswitz/oui-spy-unified-blue`; those
+`colonelpanichacks/oui-spy`, `colonelpanichacks/oui-spy-unified-blue`, and `flock-you`; those
 signatures have since been re-sourced from public registries and the classifiers
 re-derived from public standards, so the project no longer carries their
 all-rights-reserved code.
