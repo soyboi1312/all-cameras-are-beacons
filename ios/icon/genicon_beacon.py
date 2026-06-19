@@ -1,19 +1,19 @@
 #!/usr/bin/env python3
 # Beacon app-icon generator (Pillow).
 #
-# Draws the full beacon ONCE on a transparent, supersampled canvas, then writes
-# the opaque iOS 1024 icon AND all five Android adaptive-icon foregrounds from
-# that single source, so the two platforms can never drift again.
+# Draws the beacon ONCE on a transparent, supersampled canvas, then writes both
+# the opaque iOS 1024 icon and all five Android foregrounds from that one source,
+# so the two platforms can't drift apart.
 #
 # Tweak the PARAMS block and re-run:
 #     python3 ios/icon/genicon_beacon.py
 #
 # Notes:
-#  - The iOS PNG is saved as RGB (no alpha). App Store Connect rejects icons
-#    that carry an alpha channel, so do NOT change that.
-#  - The Android foregrounds are transparent (the pupil is a real hole) so the
+#  - Save the iOS PNG as RGB (no alpha). App Store Connect rejects icons with an
+#    alpha channel, so don't change that.
+#  - The Android foregrounds stay transparent (the pupil is a real hole) so the
 #    adaptive background colour (#0d0a0b, in res/values/ic_launcher_background.xml)
-#    shows through; keep that colour in sync with BG below.
+#    shows through. Keep that colour in sync with BG below.
 import os
 from PIL import Image, ImageDraw
 

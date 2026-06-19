@@ -10,8 +10,8 @@ import android.os.Bundle
 import androidx.lifecycle.AndroidViewModel
 import tech.acab.app.ble.AcabBleManager
 
-/** Holds the BLE manager so the connection survives configuration changes, and
- *  feeds the phone's location to it for geotagging non-drone detections. */
+/** Keeps the BLE manager alive across config changes (so the connection survives),
+ *  and feeds it the phone's location for geotagging non-drone detections. */
 class AcabViewModel(app: Application) : AndroidViewModel(app) {
     val ble = AcabBleManager(app.applicationContext)
 
@@ -28,9 +28,9 @@ class AcabViewModel(app: Application) : AndroidViewModel(app) {
         override fun onStatusChanged(provider: String?, status: Int, extras: Bundle?) {}
     }
 
-    /** Begin location updates once a location permission is granted. Uses GPS and
-     *  network providers so a fix arrives quickly, and indoors too. Safe to call
-     *  more than once; re-registering the same listener just refreshes it. */
+    /** Start location updates once a location permission is granted. Uses both GPS
+     *  and network providers so a fix comes in fast, and works indoors too. Safe to
+     *  call more than once; re-registering the same listener just refreshes it. */
     @SuppressLint("MissingPermission")
     fun startLocation() {
         for (provider in listOf(LocationManager.GPS_PROVIDER, LocationManager.NETWORK_PROVIDER)) {

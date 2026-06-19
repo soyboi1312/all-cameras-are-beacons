@@ -19,17 +19,17 @@ extern "C" {
 }
 
 // ---------------------------------------------------------------------------
-// Accumulating a drone's messages into one identity.
+// Gathering a drone's messages into one identity.
 //
-// A drone spreads its Remote ID across separate messages (BasicID, Location,
-// System, OperatorID, ...). In BT4 legacy advertising each advert carries only
-// ONE of them, so a single frame decodes to a partial record (e.g. BasicID but
-// no position). We stash the fields per drone in a small track table, so every
-// detection we emit is as complete as everything seen so far.
+// A drone splits its Remote ID across separate messages (BasicID, Location,
+// System, OperatorID, ...). In BT4 legacy advertising each advert carries just
+// ONE of them, so a single frame only decodes to a partial record (e.g. BasicID
+// but no position). We keep the fields per drone in a small track table, so each
+// detection we emit holds everything seen so far.
 //
-// Once a BasicID shows up we key the track by UAS-ID (survives MAC rotation,
-// spans BLE + WiFi); before that, by MAC. Both radio tasks decode, so a spinlock
-// guards the table - same pattern as the scanner's dedup table.
+// Once a BasicID arrives we key the track by UAS-ID (survives MAC rotation, spans
+// BLE + WiFi); before that, by MAC. Both radio tasks decode, so a spinlock guards
+// the table - same as the scanner's dedup table.
 // ---------------------------------------------------------------------------
 #define DRONE_TRACK_MAX  16
 #define DRONE_TRACK_TTL  60000UL          // forget a track after 60 s of silence
@@ -89,7 +89,7 @@ static bool fillFromODID(const ODID_UAS_Data* uas, const uint8_t mac[6],
                   uas->SystemValid     || uas->OperatorIDValid;
     if (!useful) return false;
 
-    // Pull out this frame's fields before locking - keep string work out of it.
+    // Pull this frame's fields out before locking - keep string work off the lock.
     char frameId[ODID_ID_SIZE + 1] = {0};
     if (uas->BasicIDValid[0])
         strncpy(frameId, (const char*)uas->BasicID[0].UASID, ODID_ID_SIZE);
@@ -146,11 +146,11 @@ static bool fillFromODID(const ODID_UAS_Data* uas, const uint8_t mac[6],
 // ---------------------------------------------------------------------------
 // ASTM F3411 / OpenDroneID over Bluetooth Legacy puts the Remote ID message in a
 // Service-Data AD structure: type 0x16, Service UUID 0xFFFA (little-endian FA FF),
-// app code 0x0D, a counter byte, then the packed ODID message. We scan every AD
-// structure for that element rather than assume a fixed offset, so a drone whose
-// advert opens with a Flags structure (typical on BT5 extended advertising) still
-// registers. The signature bytes are all from the public spec; the message body
-// is handed to the Apache-licensed decoder.
+// app code 0x0D, a counter byte, then the packed ODID message. We check every AD
+// structure for it instead of assuming a fixed offset, so a drone whose advert
+// opens with a Flags structure (common on BT5 extended advertising) still gets
+// caught. The signature bytes are all from the public spec; the message body goes
+// to the Apache-licensed decoder.
 bool droneClassifyBLE(const uint8_t mac[6], const uint8_t* payload, size_t len,
                       int rssi, AcabDetection* out) {
     if (!payload || len < 6) return false;
@@ -182,7 +182,7 @@ bool droneClassifyBLE(const uint8_t mac[6], const uint8_t* payload, size_t len,
 // ---------------------------------------------------------------------------
 // 802.11 management frame (WiFi promiscuous capture)
 // ---------------------------------------------------------------------------
-// Remote ID rides two public ASTM F3411 frame types: a NAN action frame (fixed
+// Remote ID comes in two public ASTM F3411 frame types: a NAN action frame (fixed
 // multicast destination 51:6f:9a:01:00:00) and a beacon carrying an ODID vendor
 // IE (Wi-Fi Alliance OUI 90:3a:e6 or ASTM OUI fa:0b:bc). Both hand their ODID
 // payload to the Apache-licensed decoder.

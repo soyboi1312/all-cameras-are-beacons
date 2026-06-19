@@ -45,13 +45,13 @@ import tech.acab.app.model.Detection
 import tech.acab.app.model.DeviceType
 import tech.acab.app.ui.theme.Acab
 
-/** Rough RSSI -> distance (metres) for a no-GPS proximity ring. Log-distance
- *  path-loss model — a ballpark, not a measurement. */
+/** Rough RSSI -> distance (metres) for a no-GPS proximity ring. Uses a log-distance
+ *  path-loss model — a ballpark, not a real measurement. */
 private fun rssiRadiusMeters(rssi: Int): Double =
     Math.pow(10.0, (-50.0 - rssi) / 25.0).coerceIn(5.0, 600.0)   // TxPower -50 dBm, n ~ 2.5
 
 /** Located detections dropped on a dark map, filterable by category. Fixed installs
- *  use the phone's position when first heard; drones use their own broadcast coords. */
+ *  use the phone's position from when first heard; drones use their own broadcast coords. */
 @Composable
 fun MapScreen(ble: AcabBleManager, onSelect: (Detection) -> Unit) {
     val context = LocalContext.current
@@ -61,7 +61,7 @@ fun MapScreen(ble: AcabBleManager, onSelect: (Detection) -> Unit) {
     val markers = rememberCategoryMarkers()   // category pins, built once
     val operatorMarker = rememberOperatorMarker()
 
-    // osmdroid needs a user agent set before its first tile fetch, or the CDN 403s.
+    // osmdroid needs a user agent set before its first tile fetch, or the tile server rejects it.
     remember { Configuration.getInstance().userAgentValue = context.packageName }
 
     val located = detections.filter { ble.mapCoord(it) != null }
@@ -77,8 +77,8 @@ fun MapScreen(ble: AcabBleManager, onSelect: (Detection) -> Unit) {
                     setMultiTouchControls(true)
                     controller.setZoom(15.0)
                     // "you are here" dot; centers and follows once a fix lands.
-                    // osmdroid no-ops without permission, so this is safe even
-                    // before location is granted.
+                    // osmdroid does nothing without permission, so this is safe
+                    // even before location is granted.
                     val self = MyLocationNewOverlay(GpsMyLocationProvider(ctx), this).apply {
                         enableMyLocation()
                         enableFollowLocation()
@@ -149,8 +149,8 @@ fun MapScreen(ble: AcabBleManager, onSelect: (Detection) -> Unit) {
                         })
                     }
                 }
-                // before the first fix, frame the freshest pin so it isn't lost;
-                // after that, follow-location keeps the map on the operator.
+                // before the first fix, center on the freshest pin so it isn't lost;
+                // after that, follow-location keeps the map on you.
                 if (myLocation.value?.myLocation == null) {
                     shown.firstOrNull()?.let { d ->
                         ble.mapCoord(d)?.let { (lat, lon) -> map.controller.setCenter(GeoPoint(lat, lon)) }

@@ -104,7 +104,7 @@ struct DetectionDetailView: View {
     }
 
     /// Shown for OUI-only matches: an OUI only names the chipset vendor, which Flock
-    /// shares with consumer gear, so these can be false positives.
+    /// shares with consumer gear, so these matches can be false positives.
     private var falsePositiveNote: some View {
         VStack(alignment: .leading, spacing: 5) {
             HStack(spacing: 6) {

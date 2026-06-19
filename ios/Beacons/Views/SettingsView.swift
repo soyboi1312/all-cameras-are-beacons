@@ -51,8 +51,8 @@ struct DeviceView: View {
     private func sync() {
         guard let s = ble.status else { return }
         master = Double(s.volume)
-        // Keep a just-toggled switch at the user's value until the board confirms it,
-        // so the ~5s status frame can't snap it back to off mid-flight.
+        // Hold a just-toggled switch at the user's value until the board confirms it,
+        // so the ~5s status frame can't snap it back to off before then.
         if pendingBodyCam { if s.axon == bodyCamOn { pendingBodyCam = false } } else { bodyCamOn = s.axon }
         if pendingTracker { if s.tracker == trackerOn { pendingTracker = false } } else { trackerOn = s.tracker }
         bleOn  = s.ble
@@ -201,7 +201,7 @@ struct DeviceView: View {
     }
 
     // Themed 3-way switch: equal segments in a capsule, the active one filled with
-    // the accent. A stock .segmented Picker wouldn't match the theme.
+    // the accent. Rolled our own because a stock .segmented Picker won't match the theme.
     private var alertModePicker: some View {
         HStack(spacing: 4) {
             segment("Buzzer",  .buzzer)

@@ -59,14 +59,14 @@ fun DeviceScreen(ble: AcabBleManager) {
     val mode by ble.alertMode.collectAsState()
     val context = LocalContext.current
 
-    // Mirror the toggles locally so an optimistic flip sticks until the next status
-    // frame, instead of snapping back to the stale value mid-write.
+    // Keep a local copy of each toggle so flipping one sticks until the next status
+    // frame, instead of snapping back to the old value mid-write.
     var bleOn by remember { mutableStateOf(status?.ble == true) }
     var wifiOn by remember { mutableStateOf(status?.wifi == true) }
     var bodyCamOn by remember { mutableStateOf(status?.bodyCam == true) }
     var trackerOn by remember { mutableStateOf(status?.tracker == true) }
 
-    // Re-sync the mirrors whenever a fresh status frame lands.
+    // Re-sync the local copies whenever a fresh status frame lands.
     LaunchedEffect(status) {
         status?.let { s ->
             bleOn = s.ble
@@ -93,7 +93,7 @@ fun DeviceScreen(ble: AcabBleManager) {
         DeviceHero(name = name, firmware = status?.firmware, connected = status != null)
         FirmwareCard(installed = status?.version)
 
-        // scan radios (optimistic toggles, re-synced above)
+        // scan radios (toggles flip right away, re-synced above)
         Column(Modifier.fillMaxWidth().panel(), verticalArrangement = Arrangement.spacedBy(14.dp)) {
             Kicker("SCAN RADIOS")
             ToggleRow("Bluetooth LE", "ALPR · drone · trackers", checked = bleOn) {
@@ -105,7 +105,7 @@ fun DeviceScreen(ble: AcabBleManager) {
             }
         }
 
-        // detectors (optimistic toggles, re-synced above)
+        // detectors (toggles flip right away, re-synced above)
         Column(Modifier.fillMaxWidth().panel(), verticalArrangement = Arrangement.spacedBy(14.dp)) {
             Kicker("DETECTORS")
             ToggleRow("Body cams", "Axon signature · experimental",
@@ -213,9 +213,9 @@ private fun FirmwareCard(installed: String?) {
 }
 
 /**
- * Mute switch (checked = silenced), a master volume slider, and a UI-only PER
- * THREAT section. The firmware only knows about the master level (same as iOS),
- * so the per-threat values just live in SharedPreferences and never get sent.
+ * Mute switch (checked = silenced), a master volume slider, and a UI-only PER THREAT
+ * section. The firmware only has one master level (same as iOS), so the per-threat
+ * values just live in SharedPreferences and never get sent to the board.
  */
 @Composable
 private fun BuzzerCard(
@@ -228,8 +228,8 @@ private fun BuzzerCard(
     val context = LocalContext.current
     val prefs = remember { context.getSharedPreferences("acab.volume", Context.MODE_PRIVATE) }
 
-    // Hold the master value locally so dragging just repaints the UI; write once on
-    // release (onValueChangeFinished) rather than on every frame.
+    // Keep the master value locally so dragging only repaints the UI; write once when
+    // the drag ends (onValueChangeFinished), not on every frame.
     var master by remember { mutableFloatStateOf(volume.toFloat()) }
     LaunchedEffect(volume) { master = volume.toFloat() }
 

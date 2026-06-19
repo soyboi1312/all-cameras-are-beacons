@@ -10,8 +10,8 @@
  *
  *   MESH_PROTO - a ToRadio protobuf frame with MeshPacket.channel set, so
  *                detections go out on a channel index you pick. Needs the Heltec
- *                Serial Module in PROTO mode with that channel configured. This is
- *                how you transmit on a specific channel.
+ *                Serial Module in PROTO mode with that channel set up. Use this to
+ *                transmit on a specific channel.
  *
  * Every message names the unit: "Flock camera detected", "Flock Raven detected",
  * "Axon body camera detected", "Drone detected".

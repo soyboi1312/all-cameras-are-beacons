@@ -1,8 +1,8 @@
 import Foundation
 
-/// The IEEE-registered vendor for each Flock OUI the detector watches. Flock runs on
+/// The IEEE-registered vendor for each Flock OUI the detector watches. Flock uses
 /// off-the-shelf modules, so most of these are chipset makers (Liteon, Espressif, USI,
-/// Silicon Labs) or consumer brands — only b41e52 is actually Flock's. We show this on
+/// Silicon Labs) or consumer brands. Only b41e52 is actually Flock's. We show this on
 /// the detail screen so an OUI match reads honestly.
 enum OUIVendors {
     static let table: [String: String] = [

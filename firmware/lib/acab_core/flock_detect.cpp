@@ -53,11 +53,11 @@ static bool nameMatch(const char* name) {
     if (!name || !name[0]) return false;
     for (size_t i = 0; i < FLOCK_NAME_COUNT; i++)
         if (ciContains(name, FLOCK_NAME_PATTERNS[i])) return true;
-    // Bare 10-digit-name matching removed 2026-06-18: it false-positived in the
-    // field on rotating/private BLE addresses with placeholder numeric names (a
+    // Bare 10-digit-name matching removed 2026-06-18: in the field it false-
+    // positived on rotating/private BLE addresses with placeholder numeric names (a
     // phone advertising "0102000000", not a camera). The specific Flock signatures
-    // (Penguin / FS / 0x09C8 / Flock- SSID / b4:1e:52) stay. To recover 10-digit
-    // matching safely, gate it on a public (non-random) BLE address.
+    // (Penguin / FS / 0x09C8 / Flock- SSID / b4:1e:52) stay. To bring 10-digit
+    // matching back safely, gate it on a public (non-random) BLE address.
     return false;
 }
 
@@ -118,7 +118,7 @@ static void parseAdv(const uint8_t* adv, size_t len, AdvFields* f) {
                 // camera OUI/name match. Each UUID is 16 bytes, little-endian, and
                 // Raven's all sit on the Bluetooth base UUID
                 // (0000xxxx-0000-1000-8000-00805f9b34fb), so match that LE prefix
-                // and lift the 16-bit short back out for the Raven test below.
+                // and pull the 16-bit short back out for the Raven test below.
                 static const uint8_t BT_BASE_LE[12] =
                     { 0xfb,0x34,0x9b,0x5f,0x80,0x00,0x00,0x80,0x00,0x10,0x00,0x00 };
                 for (uint8_t k = 0; k + 16 <= dataLen && f->svcCount < 16; k += 16) {
@@ -240,7 +240,7 @@ bool flockClassifyWiFi(const uint8_t* frame, size_t len, int rssi,
 
     // --- Primary: the "Flock-<partial MAC>" AP name is the strong WiFi signature
     //     (src: ryanohoro / GainSec). Match it directly with no OUI gate, since a
-    //     camera's WiFi MAC is the module-maker's, not Flock's own OUI. ---
+    //     camera's WiFi MAC belongs to the module maker, not Flock's own OUI. ---
     size_t pfxLen = strlen(FLOCK_SSID_PREFIX);
     if (sawSSID && !emptySSID && strncmp(ssid, FLOCK_SSID_PREFIX, pfxLen) == 0) {
         acabInit(out, ACAB_FLOCK_CAMERA, SRC_WIFI, addr2, (int16_t)rssi);

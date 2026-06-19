@@ -17,10 +17,10 @@
 // MAC OUI
 // ---------------------------------------------------------------------------
 // Only Flock Safety's OWN IEEE block is defensibly Flock-specific. The WiFi/BT
-// silicon is a LiteOn WCBN3510A, and Lite-On's OUIs are shared across millions
-// of consumer devices, so matching them is a false-positive magnet (in the field
-// they flagged a Molekule air purifier and a home camera). The old ~67-OUI
-// "superset" is intentionally gone; match the SSID / name / mfg-id below instead.
+// silicon is a LiteOn WCBN3510A, and Lite-On's OUIs are shared across millions of
+// consumer devices, so matching them is a false-positive magnet (in the field they
+// flagged a Molekule air purifier and a home camera). The old ~67-OUI "superset"
+// is gone on purpose; match the SSID / name / mfg-id below instead.
 struct FlockOui { uint8_t b[3]; uint8_t ext; };
 static const FlockOui FLOCK_OUI[] = {
     // B4:1E:52  Flock Safety, Inc.  (IEEE MA-L, registered 2024-05-09)

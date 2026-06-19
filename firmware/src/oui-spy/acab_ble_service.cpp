@@ -99,8 +99,8 @@ class CfgCb : public NimBLECharacteristicCallbacks {
 void acabBleBegin(const char* deviceName) {
     NimBLEDevice::init(deviceName ? deviceName : "ACAB");
     NimBLEDevice::setMTU(247);   // fit a detection JSON in one notify
-    // Encrypted, bonded link for the whole service - so a stranger can't silence
-    // the scanner (config write) or watch what you're detecting (detection/status
+    // Encrypted, bonded link for the whole service, so a stranger can't silence the
+    // scanner (config write) or watch what you're detecting (detection/status
     // stream). "Just works" pairing, no passkey, since the board has no I/O.
     NimBLEDevice::setSecurityAuth(true, false, true);            // bonding, no MITM, LE Secure Connections
     NimBLEDevice::setSecurityIOCap(BLE_HS_IO_NO_INPUT_OUTPUT);

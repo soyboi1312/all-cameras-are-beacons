@@ -1,9 +1,9 @@
 package tech.acab.app.model
 
-/** The IEEE-registered vendor for each Flock OUI the detector watches. Flock runs on
+/** The IEEE-registered vendor for each Flock OUI the detector watches. Flock uses
  *  off-the-shelf modules, so most of these are chipset makers (Liteon, Espressif, USI,
- *  Silicon Labs) or consumer brands, not Flock. Shown on the detail screen to keep an
- *  OUI match honest — only b41e52 is actually Flock's. */
+ *  Silicon Labs) or consumer brands, not Flock itself. Shown on the detail screen to
+ *  keep an OUI match honest — only b41e52 is actually Flock's. */
 val OUI_VENDORS: Map<String, String> = mapOf(
     "00180a" to "Cisco Meraki",
     "00236c" to "Apple",

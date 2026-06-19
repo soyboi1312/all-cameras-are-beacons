@@ -27,15 +27,15 @@ class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         syncPermissionState()
-        // Prompt for anything still missing (also catches upgrades where Bluetooth
-        // was granted but location never asked). Fresh launches only, so a rotation
-        // doesn't re-pester.
+        // Ask for anything still missing (this also catches upgrades where Bluetooth
+        // was granted but location was never asked for). Fresh launches only, so a
+        // rotation doesn't nag again.
         if (savedInstanceState == null && !requestedPermissions().all { hasPermission(it) }) {
             requestPermissions.launch(requestedPermissions())
         }
         setContent {
-            // Space Grotesk is the default face for any Text that isn't mono, like
-            // the iOS app. Component colors stay untouched.
+            // Space Grotesk is the default face for any non-mono Text, like the iOS
+            // app. Doesn't touch component colors.
             CompositionLocalProvider(
                 LocalTextStyle provides LocalTextStyle.current.copy(fontFamily = Acab.display)
             ) {
@@ -55,8 +55,8 @@ class MainActivity : ComponentActivity() {
     }
 
     // Everything we ask for in one prompt: BLE plus location for the map. On Android
-    // 12+ a FINE request is ignored unless COARSE rides along with it — that's why
-    // the location prompt used to never show up.
+    // 12+ you have to request COARSE alongside FINE or the FINE request is ignored —
+    // that's why the location prompt used to never show up.
     private fun requestedPermissions(): Array<String> =
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S)
             arrayOf(

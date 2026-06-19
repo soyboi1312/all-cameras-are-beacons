@@ -23,7 +23,7 @@ static uint32_t       gLastSend = 0;
 MeshLinkConfig meshLinkDefaults() {
     MeshLinkConfig c;
     c.transport     = MESH_TEXT;   // stock Mesh-Detect Heltec uses Serial Module TextMessage,
-                                   // which broadcasts on the public/primary channel. Switch to
+                                   // which broadcasts on the public/primary channel. Use
                                    // MESH_PROTO (+ channelIndex) for a private channel.
     c.channelIndex  = 0;           // only used by MESH_PROTO
     c.uartBaud      = 115200;
@@ -112,8 +112,8 @@ static void buildText(const AcabDetection& d, char* buf, size_t cap) {
     }
 }
 
-// Send any text line over the mesh, using the configured transport + channel.
-// Skips dedup/rate-limit - used by detections (via meshLinkSend) and the boot
+// Send any text line over the mesh, using the configured transport + channel. No
+// dedup or rate-limit - used by detections (via meshLinkSend) and the boot
 // self-test ping.
 void meshLinkSendText(const char* text) {
     Serial.printf("[ACAB-mesh] -> %s\n", text);

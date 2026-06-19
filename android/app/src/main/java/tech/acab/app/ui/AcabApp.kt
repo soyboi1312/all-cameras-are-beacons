@@ -34,7 +34,7 @@ import tech.acab.app.model.Detection
 import tech.acab.app.ui.theme.Acab
 
 /**
- * The pre-connection screen: scan, connect (which kicks off bonding), stream
+ * The pre-connection screen: scan, connect (which starts bonding), then stream
  * detections. Once the link is up, the four-tab MainScreen takes over.
  */
 @Composable

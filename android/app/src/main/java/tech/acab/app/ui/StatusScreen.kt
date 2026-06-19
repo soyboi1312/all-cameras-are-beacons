@@ -113,7 +113,7 @@ private fun BrandMark(size: Int) {
 }
 
 /** Status pill: amber DEMO in sample-data mode, crimson LINKED + version when
- *  connected, faint OFFLINE otherwise. */
+ *  connected, or faint OFFLINE otherwise. */
 @Composable
 private fun LinkChip(version: String?, demo: Boolean = false) {
     val connected = version != null

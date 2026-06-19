@@ -5,12 +5,12 @@
  * public OUI 00:25:DF (not a random address), with a payload that self-identifies
  * as "...BWC DEVICE". So OUI detection is now ENABLED in the oui-spy build
  * (axonUseRegistryCandidate + axonSetEnabled, in main.cpp). The older "stays
- * disabled" notes below are kept for history. One caveat remains: the OUI alone
- * can't tell a body cam from another Axon product (TASER/dock/fleet cam) - AND a
- * "BWC DEVICE" payload check on top if false positives ever crop up.
+ * disabled" notes below are kept for history. One caveat: the OUI alone can't tell
+ * a body cam from another Axon product (TASER/dock/fleet cam) - add a "BWC DEVICE"
+ * payload check on top if false positives ever crop up.
  *
- * The idea: body cams are BLE devices, so passive detection works in principle as
- * long as they advertise a stable signature instead of a rotating random address.
+ * The idea: body cams are BLE devices, so passive detection works in principle, as
+ * long as they advertise a stable signature and not a rotating random address.
  *
  * What we know for sure: Axon Enterprise, Inc. owns exactly one IEEE MAC block,
  * OUI 00:25:DF (MA-L, registered 2010 as TASER International, updated 2025-01-30).
@@ -19,7 +19,7 @@
  *
  * Settled in the field: body cams DO advertise on the public 00:25:DF MAC (not a
  * resolvable random address), so passive OUI detection works. The module is now:
- *   - ENABLED by default - field-validated, so it earns its place in the scan.
+ *   - ENABLED by default - field-validated, so it earns its spot in the scan.
  *   - DATA-DRIVEN - load a captured signature with axonLoadSignature(), or use the
  *     registry OUI via axonUseRegistryCandidate().
  *   - TIGHTENABLE - OUI-only is the loose match (any Axon product); set

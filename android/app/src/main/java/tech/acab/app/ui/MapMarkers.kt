@@ -24,9 +24,9 @@ import tech.acab.app.model.DeviceType
 import tech.acab.app.ui.theme.Acab
 import tech.acab.app.ui.theme.tone
 
-/** Map marker icons, one per detection type, like the iOS pins: a filled
- *  category-tone dot with a dark ring and the category glyph. Built once and
- *  reused across every marker of a type. */
+/** Map marker icons, one per detection type, like the iOS pins: a filled dot in the
+ *  category tone, with a dark ring and the category glyph. Built once per type and
+ *  reused across all of that type's markers. */
 @Composable
 fun rememberCategoryMarkers(): Map<DeviceType, BitmapDrawable> = mapOf(
     DeviceType.FLOCK_CAMERA to rememberCategoryMarker(DeviceType.FLOCK_CAMERA),

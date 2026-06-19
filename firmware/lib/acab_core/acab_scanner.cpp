@@ -123,8 +123,8 @@ static void sinkTask(void*) {
 }
 
 // Drones rotate their MAC and broadcast on both radios, so key them by UAS-ID
-// instead - that's the stable "one drone = one entry" identity. Everything else
-// keys by MAC. Returns d.mac, or a hashed 6-byte key written into scratch.
+// instead - the stable "one drone = one entry" identity. Everything else keys by
+// MAC. Returns d.mac, or a hashed 6-byte key written into scratch.
 static const uint8_t* dedupKey(const AcabDetection& d, uint8_t scratch[6]) {
     if (d.type == ACAB_DRONE && d.id[0]) {
         uint32_t h = 2166136261u;                  // FNV-1a over the UAS-ID
@@ -178,8 +178,8 @@ public:
     void onResult(NimBLEAdvertisedDevice* dev) override {
         gBleSeen++;
         // NimBLE keeps the address little-endian and getNative() points at a
-        // temporary, so copy AND flip to human order (mac[0] = OUI byte) - what
-        // our OUI tables expect.
+        // temporary, so copy it AND flip to human order (mac[0] = OUI byte), which
+        // is what our OUI tables expect.
         NimBLEAddress addr = dev->getAddress();
         const uint8_t* nat = addr.getNative();
         if (!nat) return;
@@ -191,7 +191,7 @@ public:
         size_t   plen    = dev->getPayloadLength();
 
 #ifdef ACAB_DIAG
-        // Log EVERY advert, matched or not. Next to a real camera on the bench
+        // Log EVERY advert, matched or not. On the bench next to a real camera,
         // this shows whether its advert arrives at all and what it carries
         // (name / mfg id / OUI), to compare against the signature tables.
         {
@@ -232,9 +232,9 @@ static void bleScanTask(void*) {
 // WiFi
 // ---------------------------------------------------------------------------
 #ifdef ACAB_DIAG_WIFI
-// Bench diagnostic: log every beacon / probe-response (BSSID + SSID + RSSI), so
-// a field test next to a pole-mounted camera can spot its WiFi presence, if any.
-// Parsing + serial happen off the promiscuous callback via a queue and task.
+// Bench diagnostic: log every beacon / probe-response (BSSID + SSID + RSSI), so a
+// field test next to a pole-mounted camera can spot its WiFi presence, if any.
+// Parsing + serial run off the promiscuous callback via a queue and task.
 struct WifiDiagItem { uint8_t bssid[6]; int8_t rssi; char ssid[33]; };
 static QueueHandle_t gWifiDiagQ = nullptr;
 static void wifiDiagTask(void*) {
@@ -279,11 +279,11 @@ static void IRAM_ATTR wifiRxCallback(void* buf, wifi_promiscuous_pkt_type_t type
 }
 
 // Channel 6 is the OpenDroneID Wi-Fi "social" channel - Remote-ID NAN/beacon
-// frames live there, and sky-spy just parks on it for drones. A plain 1..13
-// sweep would sit on ch6 only ~8% of the time and miss a drone we drive past.
-// So this sequence revisits ch6 between every step (~50% dwell) while still
-// touching all 13 (and favouring the 1/6/11 non-overlappers), keeping Flock
-// Wi-Fi covered too since it can sit anywhere.
+// frames live there, and sky-spy just parks on it for drones. A plain 1..13 sweep
+// would sit on ch6 only ~8% of the time and miss a drone we drive past. So this
+// sequence comes back to ch6 between every step (~50% dwell) while still touching
+// all 13 (and favouring the 1/6/11 non-overlappers). That keeps Flock Wi-Fi
+// covered too, since it can sit anywhere.
 static const uint8_t WIFI_HOP_SEQ[] = {
     6, 1, 6, 11, 6, 2, 6, 3, 6, 4, 6, 5, 6, 7, 6, 8, 6, 9, 6, 10, 6, 12, 6, 13
 };

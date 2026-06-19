@@ -40,8 +40,8 @@ enum BLEConnectionState: Equatable {
 }
 
 /// Drives the link to an OUI-Spy board: scan, connect, stream detections, push
-/// config. CoreBluetooth uses `queue: nil`, so every delegate callback lands on the
-/// main thread — which is why we can mutate @Published state directly from them.
+/// config. CoreBluetooth runs on `queue: nil`, so every delegate callback lands on
+/// the main thread. That's why we can set @Published state straight from them.
 final class BLEManager: NSObject, ObservableObject {
     @Published private(set) var connectionState: BLEConnectionState = .unknown
     @Published private(set) var discovered: [DiscoveredDevice] = []
@@ -89,8 +89,8 @@ final class BLEManager: NSObject, ObservableObject {
         guard central.state == .poweredOn else { return }
         discovered.removeAll()
         connectionState = .scanning
-        // Allow duplicates so we reliably catch the scan-response manufacturer data
-        // (the firmware version) — it often arrives a callback or two after the first advert.
+        // Allow duplicates so we don't miss the scan-response manufacturer data
+        // (the firmware version) — it usually shows up a callback or two after the first advert.
         central.scanForPeripherals(withServices: [ACABProfile.service],
                                    options: [CBCentralManagerScanOptionAllowDuplicatesKey: true])
     }
@@ -178,15 +178,15 @@ final class BLEManager: NSObject, ObservableObject {
     }
 
     /// Where the phone was when we first heard this (the board has no GPS). Drones
-    /// broadcast their own position; for Flock/Raven/Axon this is what pins them on
-    /// the map. Nil if location wasn't available at first sighting.
+    /// send their own position, but for Flock/Raven/Axon this is what pins them on
+    /// the map. Nil if we had no location at first sighting.
     func capturedLocation(for id: String) -> CLLocationCoordinate2D? { capturedLoc[id] }
 
     // MARK: - Export
 
     /// CSV of the current log: when, what, and where for each detection. "Where" is
-    /// your phone's position at first sighting (the board has no GPS), blank if
-    /// location wasn't available.
+    /// your phone's position at first sighting (the board has no GPS), or blank if we
+    /// had no location then.
     func detectionsCSV() -> String {
         let fmt = ISO8601DateFormatter()
         var rows = ["detected_at,type,mac,rssi,source,matched_on,confidence,sightings,approx_lat,approx_lon"]
@@ -248,14 +248,13 @@ final class BLEManager: NSObject, ObservableObject {
     }
 
     /// True when a Focus (or Do Not Disturb) is on, so vibrate alerts stay quiet.
-    /// If we can't read Focus (never authorized), we treat it as off so alerts
-    /// still fire.
+    /// If we can't read Focus (never authorized), treat it as off so alerts still fire.
     private var focusActive: Bool {
         INFocusStatusCenter.default.focusStatus.isFocused == true
     }
 
-    /// Buzzer loudness, 0...100. `preview: true` also asks the board to beep once at
-    /// that level — handy on slider release so you can hear it.
+    /// Buzzer loudness, 0...100. `preview: true` also has the board beep once at that
+    /// level, so you can hear it on slider release.
     func setVolume(_ v: Int, preview: Bool = false) {
         var cfg: [String: Any] = ["volume": max(0, min(100, v))]
         if preview { cfg["beep"] = true }

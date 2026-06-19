@@ -9,7 +9,7 @@ import tech.acab.app.R
 import tech.acab.app.model.DeviceType
 
 /** Display face (Space Grotesk) and data face (JetBrains Mono) — the same TTFs the
- *  iOS app bundles. Space Grotesk only ships three cuts, so SemiBold borrows Bold. */
+ *  iOS app bundles. Space Grotesk only ships three weights, so SemiBold reuses Bold. */
 val SpaceGrotesk = FontFamily(
     Font(R.font.space_grotesk_regular, FontWeight.Normal),
     Font(R.font.space_grotesk_medium, FontWeight.Medium),

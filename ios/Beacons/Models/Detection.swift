@@ -32,8 +32,8 @@ struct Detection: Identifiable, Equatable {
     let count: Int               // sightings this session (json "n")
     let isNew: Bool              // first sighting in the dedup window (json "new")
 
-    /// Stable identity. Drones group by UAS-ID so they survive MAC rotation (matching
-    /// the firmware's dedup key); everything else is one entry per (type, MAC).
+    /// Stable identity. Drones group by UAS-ID so they survive MAC rotation, matching
+    /// the firmware's dedup key. Everything else is one entry per (type, MAC).
     var id: String {
         if type == .drone, let uasID, !uasID.isEmpty { return "\(type.rawValue):\(uasID)" }
         return "\(type.rawValue):\(mac)"
@@ -68,8 +68,8 @@ struct Detection: Identifiable, Equatable {
     }
 
     /// Drone maker decoded from a CTA-2063-A Remote ID serial. The serial is a 4-char
-    /// maker code + a length digit + the device serial; we name the codes we know and
-    /// otherwise just show the raw code.
+    /// maker code, then a length digit, then the device serial. We name the codes we
+    /// know and show the raw code otherwise.
     var ridManufacturer: String? {
         guard type == .drone, let s = uasID, s.count >= 5 else { return nil }
         let chars = Array(s)
@@ -100,10 +100,10 @@ extension Detection: Decodable {
 
     init(from decoder: Decoder) throws {
         let k = try decoder.container(keyedBy: CodingKeys.self)
-        // Drop any detection whose type this build doesn't surface (e.g. police
-        // gear, t=6, which the firmware still emits). Throwing here makes the
-        // enclosing JSONDecoder().decode(...) fail at the try? call sites, so the
-        // row is skipped rather than mislabeled by a .flockCamera fallback.
+        // Drop any detection whose type this build doesn't show (e.g. police gear,
+        // t=6, which the firmware still emits). Throwing makes the enclosing
+        // JSONDecoder().decode(...) fail at the try? call sites, so the row is
+        // skipped instead of getting mislabeled by a .flockCamera fallback.
         guard let dt = DeviceType(rawValue: (try? k.decode(Int.self, forKey: .t)) ?? 0) else {
             throw DecodingError.dataCorruptedError(
                 forKey: .t, in: k, debugDescription: "unsupported device type for this build")

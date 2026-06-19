@@ -50,11 +50,11 @@ data class FoundBoard(val device: BluetoothDevice, val name: String, val rssi: I
 data class IgnoredDevice(val mac: String, val label: String)
 
 /**
- * Drives the link to an OUI-Spy board: scan by service UUID, connect, bond (the
- * GATT service is encrypted), subscribe to the detection + status notifies, parse,
- * and write config. Android's BLE stack does one op at a time, so the connect
- * sequence is chained through the callbacks. Permissions are the caller's problem —
- * the UI requests SCAN/CONNECT before any of this runs.
+ * Drives the link to an OUI-Spy board: scan by service UUID, connect, bond (the GATT
+ * service is encrypted), subscribe to the detection + status notifies, parse, and
+ * write config. Android's BLE stack only does one op at a time, so the connect steps
+ * are chained through the callbacks. Permissions are the caller's job — the UI asks
+ * for SCAN/CONNECT before any of this runs.
  */
 @SuppressLint("MissingPermission")
 class AcabBleManager(private val context: Context) {
@@ -236,12 +236,12 @@ class AcabBleManager(private val context: Context) {
                     charOf(g, AcabProfile.STATUS)?.let { g.readCharacteristic(it) }
                     _state.value = ConnState.READY
                     sendIgnoreList()   // re-push the whitelist for this session
-                    setBuzzer(_alertMode.value == AlertMode.BUZZER)   // a fresh board powers up with the buzzer on; match the phone's mode
+                    setBuzzer(_alertMode.value == AlertMode.BUZZER)   // a fresh board boots with the buzzer on; sync it to the phone's mode
                 }
             }
         }
 
-        // API 33+ hands us the value directly; older versions read characteristic.value.
+        // API 33+ passes the value in; older versions read it off characteristic.value.
         override fun onCharacteristicChanged(
             g: BluetoothGatt, c: BluetoothGattCharacteristic, value: ByteArray,
         ) = ingest(c.uuid, value)
@@ -307,7 +307,7 @@ class AcabBleManager(private val context: Context) {
                     }
                 }
                 _detections.value = store.values.toList().asReversed()
-                if (_alertMode.value == AlertMode.VIBRATE && firstTime && !focusSuppressed()) alertHaptic(d.type)   // buzz on first sighting, unless DND/Focus is on
+                if (_alertMode.value == AlertMode.VIBRATE && firstTime && !focusSuppressed()) alertHaptic(d.type)   // buzz on the first sighting, unless DND/Focus is on
             }
             AcabProfile.STATUS -> _status.value = DeviceStatus.fromJson(json)
         }
@@ -339,8 +339,8 @@ class AcabBleManager(private val context: Context) {
     fun setBleScan(on: Boolean) = writeConfig(JSONObject().put("ble", on))
     fun setWifiScan(on: Boolean) = writeConfig(JSONObject().put("wifi", on))
 
-    /** Pick how sightings announce. VIBRATE and SILENT both mute the board's buzzer
-     *  (when a chirp would give you away); VIBRATE buzzes this phone instead. */
+    /** Pick how sightings get announced. VIBRATE and SILENT both mute the board's
+     *  buzzer, for when a chirp would give you away; VIBRATE buzzes this phone instead. */
     fun setAlertMode(mode: AlertMode) {
         _alertMode.value = mode
         prefs.edit().putString("alertMode", mode.name).apply()
@@ -370,8 +370,8 @@ class AcabBleManager(private val context: Context) {
         return System.currentTimeMillis() - ls > olderThanMs
     }
 
-    /** Where to drop the map pin: the detection's own coords (drones) or the phone's
-     *  position when we first heard it. */
+    /** Where to drop the map pin: the detection's own coords (drones), or the phone's
+     *  position from when we first heard it. */
     fun mapCoord(d: Detection): Pair<Double, Double>? {
         val la = d.lat; val lo = d.lon
         return if (la != null && lo != null) la to lo else capturedLoc[d.id]
@@ -396,8 +396,8 @@ class AcabBleManager(private val context: Context) {
     }
 
     /** CSV of the current log: when, what, and where for each detection. Location is
-     *  the phone's rough position when first heard (the board has no GPS), or blank
-     *  if we didn't have one. */
+     *  the phone's rough position from when we first heard it (the board has no GPS),
+     *  or blank if we didn't have one. */
     fun detectionsCsv(): String {
         val rows = StringBuilder(
             "detected_at,type,mac,rssi,source,matched_on,confidence,sightings,approx_lat,approx_lon")
@@ -464,7 +464,7 @@ class AcabBleManager(private val context: Context) {
 
     // ---- demo mode (explore the UI with sample data, no board) ----
 
-    /** Seed some sample detections so the whole UI works without a board.
+    /** Seed sample detections so the whole UI works without a board.
      *  Behind the connect screen's "Continue without pairing" button. */
     fun seedDemoData() {
         _demoMode.value = true

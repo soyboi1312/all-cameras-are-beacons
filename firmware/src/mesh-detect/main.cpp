@@ -31,7 +31,7 @@
 
 // How often the diagnostic heartbeat fires. With -DACAB_DIAG, the unit pushes a
 // radio-health line to the mesh this often, so a drive test is readable without a
-// serial cable. ACAB_DIAG also turns on a verbose per-advert serial log (see
+// serial cable. ACAB_DIAG also turns on a chatty per-advert serial log (see
 // acab_scanner).
 #ifndef ACAB_HEARTBEAT_MS
 #define ACAB_HEARTBEAT_MS 120000
@@ -100,7 +100,7 @@ void loop() {
     uint32_t now = millis();
 
     // One-time boot self-test: announce on the mesh ~10s after power-up, once the
-    // Heltec is up, to confirm the send path without waiting for a detection.
+    // Heltec is up, to check the send path without waiting for a detection.
     if (!bootPinged && now > 10000) {
         bootPinged = true;
         meshLinkSendText("mesh-detect ACAB online");

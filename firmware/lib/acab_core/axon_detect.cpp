@@ -29,10 +29,10 @@ static const AxonSignature AXON_PLACEHOLDER = {
     /* baseConfidence*/ 40,
 };
 
-// Axon Enterprise's only IEEE OUI, 00:25:DF (cite in axon_signatures.h).
+// Axon Enterprise's only IEEE OUI, 00:25:DF (cited in axon_signatures.h).
 // FIELD-VALIDATED 2026-06-17: real Axon body cams advertise on this public OUI.
-// OUI-only is the loose match (could be any Axon product); classify() checks for
-// the "BWCDEVICE" service-data tag on top and, when present, confirms body cam and
+// OUI-only is the loose match (could be any Axon product); classify() also checks
+// for the "BWCDEVICE" service-data tag, and when it's there, confirms body cam and
 // raises confidence. Set usePayload=true here to REQUIRE the tag (strictest match).
 static const AxonSignature AXON_REGISTRY_CANDIDATE = {
     /* useMfgId      */ false, /* mfgId */ 0x0000,
@@ -64,7 +64,7 @@ static bool ciContains(const char* hay, const char* needle) {
     return false;
 }
 
-// Case-insensitive search for an ASCII needle inside a raw byte buffer, trying the
+// Case-insensitive search for an ASCII needle in a raw byte buffer, checking the
 // buffer both forward and reversed. BLE carries 128-bit UUIDs little-endian, so an
 // ASCII-encoded UUID (like Axon's "...BWCDEVICE") only reads right when reversed.
 static bool bytesContainAscii(const uint8_t* buf, uint8_t len, const char* needle) {
@@ -128,8 +128,8 @@ bool axonClassifyBLE(const uint8_t mac[6], const uint8_t* adv, size_t advLen,
     if (adv && advLen) parseAdv(adv, advLen, &f);
     else memset(&f, 0, sizeof(f));
 
-    // Every set criterion has to match. With none set (the placeholder), nothing
-    // matches and we bail - by design.
+    // Every criterion that's set has to match. With none set (the placeholder),
+    // nothing matches and we bail - by design.
     bool any = false, ok = true;
 
     if (gSig.useMfgId) {
@@ -167,8 +167,8 @@ bool axonClassifyBLE(const uint8_t mac[6], const uint8_t* adv, size_t advLen,
     out->method = gSig.useMfgId ? M_MFG_ID : (gSig.useOui ? M_OUI : M_NAME);
     if (f.haveName) strncpy(out->name, f.name, sizeof(out->name) - 1);
 
-    // Confirm it's specifically a body cam (vs dock / TASER / fleet) when the
-    // advert carries the "BWCDEVICE" service-data tag; that earns higher confidence.
+    // If the advert carries the "BWCDEVICE" service-data tag, confirm it's a body
+    // cam (vs dock / TASER / fleet) and give it higher confidence.
     if (bytesContainAscii(f.svc, f.svcLen, AXON_BWC_PAYLOAD)) {
         out->confidence = gSig.baseConfidence < 90 ? 90 : gSig.baseConfidence;
         snprintf(out->detail, sizeof(out->detail), "BWC DEVICE");

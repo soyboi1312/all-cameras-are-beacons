@@ -81,7 +81,7 @@ data class Detection(
     val count: Int,
     val isNew: Boolean,
 ) {
-    /** Stable identity. Drones key on UAS-ID (survives MAC rotation, same as the
+    /** Stable identity. Drones key on UAS-ID, which survives MAC rotation (same as the
      *  firmware's dedup key); everything else uses type + mac. */
     val id: String get() =
         if (type == DeviceType.DRONE && !rid.isNullOrEmpty()) "${type.raw}:$rid"
@@ -92,8 +92,8 @@ data class Detection(
         1 -> "On ground"; 2 -> "Airborne"; 3 -> "Emergency"; 4 -> "System fault"; else -> null
     }
 
-    /** Manufacturer from a CTA-2063-A Remote ID serial (4-char code + length digit +
-     *  serial). Names the codes we know; otherwise just shows the code. */
+    /** Maker from a CTA-2063-A Remote ID serial (4-char code + length digit + serial).
+     *  Names the codes we know; otherwise just shows the code. */
     val ridManufacturer: String? get() {
         if (type != DeviceType.DRONE) return null
         val s = rid ?: return null

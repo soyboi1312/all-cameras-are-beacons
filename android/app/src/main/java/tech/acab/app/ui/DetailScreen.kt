@@ -193,7 +193,7 @@ private fun BadgePill(label: String, tone: Color) {
     }
 }
 
-/** Heads-up for OUI-only matches: the OUI just names the chipset vendor, which Flock
+/** Heads-up for OUI-only matches: the OUI only names the chipset vendor, which Flock
  *  shares with consumer gear, so these can be false positives. */
 @Composable
 private fun FalsePositiveNote() {
@@ -252,7 +252,7 @@ private fun LocationPanel(d: Detection, lat: Double, lon: Double) {
     val markers = rememberCategoryMarkers()
     val operatorMarker = rememberOperatorMarker()
 
-    // osmdroid needs a user agent set before its first tile fetch, or the CDN 403s.
+    // osmdroid needs a user agent set before its first tile fetch, or the tile server rejects it.
     remember { Configuration.getInstance().userAgentValue = context.packageName }
 
     Column(Modifier.fillMaxWidth().panel(), verticalArrangement = Arrangement.spacedBy(10.dp)) {
