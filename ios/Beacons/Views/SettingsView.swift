@@ -336,7 +336,7 @@ struct DeviceView: View {
     private var aboutCard: some View {
         VStack(alignment: .leading, spacing: 12) {
             Kicker("ABOUT")
-            Text("Beacons is a companion app for counter-surveillance scanner firmware, built for Colonel Panic's OUI-Spy hardware.")
+            Text("All Cameras Are Beacons is a companion app for counter-surveillance scanner firmware, built for Colonel Panic's OUI-Spy hardware.")
                 .font(ACABTheme.mono(11)).foregroundStyle(ACABTheme.dim)
                 .fixedSize(horizontal: false, vertical: true)
             Divider().overlay(ACABTheme.line)
