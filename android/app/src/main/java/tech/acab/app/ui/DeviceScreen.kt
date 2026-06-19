@@ -145,8 +145,10 @@ fun DeviceScreen(ble: AcabBleManager) {
         DisconnectButton { ble.disconnect() }
 
         AboutCard(
+            onColonel = { context.openUrl("https://colonelpanic.tech") },
             onSource = { context.openUrl("https://github.com/soyboi1312/all-cameras-are-beacons") },
             onPrivacy = { context.openUrl("https://soyboi1312.github.io/all-cameras-are-beacons/privacy.html") },
+            onMadeBy = { context.openUrl("https://github.com/soyboi1312") },
         )
     }
 }
@@ -428,19 +430,21 @@ private fun shortMac(mac: String): String {
     return if (parts.size >= 2) parts.takeLast(2).joinToString(":").uppercase() else mac.uppercase()
 }
 
-/** What the app is, where the source lives, and the privacy stance. */
+/** What the app is, the hardware it runs on, where the source lives, and the privacy stance. */
 @Composable
-private fun AboutCard(onSource: () -> Unit, onPrivacy: () -> Unit) {
+private fun AboutCard(onColonel: () -> Unit, onSource: () -> Unit, onPrivacy: () -> Unit, onMadeBy: () -> Unit) {
     Column(Modifier.fillMaxWidth().panel(), verticalArrangement = Arrangement.spacedBy(12.dp)) {
         Kicker("ABOUT")
-        Text("Passive counter-surveillance detection. Nothing it finds leaves your device.",
+        Text("All Cameras Are Beacons is a companion app for counter-surveillance scanner firmware, built for Colonel Panic's OUI-Spy hardware.",
             color = Acab.dim, fontSize = 11.sp, fontFamily = Acab.mono)
         HorizontalDivider(color = Acab.line)
-        AboutLink("Source", "github.com/soyboi1312/all-cameras-are-beacons", onSource)
+        AboutLink("Colonel Panic", "colonelpanic.tech · OUI-Spy hardware", onColonel)
+        HorizontalDivider(color = Acab.line)
+        AboutLink("Source on GitHub", "github.com/soyboi1312/all-cameras-are-beacons", onSource)
         HorizontalDivider(color = Acab.line)
         AboutLink("Privacy", "no data leaves your device", onPrivacy)
         Text("made by soyboi", color = Acab.faint, fontSize = 10.sp, fontFamily = Acab.mono,
-            modifier = Modifier.fillMaxWidth().padding(top = 4.dp), textAlign = androidx.compose.ui.text.style.TextAlign.Center)
+            modifier = Modifier.fillMaxWidth().clickable(onClick = onMadeBy).padding(top = 4.dp), textAlign = androidx.compose.ui.text.style.TextAlign.Center)
     }
 }
 
