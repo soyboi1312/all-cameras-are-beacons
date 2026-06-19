@@ -1,0 +1,9 @@
+<resources>
+    <!-- Minimal host theme; Compose draws the actual UI. Dark window + bars so
+         there is no light flash before the first frame. -->
+    <style name="Theme.OuiAcab" parent="android:Theme.Material.NoActionBar">
+        <item name="android:windowBackground">#0A0608</item>
+        <item name="android:statusBarColor">#0A0608</item>
+        <item name="android:navigationBarColor">#0A0608</item>
+    </style>
+</resources>

@@ -1,0 +1,11 @@
+All Cameras Are Beacons
+Copyright 2026 soyboi
+
+This product includes software from the OpenDroneID project
+(opendroneid-core-c), licensed under the Apache License, Version 2.0.
+That component's license is retained alongside its source at
+firmware/lib/acab_core/opendroneid/LICENSE.
+
+This project runs on Colonel Panic's OUI-Spy hardware. Earlier releases ported
+detection code from oui-spy; the signatures have since been re-sourced from public
+registries and the classifiers re-derived from public standards. See CREDITS.md.

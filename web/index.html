@@ -1,0 +1,297 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>All Cameras Are Beacons · Firmware Flasher</title>
+<meta name="description" content="Browser-based firmware flasher for All Cameras Are Beacons, counter-surveillance detection for OUI-Spy and Mesh-Detect hardware.">
+<script type="module" src="https://unpkg.com/esp-web-tools@10/dist/web/install-button.js?module"></script>
+<style>
+  :root{
+    --bg:#0a0a0b; --panel:#141417; --line:#26262b; --ink:#ededf0;
+    --dim:#8a8a93; --accent:#e4322b; --accent-dim:#7a1c19; --ok:#3ad07a;
+    --mono:ui-monospace,"SF Mono",Menlo,Consolas,monospace;
+  }
+  *{box-sizing:border-box;margin:0;padding:0}
+  body{background:var(--bg);color:var(--ink);font-family:var(--mono);
+    line-height:1.5;-webkit-font-smoothing:antialiased;
+    background-image:repeating-linear-gradient(0deg,transparent 0 39px,#ffffff06 39px 40px);}
+  .wrap{max-width:840px;margin:0 auto;padding:32px 20px 64px}
+  header{border:1px solid var(--line);background:var(--panel);padding:28px 26px;position:relative;overflow:hidden}
+  header::before{content:"";position:absolute;inset:0 auto 0 0;width:4px;background:var(--accent)}
+  .mark{font-size:46px;font-weight:800;letter-spacing:10px}
+  .mark b{color:var(--accent)}
+  .expand{font-size:12px;color:var(--dim);letter-spacing:3px;margin-top:6px;text-transform:uppercase}
+  .lede{margin-top:16px;color:var(--ink);font-size:14px;max-width:62ch}
+  .scope{margin-top:14px;font-size:12px;color:var(--dim);border-top:1px solid var(--line);padding-top:12px}
+  .scope b{color:var(--ok)}
+
+  .note{margin:20px 0;border:1px solid var(--accent-dim);background:#1a0e0d;
+    color:#f2c6c4;font-size:12.5px;padding:12px 14px;display:flex;gap:10px;align-items:flex-start}
+  .note .x{color:var(--accent);font-weight:800}
+
+  .grid{display:grid;grid-template-columns:1fr 1fr;gap:16px;margin-top:22px}
+  @media(max-width:680px){.grid{grid-template-columns:1fr}.mark{font-size:34px;letter-spacing:6px}}
+  .card{border:1px solid var(--line);background:var(--panel);padding:22px;display:flex;flex-direction:column}
+  .card h2{font-size:18px;letter-spacing:1px;display:flex;align-items:center;gap:8px}
+  .tag{font-size:10px;letter-spacing:1px;color:var(--bg);background:var(--dim);padding:2px 6px;border-radius:2px}
+  .card p{color:var(--dim);font-size:13px;margin:10px 0 18px;flex:1}
+  .card ul{list-style:none;font-size:12px;color:var(--dim);margin:0 0 18px}
+  .card li{padding:2px 0 2px 16px;position:relative}
+  .card li::before{content:"›";position:absolute;left:0;color:var(--accent)}
+
+  .btn{appearance:none;cursor:pointer;font-family:var(--mono);font-size:14px;font-weight:700;
+    letter-spacing:1px;color:var(--bg);background:var(--accent);border:none;padding:12px 18px;
+    width:100%;transition:filter .15s}
+  .btn:hover{filter:brightness(1.12)}
+  esp-web-install-button[install-unsupported] .btn{background:var(--line);color:var(--dim);cursor:not-allowed}
+  .unsupported,.not-allowed{display:block;font-size:12px;color:var(--accent);margin-top:6px}
+  esp-web-install-button{display:block}
+  esp-web-install-button + esp-web-install-button{margin-top:8px}
+  .btn.btn-alt{background:transparent;color:var(--ink);border:1px solid var(--line)}
+  .btn.btn-alt:hover{filter:none;border-color:var(--accent)}
+
+  /* The esp-web-tools flashing dialog is Material Web 3 inside, defaulting to a
+     white surface and Roboto, which clashes with this page. Retheme it by
+     overriding the MD3 tokens on the two dialog hosts; the inner parts inherit
+     them. !important is required to beat the component's own :host defaults
+     across the shadow boundary. */
+  ewt-install-dialog,
+  ewt-no-port-picked-dialog{
+    --roboto-font:var(--mono)!important;
+    --md-ref-typeface-brand:var(--mono)!important;
+    --md-ref-typeface-plain:var(--mono)!important;
+    --text-color:var(--dim)!important;
+    --danger-color:var(--accent)!important;
+    --md-sys-color-primary:var(--accent)!important;
+    --md-sys-color-on-primary:var(--bg)!important;
+    --md-sys-color-error:var(--accent)!important;
+    --md-sys-color-on-error:var(--bg)!important;
+    --md-sys-color-surface:var(--panel)!important;
+    --md-sys-color-surface-container:var(--panel)!important;
+    --md-sys-color-surface-container-low:var(--panel)!important;
+    --md-sys-color-surface-container-lowest:var(--bg)!important;
+    --md-sys-color-surface-container-high:var(--panel)!important;
+    --md-sys-color-surface-container-highest:var(--line)!important;
+    --md-sys-color-surface-tint:var(--panel)!important;
+    --md-sys-color-on-surface:var(--ink)!important;
+    --md-sys-color-on-surface-variant:var(--dim)!important;
+    --md-sys-color-secondary-container:var(--line)!important;
+    --md-sys-color-on-secondary-container:var(--ink)!important;
+    --md-sys-color-outline:var(--line)!important;
+    --md-sys-color-outline-variant:var(--line)!important;
+    --md-sys-color-scrim:#000!important;
+  }
+
+  .targets{margin-top:30px;border:1px solid var(--line);background:var(--panel);padding:22px}
+  .targets h3{font-size:13px;letter-spacing:2px;color:var(--dim);text-transform:uppercase;margin-bottom:14px}
+  .tline{display:grid;grid-template-columns:150px 1fr auto;gap:10px;font-size:13px;padding:8px 0;border-top:1px solid var(--line)}
+  .tline:first-of-type{border-top:none}
+  .tline .n{color:var(--ink);font-weight:700}
+  .tline .r{color:var(--dim)}
+  .tline .s{font-size:11px;color:var(--ok)}
+  .tline .s.exp{color:var(--accent)}
+  .tline .s.opt{color:var(--dim)}
+
+  footer{margin-top:30px;font-size:12px;color:var(--dim);display:flex;flex-wrap:wrap;gap:16px;
+    border-top:1px solid var(--line);padding-top:16px}
+  footer a{color:var(--ink);text-decoration:none;border-bottom:1px solid var(--accent-dim)}
+  footer a:hover{border-color:var(--accent)}
+  .steps{margin-top:8px;font-size:12px;color:var(--dim)}
+  .steps code{color:var(--ink);background:#000;padding:1px 5px;border:1px solid var(--line)}
+  .steps a{color:var(--ink);text-decoration:none;border-bottom:1px solid var(--accent-dim)}
+  .steps a:hover{border-color:var(--accent)}
+  .lede a{color:var(--ink);text-decoration:none;border-bottom:1px solid var(--accent-dim)}
+  .lede a:hover{border-color:var(--accent)}
+
+  /* Re-pair reminder, shown only when the flasher's ERASE screen appears (erase
+     wipes NVS, where the BLE bond lives, so the phone must pair again). It's a
+     native <dialog>: showModal() puts it in the top layer, above the ESP Web Tools
+     dialog. A normal flash never shows the erase screen, so this stays hidden. */
+  #eraseDialog{position:fixed;top:50%;left:50%;transform:translate(-50%,-50%);margin:0;
+    max-width:440px;width:calc(100% - 32px);border:1px solid var(--accent);
+    background:var(--panel);color:var(--ink);font-family:var(--mono);padding:0}
+  #eraseDialog::backdrop{background:rgba(0,0,0,.6)}
+  #eraseDialog .ed-bd{padding:20px 22px}
+  #eraseDialog h3{font-size:15px;letter-spacing:1px;color:var(--accent);margin-bottom:10px;
+    display:flex;align-items:center;gap:8px}
+  #eraseDialog p{font-size:13px;line-height:1.5;color:var(--dim)}
+  #eraseDialog p b{color:var(--ink)}
+  #eraseDialog .ed-act{display:flex;justify-content:flex-end;margin-top:18px}
+  #eraseDialog .ed-act button{appearance:none;cursor:pointer;font-family:var(--mono);
+    font-size:13px;font-weight:700;letter-spacing:1px;color:var(--bg);background:var(--accent);
+    border:none;padding:10px 16px}
+  #eraseDialog .ed-act button:hover{filter:brightness(1.12)}
+</style>
+</head>
+<body>
+
+<dialog id="eraseDialog">
+  <div class="ed-bd">
+    <h3><span>!</span> Erasing will unpair Bluetooth</h3>
+    <p>Erase wipes the board's stored Bluetooth bond. If this device was paired with your
+      phone (the <b>All Cameras Are Beacons</b> app), you'll need to <b>remove the existing pairing</b> in
+      your phone's Bluetooth settings and pair again — otherwise the app won't reconnect.
+      A normal flash without erase keeps the pairing.</p>
+    <div class="ed-act"><button id="eraseDialogOk" type="button" autofocus>Got it</button></div>
+  </div>
+</dialog>
+
+<div class="wrap">
+
+  <header>
+    <div class="mark"><b>A</b>C<b>A</b>B</div>
+    <div class="expand">All&nbsp;Cameras&nbsp;Are&nbsp;Beacons</div>
+    <p class="lede">Counter-surveillance detection firmware for the
+      <a href="https://colonelpanic.tech/" target="_blank" rel="noopener">Colonel Panic
+      <b>OUI-Spy</b> and <b>Mesh-Detect</b></a> boards (XIAO ESP32-S3). Plug the board
+      into USB, pick a build, and flash it from this page. No toolchain is required.</p>
+    <div class="scope">ACAB is passive <b>detect-and-report</b> only. It listens for the
+      advertisements these devices already broadcast, with no jamming, spoofing, or interference.</div>
+  </header>
+
+  <div class="note" id="browserNote">
+    <span class="x">!</span>
+    <span>Web flashing needs the <b>Web Serial API</b>, so use <b>Chrome, Edge, or Opera on
+    desktop</b>. Safari and Firefox do not work. The board must be connected by USB-C.</span>
+  </div>
+
+  <div class="grid">
+    <div class="card">
+      <h2>OUI-Spy <span class="tag">APP</span></h2>
+      <p>An app-controlled scanner that streams detections to the All Cameras Are Beacons iOS app over BLE
+         and beeps a distinct tone for each target class.</p>
+      <ul>
+        <li>BLE + WiFi scanning</li>
+        <li>ACAB GATT service</li>
+        <li>buzzer / LED alerts</li>
+      </ul>
+      <p class="steps">The board pairs with the <b>All Cameras Are Beacons</b> iPhone app for live detections
+         and controls. Get it free on TestFlight via the
+         <a href="https://github.com/soyboi1312/all-cameras-are-beacons#the-phone-app" target="_blank" rel="noopener">README</a>.</p>
+      <esp-web-install-button manifest="./manifest-oui-spy.json">
+        <button class="btn" slot="activate">FLASH OUI-SPY</button>
+        <span slot="unsupported" class="unsupported">Browser not supported. Use Chrome or Edge.</span>
+        <span slot="not-allowed" class="not-allowed">Must be served over HTTPS or localhost.</span>
+      </esp-web-install-button>
+    </div>
+
+    <div class="card">
+      <h2>Mesh-Detect <span class="tag">MESH</span></h2>
+      <p>A standalone scanner that uplinks labelled alerts through a wired Heltec V3
+         Meshtastic node on a channel you choose.</p>
+      <ul>
+        <li>BLE + WiFi scanning</li>
+        <li>Meshtastic uplink</li>
+        <li>private-channel alerts</li>
+      </ul>
+      <p class="steps"><b>Plug USB-C into the XIAO Seeed ESP32-S3</b>, the small scanner
+         board, <b>not</b> the Heltec V3. This build flashes the XIAO; flash the Heltec V3
+         separately with <a href="https://flasher.meshtastic.org/" target="_blank" rel="noopener">Meshtastic
+         firmware</a>.</p>
+      <p class="steps"><b>Public</b> puts detections on the main LongFast channel (anyone
+         nearby sees them). <b>Private</b> puts them on an encrypted <code>acab</code> channel
+         only your nodes can read, and also needs the Heltec set up to match (see the
+         <a href="https://github.com/soyboi1312/all-cameras-are-beacons/blob/main/docs/mesh-setup.md" target="_blank" rel="noopener">mesh
+         setup guide</a>).</p>
+      <esp-web-install-button manifest="./manifest-mesh-detect.json">
+        <button class="btn" slot="activate">FLASH MESH-DETECT (PUBLIC)</button>
+        <span slot="unsupported" class="unsupported">Browser not supported. Use Chrome or Edge.</span>
+        <span slot="not-allowed" class="not-allowed">Must be served over HTTPS or localhost.</span>
+      </esp-web-install-button>
+      <esp-web-install-button manifest="./manifest-mesh-detect-ch1.json">
+        <button class="btn btn-alt" slot="activate">FLASH MESH-DETECT (PRIVATE)</button>
+        <span slot="unsupported" class="unsupported">Browser not supported. Use Chrome or Edge.</span>
+        <span slot="not-allowed" class="not-allowed">Must be served over HTTPS or localhost.</span>
+      </esp-web-install-button>
+    </div>
+  </div>
+
+  <div class="targets">
+    <h3>What it detects</h3>
+    <div class="tline"><span class="n">Flock camera</span><span class="r">Flock Safety ALPR · BLE + WiFi</span><span class="s">ready</span></div>
+    <div class="tline"><span class="n">Flock Raven</span><span class="r">audio / gunshot sensor · BLE</span><span class="s">ready</span></div>
+    <div class="tline"><span class="n">Drone</span><span class="r">FAA Remote ID · BLE + WiFi</span><span class="s">ready</span></div>
+    <div class="tline"><span class="n">Axon body camera</span><span class="r">Axon Enterprise · BLE</span><span class="s">ready</span></div>
+    <div class="tline"><span class="n">Item tracker</span><span class="r">AirTag · Tile · SmartTag · BLE</span><span class="s opt">opt-in</span></div>
+  </div>
+
+  <footer>
+    <span>All Cameras Are Beacons v1.0</span>
+    <a href="https://github.com/soyboi1312/all-cameras-are-beacons" id="repoLink">source</a>
+    <span style="flex:1"></span>
+    <span class="steps">After flashing: open a serial monitor at <code>115200</code> to watch detections.</span>
+  </footer>
+
+</div>
+
+<script>
+  // Hide the warning banner on browsers that actually support Web Serial.
+  if ('serial' in navigator) {
+    document.getElementById('browserNote').style.display = 'none';
+  }
+
+  // Bluetooth re-pair reminder. ESP Web Tools' install dialog has an "Erase device"
+  // checkbox (an <ew-checkbox>) on its erase screen. Erase wipes NVS, where the BLE
+  // bond lives, so the phone must pair again. We fire ONLY once that checkbox is
+  // actually checked (not when the screen merely appears), and show our own
+  // top-layer <dialog> above theirs. Backup: the real "erasing" flash state. Warns
+  // at most once per install session.
+  (function () {
+    var dlg = document.getElementById('eraseDialog');
+    if (!dlg || !dlg.showModal) return;
+    var okBtn = document.getElementById('eraseDialogOk');
+    if (okBtn) okBtn.addEventListener('click', function () { try { dlg.close(); } catch (e) {} });
+
+    var warned = false;
+    function warn() {
+      if (warned) return;
+      warned = true;
+      try { if (!dlg.open) dlg.showModal(); } catch (e) {}
+    }
+
+    // Collect matching elements across nested shadow roots.
+    function deepQueryAll(root, sel, out) {
+      out = out || [];
+      if (!root || !root.querySelectorAll) return out;
+      root.querySelectorAll(sel).forEach(function (e) { out.push(e); });
+      root.querySelectorAll('*').forEach(function (e) {
+        if (e.shadowRoot) deepQueryAll(e.shadowRoot, sel, out);
+      });
+      return out;
+    }
+
+    // True only once the user has CHECKED an "Erase device" box in the flasher dialog.
+    function eraseChecked() {
+      var dialogs = document.querySelectorAll('ewt-install-dialog'), i, j;
+      for (i = 0; i < dialogs.length; i++) {
+        var boxes = deepQueryAll(dialogs[i].shadowRoot, 'ew-checkbox');
+        for (j = 0; j < boxes.length; j++) if (boxes[j].checked) return true;
+      }
+      return false;
+    }
+
+    // Clicks are composed, so a capture listener on document sees the checkbox click
+    // even though it lives in shadow DOM. Re-check just after the click settles.
+    document.addEventListener('click', function () {
+      setTimeout(function () { if (eraseChecked()) warn(); }, 0);
+    }, true);
+
+    // Re-arm when the install session ends (dialog removed from the page).
+    try {
+      new MutationObserver(function () {
+        if (!document.querySelector('ewt-install-dialog')) warned = false;
+      }).observe(document.body, { childList: true, subtree: true });
+    } catch (e) {}
+
+    // Backup trigger: the actual "erasing" flash state (stable, non-minified string).
+    document.querySelectorAll('esp-web-install-button').forEach(function (b) {
+      b.addEventListener('state-changed', function (e) {
+        var s = e && e.detail && e.detail.state;
+        if (s && String(s).toLowerCase().indexOf('eras') !== -1) warn();
+      });
+    });
+  })();
+</script>
+</body>
+</html>

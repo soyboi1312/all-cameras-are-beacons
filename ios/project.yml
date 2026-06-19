@@ -1,0 +1,74 @@
+# XcodeGen project definition for the Beacons iOS app.
+# Generate the Xcode project with:  xcodegen generate   (brew install xcodegen)
+name: Beacons
+options:
+  bundleIdPrefix: tech.beacons
+  deploymentTarget:
+    iOS: "17.0"
+  createIntermediateGroups: true
+
+# Mark the project as reviewed for the current Xcode so it stops nagging
+# "Update to recommended settings" (XcodeGen otherwise defaults this to 1430).
+attributes:
+  LastUpgradeCheck: "2650"
+  LastSwiftUpdateCheck: "2650"
+
+settings:
+  base:
+    MARKETING_VERSION: "1.0"
+    CURRENT_PROJECT_VERSION: "1"
+    SWIFT_VERSION: "5.0"
+    CODE_SIGN_STYLE: Automatic
+    DEVELOPMENT_TEAM: "49B9T69XPF"        # baked in so `xcodegen generate` keeps signing
+    ENABLE_USER_SCRIPT_SANDBOXING: YES    # Xcode-recommended build setting
+
+targets:
+  Beacons:
+    type: application
+    platform: iOS
+    sources:
+      - Beacons
+    info:
+      path: Beacons/Resources/Info.plist
+      properties:
+        CFBundleDisplayName: "Beacons"
+        # Drive version/build from the MARKETING_VERSION / CURRENT_PROJECT_VERSION
+        # build settings (XcodeGen otherwise bakes a literal 1.0/1 into the plist,
+        # which then wins because GENERATE_INFOPLIST_FILE is NO).
+        CFBundleShortVersionString: "$(MARKETING_VERSION)"
+        CFBundleVersion: "$(CURRENT_PROJECT_VERSION)"
+        # App uses only standard/exempt encryption (BLE, HTTPS), declared so
+        # TestFlight/App Store Connect stops asking for export compliance each build.
+        ITSAppUsesNonExemptEncryption: false
+        NSBluetoothAlwaysUsageDescription: "This app connects to your ESP32 board over Bluetooth to receive detections."
+        NSLocationWhenInUseUsageDescription: "This app tags each detection with your approximate location so the exported log shows where devices were seen."
+        NSFocusStatusUsageDescription: "This app checks whether a Focus or Do Not Disturb is active so it can stay silent and skip the vibrate alert while you have one on."
+        UIBackgroundModes:
+          - bluetooth-central
+          - location
+        UIAppFonts:
+          - SpaceGrotesk-Regular.ttf
+          - SpaceGrotesk-Medium.ttf
+          - SpaceGrotesk-Bold.ttf
+          - JetBrainsMono-Regular.ttf
+          - JetBrainsMono-Medium.ttf
+          - JetBrainsMono-SemiBold.ttf
+          - JetBrainsMono-Bold.ttf
+        UILaunchScreen: {}
+        UIApplicationSceneManifest:
+          UIApplicationSupportsMultipleScenes: false
+        UISupportedInterfaceOrientations:
+          - UIInterfaceOrientationPortrait
+        UISupportedInterfaceOrientations~ipad:
+          - UIInterfaceOrientationPortrait
+          - UIInterfaceOrientationPortraitUpsideDown
+          - UIInterfaceOrientationLandscapeLeft
+          - UIInterfaceOrientationLandscapeRight
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: tech.beacons.app
+        PRODUCT_NAME: Beacons
+        TARGETED_DEVICE_FAMILY: "1,2"
+        GENERATE_INFOPLIST_FILE: NO
+        ENABLE_PREVIEWS: YES
+        ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon

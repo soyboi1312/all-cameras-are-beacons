@@ -1,0 +1,21 @@
+# PlatformIO build output
+.pio/
+firmware/.pio/
+
+# Local reference copies of the upstream oui-spy repo (not part of ACAB)
+_reference/
+
+# OS / editor cruft
+.DS_Store
+*.swp
+.vscode/
+.idea/
+
+# Logs
+*.log
+
+# NOTE: web/firmware/*.bin ARE committed on purpose - the flasher serves them.
+
+# XcodeGen generates these from ios/project.yml (run `xcodegen generate`)
+ios/*.xcodeproj/
+ios/Beacons/Resources/Info.plist

@@ -1,0 +1,14 @@
+{
+  "name": "ACAB Mesh-Detect",
+  "version": "1.0",
+  "funding_url": "",
+  "new_install_prompt_erase": true,
+  "builds": [
+    {
+      "chipFamily": "ESP32-S3",
+      "parts": [
+        { "path": "firmware/acab-mesh-detect.bin", "offset": 0 }
+      ]
+    }
+  ]
+}

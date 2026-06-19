@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- Near-black to match the iOS icon's edges, so the inset foreground reads
+         as one seamless icon under any launcher mask. -->
+    <color name="ic_launcher_background">#0d0a0b</color>
+</resources>

@@ -1,0 +1,14 @@
+{
+  "name": "ACAB OUI-Spy",
+  "version": "1.0",
+  "funding_url": "",
+  "new_install_prompt_erase": true,
+  "builds": [
+    {
+      "chipFamily": "ESP32-S3",
+      "parts": [
+        { "path": "firmware/acab-oui-spy.bin", "offset": 0 }
+      ]
+    }
+  ]
+}
