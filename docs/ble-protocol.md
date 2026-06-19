@@ -1,6 +1,6 @@
-# ACAB BLE GATT Protocol (OUI-Spy ↔ iOS app)
+# ACAB BLE GATT Protocol (oui-spy ↔ iOS app)
 
-This is the contract between the OUI-Spy firmware and the native SwiftUI app
+This is the contract between the ACAB oui-spy firmware and the native SwiftUI app
 (Phase 2). The firmware advertises as **`ACAB`** and exposes one service.
 
 ## Service & characteristics
@@ -81,7 +81,7 @@ The firmware re-notifies Status after applying a config write.
 ## Status (read / notify)
 
 ```json
-{"fw":"ACAB-ouispy 0.9","up":1234,"total":42,
+{"fw":"ACAB-ouispy 1.0","up":1234,"total":42,
  "ble":true,"wifi":true,"axon":false,"buzzer":true,"vol":80,"gps":false}
 ```
 
