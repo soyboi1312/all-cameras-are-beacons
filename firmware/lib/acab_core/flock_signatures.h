@@ -30,6 +30,35 @@ static const FlockOui FLOCK_OUI[] = {
 static const size_t FLOCK_OUI_COUNT = sizeof(FLOCK_OUI) / sizeof(FLOCK_OUI[0]);
 
 // ---------------------------------------------------------------------------
+// WiFi client OUIs (Falcon cameras) - PROBE-REQUEST matched
+// ---------------------------------------------------------------------------
+// Falcon cams join a network as WiFi clients (no "Flock-" AP of their own) and give
+// themselves away with probe requests from a Liteon WiFi module. These specific Liteon
+// OUIs were seen on deflock-confirmed Falcons in the field (own field captures, 2026-06).
+// Liteon is shared silicon, so these are matched on PROBE REQUESTS ONLY (see
+// flockClassifyWiFi) to hold false positives down; grow the list from more field captures.
+struct FalconWifiOui { uint8_t b[3]; };
+static const FalconWifiOui FALCON_WIFI_OUI[] = {
+    // Own field captures (deflock-confirmed Falcons, 2026-06):
+    {{0xD8,0xF3,0xBC}},  // D8:F3:BC:7D:D4:CF
+    {{0xC0,0x35,0x32}},  // C0:35:32:AF:A3:7D
+    {{0x24,0xB2,0xB9}},  // 24:B2:B9:F5:D0:43
+    {{0xF4,0x6A,0xDD}},  // F4:6A:DD:62:38:5D / :5E:3A:F3
+    // Additional candidate Liteon "Flock WiFi" OUIs (pending own-capture confirmation).
+    // All IEEE-registered to Liteon Technology - the same module family as the four
+    // above. Probe-req gated like the rest, so the shared-silicon FP risk stays bounded.
+    {{0x70,0xC9,0x4E}},
+    {{0x3C,0x91,0x80}},
+    {{0x80,0x30,0x49}},
+    {{0x14,0x5A,0xFC}},
+    {{0x74,0x4C,0xA1}},
+    {{0x9C,0x2F,0x9D}},
+    {{0x94,0x08,0x53}},
+    {{0xE4,0xAA,0xEA}},
+};
+static const size_t FALCON_WIFI_OUI_COUNT = sizeof(FALCON_WIFI_OUI) / sizeof(FALCON_WIFI_OUI[0]);
+
+// ---------------------------------------------------------------------------
 // WiFi SSID prefix
 // ---------------------------------------------------------------------------
 // Falcon cameras stand up a setup/health AP named "Flock-<partial MAC>". This is

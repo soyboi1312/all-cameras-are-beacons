@@ -38,6 +38,18 @@ static bool ouiMatch(const uint8_t mac[6]) {
     return false;
 }
 
+// Falcon cameras' Liteon WiFi-module OUIs (probe-request matched - see
+// flockClassifyWiFi). Same random-MAC guard as ouiMatch.
+static bool falconWifiOui(const uint8_t mac[6]) {
+    if (mac[0] & 0x02) return false;
+    for (size_t i = 0; i < FALCON_WIFI_OUI_COUNT; i++) {
+        if (mac[0] == FALCON_WIFI_OUI[i].b[0] && mac[1] == FALCON_WIFI_OUI[i].b[1] &&
+            mac[2] == FALCON_WIFI_OUI[i].b[2])
+            return true;
+    }
+    return false;
+}
+
 // case-insensitive substring (so we don't depend on GNU strcasestr)
 static bool ciContains(const char* hay, const char* needle) {
     if (!hay || !needle || !*needle) return false;
@@ -253,6 +265,19 @@ bool flockClassifyWiFi(const uint8_t* frame, size_t len, int rssi,
     // --- Secondary: Flock's own OUI (B4:1E:52) on the transmitter or BSSID ---
     bool txHit  = ouiMatch(addr2);
     bool bssHit = ouiMatch(addr3);
+
+    // Falcon cams ride as WiFi clients (Liteon module, no "Flock-" AP) and give
+    // themselves away with PROBE REQUESTS. Match their OUI on a probe request only -
+    // Liteon is shared silicon, so the probe-req gate holds the false positives down.
+    // (Field-validated at a live Falcon, 2026-06.)
+    if (subtype == 0x4 && falconWifiOui(addr2)) {
+        acabInit(out, ACAB_FLOCK_CAMERA, SRC_WIFI, addr2, (int16_t)rssi);
+        out->method = M_PROBE;
+        out->confidence = 72;
+        snprintf(out->detail, sizeof(out->detail), "Falcon probe (OUI)");
+        return true;
+    }
+
     if (!txHit && !bssHit) return false;
 
     const uint8_t* src = txHit ? addr2 : addr3;

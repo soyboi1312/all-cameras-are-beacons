@@ -205,6 +205,25 @@ public:
         }
 #endif
 
+#ifdef ACAB_DIAG
+        // Watchlist (diag only): "Pigvision" is a candidate Flock BLE name we have not
+        // field-confirmed yet, so it is deliberately NOT in the production name table.
+        // Flag it loudly here; a real sighting is the signal to promote it into
+        // FLOCK_NAME_PATTERNS (flock_signatures.h). Case-insensitive substring, no deps.
+        {
+            std::string nm = dev->getName();
+            bool pig = false;
+            for (const char* p = nm.c_str(); *p && !pig; p++) {
+                const char* a = p; const char* w = "pigvision";
+                while (*w) { char c = *a; if (c >= 'A' && c <= 'Z') c += 32; if (c != *w) break; a++; w++; }
+                if (!*w) pig = true;
+            }
+            if (pig)
+                Serial.printf("[ble] *** PIGVISION CANDIDATE *** %02X:%02X:%02X:%02X:%02X:%02X rssi=%d name=\"%s\"\n",
+                              mac[0], mac[1], mac[2], mac[3], mac[4], mac[5], rssi, nm.c_str());
+        }
+#endif
+
         AcabDetection d;
         // Try most-specific first: drone (standardised) -> Flock -> tracker -> Axon,
         // then the broad Motorola/police OUI last so it never preempts a real match.
@@ -245,19 +264,70 @@ static void wifiDiagTask(void*) {
                           it.bssid[0], it.bssid[1], it.bssid[2], it.bssid[3], it.bssid[4],
                           it.bssid[5], it.rssi, it.ssid);
 }
+
+// Flock Falcon Wi-Fi OUIs seen in the field (own captures, 2026-06),
+// all Liteon allocations. Liteon is shared silicon = FP-prone (bench only); a
+// production match needs the specific Falcon sub-OUI range, not the whole block.
+static inline bool falconOui(const uint8_t* m) {
+    return (m[0]==0xD8 && m[1]==0xF3 && m[2]==0xBC) ||   // D8:F3:BC
+           (m[0]==0xC0 && m[1]==0x35 && m[2]==0x32) ||   // C0:35:32
+           (m[0]==0x24 && m[1]==0xB2 && m[2]==0xB9) ||   // 24:B2:B9
+           (m[0]==0xF4 && m[1]==0x6A && m[2]==0xDD);     // F4:6A:DD
+}
 #endif
 
 static void IRAM_ATTR wifiRxCallback(void* buf, wifi_promiscuous_pkt_type_t type) {
     if (!gWifiEnabled) return;
-    if (type != WIFI_PKT_MGMT) return;
     wifi_promiscuous_pkt_t* pkt = (wifi_promiscuous_pkt_t*)buf;
     const uint8_t* payload = pkt->payload;
     int len  = pkt->rx_ctrl.sig_len;
     int rssi = pkt->rx_ctrl.rssi;
     if (len < 24) return;
+
+#ifdef ACAB_DIAG_WIFI
+    // DATA frames: Falcon cams ride as WiFi clients (no "Flock-" beacon), so look for
+    // a Falcon MAC OUI in any of the three address fields (addr1 @+4, addr2 @+10,
+    // addr3 @+16) and log it. PROVISIONAL OUIs from own captures; Liteon is shared
+    // silicon so this is FP-prone - bench validation only.
+    if (type == WIFI_PKT_DATA && gWifiDiagQ) {
+        static uint32_t gDataN = 0; gDataN++;
+        const uint8_t* aa[3] = { payload + 4, payload + 10, payload + 16 };
+        bool matched = false;
+        for (int k = 0; k < 3; k++) {
+            const uint8_t* m = aa[k];
+            if (falconOui(m)) {
+                WifiDiagItem it;
+                memcpy(it.bssid, m, 6);
+                it.rssi = (int8_t)rssi;
+                memcpy(it.ssid, "DATA-FALCON", 12);
+                xQueueSend(gWifiDiagQ, &it, 0);
+                matched = true;
+                break;
+            }
+        }
+        if (!matched && (gDataN % 300) == 0) {   // sample: proves data frames are arriving
+            WifiDiagItem it;
+            memcpy(it.bssid, aa[1], 6);           // addr2 = source
+            it.rssi = (int8_t)rssi;
+            memcpy(it.ssid, "DATA-sample", 12);
+            xQueueSend(gWifiDiagQ, &it, 0);
+        }
+    }
+#endif
+
+    if (type != WIFI_PKT_MGMT) return;
     gWifiSeen++;
 
 #ifdef ACAB_DIAG_WIFI
+    // probe request (0x40): Falcon cams scan for networks as WiFi clients - match
+    // their OUI in addr2 (the prober). Lighter path: we already receive mgmt frames.
+    if (gWifiDiagQ && payload[0] == 0x40 && falconOui(payload + 10)) {
+        WifiDiagItem it;
+        memcpy(it.bssid, payload + 10, 6);
+        it.rssi = (int8_t)rssi;
+        memcpy(it.ssid, "PROBE-FALCON", 13);
+        xQueueSend(gWifiDiagQ, &it, 0);
+    }
     // beacon (0x80) or probe-response (0x50): grab BSSID + SSID for the bench log
     if (gWifiDiagQ && (payload[0] == 0x80 || payload[0] == 0x50) && len >= 38) {
         WifiDiagItem it;
@@ -363,6 +433,12 @@ void acabScannerBegin(const AcabScannerConfig& cfg, AcabDetectionSink sink) {
         WiFi.mode(WIFI_STA);
         WiFi.disconnect();
         esp_wifi_set_promiscuous(true);
+#ifdef ACAB_DIAG_WIFI
+        // also deliver DATA frames (Falcon cams are WiFi clients, not beacon APs)
+        { wifi_promiscuous_filter_t pf;
+          pf.filter_mask = WIFI_PROMIS_FILTER_MASK_MGMT | WIFI_PROMIS_FILTER_MASK_DATA;
+          esp_wifi_set_promiscuous_filter(&pf); }
+#endif
         esp_wifi_set_promiscuous_rx_cb(&wifiRxCallback);
         esp_wifi_set_channel(cfg.wifiChannelHop ? 6 : cfg.wifiFixedChannel,
                              WIFI_SECOND_CHAN_NONE);

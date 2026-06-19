@@ -32,13 +32,29 @@ Bulk-OUI mirrors: macaddress.io, maclookup.app, github.com/Ringmast4r/OUI-Master
 | BLE name | literal | `FS Ext Battery` | ryanohoro |
 | BLE mfg data | company ID | `0x09C8` (Flock's BT module; ryanohoro attributes to XUNTONG) | ryanohoro |
 | MAC OUI | exact | `B4:1E:52` (Flock Safety, MA-L, reg. 2024-05-09) | IEEE / maclookup.app |
+| WiFi probe-req | OUI, probe-req only | Liteon `D8:F3:BC` `C0:35:32` `24:B2:B9` `F4:6A:DD` | own field capture (2026-06) |
+| WiFi probe-req | OUI, probe-req only | Liteon `70:C9:4E` `3C:91:80` `80:30:49` `14:5A:FC` `74:4C:A1` `9C:2F:9D` `94:08:53` `E4:AA:EA` | candidate, pending own capture |
 
 **Detection-quality notes (read before you copy the old tables):**
 - The WiFi/BT chip is a LiteOn WCBN3510A. Lite-On's OUIs are shared across millions of
-  consumer devices, so OUI-matching on Lite-On is a false-positive magnet. Do not do it.
-- Drop the old ~67-OUI "superset" entirely. It was both ported curation and the source of
-  the field false positives. `B4:1E:52` (Flock's own block) is the only OUI defensibly
-  Flock-specific; everything else was a shared module maker.
+  consumer devices, so matching them on *any* frame is a false-positive magnet, and the old
+  ~67-OUI "superset" (ported curation + the source of the field false positives) stays dropped.
+  `B4:1E:52` (Flock's own block) is the only OUI defensibly Flock-specific on its own.
+- **Probe-request exception (Falcon as WiFi client):** Falcon cams join a network as WiFi
+  clients (no `Flock-` AP of their own) and emit probe requests from a Liteon module. Four
+  specific Liteon OUIs (`D8:F3:BC` `C0:35:32` `24:B2:B9` `F4:6A:DD`) were seen on deflock-
+  confirmed Falcons in the field and field-validated at a live Falcon (both `24:B2:B9` and
+  `F4:6A:DD` caught over probe requests). They are matched
+  on PROBE REQUESTS ONLY: the probe-req gate plus the specific (not superset) OUIs keeps this far
+  tighter than the old broad match. Residual risk is a non-Flock Liteon device probing nearby, so
+  it ships as a medium-confidence signal (conf 72), not proof. The list now also carries 8 more
+  Liteon OUIs (`70:C9:4E` `3C:91:80` `80:30:49` `14:5A:FC` `74:4C:A1` `9C:2F:9D` `94:08:53` `E4:AA:EA`),
+  candidate and probe-req gated, flagged pending our own field confirmation. Deliberately NOT
+  matching `08:3A:88` (USI; our Molekule
+  air-purifier FP) or its SiLabs "FS Ext Battery" OUI blocks, which the BLE name match already covers.
+- **Watchlist (diag only):** the BLE name `Pigvision` is a candidate Flock signature carried ONLY in
+  the `ACAB_DIAG` build (it logs `*** PIGVISION CANDIDATE ***`), never in production. A confirmed
+  field sighting is the trigger to promote it into `FLOCK_NAME_PATTERNS`.
 - The bare 10-digit BLE name is inherently ambiguous (any device with a 10-digit name
   matches, including phones). Gate it with RSSI and/or a co-signal before alerting.
 
