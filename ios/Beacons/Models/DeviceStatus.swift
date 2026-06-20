@@ -46,7 +46,7 @@ extension DeviceStatus: Decodable {
 extension DeviceStatus {
     /// Latest firmware this app ships against. Bump on a firmware release so the
     /// Device screen flags the update.
-    static let latestVersion = "1.0"
+    static let latestVersion = "1.1"
 
     /// Just the version number out of `fw` ("ACAB-ouispy 0.1.0" -> "0.1.0").
     var version: String { firmware.split(separator: " ").last.map(String.init) ?? firmware }

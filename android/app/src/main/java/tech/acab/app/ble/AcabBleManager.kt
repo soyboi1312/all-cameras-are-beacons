@@ -479,7 +479,7 @@ class AcabBleManager(private val context: Context) {
         _demoMode.value = true
         _deviceName.value = "ACAB"
         _status.value = DeviceStatus.fromJson(JSONObject(
-            """{"fw":"ACAB 1.0","up":4920,"total":7,"ble":true,"wifi":true,"bodycam":false,"tracker":true,"buzzer":true,"vol":70,"gps":true}"""))
+            """{"fw":"ACAB 1.1","up":4920,"total":7,"ble":true,"wifi":true,"bodycam":false,"tracker":true,"buzzer":true,"vol":70,"gps":true}"""))
         val samples = listOf(
             """{"t":1,"s":1,"meth":1,"c":95,"mac":"AC:AB:00:7F:2A:10","rssi":-54,"name":"FlockSafety","lat":37.7799,"lon":-122.4202,"n":12,"new":true}""",
             """{"t":1,"s":0,"meth":4,"c":88,"mac":"AC:AB:00:91:5B:22","rssi":-67,"lat":37.7782,"lon":-122.4175,"n":4}""",

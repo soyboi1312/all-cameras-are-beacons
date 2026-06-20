@@ -81,7 +81,7 @@ The firmware re-notifies Status after applying a config write.
 ## Status (read / notify)
 
 ```json
-{"fw":"ACAB-ouispy 1.0","up":1234,"total":42,
+{"fw":"ACAB-ouispy 1.1","up":1234,"total":42,
  "ble":true,"wifi":true,"axon":false,"buzzer":true,"vol":80,"gps":false}
 ```
 

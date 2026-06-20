@@ -346,6 +346,9 @@ struct DeviceView: View {
             linkRow("Source on GitHub", "github.com/soyboi1312/all-cameras-are-beacons",
                     URL(string: "https://github.com/soyboi1312/all-cameras-are-beacons")!)
             Divider().overlay(ACABTheme.line)
+            linkRow("Works with Mesh-Detect", "pairs with Mesh-Detect boards too",
+                    URL(string: "https://github.com/soyboi1312/all-cameras-are-beacons#the-phone-apps")!)
+            Divider().overlay(ACABTheme.line)
             linkRow("Privacy", "no data leaves your device",
                     URL(string: "https://soyboi1312.github.io/all-cameras-are-beacons/privacy.html")!)
             Link(destination: URL(string: "https://github.com/soyboi1312")!) {

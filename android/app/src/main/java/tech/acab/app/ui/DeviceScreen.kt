@@ -48,7 +48,7 @@ import tech.acab.app.ui.theme.Acab
 import tech.acab.app.ui.theme.tone
 
 /** Latest published firmware; bump this with each release. */
-private const val LATEST = "1.0"
+private const val LATEST = "1.1"
 
 /** Device tab: board status, scan radios, detectors, and the alert buzzer. */
 @Composable
@@ -149,6 +149,7 @@ fun DeviceScreen(ble: AcabBleManager) {
         AboutCard(
             onColonel = { context.openUrl("https://colonelpanic.tech") },
             onSource = { context.openUrl("https://github.com/soyboi1312/all-cameras-are-beacons") },
+            onMesh = { context.openUrl("https://github.com/soyboi1312/all-cameras-are-beacons#the-phone-apps") },
             onPrivacy = { context.openUrl("https://soyboi1312.github.io/all-cameras-are-beacons/privacy.html") },
             onMadeBy = { context.openUrl("https://github.com/soyboi1312") },
         )
@@ -434,7 +435,7 @@ private fun shortMac(mac: String): String {
 
 /** What the app is, the hardware it runs on, where the source lives, and the privacy stance. */
 @Composable
-private fun AboutCard(onColonel: () -> Unit, onSource: () -> Unit, onPrivacy: () -> Unit, onMadeBy: () -> Unit) {
+private fun AboutCard(onColonel: () -> Unit, onSource: () -> Unit, onMesh: () -> Unit, onPrivacy: () -> Unit, onMadeBy: () -> Unit) {
     Column(Modifier.fillMaxWidth().panel(), verticalArrangement = Arrangement.spacedBy(12.dp)) {
         Kicker("ABOUT")
         Text("All Cameras Are Beacons is a companion app for counter-surveillance scanner firmware, built for Colonel Panic's OUI-Spy hardware.",
@@ -443,6 +444,8 @@ private fun AboutCard(onColonel: () -> Unit, onSource: () -> Unit, onPrivacy: ()
         AboutLink("Colonel Panic", "colonelpanic.tech · OUI-Spy hardware", onColonel)
         HorizontalDivider(color = Acab.line)
         AboutLink("Source on GitHub", "github.com/soyboi1312/all-cameras-are-beacons", onSource)
+        HorizontalDivider(color = Acab.line)
+        AboutLink("Works with Mesh-Detect", "pairs with Mesh-Detect boards too", onMesh)
         HorizontalDivider(color = Acab.line)
         AboutLink("Privacy", "no data leaves your device", onPrivacy)
         Text("made by soyboi", color = Acab.faint, fontSize = 10.sp, fontFamily = Acab.mono,

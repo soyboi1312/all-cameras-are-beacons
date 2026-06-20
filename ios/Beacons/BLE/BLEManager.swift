@@ -323,7 +323,7 @@ final class BLEManager: NSObject, ObservableObject {
         connectionState = .connected
         connectedName = "ESP32 board"
         status = decodeJSON(DeviceStatus.self, [
-            "fw": "esp32-scanner 1.0", "up": 4920, "total": 7, "ble": true, "wifi": true,
+            "fw": "esp32-scanner 1.1", "up": 4920, "total": 7, "ble": true, "wifi": true,
             "axon": false, "tracker": true, "buzzer": true, "vol": 70, "gps": true,
         ])
         let samples: [[String: Any]] = [
