@@ -31,7 +31,7 @@ struct DeviceView: View {
                         radiosCard
                         detectorsCard
                         if !ble.ignored.isEmpty { ignoredCard }
-                        buzzerCard
+                        if ble.status?.isMeshDetect != true { buzzerCard }   // mesh board has no buzzer
                         statsGrid
                         disconnectButton
                         aboutCard

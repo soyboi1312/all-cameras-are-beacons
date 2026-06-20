@@ -14,6 +14,7 @@
 #include "tracker_detect.h"
 #include "police_detect.h"
 #include "acab_version.h"
+#include "acab_ble_service.h"
 #include "mesh_link.h"
 
 // Onboard LED (XIAO S3, inverted: LOW = on) - brief blink on each new detection.
@@ -37,9 +38,18 @@
 #define ACAB_HEARTBEAT_MS 120000
 #endif
 
-// Scanner sink: forward every hit to the mesh, blink the LED on first sighting.
-static void onDetection(const AcabDetection& d, bool isNew) {
-    meshLinkSend(d, isNew);
+// Scanner sink: forward every hit to the app (if connected) and the mesh, blink the
+// LED on first sighting.
+static void onDetection(const AcabDetection& d0, bool isNew) {
+    AcabDetection d = d0;
+    // Tag non-drone hits with the phone's GPS, but ONLY while the app is connected:
+    // no app means no location source, so the mesh line carries no coords. Drones
+    // already broadcast their own coords, so those still go out regardless.
+    if (d.type != ACAB_DRONE && !(d.lat || d.lon) && acabBleClientConnected())
+        acabBleGetPhoneGps(&d.lat, &d.lon, 60000);
+
+    acabBleNotifyDetection(d, isNew);   // stream to the app over BLE, same as oui-spy
+    meshLinkSend(d, isNew);             // and over the Meshtastic uplink
     if (isNew) {
         char mac[18];
         acabFormatMac(d.mac, mac);
@@ -67,9 +77,13 @@ void setup() {
     mesh.transport = (ACAB_MESH_CHANNEL == 0) ? MESH_TEXT : MESH_PROTO;
     meshLinkBegin(mesh);
 
-    // No GATT server here, so this build owns the BLE stack - let the scanner init it.
+    // Run the same GATT service oui-spy does, so the app can connect to a Mesh-Detect
+    // board too: see detections, configure it, and push the phone's GPS (which we tag
+    // onto the mesh uplink). acabBleBegin inits NimBLE; the scanner then reuses it.
+    acabBleBegin("ACAB-mesh", "mesh-detect-ACAB");
+
     AcabScannerConfig cfg = acabScannerDefaults();
-    cfg.initNimBLE = true;
+    cfg.initNimBLE = false;            // the GATT service already inited NimBLE
     cfg.bleDeviceName = "ACAB-mesh";
 
     // Axon body-cam detection on OUI 00:25:DF (field-validated 2026-06-17: real
@@ -109,6 +123,7 @@ void loop() {
 
     if (now - lastBeat > 60000) {
         lastBeat = now;
+        acabBleUpdateStatus();        // refresh the connected app's status view
         Serial.printf("[ACAB] alive | ble=%lu wifi=%lu det=%lu\n",
                       (unsigned long)acabScannerBleSeen(),
                       (unsigned long)acabScannerWifiSeen(),

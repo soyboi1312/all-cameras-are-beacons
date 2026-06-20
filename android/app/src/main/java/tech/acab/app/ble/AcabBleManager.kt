@@ -383,8 +383,17 @@ class AcabBleManager(private val context: Context) {
     /** The phone's last known coordinate (centers a no-GPS RSSI ring). */
     fun selfCoord(): Pair<Double, Double>? = lastLat?.let { la -> lastLon?.let { lo -> la to lo } }
 
-    /** Feed in the phone's location so we can geotag non-drone detections. */
-    fun setLocation(lat: Double, lon: Double) { lastLat = lat; lastLon = lon }
+    private var lastGpsSent = 0L
+    /** Feed in the phone's location: geotag non-drone detections locally, and push it
+     *  to a connected board so a Mesh-Detect uplink can carry where we are (throttled). */
+    fun setLocation(lat: Double, lon: Double) {
+        lastLat = lat; lastLon = lon
+        val now = System.currentTimeMillis()
+        if (_state.value == ConnState.READY && now - lastGpsSent > 15_000) {
+            lastGpsSent = now
+            writeConfig(JSONObject().put("lat", lat).put("lon", lon))
+        }
+    }
 
     // ---- log clear + CSV export ----
 

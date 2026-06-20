@@ -51,6 +51,9 @@ extension DeviceStatus {
     /// Just the version number out of `fw` ("ACAB-ouispy 0.1.0" -> "0.1.0").
     var version: String { firmware.split(separator: " ").last.map(String.init) ?? firmware }
 
+    /// True for a Mesh-Detect board (no buzzer; its fw label starts "mesh-detect").
+    var isMeshDetect: Bool { firmware.hasPrefix("mesh-detect") }
+
     /// Installed firmware older than `latestVersion`?
     var updateAvailable: Bool {
         version.compare(Self.latestVersion, options: .numeric) == .orderedAscending

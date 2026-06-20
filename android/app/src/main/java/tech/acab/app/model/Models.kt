@@ -149,6 +149,9 @@ data class DeviceStatus(
     /** Just the version, e.g. "0.2.3" from "ACAB-ouispy 0.2.3". */
     val version: String get() = firmware.substringAfterLast(' ', firmware)
 
+    /** True for a Mesh-Detect board (no buzzer; its fw label starts "mesh-detect"). */
+    val isMeshDetect: Boolean get() = firmware.startsWith("mesh-detect")
+
     companion object {
         fun fromJson(o: JSONObject) = DeviceStatus(
             firmware = o.optString("fw", ""),

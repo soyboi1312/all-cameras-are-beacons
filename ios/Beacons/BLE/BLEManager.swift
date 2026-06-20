@@ -274,6 +274,16 @@ final class BLEManager: NSObject, ObservableObject {
         peripheral.writeValue(data, for: configChar, type: .withResponse)
     }
 
+    /// Push the phone's GPS to the board so a Mesh-Detect uplink can carry where we
+    /// are. Throttled - the board only needs a periodic fix, not every CL update.
+    private var lastGpsSent = Date.distantPast
+    private func sendPhoneLocation() {
+        guard let c = lastCoord, configChar != nil,
+              Date().timeIntervalSince(lastGpsSent) > 15 else { return }
+        lastGpsSent = Date()
+        writeConfig(["lat": c.latitude, "lon": c.longitude])
+    }
+
     // MARK: - Decoding
 
     // Hot path: every detection notify from the board lands here.
@@ -448,6 +458,7 @@ extension BLEManager: CBPeripheralDelegate {
         connectionState = .connected
         sendIgnoreList()   // re-send the whitelist so the board has it this session
         setBuzzerEnabled(alertMode == .buzzer)   // a fresh board boots up buzzing; match the phone's mode
+        lastGpsSent = .distantPast; sendPhoneLocation()   // push our location to the freshly-connected board
     }
 
     func peripheral(_ peripheral: CBPeripheral, didUpdateValueFor characteristic: CBCharacteristic,
@@ -466,6 +477,7 @@ extension BLEManager: CBPeripheralDelegate {
 extension BLEManager: CLLocationManagerDelegate {
     func locationManager(_ manager: CLLocationManager, didUpdateLocations locations: [CLLocation]) {
         lastCoord = locations.last?.coordinate
+        sendPhoneLocation()
     }
     func locationManagerDidChangeAuthorization(_ manager: CLLocationManager) {
         switch manager.authorizationStatus {

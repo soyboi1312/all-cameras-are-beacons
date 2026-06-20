@@ -119,12 +119,14 @@ fun DeviceScreen(ble: AcabBleManager) {
             }
         }
 
-        BuzzerCard(
-            mode = mode,
-            volume = (status?.volume ?: 0),
-            onMode = { ble.setAlertMode(it) },
-            onVolumeCommit = { ble.setVolume(it, preview = true) },
-        )
+        if (status?.isMeshDetect != true) {   // mesh board has no buzzer
+            BuzzerCard(
+                mode = mode,
+                volume = (status?.volume ?: 0),
+                onMode = { ble.setAlertMode(it) },
+                onVolumeCommit = { ble.setVolume(it, preview = true) },
+            )
+        }
 
         StatsGrid(
             uptime = status?.uptime,

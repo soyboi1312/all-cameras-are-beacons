@@ -5,11 +5,26 @@
 #include "axon_detect.h"
 #include "tracker_detect.h"
 #include "acab_scanner.h"
-#include "alerts.h"
 
 #include <Arduino.h>
 #include <NimBLEDevice.h>
 #include <ArduinoJson.h>
+
+// The buzzer (alerts) is OUI-Spy hardware; the Mesh-Detect board has none. These
+// weak no-ops let this shared service link on a buzzer-less build - oui-spy's
+// alerts.cpp provides the strong overrides; mesh-detect falls through to these.
+__attribute__((weak)) void    alertsSetBuzzerEnabled(bool) {}
+__attribute__((weak)) bool    alertsBuzzerEnabled()         { return false; }
+__attribute__((weak)) void    alertsSetVolume(uint8_t)      {}
+__attribute__((weak)) uint8_t alertsVolume()                { return 0; }
+__attribute__((weak)) void    alertsBeepTest()              {}
+
+// Latest phone GPS the app pushed over the config characteristic (0 = none yet).
+static volatile double   gPhoneLat = 0, gPhoneLon = 0;
+static volatile uint32_t gPhoneGpsMs = 0;
+
+// Build label for the status "fw" string (oui-spy vs mesh-detect). Set in acabBleBegin.
+static const char* gFwLabel = "ACAB-ouispy";
 
 static NimBLEServer*         gServer = nullptr;
 static NimBLECharacteristic* gDetChar = nullptr;
@@ -92,11 +107,18 @@ class CfgCb : public NimBLECharacteristicCallbacks {
             acabScannerSetIgnoreList(macs, n);
             Serial.printf("[ACAB] ignore list: %d device(s)\n", n);
         }
+        // Phone GPS from the app: where we are, stamped onto detections + the mesh line.
+        if (doc["lat"].is<float>() && doc["lon"].is<float>()) {
+            gPhoneLat   = doc["lat"].as<double>();
+            gPhoneLon   = doc["lon"].as<double>();
+            gPhoneGpsMs = millis();
+        }
         acabBleUpdateStatus();
     }
 };
 
-void acabBleBegin(const char* deviceName) {
+void acabBleBegin(const char* deviceName, const char* fwLabel) {
+    gFwLabel = fwLabel ? fwLabel : "ACAB-ouispy";
     NimBLEDevice::init(deviceName ? deviceName : "ACAB");
     NimBLEDevice::setMTU(247);   // fit a detection JSON in one notify
     // Encrypted, bonded link for the whole service, so a stranger can't silence the
@@ -181,7 +203,9 @@ void acabBleNotifyDetection(const AcabDetection& d, bool isNew) {
 void acabBleUpdateStatus() {
     if (!gStatChar) return;
     JsonDocument doc;
-    doc["fw"]     = "ACAB-ouispy " ACAB_FW_VERSION;
+    static char fwbuf[40];
+    snprintf(fwbuf, sizeof(fwbuf), "%s %s", gFwLabel, ACAB_FW_VERSION);
+    doc["fw"]     = fwbuf;
     doc["up"]     = (uint32_t)(millis() / 1000);
     doc["total"]  = acabScannerTotalDetections();
     doc["ble"]    = acabScannerBLEEnabled();
@@ -191,7 +215,7 @@ void acabBleUpdateStatus() {
     doc["tracker"]= trackerIsEnabled();
     doc["buzzer"] = alertsBuzzerEnabled();
     doc["vol"]    = alertsVolume();
-    doc["gps"]    = false;
+    doc["gps"]    = (gPhoneGpsMs != 0) && (millis() - gPhoneGpsMs < 60000);
 
     char buf[200];
     size_t len = serializeJson(doc, buf, sizeof(buf));
@@ -200,3 +224,12 @@ void acabBleUpdateStatus() {
 }
 
 bool acabBleClientConnected() { return gConnected; }
+
+// Latest phone GPS the app pushed, if it arrived within maxAgeMs. Returns false
+// (leaving lat/lon untouched) when there's no fresh fix.
+bool acabBleGetPhoneGps(double* lat, double* lon, uint32_t maxAgeMs) {
+    if (gPhoneGpsMs == 0 || (millis() - gPhoneGpsMs) > maxAgeMs) return false;
+    if (lat) *lat = gPhoneLat;
+    if (lon) *lon = gPhoneLon;
+    return true;
+}

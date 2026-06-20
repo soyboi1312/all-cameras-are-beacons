@@ -104,11 +104,11 @@ static void buildText(const AcabDetection& d, char* buf, size_t cap) {
         if (d.id[0])
             n += snprintf(buf + n, cap - n, " | RID %s", d.id);
         if ((d.lat || d.lon) && (size_t)n < cap)
-            n += snprintf(buf + n, cap - n, " | %.5f,%.5f", d.lat, d.lon);
+            n += snprintf(buf + n, cap - n, " | https://maps.google.com/?q=%.5f,%.5f", d.lat, d.lon);
         if (d.altitude && (size_t)n < cap)
             n += snprintf(buf + n, cap - n, " | alt %ldm", (long)d.altitude);
     } else if (gCfg.includeGPS && (d.lat || d.lon) && (size_t)n < cap) {
-        n += snprintf(buf + n, cap - n, " | %.5f,%.5f", d.lat, d.lon);
+        n += snprintf(buf + n, cap - n, " | https://maps.google.com/?q=%.5f,%.5f", d.lat, d.lon);
     }
 }
 
