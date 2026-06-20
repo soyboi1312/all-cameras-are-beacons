@@ -94,7 +94,7 @@ firmware/
 ios/                          # the native iPhone app
 android/                      # the native Android app
 web/                          # the browser flasher
-docs/                         # protocol, mesh wiring, Axon notes
+docs/                         # protocol, mesh wiring, Axon notes, enclosure/antenna
 ```
 
 ## Where things stand
