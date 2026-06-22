@@ -27,7 +27,8 @@ enum AcabDeviceType : uint8_t {
     ACAB_DRONE         = 4,   // FAA Remote ID broadcasting UAS
     ACAB_TRACKER       = 5,   // BLE item tracker (AirTag/Find My, Tile, Samsung SmartTag)
     ACAB_POLICE_GEAR   = 6,   // Motorola Solutions WiFi/BLE device (LE-equipment proxy; OUI match)
-    ACAB_TYPE_COUNT    = 7
+    ACAB_NEARBY_DEVICE = 7,   // Desert mode: any device in range (no specific signature)
+    ACAB_TYPE_COUNT    = 8
 };
 
 // How we saw it on the radio.
@@ -95,6 +96,7 @@ static inline const char* acabTypeLabel(AcabDeviceType t) {
         case ACAB_DRONE:        return "Drone";
         case ACAB_TRACKER:      return "Tracker";
         case ACAB_POLICE_GEAR:  return "Police gear";
+        case ACAB_NEARBY_DEVICE:return "Nearby device";
         default:                return "Unknown";
     }
 }
@@ -108,6 +110,7 @@ static inline const char* acabTypeTag(AcabDeviceType t) {
         case ACAB_DRONE:        return "DRONE";
         case ACAB_TRACKER:      return "TRACKER";
         case ACAB_POLICE_GEAR:  return "POLICE";
+        case ACAB_NEARBY_DEVICE:return "NEARBY";
         default:                return "UNK";
     }
 }

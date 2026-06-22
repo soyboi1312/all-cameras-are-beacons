@@ -18,14 +18,14 @@ val acabKeyPassword = (findProperty("ACAB_KEY_PASSWORD") as String?) ?: System.g
 
 android {
     namespace = "tech.acab.app"
-    compileSdk = 35
+    compileSdk = 36   // Android 16: compile against the Live Update promote APIs (targetSdk stays 35)
 
     defaultConfig {
         applicationId = "tech.acab.app"
         minSdk = 26
         targetSdk = 35
-        versionCode = 12
-        versionName = "1.0"
+        versionCode = 15
+        versionName = "1.6"
     }
 
     signingConfigs {
@@ -64,7 +64,7 @@ dependencies {
     val composeBom = platform("androidx.compose:compose-bom:2025.01.00")
     implementation(composeBom)
 
-    implementation("androidx.core:core-ktx:1.15.0")
+    implementation("androidx.core:core-ktx:1.17.0")   // 1.17+ carries the Live Update promote APIs
     implementation("androidx.lifecycle:lifecycle-runtime-ktx:2.8.7")
     implementation("androidx.lifecycle:lifecycle-viewmodel-compose:2.8.7")
     implementation("androidx.activity:activity-compose:1.9.3")

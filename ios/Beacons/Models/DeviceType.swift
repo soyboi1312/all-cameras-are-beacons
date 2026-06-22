@@ -1,14 +1,16 @@
 import SwiftUI
 
-/// The five things this app looks for. Raw values match the firmware's `t` field
-/// (see docs/ble-protocol.md). The firmware may also emit police-gear (`t=6`),
-/// but this build intentionally drops it in Detection's decoder.
+/// What this app looks for. Raw values match the firmware's `t` field (see
+/// docs/ble-protocol.md). `nearbyDevice` (t=7) is Desert mode's catch-all. The
+/// firmware no longer emits a separate police-gear type (t=6) - Motorola/LE gear
+/// now reports as a body cam.
 enum DeviceType: Int, CaseIterable, Identifiable, Codable {
     case flockCamera = 1
     case flockRaven  = 2
     case axonBodyCam = 3
     case drone       = 4
     case tracker     = 5
+    case nearbyDevice = 7   // Desert mode: any device in range
 
     var id: Int { rawValue }
 
@@ -19,6 +21,7 @@ enum DeviceType: Int, CaseIterable, Identifiable, Codable {
         case .axonBodyCam: return "Body Camera"
         case .drone:       return "Drone"
         case .tracker:     return "Tracker"
+        case .nearbyDevice:return "Nearby Device"
         }
     }
 
@@ -29,6 +32,7 @@ enum DeviceType: Int, CaseIterable, Identifiable, Codable {
         case .axonBodyCam: return "BODY CAM"
         case .drone:       return "DRONE"
         case .tracker:     return "TRACKER"
+        case .nearbyDevice:return "NEARBY"
         }
     }
 
@@ -40,6 +44,7 @@ enum DeviceType: Int, CaseIterable, Identifiable, Codable {
         case .axonBodyCam: return "person.fill.viewfinder"
         case .drone:       return "airplane"
         case .tracker:     return "dot.radiowaves.left.and.right"
+        case .nearbyDevice:return "antenna.radiowaves.left.and.right"
         }
     }
 
@@ -50,6 +55,7 @@ enum DeviceType: Int, CaseIterable, Identifiable, Codable {
         case .drone:                    return ACABTheme.droneTone
         case .axonBodyCam:              return ACABTheme.axonTone
         case .tracker:                  return ACABTheme.trackerTone
+        case .nearbyDevice:             return Color(red: 0.82, green: 0.67, blue: 0.40)   // desert sand
         }
     }
 
@@ -60,6 +66,7 @@ enum DeviceType: Int, CaseIterable, Identifiable, Codable {
         case .drone:                    return "DRONE"
         case .axonBodyCam:              return "BODY CAM"
         case .tracker:                  return "TRACKER"
+        case .nearbyDevice:             return "NEARBY"
         }
     }
 

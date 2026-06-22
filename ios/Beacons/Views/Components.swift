@@ -231,6 +231,7 @@ extension Detection {
         case .drone:                    return "UAS · Remote ID"
         case .axonBodyCam:              return "Axon (unverified)"
         case .tracker:                  return "Item tracker"
+        case .nearbyDevice:             return "Nearby device"
         }
     }
     /// Short category label for the badge pill.
@@ -241,6 +242,7 @@ extension Detection {
         case .drone:       return "AERIAL · RID"
         case .axonBodyCam: return "BODY CAMERA"
         case .tracker:     return "ITEM TRACKER"
+        case .nearbyDevice:return "DEVICE"
         }
     }
 }

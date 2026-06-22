@@ -14,6 +14,8 @@
 #include "drone_detect.h"
 #include "tracker_detect.h"
 #include "police_detect.h"
+#include "desert_detect.h"
+#include "det_log.h"
 
 #include <Arduino.h>
 #include <WiFi.h>
@@ -51,7 +53,7 @@ struct DedupEntry {
     uint32_t      lastSeen;
     uint16_t      count;
 };
-#define ACAB_DEDUP_MAX 96
+#define ACAB_DEDUP_MAX 256   // headroom for Desert mode (every device, not just matches)
 static DedupEntry gDedup[ACAB_DEDUP_MAX];
 
 // Whitelist (app-pushed): MACs we drop silently - no report, beep, or mesh.
@@ -152,6 +154,7 @@ static void handleDetection(AcabDetection& d) {
     if (e->count == 0) e->firstSeen = now;
     e->lastSeen = now;
     if (e->count < 0xFFFF) e->count++;
+    bool firstSighting = (e->count == 1);   // true only on a device's first sighting this boot
     d.firstSeen = e->firstSeen;
     d.lastSeen  = e->lastSeen;
     d.count     = e->count;
@@ -164,6 +167,10 @@ static void handleDetection(AcabDetection& d) {
     }
 
     gTotal++;
+    // Offline buffer: capture each device's FIRST sighting while the app is away.
+    // det_log no-ops when connected / disabled / keyless, so this is one record per
+    // device per boot, and only while disconnected.
+    if (firstSighting) detLogAppend(d);
     if (gSinkQ) {
         SinkItem it{d, isNew};
         xQueueSend(gSinkQ, &it, 0);   // non-blocking: drop on overflow rather than stall a radio
@@ -232,6 +239,8 @@ public:
         if (trackerClassifyBLE(mac, payload, plen, rssi, &d)) { handleDetection(d); return; }
         if (axonClassifyBLE(mac, payload, plen, rssi, &d))  { handleDetection(d); return; }
         if (policeClassifyBLE(mac, payload, plen, rssi, &d)) { handleDetection(d); return; }
+        // Desert mode (LAST): catch every remaining device as a generic "nearby device".
+        if (desertClassifyBLE(mac, payload, plen, rssi, &d)) { handleDetection(d); return; }
     }
 };
 
@@ -346,6 +355,8 @@ static void IRAM_ATTR wifiRxCallback(void* buf, wifi_promiscuous_pkt_type_t type
     if (droneClassifyWiFi(payload, len, rssi, &d)) { handleDetection(d); return; }
     if (flockClassifyWiFi(payload, len, rssi, &d)) { handleDetection(d); return; }
     if (policeClassifyWiFi(payload, len, rssi, &d)) { handleDetection(d); return; }
+    // Desert mode (LAST): catch every remaining mgmt-frame source as a "nearby device".
+    if (desertClassifyWiFi(payload, len, rssi, &d)) { handleDetection(d); return; }
 }
 
 // Channel 6 is the OpenDroneID Wi-Fi "social" channel - Remote-ID NAN/beacon

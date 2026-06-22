@@ -13,6 +13,9 @@ struct DeviceStatus: Equatable {
     let buzzer: Bool         // master audio on/off
     let volume: Int          // buzzer loudness, 0...100
     let gps: Bool
+    let bufCount: Int        // detections currently buffered on the board ("buf")
+    let bufferingOn: Bool    // offline buffering enabled ("bufon")
+    let desertMode: Bool     // Desert mode enabled ("desert")
 
     var uptimeText: String {
         let h = uptime / 3600, m = (uptime % 3600) / 60, s = uptime % 60
@@ -25,7 +28,9 @@ struct DeviceStatus: Equatable {
 extension DeviceStatus: Decodable {
     enum CodingKeys: String, CodingKey {
         case fw, up, total, ble, wifi, axon, tracker, buzzer, gps
-        case vol  // firmware sends "vol"; we call it `volume`
+        case vol         // firmware sends "vol"; we call it `volume`
+        case buf, bufon  // offline buffer: stored count + enabled flag
+        case desert      // Desert mode (report every device)
     }
 
     init(from decoder: Decoder) throws {
@@ -40,16 +45,22 @@ extension DeviceStatus: Decodable {
         buzzer   = (try? k.decode(Bool.self, forKey: .buzzer)) ?? false
         volume   = (try? k.decode(Int.self, forKey: .vol)) ?? 80
         gps      = (try? k.decode(Bool.self, forKey: .gps)) ?? false
+        bufCount    = (try? k.decode(Int.self, forKey: .buf)) ?? 0
+        bufferingOn = (try? k.decode(Bool.self, forKey: .bufon)) ?? false
+        desertMode  = (try? k.decode(Bool.self, forKey: .desert)) ?? false
     }
 }
 
 extension DeviceStatus {
     /// Latest firmware this app ships against. Bump on a firmware release so the
     /// Device screen flags the update.
-    static let latestVersion = "1.0"
+    static let latestVersion = "1.6"
 
     /// Just the version number out of `fw` ("ACAB-ouispy 0.1.0" -> "0.1.0").
     var version: String { firmware.split(separator: " ").last.map(String.init) ?? firmware }
+
+    /// True for a Mesh-Detect board (no buzzer; its fw label starts "mesh-detect").
+    var isMeshDetect: Bool { firmware.hasPrefix("mesh-detect") }
 
     /// Installed firmware older than `latestVersion`?
     var updateAvailable: Bool {

@@ -1,8 +1,13 @@
 package tech.acab.app.ui
 
+import android.Manifest
 import android.content.Context
 import android.content.Intent
+import android.content.pm.PackageManager
 import android.net.Uri
+import android.os.Build
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
@@ -38,6 +43,7 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalContext
+import androidx.core.content.ContextCompat
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
@@ -48,7 +54,7 @@ import tech.acab.app.ui.theme.Acab
 import tech.acab.app.ui.theme.tone
 
 /** Latest published firmware; bump this with each release. */
-private const val LATEST = "1.0"
+private const val LATEST = "1.6"
 
 /** Device tab: board status, scan radios, detectors, and the alert buzzer. */
 @Composable
@@ -57,7 +63,16 @@ fun DeviceScreen(ble: AcabBleManager) {
     val name by ble.deviceName.collectAsState()
     val ignored by ble.ignored.collectAsState()
     val mode by ble.alertMode.collectAsState()
+    val driveMode by ble.driveMode.collectAsState()
+    val redactLock by ble.redactLockScreen.collectAsState()
     val context = LocalContext.current
+
+    // POST_NOTIFICATIONS (Android 13+) is what makes the Drive-mode counter visible; request
+    // it when the toggle is flipped on, and surface a hint if it has been denied.
+    var notifGranted by remember { mutableStateOf(hasNotifPermission(context)) }
+    val notifLauncher = rememberLauncherForActivityResult(
+        ActivityResultContracts.RequestPermission(),
+    ) { granted -> notifGranted = granted || hasNotifPermission(context) }
 
     // Keep a local copy of each toggle so flipping one sticks until the next status
     // frame, instead of snapping back to the old value mid-write.
@@ -65,6 +80,8 @@ fun DeviceScreen(ble: AcabBleManager) {
     var wifiOn by remember { mutableStateOf(status?.wifi == true) }
     var bodyCamOn by remember { mutableStateOf(status?.bodyCam == true) }
     var trackerOn by remember { mutableStateOf(status?.tracker == true) }
+    var bufferOn by remember { mutableStateOf(status?.bufOn == true) }
+    var desertOn by remember { mutableStateOf(status?.desertMode == true) }
 
     // Re-sync the local copies whenever a fresh status frame lands.
     LaunchedEffect(status) {
@@ -73,6 +90,8 @@ fun DeviceScreen(ble: AcabBleManager) {
             wifiOn = s.wifi
             bodyCamOn = s.bodyCam
             trackerOn = s.tracker
+            bufferOn = s.bufOn
+            desertOn = s.desertMode
         }
     }
 
@@ -119,12 +138,70 @@ fun DeviceScreen(ble: AcabBleManager) {
             }
         }
 
-        BuzzerCard(
-            mode = mode,
-            volume = (status?.volume ?: 0),
-            onMode = { ble.setAlertMode(it) },
-            onVolumeCommit = { ble.setVolume(it, preview = true) },
-        )
+        // offline buffer: let the board record while the phone is away, then replay on
+        // reconnect (toggle flips right away, re-synced from status above)
+        Column(Modifier.fillMaxWidth().panel(), verticalArrangement = Arrangement.spacedBy(14.dp)) {
+            Kicker("OFFLINE BUFFER")
+            ToggleRow(
+                "Store detections offline",
+                status?.bufCount?.takeIf { bufferOn }?.let { "$it buffered · replays on reconnect" }
+                    ?: "board records while phone is away",
+                checked = bufferOn,
+            ) {
+                bufferOn = it; ble.setBuffer(it)
+            }
+        }
+
+        // drive mode: a glanceable detection counter on the lock screen + status bar
+        // (an Android 16 Live Update chip where supported), kept alive by a foreground service.
+        Column(Modifier.fillMaxWidth().panel(), verticalArrangement = Arrangement.spacedBy(14.dp)) {
+            Kicker("DRIVE MODE")
+            ToggleRow(
+                "Live counter notification",
+                "lock screen + status bar · count while you drive",
+                checked = driveMode,
+            ) { on ->
+                if (on) {
+                    if (!notifGranted && Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                        notifLauncher.launch(Manifest.permission.POST_NOTIFICATIONS)
+                    }
+                    ble.startDriveMode()
+                } else ble.endDriveMode()
+            }
+            if (driveMode && !notifGranted) {
+                Text("Allow notifications to see the counter.",
+                    color = Acab.warn, fontSize = 11.sp, fontFamily = Acab.mono)
+            }
+            HorizontalDivider(color = Acab.line)
+            ToggleRow(
+                "Hide counts on lock screen",
+                "show only “Drive mode active” when locked · counts in the shade + app",
+                checked = redactLock,
+            ) { ble.setRedactLockScreen(it) }
+        }
+
+        // desert mode: report every device in range (situational awareness in low-RF/remote spots)
+        Column(Modifier.fillMaxWidth().panel(), verticalArrangement = Arrangement.spacedBy(14.dp)) {
+            Kicker("DESERT MODE")
+            ToggleRow(
+                "Report every device",
+                "show + log ANY device nearby · best out in the open",
+                checked = desertOn,
+            ) { desertOn = it; ble.setDesert(it) }
+            if (desertOn) {
+                Text("Alerts are muted while Desert mode runs. With every nearby device reporting in, a beep for each would never let up. Switch sound back on anytime.",
+                    color = Acab.warn, fontSize = 11.sp, fontFamily = Acab.mono)
+            }
+        }
+
+        if (status?.isMeshDetect != true) {   // mesh board has no buzzer
+            BuzzerCard(
+                mode = mode,
+                volume = (status?.volume ?: 0),
+                onMode = { ble.setAlertMode(it) },
+                onVolumeCommit = { ble.setVolume(it, preview = true) },
+            )
+        }
 
         StatsGrid(
             uptime = status?.uptime,
@@ -147,6 +224,7 @@ fun DeviceScreen(ble: AcabBleManager) {
         AboutCard(
             onColonel = { context.openUrl("https://colonelpanic.tech") },
             onSource = { context.openUrl("https://github.com/soyboi1312/all-cameras-are-beacons") },
+            onMesh = { context.openUrl("https://github.com/soyboi1312/all-cameras-are-beacons#the-phone-apps") },
             onPrivacy = { context.openUrl("https://soyboi1312.github.io/all-cameras-are-beacons/privacy.html") },
             onMadeBy = { context.openUrl("https://github.com/soyboi1312") },
         )
@@ -156,6 +234,12 @@ fun DeviceScreen(ble: AcabBleManager) {
 /** Open an external link in the browser. */
 private fun Context.openUrl(url: String) =
     startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(url)).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK))
+
+/** Whether we can post notifications (always true before Android 13). */
+private fun hasNotifPermission(context: Context): Boolean =
+    Build.VERSION.SDK_INT < Build.VERSION_CODES.TIRAMISU ||
+        ContextCompat.checkSelfPermission(context, Manifest.permission.POST_NOTIFICATIONS) ==
+        PackageManager.PERMISSION_GRANTED
 
 /** Connected-device hero card. */
 @Composable
@@ -432,7 +516,7 @@ private fun shortMac(mac: String): String {
 
 /** What the app is, the hardware it runs on, where the source lives, and the privacy stance. */
 @Composable
-private fun AboutCard(onColonel: () -> Unit, onSource: () -> Unit, onPrivacy: () -> Unit, onMadeBy: () -> Unit) {
+private fun AboutCard(onColonel: () -> Unit, onSource: () -> Unit, onMesh: () -> Unit, onPrivacy: () -> Unit, onMadeBy: () -> Unit) {
     Column(Modifier.fillMaxWidth().panel(), verticalArrangement = Arrangement.spacedBy(12.dp)) {
         Kicker("ABOUT")
         Text("All Cameras Are Beacons is a companion app for counter-surveillance scanner firmware, built for Colonel Panic's OUI-Spy hardware.",
@@ -441,6 +525,8 @@ private fun AboutCard(onColonel: () -> Unit, onSource: () -> Unit, onPrivacy: ()
         AboutLink("Colonel Panic", "colonelpanic.tech · OUI-Spy hardware", onColonel)
         HorizontalDivider(color = Acab.line)
         AboutLink("Source on GitHub", "github.com/soyboi1312/all-cameras-are-beacons", onSource)
+        HorizontalDivider(color = Acab.line)
+        AboutLink("Works with Mesh-Detect", "pairs with Mesh-Detect boards too", onMesh)
         HorizontalDivider(color = Acab.line)
         AboutLink("Privacy", "no data leaves your device", onPrivacy)
         Text("made by soyboi", color = Acab.faint, fontSize = 10.sp, fontFamily = Acab.mono,

@@ -13,8 +13,10 @@
 #include "acab_scanner.h"
 #include "axon_detect.h"
 #include "police_detect.h"
+#include "tracker_detect.h"
 #include "acab_ble_service.h"
 #include "alerts.h"
+#include "det_log.h"
 
 // Scanner sink: send each detection to the app, the buzzer, and serial.
 static void onDetection(const AcabDetection& d, bool isNew) {
@@ -42,6 +44,10 @@ void setup() {
     // BLE service inits NimBLE + starts advertising for the app.
     acabBleBegin("ACAB");
 
+    // Offline detection buffer: mount the flash ring + bump the boot counter. Stays
+    // inert (no capture) until the app enables it and pushes an at-rest key.
+    detLogBegin();
+
     // Scanner reuses the NimBLE stack we just inited (initNimBLE=false) and adds
     // WiFi promiscuous on top.
     AcabScannerConfig cfg = acabScannerDefaults();
@@ -54,9 +60,15 @@ void setup() {
     axonUseRegistryCandidate();
     axonSetEnabled(true);
 
-    // Motorola Solutions / police-gear detection (OUI 4C:CC:34): a broad LE-equipment
-    // proxy (see police_detect.cpp). On for the app build.
+    // Motorola Solutions / LE-gear detection (OUI 4C:CC:34): a broad LE-equipment proxy
+    // (see police_detect.cpp), now folded into the body-cam category and tied to the
+    // body-cam toggle. On at boot for the app build; the toggle controls it thereafter.
     policeSetEnabled(true);
+
+    // Item-tracker detection: restore the persisted app toggle (default OFF), so a
+    // tracker scan you enabled in the app survives a reboot. Off by default because
+    // AirTags / Tiles are everywhere and would otherwise bury the surveillance hits.
+    trackerRestoreEnabled(false);
 
     acabScannerBegin(cfg, onDetection);
 
@@ -71,5 +83,6 @@ void loop() {
         lastStatus = now;
         acabBleUpdateStatus();
     }
+    acabBleDrainTick();   // stream buffered detections back on the app's sync request
     delay(20);
 }

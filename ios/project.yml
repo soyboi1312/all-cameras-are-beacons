@@ -4,7 +4,7 @@ name: Beacons
 options:
   bundleIdPrefix: tech.beacons
   deploymentTarget:
-    iOS: "17.0"
+    iOS: "18.0"   # bumped from 17.0 for supplementalActivityFamilies (CarPlay Dashboard) + ControlWidget
   createIntermediateGroups: true
 
 # Mark the project as reviewed for the current Xcode so it stops nagging
@@ -15,8 +15,8 @@ attributes:
 
 settings:
   base:
-    MARKETING_VERSION: "1.0"
-    CURRENT_PROJECT_VERSION: "1"
+    MARKETING_VERSION: "1.6"
+    CURRENT_PROJECT_VERSION: "4"
     SWIFT_VERSION: "5.0"
     CODE_SIGN_STYLE: Automatic
     DEVELOPMENT_TEAM: "49B9T69XPF"        # baked in so `xcodegen generate` keeps signing
@@ -28,6 +28,9 @@ targets:
     platform: iOS
     sources:
       - Beacons
+    dependencies:
+      - target: BeaconsWidget
+        embed: true
     info:
       path: Beacons/Resources/Info.plist
       properties:
@@ -37,6 +40,11 @@ targets:
         # which then wins because GENERATE_INFOPLIST_FILE is NO).
         CFBundleShortVersionString: "$(MARKETING_VERSION)"
         CFBundleVersion: "$(CURRENT_PROJECT_VERSION)"
+        # Live Activity (Dynamic Island + Lock Screen detection counter, plus the
+        # iOS 26 CarPlay Dashboard mirror). FrequentUpdates raises the update budget
+        # for the BLE-driven count; the user can still disable it in Settings.
+        NSSupportsLiveActivities: true
+        NSSupportsLiveActivitiesFrequentUpdates: true
         # App uses only standard/exempt encryption (BLE, HTTPS), declared so
         # TestFlight/App Store Connect stops asking for export compliance each build.
         ITSAppUsesNonExemptEncryption: false
@@ -72,3 +80,29 @@ targets:
         GENERATE_INFOPLIST_FILE: NO
         ENABLE_PREVIEWS: YES
         ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
+
+  # Widget extension: hosts the Live Activity (Dynamic Island + Lock Screen counter).
+  BeaconsWidget:
+    type: app-extension
+    platform: iOS
+    sources:
+      - BeaconsWidget
+      - path: Beacons/Shared/DetectionActivityAttributes.swift
+      - path: Beacons/Shared/DriveModeIntents.swift
+    info:
+      path: BeaconsWidget/Info.plist
+      properties:
+        CFBundleDisplayName: "Beacons"
+        CFBundleShortVersionString: "$(MARKETING_VERSION)"
+        CFBundleVersion: "$(CURRENT_PROJECT_VERSION)"
+        NSExtension:
+          NSExtensionPointIdentifier: com.apple.widgetkit-extension
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: tech.beacons.app.widget
+        PRODUCT_NAME: BeaconsWidget
+        TARGETED_DEVICE_FAMILY: "1,2"
+        GENERATE_INFOPLIST_FILE: NO
+        ENABLE_PREVIEWS: YES
+        SKIP_INSTALL: YES
+        CODE_SIGN_STYLE: Automatic

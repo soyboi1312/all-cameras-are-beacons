@@ -62,5 +62,6 @@ fun DeviceType.tone(): Color = when (this) {
     DeviceType.BODY_CAM -> Acab.bodyCamTone
     DeviceType.TRACKER -> Acab.trackerTone
     DeviceType.POLICE_GEAR -> Acab.policeTone
+    DeviceType.NEARBY_DEVICE -> Color(0xFFD1AB66)   // desert sand
     DeviceType.UNKNOWN -> Acab.dim
 }

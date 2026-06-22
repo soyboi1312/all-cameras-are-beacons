@@ -1,5 +1,7 @@
 /*
- * ACAB - Police / Motorola Solutions gear detector implementation.
+ * ACAB - Motorola Solutions gear detector (a law-enforcement-equipment proxy).
+ * Matches are reported under the BODY-CAM device type, so the apps fold them into the
+ * "Body cam" category (the separate police-gear category is merged into body cam).
  * Signatures in police_signatures.h, sourced from the IEEE OUI registry.
  */
 #include "police_detect.h"
@@ -21,9 +23,12 @@ static bool ouiMatch(const uint8_t mac[6]) {
 }
 
 static bool emit(AcabDetection* out, const uint8_t mac[6], int rssi, AcabSource src) {
-    acabInit(out, ACAB_POLICE_GEAR, src, mac, (int16_t)rssi);
+    // Reported under the body-cam type so the apps bucket it in the "Body cam" category.
+    // The detail names the real source; no "police" wording goes on the wire, which keeps
+    // the iOS build App-Store-safe (iOS no longer has to special-case a police category).
+    acabInit(out, ACAB_AXON_BODYCAM, src, mac, (int16_t)rssi);
     out->method = M_OUI;
-    out->confidence = 60;   // the device IS Motorola Solutions; "police" is the inference
+    out->confidence = 60;   // the device IS Motorola Solutions (an LE-equipment proxy)
     snprintf(out->detail, sizeof(out->detail), "Motorola Solutions OUI");
     return true;
 }

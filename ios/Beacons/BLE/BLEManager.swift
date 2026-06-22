@@ -4,6 +4,8 @@ import CoreLocation
 import Combine
 import UIKit
 import Intents
+import ActivityKit
+import Security
 
 /// A board we spotted while scanning.
 struct DiscoveredDevice: Identifiable {
@@ -43,6 +45,10 @@ enum BLEConnectionState: Equatable {
 /// config. CoreBluetooth runs on `queue: nil`, so every delegate callback lands on
 /// the main thread. That's why we can set @Published state straight from them.
 final class BLEManager: NSObject, ObservableObject {
+    /// Shared instance: the app, its App Intents (the Control Center toggle), and the Live
+    /// Activity End button all drive ONE link. ACABApp injects this as the environment object.
+    static let shared = BLEManager()
+
     @Published private(set) var connectionState: BLEConnectionState = .unknown
     @Published private(set) var discovered: [DiscoveredDevice] = []
     @Published private(set) var detections: [Detection] = []
@@ -51,6 +57,15 @@ final class BLEManager: NSObject, ObservableObject {
     @Published private(set) var ignored: [IgnoredDevice] = []
     @Published private(set) var demoMode = false   // canned sample data, no real board
     @Published private(set) var alertMode: AlertMode = .buzzer
+    @Published private(set) var driveModeOn = false   // Live Activity (Drive mode) running
+    /// Hide detection counts on the Lock Screen banner (user setting, default on). The
+    /// counts still show in the Dynamic Island and in the app.
+    @Published var redactLockScreen = true {
+        didSet {
+            UserDefaults.standard.set(redactLockScreen, forKey: redactKey)
+            if driveModeOn { liveActivity.update(liveState(lastKind: ""), escalate: true) }
+        }
+    }
 
     private var central: CBCentralManager!
     private var peripheral: CBPeripheral?
@@ -66,15 +81,38 @@ final class BLEManager: NSObject, ObservableObject {
     private var capturedLoc: [String: CLLocationCoordinate2D] = [:]
     private let ignoreKey = "acab.ignoredDevices"
     private let alertModeKey = "acab.alertMode"
+    private let lastSeqKey = "acab.lastSeq"   // persisted across disconnects; survives relaunch
+    private let redactKey = "acab.redactLockScreen"
+
+    // Offline detection buffer. The board buffers detections (encrypted at rest with
+    // our key) while we're away, then replays them on {sync}. We file replayed records
+    // into the same store + dedup as live ones, but with their original timestamp and
+    // no alert.
+    @Published private(set) var bufferingOn = false   // mirrors the board's "bufon"
+    private var histReceived = 0                       // records filed this drain
+    private var lastGoodSeq: UInt32 = 0                // highest contiguous seq filed this drain
+    private var histPseudoTick = 0                     // monotonically-decreasing pseudo-time source for approx records
     private let notifHaptic = UINotificationFeedbackGenerator()
     private let impactHaptic = UIImpactFeedbackGenerator(style: .medium)
 
     private let locationManager = CLLocationManager()
     private var lastCoord: CLLocationCoordinate2D?
 
+    private let liveActivity = LiveActivityController()   // Dynamic Island / Lock Screen counter
+    // Per-category live counts, maintained in publishDetections() so the Live Activity
+    // snapshot is O(1) instead of re-scanning the store on every detection notify.
+    private var liveCounts = (alpr: 0, drones: 0, body: 0, trackers: 0)
+
     override init() {
         super.init()
         loadIgnored()
+        loadPersistedDetections()   // bring back any history filed in a past session
+        if let v = UserDefaults.standard.object(forKey: redactKey) as? Bool { redactLockScreen = v }
+        // Keep the Drive-mode toggle honest: the controller flips it back off if the Live
+        // Activity ends or the user swipes it away, and re-adopts one still running from a
+        // previous launch (so a relaunch mid-drive resumes instead of orphaning it).
+        liveActivity.onInactive = { [weak self] in self?.driveModeOn = false }
+        if liveActivity.adoptExisting() { driveModeOn = true }
         alertMode = AlertMode(rawValue: UserDefaults.standard.string(forKey: alertModeKey) ?? "") ?? .buzzer
         if alertMode == .vibrate { requestFocusAuthIfNeeded() }
         central = CBCentralManager(delegate: self, queue: nil)
@@ -116,6 +154,60 @@ final class BLEManager: NSObject, ObservableObject {
         store.removeAll(); lastSeen.removeAll(); rssiHistory.removeAll()
         trackHistory.removeAll()
         firstSeenAt.removeAll(); capturedLoc.removeAll(); detections = []
+        liveCounts = (0, 0, 0, 0)
+        deletePersistedDetections()   // also wipe the on-disk history
+        if driveModeOn { liveActivity.update(liveState(lastKind: "")) }
+    }
+
+    // MARK: - Drive mode (Live Activity: Dynamic Island + Lock Screen counter)
+
+    /// Live Activities can be disabled per-app in Settings; the toggle surfaces a hint.
+    var liveActivitiesEnabled: Bool { liveActivity.isAvailable }
+
+    /// Start the Drive-mode Live Activity. iOS requires the app to be foregrounded to
+    /// begin one; the toggle lives in DeviceView, which is on-screen when tapped.
+    func startDriveMode() {
+        guard liveActivity.isAvailable else { return }
+        liveActivity.dropIfInactive()
+        if liveActivity.adoptExisting() {   // reuse one already running (e.g. the Control Center toggle)
+            driveModeOn = true
+            liveActivity.update(liveState(lastKind: ""))
+            return
+        }
+        // Reflect whether the system actually started the activity (request can fail
+        // silently); the controller also resets driveModeOn if it's later dismissed.
+        driveModeOn = liveActivity.start(deviceName: connectedName ?? "Beacons",
+                                         state: liveState(lastKind: ""))
+    }
+
+    func endDriveMode() {
+        driveModeOn = false
+        liveActivity.end()
+    }
+
+    /// Re-sync Drive mode with reality when the app returns to the foreground: adopt an
+    /// activity started by the Control Center toggle, and turn the flag off if the Live
+    /// Activity was ended (the in-activity End button, the toggle, or a swipe-away).
+    func reconcileDriveMode() {
+        liveActivity.dropIfInactive()
+        if liveActivity.adoptExisting() {
+            driveModeOn = true
+            liveActivity.update(liveState(lastKind: ""))
+        } else {
+            driveModeOn = false
+        }
+    }
+
+    /// Snapshot the live store into the Live Activity's per-category counts. Mirrors the
+    /// dashboard tiles exactly (ALPR = flockCamera + flockRaven; no police bucket).
+    private func liveState(lastKind: String) -> DetectionActivityAttributes.DetectionState {
+        // O(1): counts are maintained by publishDetections() (which already iterates the
+        // store for the sort), not re-scanned here on every detection notify.
+        return .init(alpr: liveCounts.alpr, drones: liveCounts.drones,
+                     bodyCams: liveCounts.body, trackers: liveCounts.trackers,
+                     lastKind: lastKind, lastSeen: Date(),
+                     connected: connectionState == .connected || demoMode,
+                     redact: redactLockScreen)
     }
 
     /// A drone's accumulated flight path (empty for everything else).
@@ -156,6 +248,17 @@ final class BLEManager: NSObject, ObservableObject {
     private func sendIgnoreList() { writeConfig(["ignore": ignored.map { $0.mac }]) }
 
     private func publishDetections() {
+        var a = 0, dr = 0, b = 0, tr = 0
+        for d in store.values {
+            switch d.type {
+            case .flockCamera, .flockRaven: a += 1
+            case .drone:                    dr += 1
+            case .axonBodyCam:              b += 1
+            case .tracker:                  tr += 1
+            case .nearbyDevice:             break   // Desert-mode devices don't fill the drive-mode buckets
+            }
+        }
+        liveCounts = (a, dr, b, tr)
         detections = store.values.sorted {
             (lastSeen[$0.id] ?? .distantPast) > (lastSeen[$1.id] ?? .distantPast)
         }
@@ -220,6 +323,25 @@ final class BLEManager: NSObject, ObservableObject {
     /// Toggle the board's BLE item-tracker detector (off by default).
     func setTrackerEnabled(_ on: Bool) { writeConfig(["tracker": on]) }
 
+    /// Toggle Desert mode: the board reports EVERY device in range (not just signatures).
+    /// Enabling it drops alerts to Silent; with everything reporting in, the buzzer and
+    /// haptics would otherwise never stop. The user can switch sound back on afterward.
+    func setDesertMode(_ on: Bool) {
+        writeConfig(["desert": on])
+        if on && alertMode != .silent { setAlertMode(.silent) }
+    }
+
+    /// Toggle the board's offline detection buffer (off by default in firmware). When
+    /// on, the board stores detections while we're disconnected and replays them on
+    /// the next {sync}.
+    func setBufferingEnabled(_ on: Bool) {
+        bufferingOn = on
+        writeConfig(["buffer": on])
+    }
+
+    /// Erase the board's stored buffer.
+    func clearBufferLog() { writeConfig(["clearlog": true]) }
+
     /// Master audio on/off.
     func setBuzzerEnabled(_ on: Bool) { writeConfig(["buzzer": on]) }
 
@@ -274,19 +396,169 @@ final class BLEManager: NSObject, ObservableObject {
         peripheral.writeValue(data, for: configChar, type: .withResponse)
     }
 
+    /// Push the phone's GPS to the board so a Mesh-Detect uplink can carry where we
+    /// are. Throttled - the board only needs a periodic fix, not every CL update.
+    private var lastGpsSent = Date.distantPast
+    private func sendPhoneLocation() {
+        guard let c = lastCoord, configChar != nil,
+              Date().timeIntervalSince(lastGpsSent) > 15 else { return }
+        lastGpsSent = Date()
+        writeConfig(["lat": c.latitude, "lon": c.longitude])
+    }
+
+    // MARK: - Offline buffer: key, handshake, lastSeq, persistence
+
+    /// Highest buffer seq we've successfully filed. Persisted so a reconnect only asks
+    /// the board for records newer than this. Survives disconnects and relaunches —
+    /// disconnect cleanup must NOT clear it.
+    private var lastSeq: UInt32 {
+        get { UInt32(UserDefaults.standard.integer(forKey: lastSeqKey)) }
+        set { UserDefaults.standard.set(Int(newValue), forKey: lastSeqKey) }
+    }
+
+    /// The Detections-replay handshake, run once the Detections characteristic starts
+    /// notifying: hand the board our key, the current epoch, then ask it to replay
+    /// everything newer than lastSeq. Order matters and must follow the subscribe.
+    private func sendBufferHandshake() {
+        let key = bufferKeyHex()
+        // Reset per-drain counters; resume contiguity from where we left off.
+        histReceived = 0
+        histPseudoTick = 0
+        lastGoodSeq = lastSeq
+        writeConfig(["key": key])
+        writeConfig(["epoch": Int(Date().timeIntervalSince1970)])
+        writeConfig(["sync": Int(lastSeq)])
+    }
+
+    // MARK: key (Keychain)
+
+    private let keyTag = "tech.beacons.app.bufferKey"
+
+    /// Our persistent 32-byte buffer key as 64 lowercase hex chars. Generated once and
+    /// stored in the Keychain, reused on every launch.
+    private func bufferKeyHex() -> String {
+        let raw = loadOrCreateBufferKey()
+        return raw.map { String(format: "%02x", $0) }.joined()
+    }
+
+    private func loadOrCreateBufferKey() -> Data {
+        if let existing = keychainReadKey() { return existing }
+        var bytes = [UInt8](repeating: 0, count: 32)
+        _ = SecRandomCopyBytes(kSecRandomDefault, bytes.count, &bytes)
+        let data = Data(bytes)
+        keychainWriteKey(data)
+        return data
+    }
+
+    private func keychainReadKey() -> Data? {
+        let q: [String: Any] = [
+            kSecClass as String: kSecClassGenericPassword,
+            kSecAttrAccount as String: keyTag,
+            kSecReturnData as String: true,
+            kSecMatchLimit as String: kSecMatchLimitOne,
+        ]
+        var out: CFTypeRef?
+        guard SecItemCopyMatching(q as CFDictionary, &out) == errSecSuccess,
+              let data = out as? Data, data.count == 32 else { return nil }
+        return data
+    }
+
+    private func keychainWriteKey(_ data: Data) {
+        let base: [String: Any] = [
+            kSecClass as String: kSecClassGenericPassword,
+            kSecAttrAccount as String: keyTag,
+        ]
+        SecItemDelete(base as CFDictionary)
+        var add = base
+        add[kSecValueData as String] = data
+        // AfterFirstUnlockThisDeviceOnly: readable for the while-locked BLE handshake, but
+        // ThisDeviceOnly makes the key non-exportable (kept out of iTunes/Finder backups).
+        add[kSecAttrAccessible as String] = kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly
+        SecItemAdd(add as CFDictionary, nil)
+    }
+
+    // MARK: local persistence (Application Support)
+
+    /// Where we checkpoint filed detections so replayed history survives a relaunch.
+    private var persistURL: URL? {
+        guard let dir = try? FileManager.default.url(
+            for: .applicationSupportDirectory, in: .userDomainMask,
+            appropriateFor: nil, create: true) else { return nil }
+        return dir.appendingPathComponent("acab-detections.json")
+    }
+
+    /// One persisted detection row: the raw record plus the timing we reconstructed.
+    private struct StoredRow: Codable {
+        let detection: Detection
+        let firstSeen: Date?
+        let lastSeen: Date?
+        let lat: Double?
+        let lon: Double?
+    }
+
+    private func persistDetections() {
+        guard let url = persistURL else { return }
+        let rows = store.values.map { d -> StoredRow in
+            let c = capturedLoc[d.id]
+            return StoredRow(detection: d, firstSeen: firstSeenAt[d.id], lastSeen: lastSeen[d.id],
+                             lat: c?.latitude, lon: c?.longitude)
+        }
+        // .completeFileProtection: the detections file (MACs + phone GPS + timestamps) is
+        // unreadable while the device is locked, so a seized locked phone can't yield it.
+        if let data = try? JSONEncoder().encode(rows) {
+            try? data.write(to: url, options: [.atomic, .completeFileProtection])
+        }
+    }
+
+    private func loadPersistedDetections() {
+        guard let url = persistURL, let data = try? Data(contentsOf: url),
+              let rows = try? JSONDecoder().decode([StoredRow].self, from: data) else { return }
+        for r in rows {
+            let d = r.detection
+            store[d.id] = d
+            if let f = r.firstSeen { firstSeenAt[d.id] = f }
+            if let l = r.lastSeen { lastSeen[d.id] = l }
+            if let lat = r.lat, let lon = r.lon {
+                capturedLoc[d.id] = CLLocationCoordinate2D(latitude: lat, longitude: lon)
+            }
+        }
+        publishDetections()
+    }
+
+    private func deletePersistedDetections() {
+        if let url = persistURL { try? FileManager.default.removeItem(at: url) }
+    }
+
     // MARK: - Decoding
 
-    // Hot path: every detection notify from the board lands here.
+    // Hot path: every detection notify from the board lands here. This carries both
+    // live detections and, during a buffer drain, replayed history records plus a
+    // closing sentinel.
     private func ingestDetection(_ data: Data) {
+        // The drain ends with a sentinel {"hist":"end","n":N} that isn't a Detection
+        // (no "t"). Catch it first so we can verify the count and re-sync on a gap.
+        if let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+           (obj["hist"] as? String) == "end" {
+            handleHistEnd(expected: (obj["n"] as? Int) ?? histReceived)
+            return
+        }
+
         guard let d = try? JSONDecoder().decode(Detection.self, from: data) else { return }
         if isIgnored(d.mac) { return }       // whitelisted — drop it (the board does too)
+
         let firstTime = store[d.id] == nil
-        if firstTime {                       // first sighting: stamp time and place
-            firstSeenAt[d.id] = Date()
-            capturedLoc[d.id] = lastCoord
+        if d.isHistory {
+            // Replayed buffered record: file it with its original time, no alert.
+            ingestHistory(d, firstTime: firstTime)
+        } else {
+            if firstTime {                   // first sighting: stamp time and place
+                firstSeenAt[d.id] = Date()
+                capturedLoc[d.id] = lastCoord
+            }
+            store[d.id] = d
+            lastSeen[d.id] = Date()
         }
-        store[d.id] = d
-        lastSeen[d.id] = Date()
+
         var h = rssiHistory[d.id] ?? []
         h.append(d.rssi); if h.count > 48 { h.removeFirst(h.count - 48) }  // keep the last 48
         rssiHistory[d.id] = h
@@ -298,11 +570,71 @@ final class BLEManager: NSObject, ObservableObject {
             }
         }
         publishDetections()
-        if alertMode == .vibrate, firstTime, !focusActive { alertHaptic(for: d.type) }   // skip while a Focus is on
+        if d.isHistory { persistDetections() }   // history changed the store; checkpoint it
+        // Live first sightings buzz; replayed history never does.
+        if !d.isHistory, alertMode == .vibrate, firstTime, !focusActive { alertHaptic(for: d.type) }
+        // Drive mode: push the live count to the Dynamic Island / Lock Screen. A brand-new
+        // device escalates (immediate); the rest coalesce in the controller. History never updates.
+        if !d.isHistory, driveModeOn {
+            liveActivity.update(liveState(lastKind: d.type.category), escalate: firstTime)
+        }
+    }
+
+    /// File one replayed buffered record. Uses the record's own timestamp ("at") when
+    /// the board knew it; otherwise a synthetic monotonically-DECREASING pseudo-time
+    /// derived from seq, so the newest-first sort in publishDetections() leaves history
+    /// behind live hits instead of pulling it to "now".
+    private func ingestHistory(_ d: Detection, firstTime: Bool) {
+        let stamp: Date
+        if let at = d.capturedAt {
+            stamp = at                       // absolute time the board captured it
+        } else {
+            // approx (or no "at"): fabricate a strictly-decreasing time well in the past.
+            histPseudoTick += 1
+            stamp = Date(timeIntervalSince1970: 1).addingTimeInterval(-Double(histPseudoTick))
+        }
+        // Don't let a replayed record clobber a fresher live entry or an earlier-filed
+        // history record for the same id.
+        if firstTime {
+            firstSeenAt[d.id] = stamp
+            capturedLoc[d.id] = d.coordinate
+            store[d.id] = d
+            lastSeen[d.id] = stamp
+        } else if let existing = lastSeen[d.id], stamp < existing {
+            // keep the newer of the two as the sort key, but make sure the record exists
+            if store[d.id] == nil { store[d.id] = d }
+        } else {
+            store[d.id] = d
+            lastSeen[d.id] = stamp
+            if firstSeenAt[d.id] == nil { firstSeenAt[d.id] = stamp }
+        }
+
+        histReceived += 1
+        // Advance the contiguous high-water mark only on an in-order seq.
+        if let s = d.seq, s == lastGoodSeq + 1 { lastGoodSeq = s }
+    }
+
+    /// End-of-drain sentinel. Verify we got every record the board promised; if a seq
+    /// gap dropped some, re-issue {sync} from the last contiguous seq to refill. On a
+    /// clean drain, persist lastSeq so we don't re-request what we already have.
+    private func handleHistEnd(expected: Int) {
+        let ok = histReceived == expected
+        if ok {
+            if lastGoodSeq > lastSeq { lastSeq = lastGoodSeq }
+            persistDetections()
+        } else {
+            // Gap: ask the board to replay again from the last good contiguous seq.
+            writeConfig(["sync": Int(lastGoodSeq)])
+        }
+        histReceived = 0
+        histPseudoTick = 0
     }
 
     private func ingestStatus(_ data: Data) {
-        if let s = try? JSONDecoder().decode(DeviceStatus.self, from: data) { status = s }
+        if let s = try? JSONDecoder().decode(DeviceStatus.self, from: data) {
+            status = s
+            bufferingOn = s.bufferingOn   // keep the toggle in step with the board
+        }
     }
 
     /// Fill the app with sample detections so you can explore the whole UI without a
@@ -313,7 +645,7 @@ final class BLEManager: NSObject, ObservableObject {
         connectionState = .connected
         connectedName = "ESP32 board"
         status = decodeJSON(DeviceStatus.self, [
-            "fw": "esp32-scanner 1.0", "up": 4920, "total": 7, "ble": true, "wifi": true,
+            "fw": "esp32-scanner 1.6", "up": 4920, "total": 7, "ble": true, "wifi": true,
             "axon": false, "tracker": true, "buzzer": true, "vol": 70, "gps": true,
         ])
         let samples: [[String: Any]] = [
@@ -340,9 +672,7 @@ final class BLEManager: NSObject, ObservableObject {
             rssiHistory[d.id] = [-6, -3, -7, -1, -4, 2, -2, 1, -3, 0, -1, 1, -2, 0]
                 .map { max(-99, min(-30, r + $0)) }
         }
-        detections = store.values.sorted {
-            (lastSeen[$0.id] ?? .distantPast) > (lastSeen[$1.id] ?? .distantPast)
-        }
+        publishDetections()   // sort the feed + populate the live category counts
     }
 
     /// Drop demo mode and go back to the connect screen.
@@ -421,6 +751,7 @@ extension BLEManager: CBCentralManagerDelegate {
         connectedName = nil
         status = nil
         connectionState = (central.state == .poweredOn) ? .idle : .unknown
+        if driveModeOn { liveActivity.setConnected(false) }   // -> "Reconnecting…", don't end the session
     }
 }
 
@@ -446,8 +777,19 @@ extension BLEManager: CBPeripheralDelegate {
             }
         }
         connectionState = .connected
+        if driveModeOn { liveActivity.setConnected(true) }   // back from a dropout
         sendIgnoreList()   // re-send the whitelist so the board has it this session
         setBuzzerEnabled(alertMode == .buzzer)   // a fresh board boots up buzzing; match the phone's mode
+        lastGpsSent = .distantPast; sendPhoneLocation()   // push our location to the freshly-connected board
+    }
+
+    func peripheral(_ peripheral: CBPeripheral, didUpdateNotificationStateFor characteristic: CBCharacteristic,
+                    error: Error?) {
+        // Once the Detections characteristic is actually subscribed, run the buffer
+        // handshake (key, epoch, sync) so the board can replay anything it buffered
+        // while we were away. Order matters: this must come AFTER the subscribe.
+        guard characteristic.uuid == ACABProfile.detections, characteristic.isNotifying else { return }
+        sendBufferHandshake()
     }
 
     func peripheral(_ peripheral: CBPeripheral, didUpdateValueFor characteristic: CBCharacteristic,
@@ -466,6 +808,7 @@ extension BLEManager: CBPeripheralDelegate {
 extension BLEManager: CLLocationManagerDelegate {
     func locationManager(_ manager: CLLocationManager, didUpdateLocations locations: [CLLocation]) {
         lastCoord = locations.last?.coordinate
+        sendPhoneLocation()
     }
     func locationManagerDidChangeAuthorization(_ manager: CLLocationManager) {
         switch manager.authorizationStatus {

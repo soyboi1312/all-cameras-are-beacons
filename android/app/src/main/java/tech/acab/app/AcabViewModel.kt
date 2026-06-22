@@ -13,7 +13,9 @@ import tech.acab.app.ble.AcabBleManager
 /** Keeps the BLE manager alive across config changes (so the connection survives),
  *  and feeds it the phone's location for geotagging non-drone detections. */
 class AcabViewModel(app: Application) : AndroidViewModel(app) {
-    val ble = AcabBleManager(app.applicationContext)
+    // Process singleton, so the Drive-mode foreground service and this ViewModel share one
+    // link (the service keeps it alive when the app is backgrounded mid-drive).
+    val ble = AcabBleManager.getInstance(app)
 
     private val locationManager =
         app.getSystemService(Context.LOCATION_SERVICE) as LocationManager
@@ -45,7 +47,8 @@ class AcabViewModel(app: Application) : AndroidViewModel(app) {
 
     override fun onCleared() {
         runCatching { locationManager.removeUpdates(locListener) }
-        ble.disconnect()
+        // Keep the link if Drive mode's foreground service is holding it; else disconnect.
+        if (!ble.driveModeOn) ble.disconnect()
         super.onCleared()
     }
 }

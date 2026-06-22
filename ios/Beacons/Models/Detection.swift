@@ -32,6 +32,12 @@ struct Detection: Identifiable, Equatable {
     let count: Int               // sightings this session (json "n")
     let isNew: Bool              // first sighting in the dedup window (json "new")
 
+    // Offline-buffer replay fields (only set on a history drain; nil/false live).
+    let isHistory: Bool          // a replayed buffered record (json "hist")
+    let seq: UInt32?             // the board's buffer sequence number (json "seq")
+    let capturedAt: Date?        // when the board actually saw it, unix secs (json "at")
+    let approx: Bool             // timestamp unknown; only ordering is meaningful (json "approx")
+
     /// Stable identity. Drones group by UAS-ID so they survive MAC rotation, matching
     /// the firmware's dedup key. Everything else is one entry per (type, MAC).
     var id: String {
@@ -91,11 +97,12 @@ struct Detection: Identifiable, Equatable {
     }
 }
 
-extension Detection: Decodable {
+extension Detection: Codable {
     // The firmware's short keys; they map to the longer property names above.
     enum CodingKeys: String, CodingKey {
         case t, s, meth, c, mac, rssi, name, id, det, lat, lon, plat, plon, alt
         case spd, vspd, hdg, hgt, palt, sta, n, new
+        case hist, seq, at, approx   // offline-buffer replay
     }
 
     init(from decoder: Decoder) throws {
@@ -130,5 +137,41 @@ extension Detection: Decodable {
         ridStatus  = try? k.decodeIfPresent(Int.self, forKey: .sta)
         count      = (try? k.decode(Int.self, forKey: .n)) ?? 1
         isNew      = (try? k.decode(Bool.self, forKey: .new)) ?? false
+        isHistory  = (try? k.decode(Bool.self, forKey: .hist)) ?? false
+        seq        = try? k.decodeIfPresent(UInt32.self, forKey: .seq)
+        capturedAt = (try? k.decodeIfPresent(TimeInterval.self, forKey: .at) ?? nil).map(Date.init(timeIntervalSince1970:))
+        approx     = (try? k.decode(Bool.self, forKey: .approx)) ?? false
+    }
+
+    // Encoded only for our own on-disk history checkpoint, using the same short keys
+    // so init(from:) reads it straight back. Not part of the BLE wire protocol.
+    func encode(to encoder: Encoder) throws {
+        var k = encoder.container(keyedBy: CodingKeys.self)
+        try k.encode(type.rawValue, forKey: .t)
+        try k.encode(source.rawValue, forKey: .s)
+        try k.encode(method.rawValue, forKey: .meth)
+        try k.encode(confidence, forKey: .c)
+        try k.encode(mac, forKey: .mac)
+        try k.encode(rssi, forKey: .rssi)
+        try k.encodeIfPresent(name, forKey: .name)
+        try k.encodeIfPresent(uasID, forKey: .id)
+        try k.encodeIfPresent(detail, forKey: .det)
+        try k.encodeIfPresent(lat, forKey: .lat)
+        try k.encodeIfPresent(lon, forKey: .lon)
+        try k.encodeIfPresent(pilotLat, forKey: .plat)
+        try k.encodeIfPresent(pilotLon, forKey: .plon)
+        try k.encodeIfPresent(altitude, forKey: .alt)
+        try k.encodeIfPresent(speedH, forKey: .spd)
+        try k.encodeIfPresent(speedV, forKey: .vspd)
+        try k.encodeIfPresent(heading, forKey: .hdg)
+        try k.encodeIfPresent(heightAGL, forKey: .hgt)
+        try k.encodeIfPresent(pilotAlt, forKey: .palt)
+        try k.encodeIfPresent(ridStatus, forKey: .sta)
+        try k.encode(count, forKey: .n)
+        try k.encode(isNew, forKey: .new)
+        try k.encode(isHistory, forKey: .hist)
+        try k.encodeIfPresent(seq, forKey: .seq)
+        try k.encodeIfPresent(capturedAt.map { $0.timeIntervalSince1970 }, forKey: .at)
+        try k.encode(approx, forKey: .approx)
     }
 }

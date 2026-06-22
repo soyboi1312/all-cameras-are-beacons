@@ -1,7 +1,9 @@
 #!/usr/bin/env bash
-# Regenerate ACAB merged firmware images for the web flasher (ESP Web Tools).
-# Builds both PlatformIO envs, then merges bootloader + partitions + boot_app0 +
-# app into one image to be flashed at offset 0x0.
+# Regenerate ACAB firmware parts for the web flasher (ESP Web Tools).
+# Builds the three PlatformIO envs, then stages bootloader + partitions + boot_app0 +
+# app as SEPARATE parts, each flashed at its own offset. Keeping them separate (rather
+# than one merged blob from 0x0) leaves the NVS partition (0x9000) untouched, so a
+# no-erase web-flash PRESERVES the BLE bond + ignore list (no re-pair on a firmware update).
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
@@ -40,16 +42,17 @@ else
 fi
 
 mkdir -p "$ROOT/web/firmware"
+# Stage the four flash parts SEPARATELY (not one merged blob). esp-web-tools writes
+# each at its own offset, so the NVS partition (0x9000, the gap between partitions and
+# boot_app0) is never overwritten and a no-erase web-flash keeps the BLE bond + whitelist.
+rm -f "$ROOT/web/firmware"/acab-*.bin
 for ENV in oui-spy mesh-detect mesh-detect-ch1; do
   B="$FW/.pio/build/$ENV"
-  OUT="$ROOT/web/firmware/acab-$ENV.bin"
-  echo ">> merging $ENV"
-  "$PY" "$ESPTOOL" --chip esp32s3 merge_bin -o "$OUT" \
-    --flash_mode dio --flash_freq 80m --flash_size 8MB \
-    0x0     "$B/bootloader.bin" \
-    0x8000  "$B/partitions.bin" \
-    0xe000  "$BOOT_APP0" \
-    0x10000 "$B/firmware.bin"
-  echo "   -> $OUT"
+  echo ">> staging parts for $ENV"
+  cp "$B/bootloader.bin" "$ROOT/web/firmware/acab-$ENV-bootloader.bin"
+  cp "$B/partitions.bin" "$ROOT/web/firmware/acab-$ENV-partitions.bin"
+  cp "$BOOT_APP0"        "$ROOT/web/firmware/acab-$ENV-boot_app0.bin"
+  cp "$B/firmware.bin"   "$ROOT/web/firmware/acab-$ENV-app.bin"
+  echo "   -> acab-$ENV-{bootloader,partitions,boot_app0,app}.bin"
 done
 echo ">> done. Serve web/ over localhost or HTTPS to flash."

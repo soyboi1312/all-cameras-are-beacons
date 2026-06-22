@@ -1,13 +1,16 @@
 {
   "name": "ACAB Mesh-Detect (private channel 1)",
-  "version": "1.0",
+  "version": "1.6",
   "funding_url": "",
   "new_install_prompt_erase": true,
   "builds": [
     {
       "chipFamily": "ESP32-S3",
       "parts": [
-        { "path": "firmware/acab-mesh-detect-ch1.bin", "offset": 0 }
+        { "path": "firmware/acab-mesh-detect-ch1-bootloader.bin", "offset": 0 },
+        { "path": "firmware/acab-mesh-detect-ch1-partitions.bin", "offset": 32768 },
+        { "path": "firmware/acab-mesh-detect-ch1-boot_app0.bin", "offset": 57344 },
+        { "path": "firmware/acab-mesh-detect-ch1-app.bin", "offset": 65536 }
       ]
     }
   ]

@@ -9,6 +9,7 @@
  * standard, not taken from anyone's firmware. See docs/signatures.md.
  */
 #include "drone_detect.h"
+#include "drone_signatures.h"
 #include <Arduino.h>
 #include <string.h>
 #include <stdio.h>
@@ -141,6 +142,26 @@ static bool fillFromODID(const ODID_UAS_Data* uas, const uint8_t mac[6],
     return true;
 }
 
+// Vendor-OUI fallback (lower confidence, layered UNDER Remote ID): a device not
+// broadcasting Remote ID can still show its hand via its MAC OUI (one of the drone
+// vendor's own IEEE blocks) - a weak "vendor gear nearby" signal (controller / goggles
+// / the aircraft), so it only fires when the RID decode found nothing. drone_signatures.h.
+static bool droneVendorOui(const uint8_t mac[6]) {
+    for (size_t i = 0; i < DRONE_DJI_OUI_COUNT; i++)
+        if (mac[0] == DRONE_DJI_OUI[i][0] && mac[1] == DRONE_DJI_OUI[i][1] &&
+            mac[2] == DRONE_DJI_OUI[i][2]) return true;
+    return false;
+}
+
+static bool emitVendorOui(const uint8_t mac[6], int rssi, AcabSource src,
+                          AcabDetection* out) {
+    acabInit(out, ACAB_DRONE, src, mac, (int16_t)rssi);
+    out->method     = M_OUI;
+    out->confidence = DRONE_OUI_CONFIDENCE;
+    snprintf(out->detail, sizeof(out->detail), "DJI gear, no Remote ID");
+    return true;
+}
+
 // ---------------------------------------------------------------------------
 // BLE advertisement
 // ---------------------------------------------------------------------------
@@ -151,8 +172,8 @@ static bool fillFromODID(const ODID_UAS_Data* uas, const uint8_t mac[6],
 // opens with a Flags structure (common on BT5 extended advertising) still gets
 // caught. The signature bytes are all from the public spec; the message body goes
 // to the Apache-licensed decoder.
-bool droneClassifyBLE(const uint8_t mac[6], const uint8_t* payload, size_t len,
-                      int rssi, AcabDetection* out) {
+static bool droneRidBLE(const uint8_t mac[6], const uint8_t* payload, size_t len,
+                        int rssi, AcabDetection* out) {
     if (!payload || len < 6) return false;
 
     for (size_t i = 0; i + 1 < len; i += 1u + payload[i]) {
@@ -179,6 +200,14 @@ bool droneClassifyBLE(const uint8_t mac[6], const uint8_t* payload, size_t len,
     return false;
 }
 
+// Public BLE classifier: Remote ID first, the vendor-OUI fallback only under it.
+bool droneClassifyBLE(const uint8_t mac[6], const uint8_t* payload, size_t len,
+                      int rssi, AcabDetection* out) {
+    if (droneRidBLE(mac, payload, len, rssi, out)) return true;
+    if (droneVendorOui(mac)) return emitVendorOui(mac, rssi, SRC_BLE, out);
+    return false;
+}
+
 // ---------------------------------------------------------------------------
 // 802.11 management frame (WiFi promiscuous capture)
 // ---------------------------------------------------------------------------
@@ -186,8 +215,8 @@ bool droneClassifyBLE(const uint8_t mac[6], const uint8_t* payload, size_t len,
 // multicast destination 51:6f:9a:01:00:00) and a beacon carrying an ODID vendor
 // IE (Wi-Fi Alliance OUI 90:3a:e6 or ASTM OUI fa:0b:bc). Both hand their ODID
 // payload to the Apache-licensed decoder.
-bool droneClassifyWiFi(const uint8_t* frame, size_t len, int rssi,
-                       AcabDetection* out) {
+static bool droneRidWiFi(const uint8_t* frame, size_t len, int rssi,
+                         AcabDetection* out) {
     if (!frame || len < 24) return false;
 
     // NAN action frame: recognised solely by its multicast destination (bytes 4-9).
@@ -220,5 +249,15 @@ bool droneClassifyWiFi(const uint8_t* frame, size_t len, int rssi,
             }
         }
     }
+    return false;
+}
+
+// Public WiFi classifier: Remote ID first, then the vendor-OUI fallback on the
+// transmitter address (addr2, frame bytes 10-15) when no RID was decoded.
+bool droneClassifyWiFi(const uint8_t* frame, size_t len, int rssi,
+                       AcabDetection* out) {
+    if (droneRidWiFi(frame, len, rssi, out)) return true;
+    if (frame && len >= 16 && droneVendorOui(frame + 10))
+        return emitVendorOui(frame + 10, rssi, SRC_WIFI, out);
     return false;
 }

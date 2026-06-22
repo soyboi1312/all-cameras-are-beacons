@@ -57,13 +57,13 @@ Changed the firmware? Rebuild the browser flasher images with `./web/build-flash
 Both builds run every detector at once. The only real difference is where the alerts go:
 
 - **OUI-Spy** streams them to the **All Cameras Are Beacons** phone app (iPhone or Android) over Bluetooth.
-- **Mesh-Detect** sends labeled messages out over a wired Heltec V3 running Meshtastic, on whatever channel you pick. Each one is plain-spoken: `Flock camera detected`, `Drone detected`, and so on.
+- **Mesh-Detect** sends labeled messages out over a wired Heltec V3 running Meshtastic, on whatever channel you pick. Each one is plain-spoken: `Flock camera detected`, `Drone detected`, and so on. It **also pairs with the phone app** the same way OUI-Spy does, and while a phone is connected it tags each Meshtastic message with the phone's location as a tap-to-open maps link.
 
 Wiring and Meshtastic setup are in [docs/mesh-setup.md](docs/mesh-setup.md).
 
 ## The phone apps
 
-There are two native apps, one for **iPhone** and one for **Android**, that do the same job: pair with an OUI-Spy board over Bluetooth and show what it's finding in real time. Both give you a live status view, a map of where things were seen, a running logbook, and controls for the board's buzzer and radios. Tap any detection to open its detail card: a signal-strength history, when the device was **first** and **last** heard, and its identifiers. If something hasn't been heard in a while its signal chart greys out, so live hits stand apart from stale ones. How the apps and firmware talk is in [docs/ble-protocol.md](docs/ble-protocol.md).
+There are two native apps, one for **iPhone** and one for **Android**, that do the same job: pair with an OUI-Spy or Mesh-Detect board over Bluetooth and show what it's finding in real time. Both give you a live status view, a map of where things were seen, a running logbook, and controls for the board's buzzer and radios. Tap any detection to open its detail card: a signal-strength history, when the device was **first** and **last** heard, and its identifiers. If something hasn't been heard in a while its signal chart greys out, so live hits stand apart from stale ones. How the apps and firmware talk is in [docs/ble-protocol.md](docs/ble-protocol.md).
 
 ### iPhone
 
@@ -73,7 +73,7 @@ There are two native apps, one for **iPhone** and one for **Android**, that do t
 
 **All Cameras Are Beacons for Android** lives in [android/](android/): native Kotlin / Jetpack Compose, the same feature set, with an OpenStreetMap map (no Google dependency). It isn't on the Play Store yet, so for now you build it from source or sideload the APK. Build and release notes are in [android/README.md](android/README.md).
 
-Either app needs an OUI-Spy board to actually detect anything, but you can poke around the interface without one.
+Either app needs an OUI-Spy or Mesh-Detect board to actually detect anything, but you can poke around the interface without one.
 
 ## How the project is organized
 

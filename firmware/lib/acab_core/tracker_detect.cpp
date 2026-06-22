@@ -16,6 +16,7 @@
 #include "tracker_detect.h"
 #include <string.h>
 #include <stdio.h>
+#include <Preferences.h>   // persist the on/off toggle across reboots (NVS)
 
 #define TILE_SVC           0xFEED
 #define SAMSUNG_SMARTTAG   0xFD5A
@@ -25,8 +26,27 @@
 
 static bool gEnabled = false;
 
-void trackerSetEnabled(bool enabled) { gEnabled = enabled; }
+// NVS-backed so an app-set toggle survives a reboot. Only writes on a real change
+// (toggles are rare), so flash wear is negligible.
+void trackerSetEnabled(bool enabled) {
+    if (enabled == gEnabled) return;
+    gEnabled = enabled;
+    Preferences p;
+    p.begin("acab-trk", false);
+    p.putBool("on", enabled);
+    p.end();
+}
 bool trackerIsEnabled() { return gEnabled; }
+
+// Restore the persisted on/off (or `defaultEnabled` if never set). Call once in
+// setup() instead of hard-coding the default, so a board remembers a tracker scan
+// you turned on in the app across power cycles.
+void trackerRestoreEnabled(bool defaultEnabled) {
+    Preferences p;
+    p.begin("acab-trk", true);
+    gEnabled = p.getBool("on", defaultEnabled);
+    p.end();
+}
 
 // Pull out what we need: manufacturer data, and any 16-bit service UUID (from
 // the UUID lists 0x02/0x03 or from service data 0x16).

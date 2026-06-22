@@ -16,9 +16,12 @@
 #include "detection.h"
 #include <stddef.h>
 
-// Master on/off. Default: OFF (opt-in).
+// Master on/off. Default: OFF (opt-in). trackerSetEnabled persists the choice to
+// NVS; trackerRestoreEnabled reloads it on boot so an app-set toggle survives a
+// reboot/power-cycle instead of reverting to the compile-time default.
 void trackerSetEnabled(bool enabled);
 bool trackerIsEnabled();
+void trackerRestoreEnabled(bool defaultEnabled);
 
 // Classify a BLE advertisement as a tracker. Returns true + fills `out` only
 // when tracker detection is on AND a known tracker signature matches.

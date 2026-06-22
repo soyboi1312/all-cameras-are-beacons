@@ -14,7 +14,9 @@
 #include "tracker_detect.h"
 #include "police_detect.h"
 #include "acab_version.h"
+#include "acab_ble_service.h"
 #include "mesh_link.h"
+#include "det_log.h"
 
 // Onboard LED (XIAO S3, inverted: LOW = on) - brief blink on each new detection.
 #ifndef ACAB_LED_PIN
@@ -37,9 +39,18 @@
 #define ACAB_HEARTBEAT_MS 120000
 #endif
 
-// Scanner sink: forward every hit to the mesh, blink the LED on first sighting.
-static void onDetection(const AcabDetection& d, bool isNew) {
-    meshLinkSend(d, isNew);
+// Scanner sink: forward every hit to the app (if connected) and the mesh, blink the
+// LED on first sighting.
+static void onDetection(const AcabDetection& d0, bool isNew) {
+    AcabDetection d = d0;
+    // Tag non-drone hits with the phone's GPS, but ONLY while the app is connected:
+    // no app means no location source, so the mesh line carries no coords. Drones
+    // already broadcast their own coords, so those still go out regardless.
+    if (d.type != ACAB_DRONE && !(d.lat || d.lon) && acabBleClientConnected())
+        acabBleGetPhoneGps(&d.lat, &d.lon, 60000);
+
+    acabBleNotifyDetection(d, isNew);   // stream to the app over BLE, same as oui-spy
+    meshLinkSend(d, isNew);             // and over the Meshtastic uplink
     if (isNew) {
         char mac[18];
         acabFormatMac(d.mac, mac);
@@ -67,9 +78,17 @@ void setup() {
     mesh.transport = (ACAB_MESH_CHANNEL == 0) ? MESH_TEXT : MESH_PROTO;
     meshLinkBegin(mesh);
 
-    // No GATT server here, so this build owns the BLE stack - let the scanner init it.
+    // Run the same GATT service oui-spy does, so the app can connect to a Mesh-Detect
+    // board too: see detections, configure it, and push the phone's GPS (which we tag
+    // onto the mesh uplink). acabBleBegin inits NimBLE; the scanner then reuses it.
+    acabBleBegin("ACAB-mesh", "mesh-detect-ACAB");
+
+    // Offline detection buffer: mount the flash ring + bump the boot counter. Stays
+    // inert (no capture) until the app enables it and pushes an at-rest key.
+    detLogBegin();
+
     AcabScannerConfig cfg = acabScannerDefaults();
-    cfg.initNimBLE = true;
+    cfg.initNimBLE = false;            // the GATT service already inited NimBLE
     cfg.bleDeviceName = "ACAB-mesh";
 
     // Axon body-cam detection on OUI 00:25:DF (field-validated 2026-06-17: real
@@ -77,13 +96,15 @@ void setup() {
     axonUseRegistryCandidate();
     axonSetEnabled(true);
 
-    // Item-tracker detection stays OFF here: AirTags / Tiles / SmartTags are
-    // everywhere, and flooding them over a rate-limited LoRa uplink would bury the
-    // surveillance hits. (Already off by default; set it explicitly to lock it in.)
-    trackerSetEnabled(false);
+    // Item-tracker detection: restore the persisted app toggle (default OFF). AirTags
+    // / Tiles / SmartTags are everywhere and flooding them over the rate-limited LoRa
+    // uplink buries surveillance hits, so it stays off unless you turn it on in the
+    // app - and now that choice survives a reboot instead of reverting every boot.
+    trackerRestoreEnabled(false);
 
-    // Police/Motorola-gear detection: OFF on the mesh build too - a broad OUI match
-    // would add chatter to the rate-limited LoRa uplink. Flip on if you want it.
+    // Motorola/LE-gear detection: OFF at boot on the mesh build - a broad OUI match would
+    // add chatter to the rate-limited LoRa uplink. It's merged into the body-cam category
+    // and rides the body-cam toggle, so enabling body cams in the app turns it on here too.
     policeSetEnabled(false);
 
     acabScannerBegin(cfg, onDetection);
@@ -109,6 +130,7 @@ void loop() {
 
     if (now - lastBeat > 60000) {
         lastBeat = now;
+        acabBleUpdateStatus();        // refresh the connected app's status view
         Serial.printf("[ACAB] alive | ble=%lu wifi=%lu det=%lu\n",
                       (unsigned long)acabScannerBleSeen(),
                       (unsigned long)acabScannerWifiSeen(),
@@ -130,5 +152,6 @@ void loop() {
     }
 #endif
 
+    acabBleDrainTick();   // stream buffered detections back on the app's sync request
     delay(50);
 }

@@ -4,7 +4,7 @@ import org.json.JSONObject
 
 /** The things ACAB looks for. Raw values match the firmware "t" field. */
 enum class DeviceType(val raw: Int) {
-    UNKNOWN(0), FLOCK_CAMERA(1), FLOCK_RAVEN(2), BODY_CAM(3), DRONE(4), TRACKER(5), POLICE_GEAR(6);
+    UNKNOWN(0), FLOCK_CAMERA(1), FLOCK_RAVEN(2), BODY_CAM(3), DRONE(4), TRACKER(5), POLICE_GEAR(6), NEARBY_DEVICE(7);
 
     val label: String
         get() = when (this) {
@@ -14,6 +14,7 @@ enum class DeviceType(val raw: Int) {
             DRONE        -> "Drone"
             TRACKER      -> "Tracker"
             POLICE_GEAR  -> "Police Gear"
+            NEARBY_DEVICE-> "Nearby Device"
             UNKNOWN      -> "Unknown"
         }
 
@@ -25,6 +26,7 @@ enum class DeviceType(val raw: Int) {
             DRONE    -> "DRONE"
             TRACKER  -> "TRACKER"
             POLICE_GEAR -> "POLICE"
+            NEARBY_DEVICE -> "NEARBY"
             UNKNOWN  -> "UNKNOWN"
         }
 
@@ -37,6 +39,7 @@ enum class DeviceType(val raw: Int) {
             DRONE        -> "AERIAL · RID"
             TRACKER      -> "ITEM TRACKER"
             POLICE_GEAR  -> "MOTOROLA GEAR"
+            NEARBY_DEVICE-> "DEVICE"
             UNKNOWN      -> "UNKNOWN"
         }
 
@@ -80,6 +83,11 @@ data class Detection(
     val ridStatus: Int?,
     val count: Int,
     val isNew: Boolean,
+    // ---- offline-buffer replay fields (live detections leave these at defaults) ----
+    val hist: Boolean,      // true for a replayed history record
+    val seq: Long,          // the board's monotonic sequence number (0 when absent)
+    val at: Long,           // absolute unix seconds for the record (0 when absent)
+    val approx: Boolean,    // true when the board only knows the order, not the time
 ) {
     /** Stable identity. Drones key on UAS-ID, which survives MAC rotation (same as the
      *  firmware's dedup key); everything else uses type + mac. */
@@ -129,6 +137,10 @@ data class Detection(
             ridStatus = if (o.has("sta")) o.optInt("sta") else null,
             count = o.optInt("n", 1),
             isNew = o.optBoolean("new", false),
+            hist = o.optBoolean("hist", false),
+            seq = if (o.has("seq")) o.optLong("seq") else 0L,
+            at = if (o.has("at")) o.optLong("at") else 0L,
+            approx = o.optBoolean("approx", false),
         )
     }
 }
@@ -145,9 +157,15 @@ data class DeviceStatus(
     val buzzer: Boolean,
     val volume: Int,
     val gps: Boolean,
+    val bufCount: Int,      // records currently held in the board's offline buffer
+    val bufOn: Boolean,     // whether offline buffering is enabled on the board
+    val desertMode: Boolean,// Desert mode (report every device in range) enabled
 ) {
     /** Just the version, e.g. "0.2.3" from "ACAB-ouispy 0.2.3". */
     val version: String get() = firmware.substringAfterLast(' ', firmware)
+
+    /** True for a Mesh-Detect board (no buzzer; its fw label starts "mesh-detect"). */
+    val isMeshDetect: Boolean get() = firmware.startsWith("mesh-detect")
 
     companion object {
         fun fromJson(o: JSONObject) = DeviceStatus(
@@ -162,6 +180,9 @@ data class DeviceStatus(
             buzzer = o.optBoolean("buzzer", false),
             volume = o.optInt("vol", 80),
             gps = o.optBoolean("gps", false),
+            bufCount = o.optInt("buf", 0),
+            bufOn = o.optBoolean("bufon", false),
+            desertMode = o.optBoolean("desert", false),
         )
     }
 }

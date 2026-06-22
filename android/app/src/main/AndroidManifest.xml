@@ -30,10 +30,22 @@
     <!-- Haptic alerts for stealth mode. -->
     <uses-permission android:name="android.permission.VIBRATE" />
 
+    <!-- Drive mode: a foreground service that posts the glanceable detection-counter
+         notification and keeps the BLE link alive in the background. connectedDevice is the
+         FGS type for a held GATT link; POST_NOTIFICATIONS is the Android 13+ runtime grant. -->
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+    <!-- Android 16 (API 36): post a promoted ongoing notification = the Live Update status-bar chip. -->
+    <uses-permission android:name="android.permission.POST_PROMOTED_NOTIFICATIONS" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_CONNECTED_DEVICE" />
+
     <uses-feature android:name="android.hardware.bluetooth_le" android:required="true" />
 
+    <!-- allowBackup=false: the detections file (MACs + capture GPS + timestamps) and the
+         ignore-list prefs must not flow to cloud Auto-Backup or device-transfer. The
+         Keystore-wrapped buffer-key blob is safe, but no app data should leave the device. -->
     <application
-        android:allowBackup="true"
+        android:allowBackup="false"
         android:icon="@mipmap/ic_launcher"
         android:roundIcon="@mipmap/ic_launcher_round"
         android:label="@string/app_name"
@@ -59,5 +71,11 @@
                 android:name="android.support.FILE_PROVIDER_PATHS"
                 android:resource="@xml/file_paths" />
         </provider>
+
+        <!-- Drive-mode foreground service: the glanceable detection-counter notification. -->
+        <service
+            android:name=".ble.AcabLinkService"
+            android:exported="false"
+            android:foregroundServiceType="connectedDevice" />
     </application>
 </manifest>

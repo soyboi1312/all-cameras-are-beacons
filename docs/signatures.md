@@ -92,13 +92,25 @@ nearby" - a useful police-gear hint, but a false positive if labeled "ALPR camer
 you want it, add it as a separate, honestly-labeled signal, not as an ALPR brand.
 src: IEEE OUI registry -> https://maclookup.app/macaddress/4CCC34
 
-## Drone (Remote ID): use the licensed library, no table needed
+## Drone (Remote ID primary, DJI-OUI fallback)
 
 Vendor in **opendroneid-core-c (Apache-2.0)** and call its decoder. It is ASTM F3411
 compliant and covers BLE legacy/extended plus WiFi NAN/beacon Remote ID.
 - Library: https://github.com/opendroneid/opendroneid-core-c  (Apache-2.0, commercial-OK with attribution)
 - Spec: https://github.com/opendroneid/specs  (standard: ASTM F3411)
 - nRF52 reference for Chip B: https://github.com/sxjack/remote_id_bt5  (check its license first)
+
+**DJI-OUI fallback (secondary, lower confidence).** Remote ID is the primary path; a DJI
+craft that doesn't broadcast RID (older units, RID disabled, non-US firmware) can still be
+flagged by its MAC OUI. These are DJI's OWN corporate IEEE blocks (registrant "SZ DJI
+Technology Co.,Ltd"), not commodity module silicon, so they pass the no-shared-silicon
+rule. Matched only when the RID decode finds nothing, at low confidence (60), on either
+radio. DJI randomises its MAC in some OcuSync/Wi-Fi modes, so treat an OUI hit as "DJI
+gear nearby", not a guaranteed airborne drone.
+
+| Match on | Value | Source |
+|---|---|---|
+| MAC OUI (BLE, or WiFi addr2), no RID decoded | `60:60:1F` `34:D2:62` `48:1C:B9` `E4:7A:2C` `58:B8:58` `04:A8:5A` `8C:58:23` `0C:9A:E6` `88:29:85` `4C:43:F6` | IEEE / maclookup.app (all "SZ DJI Technology Co.,Ltd") |
 
 ## Axon body cam
 
@@ -132,6 +144,7 @@ cannot separate a body cam from other Axon gear; the `BWC DEVICE` payload narrow
 - OUI 00:25:DF (Axon Enterprise): https://maclookup.app/macaddress/0025DF
 - OUI B4:1E:52 (Flock Safety): https://maclookup.app/macaddress/b41e52
 - OpenDroneID core library (Apache-2.0): https://github.com/opendroneid/opendroneid-core-c
+- DJI OUI blocks (SZ DJI Technology Co.,Ltd): https://maclookup.app/vendors/sz-dji-technology-co-ltd
 - Tracker research: https://arxiv.org/abs/2501.17452 and https://arxiv.org/pdf/2401.13584
 
 ---

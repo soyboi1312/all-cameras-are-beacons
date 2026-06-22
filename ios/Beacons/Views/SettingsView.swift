@@ -11,6 +11,10 @@ struct DeviceView: View {
     @State private var pendingBodyCam = false
     @State private var bleOn = true
     @State private var wifiOn = true
+    @State private var bufferOn = false
+    @State private var pendingBuffer = false   // just flipped; hold until the board confirms
+    @State private var desertOn = false
+    @State private var pendingDesert = false
     // Per-threat volumes are UI-only for now — the firmware has just one master level.
     @AppStorage("vol.flock") private var flock: Double = 90
     @AppStorage("vol.drone") private var drone: Double = 55
@@ -30,8 +34,10 @@ struct DeviceView: View {
                         firmwareCard
                         radiosCard
                         detectorsCard
+                        driveModeCard
+                        desertModeCard
                         if !ble.ignored.isEmpty { ignoredCard }
-                        buzzerCard
+                        if ble.status?.isMeshDetect != true { buzzerCard }   // mesh board has no buzzer
                         statsGrid
                         disconnectButton
                         aboutCard
@@ -55,6 +61,8 @@ struct DeviceView: View {
         // so the ~5s status frame can't snap it back to off before then.
         if pendingBodyCam { if s.axon == bodyCamOn { pendingBodyCam = false } } else { bodyCamOn = s.axon }
         if pendingTracker { if s.tracker == trackerOn { pendingTracker = false } } else { trackerOn = s.tracker }
+        if pendingBuffer { if s.bufferingOn == bufferOn { pendingBuffer = false } } else { bufferOn = s.bufferingOn }
+        if pendingDesert { if s.desertMode == desertOn { pendingDesert = false } } else { desertOn = s.desertMode }
         bleOn  = s.ble
         wifiOn = s.wifi
     }
@@ -156,6 +164,51 @@ struct DeviceView: View {
             Divider().overlay(ACABTheme.line)
             radioToggle("Bluetooth trackers", "AirTag \u{00B7} Tile \u{00B7} SmartTag \u{00B7} opt-in", isOn: Binding(
                 get: { trackerOn }, set: { trackerOn = $0; pendingTracker = true; ble.setTrackerEnabled($0) }))
+            Divider().overlay(ACABTheme.line)
+            radioToggle("Store detections offline", "board buffers while away \u{00B7} replays on reconnect", isOn: Binding(
+                get: { bufferOn }, set: { bufferOn = $0; pendingBuffer = true; ble.setBufferingEnabled($0) }))
+        }
+        .panel()
+    }
+
+    // MARK: drive mode (Live Activity)
+    private var driveModeCard: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            Kicker("DRIVE MODE")
+            radioToggle("Live Activity counter",
+                        "Lock Screen + Dynamic Island \u{00B7} live count while you drive",
+                        isOn: Binding(get: { ble.driveModeOn },
+                                      set: { on in if on { ble.startDriveMode() } else { ble.endDriveMode() } }))
+            Divider().overlay(ACABTheme.line)
+            radioToggle("Hide counts on Lock Screen",
+                        "show only \u{201C}Drive mode active\u{201D} when locked \u{00B7} counts stay in the Dynamic Island + app",
+                        isOn: Binding(get: { ble.redactLockScreen },
+                                      set: { ble.redactLockScreen = $0 }))
+            if !ble.liveActivitiesEnabled {
+                Text("Turn on Live Activities for Beacons in Settings to use this.")
+                    .font(ACABTheme.mono(10.5)).foregroundStyle(ACABTheme.warn)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+        }
+        .panel()
+    }
+
+    // MARK: desert mode (report every device)
+    private var desertModeCard: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            Kicker("DESERT MODE")
+            radioToggle("Report every device",
+                        "show + log ANY device nearby \u{00B7} best out in the open",
+                        isOn: Binding(get: { desertOn },
+                                      set: { desertOn = $0; pendingDesert = true; ble.setDesertMode($0) }))
+            Text("Off the grid, anything new on the air means something arrived. Each device is tagged hardware vs. randomized (phone) MAC.")
+                .font(ACABTheme.mono(10.5)).foregroundStyle(ACABTheme.faint)
+                .fixedSize(horizontal: false, vertical: true)
+            if desertOn {
+                Text("Alerts are muted while Desert mode runs. With every nearby device reporting in, a beep for each would never let up. Switch sound back on anytime.")
+                    .font(ACABTheme.mono(10.5)).foregroundStyle(ACABTheme.warn)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
         }
         .panel()
     }
@@ -345,6 +398,9 @@ struct DeviceView: View {
             Divider().overlay(ACABTheme.line)
             linkRow("Source on GitHub", "github.com/soyboi1312/all-cameras-are-beacons",
                     URL(string: "https://github.com/soyboi1312/all-cameras-are-beacons")!)
+            Divider().overlay(ACABTheme.line)
+            linkRow("Works with Mesh-Detect", "pairs with Mesh-Detect boards too",
+                    URL(string: "https://github.com/soyboi1312/all-cameras-are-beacons#the-phone-apps")!)
             Divider().overlay(ACABTheme.line)
             linkRow("Privacy", "no data leaves your device",
                     URL(string: "https://soyboi1312.github.io/all-cameras-are-beacons/privacy.html")!)

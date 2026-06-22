@@ -16,6 +16,7 @@ import androidx.compose.material.icons.filled.GraphicEq
 import androidx.compose.material.icons.filled.LocalPolice
 import androidx.compose.material.icons.automirrored.filled.HelpOutline
 import androidx.compose.material.icons.filled.PhotoCamera
+import androidx.compose.material.icons.filled.Radar
 import androidx.compose.material.icons.filled.Sensors
 import androidx.compose.material.icons.filled.Videocam
 import androidx.compose.material3.Icon
@@ -57,6 +58,7 @@ internal fun DeviceType.icon(): ImageVector = when (this) {
     DeviceType.DRONE -> Icons.Filled.Flight
     DeviceType.TRACKER -> Icons.Filled.Sensors
     DeviceType.POLICE_GEAR -> Icons.Filled.LocalPolice
+    DeviceType.NEARBY_DEVICE -> Icons.Filled.Radar
     DeviceType.UNKNOWN -> Icons.AutoMirrored.Filled.HelpOutline
 }
 
