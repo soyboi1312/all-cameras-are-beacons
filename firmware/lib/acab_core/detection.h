@@ -71,6 +71,7 @@ struct AcabDetection {
     double         lat, lon;
     double         pilotLat, pilotLon;   // drone operator location (0 if n/a)
     int32_t        altitude;             // metres MSL (drones)
+    uint32_t       gpsAgeMs;             // age of the phone fix used to stamp lat/lon (0 = fresh / none)
 
     // Drone Remote ID flight telemetry (0 / unset for everything else).
     float          speedH;               // horizontal speed (m/s)

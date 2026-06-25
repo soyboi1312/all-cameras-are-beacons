@@ -14,6 +14,7 @@
  * AirTags rotate their MAC, so we match on payload, never OUI.
  */
 #include "tracker_detect.h"
+#include "desert_detect.h"   // Desert mode forces classification even when toggled off
 #include <string.h>
 #include <stdio.h>
 #include <Preferences.h>   // persist the on/off toggle across reboots (NVS)
@@ -90,7 +91,7 @@ static bool emit(AcabDetection* out, const uint8_t mac[6], int rssi,
 
 bool trackerClassifyBLE(const uint8_t mac[6], const uint8_t* adv, size_t advLen,
                         int rssi, AcabDetection* out) {
-    if (!gEnabled || !adv || !advLen) return false;
+    if ((!gEnabled && !desertIsEnabled()) || !adv || !advLen) return false;
     TrkAdv f; parseAdv(adv, advLen, &f);
 
     // Apple Find My - only the offline/separated form (tag away from its owner).

@@ -13,6 +13,6 @@
 #ifndef ACAB_VERSION_H
 #define ACAB_VERSION_H
 
-#define ACAB_FW_VERSION "1.6"
+#define ACAB_FW_VERSION "1.7"
 
 #endif // ACAB_VERSION_H

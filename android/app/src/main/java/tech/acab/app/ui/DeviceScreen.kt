@@ -54,7 +54,7 @@ import tech.acab.app.ui.theme.Acab
 import tech.acab.app.ui.theme.tone
 
 /** Latest published firmware; bump this with each release. */
-private const val LATEST = "1.6"
+private const val LATEST = "1.7"
 
 /** Device tab: board status, scan radios, detectors, and the alert buzzer. */
 @Composable

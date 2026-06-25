@@ -15,8 +15,8 @@ attributes:
 
 settings:
   base:
-    MARKETING_VERSION: "1.6"
-    CURRENT_PROJECT_VERSION: "4"
+    MARKETING_VERSION: "1.7"
+    CURRENT_PROJECT_VERSION: "5"
     SWIFT_VERSION: "5.0"
     CODE_SIGN_STYLE: Automatic
     DEVELOPMENT_TEAM: "49B9T69XPF"        # baked in so `xcodegen generate` keeps signing
@@ -106,3 +106,22 @@ targets:
         ENABLE_PREVIEWS: YES
         SKIP_INSTALL: YES
         CODE_SIGN_STYLE: Automatic
+
+# Explicit SHARED scheme so archiving is reliable and survives `xcodegen generate`.
+# Without this, Xcode auto-generates the scheme on open, and a regen (e.g. on a version
+# bump) drops it, leaving "No Scheme" and a greyed-out Product > Archive.
+schemes:
+  Beacons:
+    build:
+      targets:
+        Beacons: all
+    run:
+      config: Debug
+    test:
+      config: Debug
+    profile:
+      config: Release
+    analyze:
+      config: Debug
+    archive:
+      config: Release

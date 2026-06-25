@@ -83,6 +83,9 @@ data class Detection(
     val ridStatus: Int?,
     val count: Int,
     val isNew: Boolean,
+    // GPS-fix age in seconds when the board stamped lat/lon from a stale phone fix
+    // (offline / Desert mode). null when the coordinate is fresh or absent.
+    val gpsAgeSec: Int?,
     // ---- offline-buffer replay fields (live detections leave these at defaults) ----
     val hist: Boolean,      // true for a replayed history record
     val seq: Long,          // the board's monotonic sequence number (0 when absent)
@@ -94,6 +97,20 @@ data class Detection(
     val id: String get() =
         if (type == DeviceType.DRONE && !rid.isNullOrEmpty()) "${type.raw}:$rid"
         else "${type.raw}:${mac.lowercase()}"
+
+    /** When the board stamped a coordinate from a stale phone fix (offline / Desert mode),
+     *  a short "as of" string for the fix age: "5m ago", "2h ago". null when there's no
+     *  coordinate, or the fix was fresh (under 30s — treat as now). */
+    val locationAgeText: String? get() {
+        if (lat == null || lon == null) return null
+        val age = gpsAgeSec ?: return null
+        if (age < 30) return null
+        return when {
+            age < 3600 -> "${age / 60}m ago"
+            age < 86_400 -> "${age / 3600}h ago"
+            else -> "${age / 86_400}d ago"
+        }
+    }
 
     /** Readable ODID operational status (drones). */
     val ridStatusLabel: String? get() = when (ridStatus) {
@@ -137,6 +154,7 @@ data class Detection(
             ridStatus = if (o.has("sta")) o.optInt("sta") else null,
             count = o.optInt("n", 1),
             isNew = o.optBoolean("new", false),
+            gpsAgeSec = if (o.has("gage")) o.optInt("gage") else null,
             hist = o.optBoolean("hist", false),
             seq = if (o.has("seq")) o.optLong("seq") else 0L,
             at = if (o.has("at")) o.optLong("at") else 0L,
@@ -160,6 +178,7 @@ data class DeviceStatus(
     val bufCount: Int,      // records currently held in the board's offline buffer
     val bufOn: Boolean,     // whether offline buffering is enabled on the board
     val desertMode: Boolean,// Desert mode (report every device in range) enabled
+    val ignoreCount: Int,   // entries on the board's ignore list (for reconciliation)
 ) {
     /** Just the version, e.g. "0.2.3" from "ACAB-ouispy 0.2.3". */
     val version: String get() = firmware.substringAfterLast(' ', firmware)
@@ -183,6 +202,7 @@ data class DeviceStatus(
             bufCount = o.optInt("buf", 0),
             bufOn = o.optBoolean("bufon", false),
             desertMode = o.optBoolean("desert", false),
+            ignoreCount = o.optInt("ign", 0),
         )
     }
 }

@@ -50,6 +50,44 @@ import tech.acab.app.ui.theme.Acab
 private fun rssiRadiusMeters(rssi: Int): Double =
     Math.pow(10.0, (-50.0 - rssi) / 25.0).coerceIn(5.0, 600.0)   // TxPower -50 dBm, n ~ 2.5
 
+/** A group of nearby detections collapsed into one map bubble. */
+private data class Cluster(
+    val lat: Double,
+    val lon: Double,
+    val members: List<Detection>,
+    val dominantCategory: String,
+)
+
+/** Grid-cluster detections into bubbles. The cell size shrinks as you zoom in, so the
+ *  same world spot splits apart at higher zoom (tap a bubble to zoom in and break it up).
+ *  Each cell is roughly a fixed on-screen size regardless of zoom. */
+private fun clusterDetections(
+    items: List<Detection>,
+    zoom: Double,
+    coordOf: (Detection) -> Pair<Double, Double>?,
+): List<Cluster> {
+    if (items.isEmpty()) return emptyList()
+    // osmdroid: ~360 / 2^zoom degrees span the whole tile width. Pick a cell of ~64 of those
+    // pixels' worth of degrees so cells stay a steady screen size; clamp so it never degenerates.
+    val cell = (360.0 / Math.pow(2.0, zoom + 2.0)).coerceIn(1e-6, 5.0)
+    val buckets = LinkedHashMap<Long, MutableList<Pair<Detection, Pair<Double, Double>>>>()
+    for (d in items) {
+        val (lat, lon) = coordOf(d) ?: continue
+        val gx = Math.floor(lon / cell).toLong()
+        val gy = Math.floor(lat / cell).toLong()
+        val key = (gx shl 32) xor (gy and 0xFFFFFFFFL)
+        buckets.getOrPut(key) { mutableListOf() }.add(d to (lat to lon))
+    }
+    return buckets.values.map { bucket ->
+        val members = bucket.map { it.first }
+        val avgLat = bucket.sumOf { it.second.first } / bucket.size
+        val avgLon = bucket.sumOf { it.second.second } / bucket.size
+        val dominant = members.groupingBy { it.type.category }.eachCount()
+            .maxByOrNull { it.value }?.key ?: members.first().type.category
+        Cluster(avgLat, avgLon, members, dominant)
+    }
+}
+
 /** Located detections dropped on a dark map, filterable by category. Fixed installs
  *  use the phone's position from when first heard; drones use their own broadcast coords. */
 @Composable
@@ -60,6 +98,8 @@ fun MapScreen(ble: AcabBleManager, onSelect: (Detection) -> Unit) {
     val myLocation = remember { mutableStateOf<MyLocationNewOverlay?>(null) }
     val markers = rememberCategoryMarkers()   // category pins, built once
     val operatorMarker = rememberOperatorMarker()
+
+    val clusterFactory = rememberClusterMarkerFactory()
 
     // osmdroid needs a user agent set before its first tile fetch, or the tile server rejects it.
     remember { Configuration.getInstance().userAgentValue = context.packageName }
@@ -125,16 +165,48 @@ fun MapScreen(ble: AcabBleManager, onSelect: (Detection) -> Unit) {
                         }
                     }
                 }
-                shown.forEach { d ->
+                // Surveillance infrastructure (Flock ALPR, Raven, drone, body cam, police)
+                // always pins individually, so a camera is never lost inside a clump. Only the
+                // noisy mass (nearby devices + trackers) grid-clusters, below. (A tracker later
+                // flagged as "following" will promote back to an individual marker.)
+                shown.filter { it.type != DeviceType.NEARBY_DEVICE && it.type != DeviceType.TRACKER }.forEach { d ->
                     val (lat, lon) = ble.mapCoord(d) ?: return@forEach
-                    val marker = Marker(map).apply {
+                    map.overlays.add(Marker(map).apply {
                         position = GeoPoint(lat, lon)
                         icon = markers.getValue(d.type)
                         setAnchor(Marker.ANCHOR_CENTER, Marker.ANCHOR_CENTER)
                         title = d.type.category
                         setOnMarkerClickListener { _, _ -> onSelect(d); true }
+                    })
+                }
+                val clusters = clusterDetections(
+                    shown.filter { it.type == DeviceType.NEARBY_DEVICE || it.type == DeviceType.TRACKER },
+                    map.zoomLevelDouble,
+                ) { ble.mapCoord(it) }
+                for (c in clusters) {
+                    if (c.members.size == 1) {
+                        val d = c.members.first()
+                        map.overlays.add(Marker(map).apply {
+                            position = GeoPoint(c.lat, c.lon)
+                            icon = markers.getValue(d.type)
+                            setAnchor(Marker.ANCHOR_CENTER, Marker.ANCHOR_CENTER)
+                            title = d.type.category
+                            setOnMarkerClickListener { _, _ -> onSelect(d); true }
+                        })
+                    } else {
+                        val tone = catTone(c.dominantCategory)
+                        map.overlays.add(Marker(map).apply {
+                            position = GeoPoint(c.lat, c.lon)
+                            icon = clusterFactory.marker(c.members.size, tone)
+                            setAnchor(Marker.ANCHOR_CENTER, Marker.ANCHOR_CENTER)
+                            title = "${c.members.size} detections"
+                            // tapping a bubble zooms in one step toward it, splitting the cluster
+                            setOnMarkerClickListener { _, _ ->
+                                map.controller.animateTo(GeoPoint(c.lat, c.lon), map.zoomLevelDouble + 2.0, 300L)
+                                true
+                            }
+                        })
                     }
-                    map.overlays.add(marker)
                 }
                 // drone operator pins: the muted person marker, distinct from the dots
                 shown.forEach { d ->

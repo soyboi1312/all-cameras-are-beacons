@@ -262,6 +262,12 @@ private fun LocationPanel(d: Detection, lat: Double, lon: Double) {
             Text(String.format("%.5f, %.5f", lat, lon),
                 color = Acab.dim, fontSize = 10.sp, fontFamily = Acab.mono)
         }
+        // When the board stamped this from a stale phone fix (offline / Desert mode), say how
+        // old the position is so it isn't read as a live "here, now". The v1.7 headline.
+        d.locationAgeText?.let { age ->
+            Text("location as of $age", color = Acab.warn,
+                fontSize = 11.sp, fontFamily = Acab.mono)
+        }
         AndroidView(
             modifier = Modifier
                 .fillMaxWidth()

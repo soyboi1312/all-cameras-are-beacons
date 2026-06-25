@@ -15,6 +15,7 @@
  */
 #include "axon_detect.h"
 #include "axon_signatures.h"
+#include "desert_detect.h"   // Desert mode forces classification even when toggled off
 #include <ctype.h>
 #include <stdio.h>
 #include <string.h>
@@ -122,7 +123,7 @@ static void parseAdv(const uint8_t* adv, size_t len, AxAdv* f) {
 // module is off, if no criteria are set, or if any set criterion fails.
 bool axonClassifyBLE(const uint8_t mac[6], const uint8_t* adv, size_t advLen,
                      int rssi, AcabDetection* out) {
-    if (!gEnabled) return false;
+    if (!gEnabled && !desertIsEnabled()) return false;
 
     AxAdv f;
     if (adv && advLen) parseAdv(adv, advLen, &f);

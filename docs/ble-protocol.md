@@ -38,6 +38,7 @@ time the device is re-seen after the 60 s dedup window (`new` distinguishes them
 | `id` | RID serial / operator id | optional (drones) |
 | `det` | detail (raven fw, ssid, drone op-id…) | optional |
 | `lat`,`lon` | subject location | drones: broadcast position; others: detector GPS |
+| `gage` | age (s) of the GPS fix used for `lat`,`lon` | optional; set when stamped from a stale phone fix (offline / Desert) |
 | `plat`,`plon` | drone operator location | optional |
 | `alt` | altitude (m MSL) | optional (drones) |
 | `n` | sighting count this session | integer |
@@ -88,7 +89,7 @@ The firmware re-notifies Status after applying a config write.
 ## Status (read / notify)
 
 ```json
-{"fw":"ACAB-ouispy 1.6","up":1234,"total":42,
+{"fw":"ACAB-ouispy 1.7","up":1234,"total":42,
  "ble":true,"wifi":true,"axon":false,"tracker":false,"buzzer":true,"vol":80,"gps":false,"bufon":false,"desert":false}
 ```
 
@@ -106,6 +107,7 @@ The firmware re-notifies Status after applying a config write.
 | `bufon` | offline buffering is enabled |
 | `tracker` | BLE item-tracker detector enabled |
 | `desert` | Desert mode enabled (reporting every device in range) |
+| `ign` | number of MACs on the board's ignore list (for app reconciliation) |
 
 ## Desert mode
 

@@ -16,6 +16,7 @@ struct DeviceStatus: Equatable {
     let bufCount: Int        // detections currently buffered on the board ("buf")
     let bufferingOn: Bool    // offline buffering enabled ("bufon")
     let desertMode: Bool     // Desert mode enabled ("desert")
+    let ignoreCount: Int     // entries on the board's ignore list ("ign")
 
     var uptimeText: String {
         let h = uptime / 3600, m = (uptime % 3600) / 60, s = uptime % 60
@@ -31,6 +32,7 @@ extension DeviceStatus: Decodable {
         case vol         // firmware sends "vol"; we call it `volume`
         case buf, bufon  // offline buffer: stored count + enabled flag
         case desert      // Desert mode (report every device)
+        case ign         // board ignore-list count
     }
 
     init(from decoder: Decoder) throws {
@@ -48,13 +50,14 @@ extension DeviceStatus: Decodable {
         bufCount    = (try? k.decode(Int.self, forKey: .buf)) ?? 0
         bufferingOn = (try? k.decode(Bool.self, forKey: .bufon)) ?? false
         desertMode  = (try? k.decode(Bool.self, forKey: .desert)) ?? false
+        ignoreCount = (try? k.decode(Int.self, forKey: .ign)) ?? 0
     }
 }
 
 extension DeviceStatus {
     /// Latest firmware this app ships against. Bump on a firmware release so the
     /// Device screen flags the update.
-    static let latestVersion = "1.6"
+    static let latestVersion = "1.7"
 
     /// Just the version number out of `fw` ("ACAB-ouispy 0.1.0" -> "0.1.0").
     var version: String { firmware.split(separator: " ").last.map(String.init) ?? firmware }

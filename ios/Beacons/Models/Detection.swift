@@ -20,6 +20,7 @@ struct Detection: Identifiable, Equatable {
     let pilotLat: Double?        // json "plat"
     let pilotLon: Double?        // json "plon"
     let altitude: Int?           // metres MSL (drones)
+    let gpsAgeSec: Int?          // age (s) of the phone fix used for lat/lon (json "gage"; offline/Desert)
 
     // Drone Remote ID flight telemetry (drones only; nil when not broadcast).
     let speedH: Int?             // horizontal speed m/s   (json "spd")
@@ -55,11 +56,30 @@ struct Detection: Identifiable, Equatable {
         return CLLocationCoordinate2D(latitude: pilotLat, longitude: pilotLon)
     }
 
+    /// "as of N ago" when lat/lon came from a stale phone fix (offline / Desert mode);
+    /// nil when the fix is fresh or there's no location.
+    var locationAgeText: String? {
+        guard coordinate != nil, let s = gpsAgeSec, s >= 30 else { return nil }
+        if s < 90 { return "\(s)s ago" }
+        let m = s / 60
+        if m < 90 { return "\(m)m ago" }
+        let h = m / 60
+        return h < 48 ? "\(h)h ago" : "\(h / 24)d ago"
+    }
+
     /// Best label we have: advertised name, else UAS serial, else device class.
     var displayName: String {
         if let name, !name.isEmpty { return name }
         if let uasID, !uasID.isEmpty { return uasID }
         return type.label
+    }
+
+    /// True when we have a real handle (advertised name or UAS-ID) to lead with,
+    /// rather than falling back to the device class. Drives the log row layout.
+    var hasName: Bool {
+        if let name, !name.isEmpty { return true }
+        if let uasID, !uasID.isEmpty { return true }
+        return false
     }
 
     /// Readable label for the drone's ODID operational status.
@@ -101,7 +121,7 @@ extension Detection: Codable {
     // The firmware's short keys; they map to the longer property names above.
     enum CodingKeys: String, CodingKey {
         case t, s, meth, c, mac, rssi, name, id, det, lat, lon, plat, plon, alt
-        case spd, vspd, hdg, hgt, palt, sta, n, new
+        case spd, vspd, hdg, hgt, palt, sta, n, new, gage
         case hist, seq, at, approx   // offline-buffer replay
     }
 
@@ -129,6 +149,7 @@ extension Detection: Codable {
         pilotLat   = try? k.decodeIfPresent(Double.self, forKey: .plat)
         pilotLon   = try? k.decodeIfPresent(Double.self, forKey: .plon)
         altitude   = try? k.decodeIfPresent(Int.self, forKey: .alt)
+        gpsAgeSec  = try? k.decodeIfPresent(Int.self, forKey: .gage)
         speedH     = try? k.decodeIfPresent(Int.self, forKey: .spd)
         speedV     = try? k.decodeIfPresent(Int.self, forKey: .vspd)
         heading    = try? k.decodeIfPresent(Int.self, forKey: .hdg)
@@ -161,6 +182,7 @@ extension Detection: Codable {
         try k.encodeIfPresent(pilotLat, forKey: .plat)
         try k.encodeIfPresent(pilotLon, forKey: .plon)
         try k.encodeIfPresent(altitude, forKey: .alt)
+        try k.encodeIfPresent(gpsAgeSec, forKey: .gage)
         try k.encodeIfPresent(speedH, forKey: .spd)
         try k.encodeIfPresent(speedV, forKey: .vspd)
         try k.encodeIfPresent(heading, forKey: .hdg)

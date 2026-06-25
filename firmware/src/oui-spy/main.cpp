@@ -19,9 +19,20 @@
 #include "det_log.h"
 
 // Scanner sink: send each detection to the app, the buzzer, and serial.
+// In Desert mode the tracker/body-cam/police classifiers run regardless of their
+// toggle (so real types still show), but the toggle keeps gating whether we ALERT.
+static bool alertTypeEnabled(AcabDeviceType t) {
+    switch (t) {
+        case ACAB_TRACKER:      return trackerIsEnabled();
+        case ACAB_AXON_BODYCAM: return axonIsEnabled();
+        case ACAB_POLICE_GEAR:  return policeIsEnabled();
+        default:                return true;
+    }
+}
+
 static void onDetection(const AcabDetection& d, bool isNew) {
     acabBleNotifyDetection(d, isNew);
-    alertsSignal(d.type, isNew);
+    if (alertTypeEnabled(d.type)) alertsSignal(d.type, isNew);
 
     if (isNew) {
         char mac[18];

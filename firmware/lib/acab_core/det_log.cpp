@@ -116,6 +116,7 @@ static void unpackToDetection(const StoredDet* s, AcabDetection* d) {
     d->lat   = (double)s->lat_e7 / 1e7;
     d->lon   = (double)s->lon_e7 / 1e7;
     d->count = s->count;
+    d->gpsAgeMs = (uint32_t)s->gpsAgeSec * 1000;
     d->lastSeen = s->whenMs;
     memcpy(d->id,   s->uasid, sizeof(s->uasid)); d->id[sizeof(s->uasid)]   = '\0';
     memcpy(d->name, s->name,  sizeof(s->name));  d->name[sizeof(s->name)]  = '\0';
@@ -142,6 +143,9 @@ void detLogBegin() {
     // Persisted opt-in flag + monotonic boot counter, and the last-connect boot for auto-wipe.
     Preferences p; p.begin(NVS_NS, false);
     gEnabled = p.getBool("on", false);
+    // Reload a persisted at-rest key so deploy-and-leave buffering survives a reboot
+    // instead of going keyless until the app reconnects (see the SECURITY note in det_log.h).
+    if (gEnabled && p.getBytesLength("key") == 32) { p.getBytes("key", gKey, 32); gHaveKey = true; }
     gBoot    = p.getUInt("boot", 0) + 1;
     p.putUInt("boot", gBoot);
     uint32_t lastConn = p.getUInt("lastconn", gBoot);
@@ -154,13 +158,29 @@ void detLogBegin() {
 void detLogSetEnabled(bool on) {
     if (on == gEnabled) return;
     gEnabled = on;
-    Preferences p; p.begin(NVS_NS, false); p.putBool("on", on); p.end();
-    if (!on) detLogClearKey();                       // stop capturing; forget the key
+    Preferences p; p.begin(NVS_NS, false);
+    p.putBool("on", on);
+    if (on && gHaveKey) p.putBytes("key", gKey, 32);   // persist a key that arrived before enable
+    p.end();
+    if (!on) detLogClearKey();                         // stop capturing; forget the key (RAM + NVS)
 }
 bool detLogEnabled() { return gEnabled; }
 
-void detLogSetKey(const uint8_t key[32]) { memcpy(gKey, key, 32); gHaveKey = true; }
-void detLogClearKey() { memset(gKey, 0, 32); gHaveKey = false; }
+void detLogSetKey(const uint8_t key[32]) {
+    memcpy(gKey, key, 32);
+    gHaveKey = true;
+    // Persist ONLY while buffering is enabled, so the key never sits in flash while
+    // buffering is off (the app pushes the key on every connect, including when off). When
+    // on, this is the deploy-and-leave reboot-survival path; SECURITY TRADEOFF: a seized
+    // board's flash then yields the key (see det_log.h). A key that arrives before the
+    // enable is re-persisted by detLogSetEnabled(true).
+    if (gEnabled) { Preferences p; p.begin(NVS_NS, false); p.putBytes("key", gKey, 32); p.end(); }
+}
+void detLogClearKey() {
+    memset(gKey, 0, 32);
+    gHaveKey = false;
+    Preferences p; p.begin(NVS_NS, false); p.remove("key"); p.end();
+}
 bool detLogHaveKey() { return gHaveKey; }
 
 void detLogSetEpoch(uint32_t unixSec) { gEpochUnix = unixSec; gEpochAtMs = millis(); }
@@ -188,6 +208,7 @@ void detLogAppend(const AcabDetection& d) {
     s.rssi   = d.rssi;
     s.lat_e7 = (int32_t)(d.lat * 1e7);
     s.lon_e7 = (int32_t)(d.lon * 1e7);
+    s.gpsAgeSec = (d.gpsAgeMs / 1000 > 0xFFFF) ? 0xFFFF : (uint16_t)(d.gpsAgeMs / 1000);
     s.count  = d.count;
     strncpy(s.uasid, d.id,   sizeof(s.uasid));       // drone identity (truncated)
     strncpy(s.name,  d.name, sizeof(s.name));
