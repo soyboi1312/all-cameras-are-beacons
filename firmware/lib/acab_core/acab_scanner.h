@@ -35,9 +35,16 @@ void acabScannerBegin(const AcabScannerConfig& cfg, AcabDetectionSink sink);
 // with it. Drones carry their own broadcast coordinates, so they don't.
 void acabScannerSetSelfGPS(double lat, double lon, bool valid);
 
+// Re-arm offline-buffer capture (call when the app disconnects): the first sighting of
+// each device after this buffers once more, so capture isn't a single per-boot event.
+void acabScannerReArmCapture();
+
 // Whitelist: silently drop detections from these MACs (no report/beep/mesh).
 // App-pushed over config; held in RAM (the app re-sends on reconnect).
 void acabScannerSetIgnoreList(const uint8_t macs[][6], int count);
+
+// How many MACs are currently on the ignore list (for app reconciliation).
+uint32_t acabScannerIgnoreCount();
 
 // Total detections emitted this session (for status/heartbeat reporting).
 uint32_t acabScannerTotalDetections();

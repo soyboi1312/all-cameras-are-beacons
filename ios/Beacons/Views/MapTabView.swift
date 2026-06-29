@@ -9,6 +9,8 @@ struct MapTabView: View {
     @State private var filter: String?           // category key: ALPR / DRONE / BODY CAM / TRACKER
     @State private var camera: MapCameraPosition = .userLocation(fallback: .automatic)
     @State private var selected: Detection?
+    @State private var cluster: Cluster?         // tapped multi-member bubble (drives the picker sheet)
+    @State private var span: MKCoordinateSpan = .init(latitudeDelta: 0.02, longitudeDelta: 0.02)
     @State private var emptyDismissed = false
 
     /// Where the pin goes: a drone's own broadcast coordinate if it has one, else
@@ -24,6 +26,45 @@ struct MapTabView: View {
     private var totalLocated: Int { ble.detections.filter { mapCoord(for: $0) != nil }.count }
     private func count(_ cat: String) -> Int {
         ble.detections.filter { mapCoord(for: $0) != nil && $0.type.category == cat }.count
+    }
+
+    /// Only generic Desert-mode "nearby device" hits and item trackers accumulate into
+    /// count bubbles — the noisy, low-stakes mass. Surveillance infrastructure (Flock
+    /// ALPR, Raven, drone, body cam) ALWAYS renders as an individual marker, so a camera
+    /// is never lost inside a clump. (A tracker later flagged as "following" will promote
+    /// back to an individual marker.)
+    private func clusterable(_ d: Detection) -> Bool { d.type == .nearbyDevice || d.type == .tracker }
+
+    /// Drones: individual pins (they own flight-path overlays + an operator tether).
+    private var droneDetections: [Detection] { located.filter { $0.type == .drone } }
+
+    /// Surveillance infrastructure that always pins individually (located, non-drone,
+    /// non-clusterable): Flock ALPR, Raven, body cam.
+    private var infraDetections: [Detection] { located.filter { $0.type != .drone && !clusterable($0) } }
+
+    /// Grid-clustered bubbles for ONLY the clusterable hits (nearby devices + trackers).
+    /// Cell size scales with the current zoom (span / 14), so zooming in splits dense
+    /// Desert-mode clumps apart and zooming out merges them.
+    private var clusters: [Cluster] {
+        let points = located.filter { clusterable($0) }
+        guard !points.isEmpty else { return [] }
+        let cell = max(span.latitudeDelta, span.longitudeDelta) / 14
+        guard cell > 0 else {
+            return points.compactMap { d in mapCoord(for: d).map { Cluster(coord: $0, members: [d]) } }
+        }
+        var buckets: [String: [Detection]] = [:]
+        for d in points {
+            guard let c = mapCoord(for: d) else { continue }
+            let gx = (c.latitude / cell).rounded(.down)
+            let gy = (c.longitude / cell).rounded(.down)
+            buckets["\(gx):\(gy)", default: []].append(d)
+        }
+        return buckets.map { key, members in
+            // Average the members so the bubble sits in the middle of the clump.
+            let lat = members.compactMap { mapCoord(for: $0)?.latitude }.reduce(0, +) / Double(members.count)
+            let lon = members.compactMap { mapCoord(for: $0)?.longitude }.reduce(0, +) / Double(members.count)
+            return Cluster(id: key, coord: CLLocationCoordinate2D(latitude: lat, longitude: lon), members: members)
+        }
     }
 
     var body: some View {
@@ -50,14 +91,25 @@ struct MapTabView: View {
             }
             .navigationBarHidden(true)
             .sheet(item: $selected) { DetectionDetailView(detection: $0).environmentObject(ble) }
+            .sheet(item: $cluster) { c in
+                ClusterListSheet(cluster: c) { d in
+                    cluster = nil
+                    // Defer so the picker sheet finishes dismissing before the detail one
+                    // presents (two sheets can't transition at the same instant).
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.35) { selected = d }
+                }
+                .environmentObject(ble)
+                .presentationDetents([.medium, .large])
+            }
         }
     }
 
     private var map: some View {
         Map(position: $camera) {
             UserAnnotation()                       // the phone's live position
-            ForEach(located) { d in
-                if d.type == .drone { droneOverlay(d) }
+            // Drones: their own pins, flight paths, and operator tethers.
+            ForEach(droneDetections) { d in
+                droneOverlay(d)
                 if let coord = mapCoord(for: d) {
                     Annotation(d.type.shortTag, coordinate: coord) {
                         Button { selected = d } label: { MapPin(type: d.type) }
@@ -68,10 +120,33 @@ struct MapTabView: View {
                     Annotation("OP", coordinate: pilot) { OperatorPin() }
                 }
             }
+            // Surveillance infrastructure: always an individual marker, never bubbled.
+            ForEach(infraDetections) { d in
+                if let coord = mapCoord(for: d) {
+                    Annotation(d.type.shortTag, coordinate: coord) {
+                        Button { selected = d } label: { MapPin(type: d.type) }
+                            .buttonStyle(.plain)
+                    }
+                }
+            }
+            // Nearby devices + trackers: grid-clustered bubbles. A lone member renders as
+            // a normal pin; a clump renders one count bubble so a dense log stays legible.
+            ForEach(clusters) { c in
+                Annotation(c.shortTag, coordinate: c.coord) {
+                    if let only = c.single {
+                        Button { selected = only } label: { MapPin(type: only.type) }
+                            .buttonStyle(.plain)
+                    } else {
+                        Button { cluster = c } label: { ClusterBubble(cluster: c) }
+                            .buttonStyle(.plain)
+                    }
+                }
+            }
         }
         .mapStyle(.standard(elevation: .flat, pointsOfInterest: .excludingAll))
         .mapControls { MapUserLocationButton(); MapCompass() }   // tap the button to recenter on me
         .preferredColorScheme(.dark)
+        .onMapCameraChange(frequency: .onEnd) { ctx in span = ctx.region.span }
         .ignoresSafeArea()
     }
 
@@ -242,5 +317,107 @@ private struct OperatorPin: View {
             .padding(6)
             .background(ACABTheme.bg3, in: Circle())
             .overlay(Circle().strokeBorder(ACABTheme.line, lineWidth: 1))
+    }
+}
+
+// MARK: - Clustering
+
+/// A group of located detections that fall in the same grid cell at the current zoom.
+/// A single-member cluster is drawn as a normal pin; multi-member as a count bubble.
+struct Cluster: Identifiable {
+    var id: String
+    let coord: CLLocationCoordinate2D
+    let members: [Detection]
+
+    init(id: String = UUID().uuidString, coord: CLLocationCoordinate2D, members: [Detection]) {
+        self.id = id; self.coord = coord; self.members = members
+    }
+
+    /// The lone member when this isn't really a cluster (count == 1).
+    var single: Detection? { members.count == 1 ? members.first : nil }
+
+    /// The category tint for the whole bubble: a uniform clump keeps its category tint,
+    /// a mixed clump goes neutral.
+    var tint: Color {
+        let cats = Set(members.map { $0.type.category })
+        return cats.count == 1 ? (members.first?.type.tint ?? ACABTheme.accent) : ACABTheme.text
+    }
+
+    var shortTag: String { members.count == 1 ? (members.first?.type.shortTag ?? "") : "\(members.count)" }
+}
+
+/// A count bubble for a multi-member cluster — sized up a touch for bigger clumps.
+private struct ClusterBubble: View {
+    let cluster: Cluster
+    private var n: Int { cluster.members.count }
+    private var diameter: CGFloat {
+        switch n {
+        case ..<10:  return 34
+        case ..<50:  return 40
+        case ..<200: return 46
+        default:     return 52
+        }
+    }
+    var body: some View {
+        ZStack {
+            Circle().fill(cluster.tint.opacity(0.22)).frame(width: diameter + 10, height: diameter + 10)
+            Circle().fill(ACABTheme.bg2).frame(width: diameter, height: diameter)
+                .overlay(Circle().strokeBorder(cluster.tint, lineWidth: 2))
+                .shadow(color: cluster.tint.opacity(0.5), radius: 5)
+            Text("\(n)")
+                .font(ACABTheme.display(n < 100 ? 15 : 13, weight: .bold))
+                .foregroundStyle(ACABTheme.text).monospacedDigit()
+        }
+    }
+}
+
+/// Bottom sheet listing the detections inside a tapped cluster; pick one to open it.
+private struct ClusterListSheet: View {
+    let cluster: Cluster
+    let onPick: (Detection) -> Void
+    @EnvironmentObject var ble: BLEManager
+    @Environment(\.dismiss) private var dismiss
+
+    private var members: [Detection] {
+        cluster.members.sorted {
+            (ble.lastSeenDate(for: $0.id) ?? .distantPast) > (ble.lastSeenDate(for: $1.id) ?? .distantPast)
+        }
+    }
+
+    var body: some View {
+        ZStack {
+            ACABTheme.bg.ignoresSafeArea()
+            ScrollView {
+                VStack(alignment: .leading, spacing: 0) {
+                    HStack {
+                        VStack(alignment: .leading, spacing: 3) {
+                            Text("\(cluster.members.count) here")
+                                .font(ACABTheme.display(20, weight: .semibold)).foregroundStyle(ACABTheme.text)
+                            Kicker("CLUSTERED AT THIS SPOT")
+                        }
+                        Spacer()
+                        Button { dismiss() } label: {
+                            Image(systemName: "xmark").font(.system(size: 12, weight: .bold))
+                                .foregroundStyle(ACABTheme.dim)
+                                .frame(width: 32, height: 32)
+                                .background(ACABTheme.bg2, in: Circle())
+                                .overlay(Circle().strokeBorder(ACABTheme.line, lineWidth: 1))
+                        }
+                        .buttonStyle(.plain)
+                    }
+                    .padding(.bottom, 12)
+                    VStack(spacing: 0) {
+                        ForEach(Array(members.enumerated()), id: \.element.id) { i, d in
+                            Button { onPick(d) } label: { DetectionRow(detection: d) }
+                                .buttonStyle(.plain)
+                            if i < members.count - 1 { Divider().overlay(ACABTheme.line) }
+                        }
+                    }
+                    .panel()
+                }
+                .padding(ACABTheme.pad)
+            }
+        }
+        .preferredColorScheme(.dark)
     }
 }

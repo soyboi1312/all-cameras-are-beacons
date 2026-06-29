@@ -360,7 +360,14 @@ struct DeviceView: View {
     // MARK: ignored devices
     private var ignoredCard: some View {
         VStack(alignment: .leading, spacing: 12) {
-            Kicker("IGNORED")
+            HStack {
+                Kicker("IGNORED")
+                Spacer()
+                // The board echoes how many MACs it's suppressing at the source.
+                if let n = ble.status?.ignoreCount, n > 0 {
+                    Kicker("\(n) ON BOARD", color: ACABTheme.dim)
+                }
+            }
             ForEach(ble.ignored) { dev in
                 HStack(spacing: 10) {
                     Image(systemName: "bell.slash").font(.system(size: 12)).foregroundStyle(ACABTheme.faint)

@@ -129,6 +129,7 @@ void meshLinkSendText(const char* text) {
 
 // Rate-limited scanner sink: skip repeats and respect the LoRa duty-cycle floor.
 void meshLinkSend(const AcabDetection& d, bool isNew) {
+    if (d.type == ACAB_NEARBY_DEVICE) return;    // Desert-mode firehose: never relay over the mesh
     if (!isNew) return;                          // one mesh ping per dedup window
     if (millis() - gLastSend < gCfg.minIntervalMs) return;  // protect the LoRa duty cycle
     char text[256];

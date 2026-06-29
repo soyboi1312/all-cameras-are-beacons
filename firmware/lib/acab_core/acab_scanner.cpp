@@ -16,6 +16,7 @@
 #include "police_detect.h"
 #include "desert_detect.h"
 #include "det_log.h"
+#include "acab_ble_service.h"
 
 #include <Arduino.h>
 #include <WiFi.h>
@@ -52,12 +53,16 @@ struct DedupEntry {
     uint32_t      firstSeen;
     uint32_t      lastSeen;
     uint16_t      count;
+    uint32_t      loggedGen;   // capture generation this entry last buffered in (0 = never)
 };
 #define ACAB_DEDUP_MAX 256   // headroom for Desert mode (every device, not just matches)
 static DedupEntry gDedup[ACAB_DEDUP_MAX];
+// Offline-capture generation: bumped on each BLE disconnect so the first sighting of
+// every device AFTER the app leaves buffers once more, not just once per boot.
+static volatile uint32_t gCaptureGen = 1;
 
 // Whitelist (app-pushed): MACs we drop silently - no report, beep, or mesh.
-#define ACAB_IGNORE_MAX 32
+#define ACAB_IGNORE_MAX 256
 static uint8_t      gIgnore[ACAB_IGNORE_MAX][6];
 static volatile int gIgnoreCount = 0;
 static portMUX_TYPE gIgnoreMux = portMUX_INITIALIZER_UNLOCKED;
@@ -109,6 +114,7 @@ static DedupEntry* dedupFind(AcabDeviceType type, const uint8_t mac[6]) {
     slot->firstSeen = 0;
     slot->lastSeen = 0;
     slot->count = 0;
+    slot->loggedGen = 0;   // a reused slot re-arms capture for the new device
     return slot;
 }
 
@@ -139,6 +145,28 @@ static const uint8_t* dedupKey(const AcabDetection& d, uint8_t scratch[6]) {
     return d.mac;
 }
 
+// Desert-mode notify gate. Desert mode reports every device in range, so it
+// emits a detection for every advert of every nearby device. Streaming all of
+// them saturates the single BLE link and starves the inbound config-write path,
+// so the app can't even turn the mode back off and the board looks locked up.
+// Let a nearby device through only on its isNew edge (first sighting or a
+// dedup-window refresh) and cap the burst rate, leaving the link headroom for
+// commands. Real detections (Flock/drone/Axon/...) are rare and never gated.
+#define ACAB_DESERT_MAX_NOTIFY_PER_SEC 20
+static portMUX_TYPE gDesertMux = portMUX_INITIALIZER_UNLOCKED;
+static bool desertNotifyAllowed(bool isNew, uint32_t now) {
+    if (!isNew) return false;   // repeat sighting inside the dedup window: don't stream it
+    static uint32_t windowStart = 0;
+    static uint16_t inWindow = 0;
+    bool allow;
+    portENTER_CRITICAL(&gDesertMux);
+    if (now - windowStart >= 1000) { windowStart = now; inWindow = 0; }
+    allow = inWindow < ACAB_DESERT_MAX_NOTIFY_PER_SEC;
+    if (allow) inWindow++;
+    portEXIT_CRITICAL(&gDesertMux);
+    return allow;
+}
+
 // Where both radios converge.
 static void handleDetection(AcabDetection& d) {
     if (isIgnored(d.mac)) return;   // whitelisted by the app - drop silently
@@ -154,23 +182,43 @@ static void handleDetection(AcabDetection& d) {
     if (e->count == 0) e->firstSeen = now;
     e->lastSeen = now;
     if (e->count < 0xFFFF) e->count++;
-    bool firstSighting = (e->count == 1);   // true only on a device's first sighting this boot
+    // Buffer a device once per capture generation: its first sighting this boot AND its
+    // first sighting after each link drop (gCaptureGen bumps on disconnect), so capture
+    // re-arms when the app leaves instead of firing only once per boot.
+    bool shouldBuffer = (e->loggedGen != gCaptureGen);
+    if (shouldBuffer) e->loggedGen = gCaptureGen;
     d.firstSeen = e->firstSeen;
     d.lastSeen  = e->lastSeen;
     d.count     = e->count;
     portEXIT_CRITICAL(&gDedupMux);
 
-    // Stamp fixed devices with our own GPS fix (drones already carry theirs).
-    if (d.type != ACAB_DRONE && gSelfGPSValid && d.lat == 0 && d.lon == 0) {
-        d.lat = gSelfLat;
-        d.lon = gSelfLon;
+    // Stamp non-drone hits with a GPS fix so buffered/offline records carry a location
+    // (drones broadcast their own). Prefer a fresh onboard/forwarded fix; else fall back
+    // to the LAST known phone fix however old, recording its age so the app can show
+    // "location as of N ago".
+    if (d.type != ACAB_DRONE && d.lat == 0 && d.lon == 0) {
+        if (gSelfGPSValid) {
+            d.lat = gSelfLat;
+            d.lon = gSelfLon;
+        } else {
+            double la, lo; uint32_t ageMs = 0;
+            if (acabBleGetPhoneGps(&la, &lo, 0xFFFFFFFFu, &ageMs)) {
+                d.lat = la;
+                d.lon = lo;
+                d.gpsAgeMs = ageMs;
+            }
+        }
     }
 
     gTotal++;
-    // Offline buffer: capture each device's FIRST sighting while the app is away.
-    // det_log no-ops when connected / disabled / keyless, so this is one record per
-    // device per boot, and only while disconnected.
-    if (firstSighting) detLogAppend(d);
+    // Offline buffer: capture each device once per "away" period (re-armed on disconnect)
+    // while the app is gone. det_log no-ops when connected / disabled / keyless.
+    if (shouldBuffer) detLogAppend(d);
+
+    // Throttle Desert mode's per-advert firehose so it can't saturate the BLE
+    // link (gTotal and the offline buffer above still see every device).
+    if (d.type == ACAB_NEARBY_DEVICE && !desertNotifyAllowed(isNew, now)) return;
+
     if (gSinkQ) {
         SinkItem it{d, isNew};
         xQueueSend(gSinkQ, &it, 0);   // non-blocking: drop on overflow rather than stall a radio
@@ -402,6 +450,14 @@ void acabScannerSetSelfGPS(double lat, double lon, bool valid) {
     gSelfLat = lat; gSelfLon = lon; gSelfGPSValid = valid;
 }
 
+// Re-arm offline capture: bump the generation so the next sighting of every device
+// buffers once more. Called from the BLE disconnect callback (the app just left).
+void acabScannerReArmCapture() {
+    portENTER_CRITICAL(&gDedupMux);
+    gCaptureGen++;
+    portEXIT_CRITICAL(&gDedupMux);
+}
+
 void acabScannerSetIgnoreList(const uint8_t macs[][6], int count) {
     if (count < 0) count = 0;
     if (count > ACAB_IGNORE_MAX) count = ACAB_IGNORE_MAX;
@@ -415,6 +471,7 @@ void acabScannerSetIgnoreList(const uint8_t macs[][6], int count) {
 uint32_t acabScannerTotalDetections() { return gTotal; }
 uint32_t acabScannerBleSeen()  { return gBleSeen; }
 uint32_t acabScannerWifiSeen() { return gWifiSeen; }
+uint32_t acabScannerIgnoreCount() { return (uint32_t)gIgnoreCount; }
 
 void acabScannerSetBLE(bool on) {
     gBleEnabled = on;

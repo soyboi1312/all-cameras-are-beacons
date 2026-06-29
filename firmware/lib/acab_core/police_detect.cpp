@@ -6,6 +6,7 @@
  */
 #include "police_detect.h"
 #include "police_signatures.h"
+#include "desert_detect.h"   // Desert mode forces classification even when toggled off
 #include <string.h>
 #include <stdio.h>
 
@@ -36,14 +37,14 @@ static bool emit(AcabDetection* out, const uint8_t mac[6], int rssi, AcabSource 
 bool policeClassifyBLE(const uint8_t mac[6], const uint8_t* adv, size_t advLen,
                        int rssi, AcabDetection* out) {
     (void)adv; (void)advLen;
-    if (!gEnabled) return false;
+    if (!gEnabled && !desertIsEnabled()) return false;
     if (!ouiMatch(mac)) return false;
     return emit(out, mac, rssi, SRC_BLE);
 }
 
 bool policeClassifyWiFi(const uint8_t* frame, size_t len, int rssi,
                         AcabDetection* out) {
-    if (!gEnabled || !frame || len < 24) return false;
+    if ((!gEnabled && !desertIsEnabled()) || !frame || len < 24) return false;
     uint8_t ftype = (frame[0] >> 2) & 0x3;   // management frames only
     if (ftype != 0x0) return false;
     const uint8_t* addr2 = &frame[10];   // transmitter

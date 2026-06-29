@@ -51,6 +51,7 @@ class ServerCb : public NimBLEServerCallbacks {
     void onConnect(NimBLEServer*) override { gConnected = true; }
     void onDisconnect(NimBLEServer*) override {
         gConnected = false;
+        acabScannerReArmCapture();                 // app left: re-arm offline capture
         NimBLEDevice::getAdvertising()->start();   // become discoverable again
     }
 };
@@ -135,10 +136,10 @@ class CfgCb : public NimBLECharacteristicCallbacks {
             alertsBeepTest();             // volume preview at the level just set above
         }
         if (doc["ignore"].is<JsonArray>()) {
-            uint8_t macs[32][6];
+            static uint8_t macs[256][6];   // static: config writes are serialized; keeps 1.5KB off the BLE-task stack
             int n = 0;
             for (JsonVariant v : doc["ignore"].as<JsonArray>()) {
-                if (n >= 32) break;
+                if (n >= 256) break;
                 if (parseMac6(v.as<const char*>(), macs[n])) n++;
             }
             acabScannerSetIgnoreList(macs, n);
@@ -241,6 +242,7 @@ static size_t serializeDetection(const AcabDetection& d, bool isNew, char* buf, 
     if (d.id[0])     doc["id"]   = d.id;
     if (d.detail[0]) doc["det"]  = d.detail;
     if (d.lat || d.lon)           { doc["lat"]  = d.lat;  doc["lon"]  = d.lon; }
+    if (d.gpsAgeMs)               doc["gage"] = (uint32_t)(d.gpsAgeMs / 1000);   // GPS fix age (s)
     if (d.pilotLat || d.pilotLon) { doc["plat"] = d.pilotLat; doc["plon"] = d.pilotLon; }
     if (d.altitude)  doc["alt"]  = d.altitude;
     if (d.speedH)    doc["spd"]  = (int)d.speedH;
@@ -301,6 +303,7 @@ void acabBleNotifyDetection(const AcabDetection& d, bool isNew) {
     if (d.id[0])     doc["id"]   = d.id;
     if (d.detail[0]) doc["det"]  = d.detail;
     if (d.lat || d.lon)           { doc["lat"]  = d.lat;  doc["lon"]  = d.lon; }
+    if (d.gpsAgeMs)               doc["gage"] = (uint32_t)(d.gpsAgeMs / 1000);   // GPS fix age (s)
     if (d.pilotLat || d.pilotLon) { doc["plat"] = d.pilotLat; doc["plon"] = d.pilotLon; }
     if (d.altitude)  doc["alt"]  = d.altitude;
     if (d.speedH)    doc["spd"]  = (int)d.speedH;
@@ -339,6 +342,7 @@ void acabBleUpdateStatus() {
     doc["buf"]    = detLogCount();          // stored offline records
     doc["bufon"]  = detLogEnabled();        // buffering opt-in state
     doc["desert"] = desertIsEnabled();      // Desert mode (report every device in range)
+    doc["ign"]    = acabScannerIgnoreCount();  // ignore-list size, for app reconciliation
 
     char buf[200];
     size_t len = serializeJson(doc, buf, sizeof(buf));
@@ -350,12 +354,15 @@ bool acabBleClientConnected() { return gConnected; }
 
 // Latest phone GPS the app pushed, if it arrived within maxAgeMs. Returns false
 // (leaving lat/lon untouched) when there's no fresh fix.
-bool acabBleGetPhoneGps(double* lat, double* lon, uint32_t maxAgeMs) {
+bool acabBleGetPhoneGps(double* lat, double* lon, uint32_t maxAgeMs, uint32_t* ageMs) {
     portENTER_CRITICAL(&gGpsMux);
     uint32_t ms = gPhoneGpsMs; double la = gPhoneLat, lo = gPhoneLon;
     portEXIT_CRITICAL(&gGpsMux);
-    if (ms == 0 || (millis() - ms) > maxAgeMs) return false;
-    if (lat) *lat = la;
-    if (lon) *lon = lo;
+    if (ms == 0) return false;
+    uint32_t age = millis() - ms;
+    if (age > maxAgeMs) return false;
+    if (lat)   *lat   = la;
+    if (lon)   *lon   = lo;
+    if (ageMs) *ageMs = age;
     return true;
 }

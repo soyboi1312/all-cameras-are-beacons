@@ -114,6 +114,20 @@ final class LiveActivityController {
         Task { await a?.end(nil, dismissalPolicy: .immediate) }
     }
 
+    /// End and block (up to `timeout`) until ActivityKit has taken the dismissal, for use
+    /// from app termination where the process is about to die and a fire-and-forget Task
+    /// might not run. The end runs on a DETACHED task (off the blocked thread), so the
+    /// semaphore wait can't deadlock; the timeout is a safety cap inside willTerminate's
+    /// budget. Best-effort: a suspended (e.g. location-denied) app may never reach here.
+    func endBlocking(timeout: TimeInterval = 2) {
+        pending?.cancel(); pending = nil
+        guard let a = activity else { return }
+        activity = nil
+        let sem = DispatchSemaphore(value: 0)
+        Task.detached { await a.end(nil, dismissalPolicy: .immediate); sem.signal() }
+        _ = sem.wait(timeout: .now() + timeout)
+    }
+
     private func push() {
         guard let activity else { return }
         lastPushed = Date(); pending = nil

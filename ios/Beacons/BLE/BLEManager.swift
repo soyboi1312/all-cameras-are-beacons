@@ -55,6 +55,9 @@ final class BLEManager: NSObject, ObservableObject {
     @Published private(set) var status: DeviceStatus?
     @Published private(set) var connectedName: String?
     @Published private(set) var ignored: [IgnoredDevice] = []
+    /// "Mark all seen" baseline. A detection counts as New if we first heard it after
+    /// this point. Nil until the user sets a watermark (then everything older is "seen").
+    @Published private(set) var seenWatermark: Date?
     @Published private(set) var demoMode = false   // canned sample data, no real board
     @Published private(set) var alertMode: AlertMode = .buzzer
     @Published private(set) var driveModeOn = false   // Live Activity (Drive mode) running
@@ -80,6 +83,7 @@ final class BLEManager: NSObject, ObservableObject {
     private var firstSeenAt: [String: Date] = [:]
     private var capturedLoc: [String: CLLocationCoordinate2D] = [:]
     private let ignoreKey = "acab.ignoredDevices"
+    private let watermarkKey = "acab.seenWatermark"   // "mark all seen" baseline
     private let alertModeKey = "acab.alertMode"
     private let lastSeqKey = "acab.lastSeq"   // persisted across disconnects; survives relaunch
     private let redactKey = "acab.redactLockScreen"
@@ -103,15 +107,38 @@ final class BLEManager: NSObject, ObservableObject {
     // snapshot is O(1) instead of re-scanning the store on every detection notify.
     private var liveCounts = (alpr: 0, drones: 0, body: 0, trackers: 0)
 
+    // Live-feed performance. A Desert-mode firehose can fire detection notifies far
+    // faster than SwiftUI can diff a list, so we (1) cap the published array at the
+    // most-recent `liveFeedCap` rows and (2) coalesce republishes to a few Hz.
+    private let liveFeedCap = 400                  // most-recent rows kept in the live feed
+    private var publishTimer: Timer?               // pending coalesced republish
+    private var lastPublish = Date.distantPast     // when we last pushed to @Published
+    private let publishInterval: TimeInterval = 0.3   // ~3 Hz ceiling on UI updates
+
     override init() {
         super.init()
         loadIgnored()
+        if let t = UserDefaults.standard.object(forKey: watermarkKey) as? Double {
+            seenWatermark = Date(timeIntervalSince1970: t)
+        }
         loadPersistedDetections()   // bring back any history filed in a past session
         if let v = UserDefaults.standard.object(forKey: redactKey) as? Bool { redactLockScreen = v }
         // Keep the Drive-mode toggle honest: the controller flips it back off if the Live
         // Activity ends or the user swipes it away, and re-adopts one still running from a
         // previous launch (so a relaunch mid-drive resumes instead of orphaning it).
         liveActivity.onInactive = { [weak self] in self?.driveModeOn = false }
+        // Best-effort: end the Drive-mode Live Activity when the app is force-quit, so the
+        // Dynamic Island / Lock Screen counter doesn't linger. willTerminate only fires
+        // while the app is actually running in the background - during Drive mode that comes
+        // from the location updates (when location is granted), NOT bluetooth-central alone,
+        // which iOS suspends between events. A suspended app (e.g. location denied) can be
+        // killed without willTerminate; the activity's staleDate + the next-launch
+        // adoptExisting() reconcile are the backstops there. endBlocking waits for ActivityKit
+        // to take the dismissal before we return, since the process is about to die.
+        NotificationCenter.default.addObserver(forName: UIApplication.willTerminateNotification,
+                                               object: nil, queue: .main) { [weak self] _ in
+            self?.liveActivity.endBlocking()
+        }
         if liveActivity.adoptExisting() { driveModeOn = true }
         alertMode = AlertMode(rawValue: UserDefaults.standard.string(forKey: alertModeKey) ?? "") ?? .buzzer
         if alertMode == .vibrate { requestFocusAuthIfNeeded() }
@@ -151,6 +178,7 @@ final class BLEManager: NSObject, ObservableObject {
     }
 
     func clearDetections() {
+        publishTimer?.invalidate(); publishTimer = nil   // drop any queued coalesced republish
         store.removeAll(); lastSeen.removeAll(); rssiHistory.removeAll()
         trackHistory.removeAll()
         firstSeenAt.removeAll(); capturedLoc.removeAll(); detections = []
@@ -231,10 +259,54 @@ final class BLEManager: NSObject, ObservableObject {
         publishDetections()
     }
 
+    /// Silence several devices at once (the Logbook's select mode). One ignore-list
+    /// push and one republish instead of one per row. The firmware accepts up to 256
+    /// entries, so we cap the list there.
+    func ignoreDevices(_ list: [Detection]) {
+        var added = false
+        for d in list {
+            let mac = d.mac.lowercased()
+            guard !isIgnored(mac), ignored.count < 256 else { continue }
+            ignored.append(IgnoredDevice(mac: mac, label: d.displayName))
+            added = true
+        }
+        guard added else { return }
+        persistIgnored(); sendIgnoreList()
+        let muted = Set(ignored.map { $0.mac })
+        for e in store.values where muted.contains(e.mac.lowercased()) {
+            store[e.id] = nil; lastSeen[e.id] = nil
+        }
+        publishDetections()
+    }
+
     /// Un-silence a device.
     func unignore(_ mac: String) {
         ignored.removeAll { $0.mac == mac.lowercased() }
         persistIgnored(); sendIgnoreList()
+    }
+
+    // MARK: - Seen watermark ("mark all seen")
+
+    /// Drop a "seen" baseline at now: everything currently in the log becomes "seen",
+    /// and the New-only filter then shows only what arrives after this.
+    func markAllSeen() {
+        let now = Date()
+        seenWatermark = now
+        UserDefaults.standard.set(now.timeIntervalSince1970, forKey: watermarkKey)
+    }
+
+    /// Clear the baseline so every detection counts as New again.
+    func clearSeenWatermark() {
+        seenWatermark = nil
+        UserDefaults.standard.removeObject(forKey: watermarkKey)
+    }
+
+    /// Has this detection been seen yet? New means first heard after the watermark
+    /// (or always New when no watermark is set).
+    func isUnseen(_ d: Detection) -> Bool {
+        guard let mark = seenWatermark else { return true }
+        guard let first = firstSeenAt[d.id] else { return true }
+        return first > mark
     }
 
     private func loadIgnored() {
@@ -247,7 +319,14 @@ final class BLEManager: NSObject, ObservableObject {
     /// Send the ignore list to the board so it suppresses those MACs at the source.
     private func sendIgnoreList() { writeConfig(["ignore": ignored.map { $0.mac }]) }
 
+    /// Push the store into the published feed immediately. Recomputes the per-category
+    /// counts (O(store), needed for the Live Activity), sorts most-recent-first, and
+    /// caps the array so a huge Desert-mode store doesn't hand SwiftUI thousands of rows.
     private func publishDetections() {
+        publishTimer?.invalidate()
+        publishTimer = nil
+        lastPublish = Date()
+
         var a = 0, dr = 0, b = 0, tr = 0
         for d in store.values {
             switch d.type {
@@ -259,8 +338,27 @@ final class BLEManager: NSObject, ObservableObject {
             }
         }
         liveCounts = (a, dr, b, tr)
-        detections = store.values.sorted {
+        let sorted = store.values.sorted {
             (lastSeen[$0.id] ?? .distantPast) > (lastSeen[$1.id] ?? .distantPast)
+        }
+        detections = sorted.count > liveFeedCap ? Array(sorted.prefix(liveFeedCap)) : sorted
+    }
+
+    /// Coalesced republish for the hot path. Publishes at most once per
+    /// `publishInterval`; rapid-fire notifies in between collapse into one trailing
+    /// update, so a Desert-mode firehose updates the feed a few times a second instead
+    /// of thrashing SwiftUI on every record.
+    private func schedulePublish() {
+        guard publishTimer == nil else { return }   // a trailing publish is already queued
+        let elapsed = Date().timeIntervalSince(lastPublish)
+        if elapsed >= publishInterval {
+            publishDetections()
+        } else {
+            publishTimer = Timer.scheduledTimer(withTimeInterval: publishInterval - elapsed,
+                                                repeats: false) { [weak self] _ in
+                self?.publishTimer = nil
+                self?.publishDetections()
+            }
         }
     }
 
@@ -569,7 +667,7 @@ final class BLEManager: NSObject, ObservableObject {
                 trackHistory[d.id] = t
             }
         }
-        publishDetections()
+        schedulePublish()   // coalesced: a Desert-mode firehose updates the feed a few Hz, not per-record
         if d.isHistory { persistDetections() }   // history changed the store; checkpoint it
         // Live first sightings buzz; replayed history never does.
         if !d.isHistory, alertMode == .vibrate, firstTime, !focusActive { alertHaptic(for: d.type) }
@@ -645,7 +743,7 @@ final class BLEManager: NSObject, ObservableObject {
         connectionState = .connected
         connectedName = "ESP32 board"
         status = decodeJSON(DeviceStatus.self, [
-            "fw": "esp32-scanner 1.6", "up": 4920, "total": 7, "ble": true, "wifi": true,
+            "fw": "esp32-scanner 1.7", "up": 4920, "total": 7, "ble": true, "wifi": true,
             "axon": false, "tracker": true, "buzzer": true, "vol": 70, "gps": true,
         ])
         let samples: [[String: Any]] = [

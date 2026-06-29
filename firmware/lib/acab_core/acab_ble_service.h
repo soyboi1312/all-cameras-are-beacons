@@ -50,7 +50,8 @@ bool acabBleClientConnected();
 void acabBleDrainTick();
 
 // Latest phone GPS the app pushed via the Config characteristic, if fresher than
-// maxAgeMs. Returns false (lat/lon untouched) when there's no recent fix.
-bool acabBleGetPhoneGps(double* lat, double* lon, uint32_t maxAgeMs);
+// maxAgeMs (use 0xFFFFFFFF for "any age"). Returns false (outputs untouched) when
+// there's no fix. When ageMs is non-null, it gets the fix's age in millis.
+bool acabBleGetPhoneGps(double* lat, double* lon, uint32_t maxAgeMs, uint32_t* ageMs = nullptr);
 
 #endif // ACAB_BLE_SERVICE_H

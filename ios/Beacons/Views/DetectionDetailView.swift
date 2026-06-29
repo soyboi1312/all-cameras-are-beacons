@@ -266,6 +266,17 @@ struct DetectionDetailView: View {
                 Text(String(format: "%.5f, %.5f", coord.latitude, coord.longitude))
                     .font(ACABTheme.mono(10)).foregroundStyle(ACABTheme.dim)
             }
+            if let age = d.locationAgeText {
+                // The board stamped this fix from a stale phone position (offline /
+                // Desert mode), so flag how old it is.
+                HStack(spacing: 7) {
+                    Image(systemName: "clock.badge.exclamationmark")
+                        .font(.system(size: 11)).foregroundStyle(ACABTheme.warn)
+                    Text("location as of \(age)")
+                        .font(ACABTheme.mono(11, weight: .medium)).foregroundStyle(ACABTheme.warn)
+                    Spacer(minLength: 0)
+                }
+            }
             Map(initialPosition: .region(MKCoordinateRegion(
                 center: coord, span: MKCoordinateSpan(latitudeDelta: 0.008, longitudeDelta: 0.008)))) {
                 Annotation(d.type.shortTag, coordinate: coord) { miniPin }

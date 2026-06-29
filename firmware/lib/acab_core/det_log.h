@@ -8,11 +8,14 @@
  *   - OPT-IN: default OFF, master switch persisted to NVS. The app turns it on.
  *     The project's posture is "collects nothing"; a flash of geotagged sightings is
  *     a new at-rest exposure, so it is off until the user opts in.
- *   - ENCRYPTED AT REST: the sensitive payload is AES-CTR encrypted with a 32-byte
- *     key the app pushes on connect. The board holds the key in RAM ONLY and never
- *     persists it, so a seized board's flash dump is ciphertext. A reboot loses the
- *     key, so buffering pauses until the app reconnects and re-pushes it; records
- *     written under the same app key (across boots) stay decryptable on replay.
+ *   - ENCRYPTED AT REST: the sensitive payload is AES-CTR encrypted with a 32-byte key
+ *     the app pushes on connect. The key is PERSISTED to NVS while buffering is enabled
+ *     (and erased when it's turned off), so a deploy-and-leave board keeps buffering
+ *     across reboots instead of going keyless. TRADEOFF: a seized board's flash now
+ *     yields the key, so the at-rest buffer is decryptable - it is NOT ciphertext-only.
+ *     The remaining guards are the opt-in default (off) + the auto-wipe of records left
+ *     undrained across reboots; flash-encryption / encrypted NVS would restore the
+ *     seized-board protection.
  *   - AUTO-WIPE: records left undrained past a threshold are really erased, so a
  *     board out of its owner's hands self-cleans (clearlog needs the bonded phone in
  *     hand, which you do not have during a seizure).
@@ -40,7 +43,7 @@ struct __attribute__((packed)) StoredDet {
     uint32_t seq;          // monotonic: ring order + the app's sync cursor (cleartext)
     uint32_t bootCount;    // persisted monotonic boot counter, NOT random (cleartext)
     uint16_t crc;          // CRC16 over the encrypted payload; written LAST (cleartext)
-    uint16_t pad;          // reserved / alignment
+    uint16_t gpsAgeSec;    // age (s) of the GPS fix used for lat/lon (cleartext; 0 = fresh/none)
     // ---- encrypted payload (52 bytes) ----
     uint32_t whenMs;       // millis() at last sighting, this boot
     uint8_t  type, src, method, conf;

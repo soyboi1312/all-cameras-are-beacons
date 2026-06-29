@@ -24,9 +24,15 @@ import android.os.VibratorManager
 import android.security.keystore.KeyGenParameterSpec
 import android.security.keystore.KeyProperties
 import androidx.core.content.ContextCompat
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import java.util.concurrent.atomic.AtomicBoolean
 import org.json.JSONArray
 import org.json.JSONObject
 import tech.acab.app.model.Detection
@@ -91,6 +97,12 @@ class AcabBleManager(private val context: Context) {
     private val _ignored = MutableStateFlow<List<IgnoredDevice>>(emptyList())
     val ignored: StateFlow<List<IgnoredDevice>> = _ignored.asStateFlow()
 
+    // "Mark all seen" baseline: the firstSeen timestamp at the moment the user tapped it.
+    // The Log's "New only" view shows detections first heard after this point. Persisted so
+    // the watermark survives an app restart.
+    private val _seenWatermark = MutableStateFlow(0L)
+    val seenWatermark: StateFlow<Long> = _seenWatermark.asStateFlow()
+
     private val _alertMode = MutableStateFlow(AlertMode.BUZZER)
     val alertMode: StateFlow<AlertMode> = _alertMode.asStateFlow()
 
@@ -132,7 +144,18 @@ class AcabBleManager(private val context: Context) {
             AlertMode.valueOf(prefs.getString("alertMode", null) ?: "BUZZER")
         }.getOrDefault(AlertMode.BUZZER)
         _redactLockScreen.value = prefs.getBoolean("redactLock", true)
+        _seenWatermark.value = prefs.getLong("seenWatermark", 0L)
     }
+
+    // Background scope for the coalesced detection-feed publisher. Survives the link's
+    // lifecycle (it's a singleton); never torn down.
+    private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
+
+    // Coalesced detection-feed emission. A Desert-mode firehose can file hundreds of records
+    // a second; pushing each one to the StateFlow would thrash Compose. Instead a dirty flag
+    // is set on each file, and a single coroutine drains it at ~3 Hz (PUBLISH_INTERVAL_MS).
+    private val publishDirty = AtomicBoolean(false)
+    @Volatile private var publishPumpRunning = false
 
     private var gatt: BluetoothGatt? = null
     private var target: BluetoothDevice? = null
@@ -277,6 +300,7 @@ class AcabBleManager(private val context: Context) {
         rssiHistory.clear()
         capturedLoc.clear()
         trackHistory.clear()
+        publishDirty.set(false)
         _detections.value = emptyList()
         _status.value = null
         _deviceName.value = null
@@ -397,7 +421,13 @@ class AcabBleManager(private val context: Context) {
                 if (isIgnored(d.mac)) return    // whitelisted (the board mutes it too)
                 if (d.hist) fileHistory(d) else fileLive(d)
             }
-            AcabProfile.STATUS -> _status.value = DeviceStatus.fromJson(json)
+            AcabProfile.STATUS -> {
+                val s = DeviceStatus.fromJson(json)
+                _status.value = s
+                // Reconcile the whitelist: if the board reports fewer ignore entries than we
+                // hold (a reboot dropped them, say), re-push so the two converge.
+                if (s.ignoreCount < _ignored.value.size) sendIgnoreList()
+            }
         }
     }
 
@@ -460,7 +490,41 @@ class AcabBleManager(private val context: Context) {
                 if (path.size > 60) path.subList(0, path.size - 60).clear()
             }
         }
-        _detections.value = store.values.toList().asReversed()
+        schedulePublish()
+    }
+
+    /** The live feed the UI collects: newest-first, bounded to the most-recent FEED_CAP rows
+     *  so a Desert-mode firehose doesn't hand Compose thousands of items. The full store
+     *  (up to STORE_CAP) still backs the map, CSV, and counts. */
+    private fun feedSnapshot(): List<Detection> {
+        val all = store.values.toList().asReversed()
+        return if (all.size > FEED_CAP) all.take(FEED_CAP) else all
+    }
+
+    /** Coalesced publish: mark the feed dirty and make sure the ~3 Hz pump is running.
+     *  Used on the hot live/history filing path so a firehose can't thrash Compose. */
+    private fun schedulePublish() {
+        publishDirty.set(true)
+        if (!publishPumpRunning) {
+            publishPumpRunning = true
+            scope.launch {
+                while (publishDirty.getAndSet(false)) {
+                    _detections.value = feedSnapshot()
+                    delay(PUBLISH_INTERVAL_MS)
+                }
+                publishPumpRunning = false
+                // A file() that raced in after the last drain but before the flag cleared:
+                // re-arm so its update isn't stranded.
+                if (publishDirty.get() && !publishPumpRunning) schedulePublish()
+            }
+        }
+    }
+
+    /** Immediate publish for low-frequency UI actions (clear, ignore, demo seed, reload)
+     *  where the latency of the coalescing pump would feel laggy. */
+    private fun publishNow() {
+        publishDirty.set(false)
+        _detections.value = feedSnapshot()
     }
 
     /** The board finished replaying. Verify we filed exactly N records; on a mismatch
@@ -596,6 +660,7 @@ class AcabBleManager(private val context: Context) {
     fun clearLog() {
         store.clear(); firstSeenAt.clear(); lastSeenAt.clear()
         rssiHistory.clear(); capturedLoc.clear(); trackHistory.clear()
+        publishDirty.set(false)
         _detections.value = emptyList()
         writeConfig(JSONObject().put("clearlog", true))   // no-op if not connected
         lastSeq = 0L
@@ -611,7 +676,8 @@ class AcabBleManager(private val context: Context) {
     fun detectionsCsv(): String {
         val rows = StringBuilder(
             "detected_at,type,mac,rssi,source,matched_on,confidence,sightings,approx_lat,approx_lon")
-        for (d in _detections.value) {
+        // Export the full store (newest first), not the bounded live feed, so nothing is lost.
+        for (d in store.values.toList().asReversed()) {
             val whenAt = firstSeenAt[d.id]?.let { Instant.ofEpochMilli(it).toString() } ?: ""
             val coord = mapCoord(d)
             val lat = coord?.let { "%.6f".format(it.first) } ?: ""
@@ -639,13 +705,48 @@ class AcabBleManager(private val context: Context) {
         _ignored.value = _ignored.value + IgnoredDevice(mac, d.displayName)
         persistIgnored(); sendIgnoreList()
         store.keys.filter { store[it]?.mac?.lowercase() == mac }.toList().forEach { store.remove(it) }
-        _detections.value = store.values.toList().asReversed()
+        publishNow()
+    }
+
+    /** Silence a batch of devices at once (Log select-mode), pushing the merged whitelist to
+     *  the board in a single write. Caps at the firmware's 256-entry ignore list. */
+    fun ignoreDevices(detections: List<Detection>) {
+        if (detections.isEmpty()) return
+        val existing = _ignored.value.associateBy { it.mac }.toMutableMap()
+        for (d in detections) {
+            val mac = d.mac.lowercase()
+            if (mac.isEmpty() || existing.containsKey(mac)) continue
+            if (existing.size >= IGNORE_CAP) break
+            existing[mac] = IgnoredDevice(mac, d.displayName)
+        }
+        _ignored.value = existing.values.toList()
+        persistIgnored(); sendIgnoreList()
+        val macs = existing.keys
+        store.keys.filter { store[it]?.mac?.lowercase() in macs }.toList().forEach { store.remove(it) }
+        publishNow()
     }
 
     /** Un-silence a device. */
     fun unignore(mac: String) {
         _ignored.value = _ignored.value.filterNot { it.mac == mac.lowercase() }
         persistIgnored(); sendIgnoreList()
+    }
+
+    // ---- "mark all seen" baseline watermark ----
+
+    /** Drop a baseline at the newest detection's first-seen time. The Log's "New only" view
+     *  then shows only detections first heard after this point (and not on the ignore list). */
+    fun markAllSeen() {
+        val newest = store.values.mapNotNull { firstSeenAt[it.id] }.maxOrNull()
+            ?: System.currentTimeMillis()
+        _seenWatermark.value = newest
+        prefs.edit().putLong("seenWatermark", newest).apply()
+    }
+
+    /** True when this detection was first heard after the "mark all seen" watermark. */
+    fun isNewSinceWatermark(d: Detection): Boolean {
+        val fs = firstSeenAt[d.id] ?: return true
+        return fs > _seenWatermark.value
     }
 
     private fun loadIgnored() {
@@ -680,7 +781,7 @@ class AcabBleManager(private val context: Context) {
         _demoMode.value = true
         _deviceName.value = "ACAB"
         _status.value = DeviceStatus.fromJson(JSONObject(
-            """{"fw":"ACAB 1.6","up":4920,"total":7,"ble":true,"wifi":true,"bodycam":false,"tracker":true,"buzzer":true,"vol":70,"gps":true}"""))
+            """{"fw":"ACAB 1.7","up":4920,"total":7,"ble":true,"wifi":true,"bodycam":false,"tracker":true,"buzzer":true,"vol":70,"gps":true}"""))
         val samples = listOf(
             """{"t":1,"s":1,"meth":1,"c":95,"mac":"AC:AB:00:7F:2A:10","rssi":-54,"name":"FlockSafety","lat":37.7799,"lon":-122.4202,"n":12,"new":true}""",
             """{"t":1,"s":0,"meth":4,"c":88,"mac":"AC:AB:00:91:5B:22","rssi":-67,"lat":37.7782,"lon":-122.4175,"n":4}""",
@@ -697,7 +798,7 @@ class AcabBleManager(private val context: Context) {
             firstSeenAt[d.id] = now; lastSeenAt[d.id] = now
             rssiHistory[d.id] = wobble.map { (d.rssi + it).coerceIn(-99, -30) }.toMutableList()
         }
-        _detections.value = store.values.toList().asReversed()
+        publishNow()
         _state.value = ConnState.READY
     }
 
@@ -798,7 +899,7 @@ class AcabBleManager(private val context: Context) {
                 rssiHistory.getOrPut(d.id) { mutableListOf() }.add(d.rssi)
                 store[d.id] = d
             }
-            _detections.value = store.values.toList().asReversed()
+            publishNow()
         }
     }
 
@@ -834,6 +935,13 @@ class AcabBleManager(private val context: Context) {
         // Cap on distinct devices held in memory / persisted, so a long drive can't grow the
         // store without bound. Evicts oldest-first; 500 unique devices is well beyond a session.
         private const val STORE_CAP = 500
+        // Cap on rows handed to the live feed (newest-first). A Desert-mode firehose stays
+        // responsive; the full store still backs the map, CSV, and counts.
+        private const val FEED_CAP = 400
+        // Coalesce feed emissions to this cadence (~3 Hz) so the firehose can't thrash Compose.
+        private const val PUBLISH_INTERVAL_MS = 300L
+        // The firmware accepts up to 256 ignore-list entries.
+        private const val IGNORE_CAP = 256
     }
 }
 
