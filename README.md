@@ -67,7 +67,7 @@ There are two native apps, one for **iPhone** and one for **Android**, that do t
 
 ### iPhone
 
-**All Cameras Are Beacons** lives in [ios/](ios/). Try the beta on TestFlight at [testflight.apple.com/join/UjgG7Gyu](https://testflight.apple.com/join/UjgG7Gyu). Grab Apple's free [TestFlight app](https://apps.apple.com/us/app/testflight/id899247664) first, then open the link to install.
+**All Cameras Are Beacons** lives in [ios/](ios/). Try the beta on TestFlight at [testflight.apple.com/join/RC3j99A8](https://testflight.apple.com/join/RC3j99A8). Grab Apple's free [TestFlight app](https://apps.apple.com/us/app/testflight/id899247664) first, then open the link to install.
 
 ### Android
 
