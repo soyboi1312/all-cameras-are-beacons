@@ -9,10 +9,10 @@ The XIAO sends labelled detections to the Heltec over a wired UART, and the Helt
 puts them on your mesh. Each alert names the unit:
 
 ```
-Flock camera detected | WiFi | rssi -67 | 70:c9:4e:11:22:33 | 34.05012,-118.24001
+ALPR camera detected  | WiFi | rssi -67 | 70:c9:4e:11:22:33 | 34.05012,-118.24001
 Flock Raven detected  | BLE  | rssi -72 | 58:8e:81:aa:bb:cc
 Drone detected        | RID  | rssi -61 | RID 1581F4F... | 34.05,-118.24 | alt 120m
-Axon body camera detected | BLE | rssi -55 | <mac> | EXPERIMENTAL
+Body camera detected  | BLE  | rssi -55 | <mac>
 ```
 
 > The Heltec/Meshtastic side (installing the Meshtastic CLI, the optional

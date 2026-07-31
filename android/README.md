@@ -4,23 +4,35 @@ Native Kotlin + Jetpack Compose companion for the OUI-Spy ACAB board, the Androi
 counterpart to the iOS app in `../ios`. It talks to the same firmware over the
 same encrypted BLE GATT service (`../docs/ble-protocol.md`).
 
+The app is the free, open-source companion to the beacon (the sold hardware), and
+still works with DIY XIAO builds. It surfaces what the beacon detects: Axon body
+cameras on by default, opt-in BLE item trackers, and encrypted offline-buffer
+replay of hits logged while your phone was away.
+
 ## Status
 
 Working end to end. Done:
 - Gradle/Compose project, runtime permissions, the full Crimson theme.
 - BLE layer (`ble/AcabBleManager.kt`): scan by service UUID, connect, **bond**
-  (the GATT service is encrypted as of firmware 0.2.2/0.2.3), subscribe to the
-  detection + status notifies, parse the JSON, write config.
-- Models (`model/Models.kt`) matching the firmware `t`/`s`/`meth` fields.
+  (the GATT service is encrypted as of firmware 0.2.2/0.2.3), request a **512-byte
+  ATT MTU** (so the status + richer drone JSON fit one notify; config writes stay
+  chunked well under the 512 B cap), subscribe to the detection + status notifies,
+  parse the JSON, write config.
+- Models (`model/Models.kt`) matching the firmware `t`/`s`/`meth` fields, including
+  the dual-radio co-processor-alive flag (`co` -> `coAlive`); `DeviceScreen` shows a
+  fault banner when it reads `false` (the beacon board's companion BLE scanner has
+  gone silent, so its half of detection is dark).
 - Four-tab UI: status, an osmdroid (OpenStreetMap) map, log, and device controls.
 - Tap a detection for its detail card: a signal-strength history, first-seen and
   last-seen timestamps, and identifiers, with the chart greying out when a device
   goes stale. The phone's location is geotagged onto fixed-install hits.
+- Firmware updates: the app checks a hosted version manifest (no Play release
+  needed when firmware ships) and, on OTA-capable boards, pushes the update over
+  Bluetooth with progress and safe rollback; older boards get pointed at the
+  browser flasher. Not yet exercised on real hardware.
 
 Still TODO:
-- A real launcher icon (currently the `@android:drawable/ic_dialog_map`
-  placeholder; swap it in before any public release).
-- Log export, and getting onto the Play Store (see below).
+- Log export, and getting onto the Play Store / F-Droid (see below).
 
 ## Build & run
 

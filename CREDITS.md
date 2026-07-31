@@ -2,7 +2,7 @@
 
 All Cameras Are Beacons grew out of the OUI-Spy and Flock-detection community. This
 file records where the detection comes from, the public sources behind the
-signatures, the one Apache-licensed dependency, and the project's own work, so the
+signatures, the third-party components, and the project's own work, so the
 lineage stays visible.
 
 ## Detection sources
@@ -10,9 +10,13 @@ lineage stays visible.
 - **Flock Safety + Raven detection** (`firmware/lib/acab_core/flock_detect.*`):
   the MAC OUI, the `Flock-` SSID, advertised-name patterns, and the BT
   manufacturer ID are re-derived from public data, the IEEE OUI registry, the
-  community `nite-oui-collection` (@NitekryDPaul) for the Flock-specific OUI set, the
   Bluetooth SIG assigned numbers, independent Flock research (ryanohoro, CEHRP,
-  GainSec), and the **deflock.me** community. Each entry's source is documented in
+  GainSec), the **deflock.me** community, and our own field captures. Each entry's
+  source is documented in `docs/signatures.md`.
+- **Body-cam detection** (`firmware/lib/acab_core/axon_detect.*`): the Axon OUI is
+  from the IEEE registry, the `BWC DEVICE` payload is our own field capture, and the
+  Utility "BodyWorn Remote" name signature is a field observation contributed by the
+  community `nite-oui-collection` (@NitekryDPaul). Public facts only; sources in
   `docs/signatures.md`.
 - **Drone Remote ID detection** (`firmware/lib/acab_core/drone_detect.*`): our own
   classifier for the public **ASTM F3411 / OpenDroneID** broadcast formats, the
@@ -30,29 +34,61 @@ above.
 
 ## Original to this project
 
-The Axon body-cam detector, the BLE item-tracker detector, the shared `acab_core`
-engine structure, the encrypted BLE GATT protocol, the native iOS and Android
-apps, the Meshtastic uplink, and the web flasher are original to All Cameras Are Beacons.
+The Axon body-cam detector, the BLE item-tracker detector, the recording-glasses
+detector, the network-camera detector, the Motorola-gear detector, the shared
+`acab_core` engine structure, the encrypted BLE GATT protocol, the native iOS and
+Android apps (written from scratch, not derived from any upstream companion app), the
+Meshtastic uplink, and the web flasher pages are original to All Cameras Are Beacons.
+The flasher's flashing engine is the vendored **ESP Web Tools** bundle (Apache-2.0,
+see below), not our code.
 
 ## A note on licensing
 
-The only third-party code in the firmware is opendroneid-core-c, which is cleanly
-Apache-2.0, and its license travels with the vendored copy (see the LICENSE in that
-directory). Everything else, the detection signatures, the classifiers, the
-`acab_core` engine, the BLE GATT protocol, the apps, the Meshtastic uplink, and the
-web flasher, is this project's own work, built from the public references in
-`docs/signatures.md`. Earlier releases ported detection code from the unlicensed
+Two third-party *sources* are vendored into this repo. The first is
+opendroneid-core-c, which is cleanly Apache-2.0; its license travels with the main
+vendored copy at `firmware/lib/acab_core/opendroneid/` (the second copy for the
+host-side simulator at `firmware/src/odid-sim/` carries SPDX Apache-2.0 headers in
+each file instead of a separate LICENSE). The second is the compiled **ESP Web
+Tools** flasher bundle at `web/vendor/esp-web-tools/` (Apache-2.0; the bundle also
+compiles in Lit, BSD-3-Clause, plus Material Web, esptool-js, and the Improv WiFi
+SDK, all Apache-2.0). Minification strips its per-file license headers, so the full
+license text is kept alongside the bundle at `web/vendor/esp-web-tools/LICENSE`, and
+the soyboi.tech site repo carries the same license file next to its identical copy.
+The two OFL-1.1 typefaces bundled with the apps and the website are covered in the
+Fonts section below. The firmware also links three permissively-licensed
+libraries that are pulled at build time rather than vendored here: NimBLE-Arduino
+(Apache-2.0), ArduinoJson (MIT), and Adafruit SPIFlash (MIT); their notices are in
+`NOTICE`. The WiFi-promiscuous plus NimBLE concurrency approach was informed by the
+sky-spy project (architecture only, no code). Everything else, the detection
+signatures, the classifiers, the `acab_core` engine, the BLE GATT protocol, the apps,
+the Meshtastic uplink, and the web flasher pages (which drive the vendored ESP Web
+Tools bundle above), is this project's own work, built from the
+public references in `docs/signatures.md`. Earlier releases ported detection code from the unlicensed
 `colonelpanichacks/oui-spy`, `colonelpanichacks/oui-spy-unified-blue`, and `flock-you`; those
 signatures have since been re-sourced from public registries and the classifiers
 re-derived from public standards, so the project no longer carries their
 all-rights-reserved code.
 
+## Fonts
+
+Both apps and the website use two typefaces, each licensed under the **SIL Open Font
+License 1.1**, which permits free commercial use, bundling, and embedding:
+
+- **Space Grotesk**, copyright 2020 The Space Grotesk Project Authors
+  (florian karsten typefaces, github.com/floriankarsten/space-grotesk), OFL-1.1.
+- **JetBrains Mono**, copyright 2020 The JetBrains Mono Project Authors
+  (JetBrains, github.com/JetBrains/JetBrainsMono), OFL-1.1.
+
+The OFL's only redistribution condition is that this copyright and license notice
+accompany the font files; this section satisfies it. The fonts are not sold on their
+own, and no Reserved Font Name is used for anything modified.
+
 ## Keeping signatures fresh
 
-Detection signatures drift as Flock and others change hardware (this already bit
-us once, when an early port shipped a stale subset of the Flock OUIs). Run
+Detection signatures drift as vendors change hardware. Run
 
     python3 firmware/tools/check-signature-drift.py
 
-periodically to diff the local Flock OUI tables and the opendroneid decoder
-against their upstream sources. It only reports; it never changes anything.
+periodically to watch for a new opendroneid-core-c release worth re-vendoring. It no
+longer diffs the Flock OUI table against any third-party curated list (we ship only
+own-captured OUIs now); it only reports and never changes anything.

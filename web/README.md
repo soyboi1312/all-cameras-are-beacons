@@ -5,16 +5,44 @@ browser, with nothing to install. It uses
 [ESP Web Tools](https://esphome.github.io/esp-web-tools/), which talks to the
 board over USB right from Chrome.
 
+The beacon you buy ships pre-flashed and ready to pair, so this page isn't how
+you get it running out of the box. It's mostly here so owners can update to newer
+firmware in one click when the app flags a release, and so anyone building the
+public XIAO firmware themselves has a no-toolchain way to flash it.
+
+Note: the sold beacon has its own dedicated flasher page on
+[soyboi.tech/flash](https://soyboi.tech/flash.html). This page hosts the public
+XIAO builds (OUI-Spy and Mesh-Detect).
+
 ```
 web/
 ├── index.html               # the flasher page
-├── manifest-oui-spy.json     # tells the flasher about the OUI-Spy firmware
+├── manifest-oui-spy.json     # tells the flasher about the app-scanner (beacon) firmware
 ├── manifest-mesh-detect.json # ...and the Mesh-Detect firmware
 ├── build-flasher.sh          # rebuilds the flashable firmware files
+├── vendor/
+│   └── esp-web-tools/        # self-hosted ESP Web Tools 10.2.1 (see below)
 └── firmware/
     ├── acab-oui-spy.bin       # one ready-to-flash image each
     └── acab-mesh-detect.bin
 ```
+
+## Self-hosted ESP Web Tools
+
+`index.html` loads ESP Web Tools from `vendor/esp-web-tools/install-button.js`, a local
+copy pinned at **10.2.1**, rather than a live CDN. Serving it ourselves keeps the flash path
+off a third-party host, so a hijacked future unpkg publish can't inject code into the flasher.
+
+The vendored copy is the whole `?module` import graph from unpkg (27 JS chunks, all of them
+relative imports, with the `?module` query stripped so each chunk loads by plain relative name).
+It is JS only; there are no wasm or asset side-files to fetch.
+
+To refresh it on an esp-web-tools bump:
+
+1. Resolve the new exact version: `curl -sI "https://unpkg.com/esp-web-tools@10/dist/web/install-button.js?module"` and read the `location:` redirect.
+2. Recursively pull every `./chunk.js?module` reachable from `install-button.js` into `vendor/esp-web-tools/`, then strip the `?module` query from every import.
+3. Verify no `?module` and no bare (non-`./`) imports remain, and that every referenced chunk exists on disk, before committing. A half-vendored graph 404s at runtime.
+4. Keep [`soyboi.tech/flash.html`](https://soyboi.tech/flash.html) in lockstep (it currently pins the same exact version on unpkg).
 
 ## Which browsers work
 
@@ -37,9 +65,10 @@ python3 -m http.server 8000
 This repo publishes the flasher for you automatically. There's a GitHub Actions
 workflow ([.github/workflows/pages.yml](../.github/workflows/pages.yml)) that
 copies the `web/` folder up to GitHub Pages any time something in it changes, and
-the live copy lands at https://soyboi1312.github.io/all-cameras-are-beacons/. If you fork
-this, switch Pages on under **Settings → Pages → Source: GitHub Actions** and
-yours will do the same.
+the live copy lands at https://soyboi1312.github.io/all-cameras-are-beacons/, with
+[soyboi.tech/flash](https://soyboi.tech/flash.html) as the friendlier front door
+to the same page. If you fork this, switch Pages on under
+**Settings → Pages → Source: GitHub Actions** and yours will do the same.
 
 ## Rebuilding the firmware files
 

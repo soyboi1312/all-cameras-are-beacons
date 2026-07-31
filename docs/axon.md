@@ -8,10 +8,10 @@ real Axon body cameras on patrolling officers in the field, so it ships enabled.
 Axon body cams advertise BLE with a stable, non-randomised signature, so passive
 detection works. ACAB keys off two public facts:
 
-- **MAC OUI `00:25:DF`** — Axon Enterprise's only IEEE block (MA-L, registered 2010
+- **MAC OUI `00:25:DF`**: Axon Enterprise's only IEEE block (MA-L, registered 2010
   as TASER International, updated 2025-01-30). This is the loose match: it flags any
   Axon product (body cam, dock, TASER, fleet gear).
-- **The `BWCDEVICE` service-data tag** — when an advert on that OUI also carries this
+- **The `BWCDEVICE` service-data tag**: when an advert on that OUI also carries this
   tag, the classifier confirms it's specifically a *body-worn camera* (vs other Axon
   hardware) and raises confidence to 90.
 
