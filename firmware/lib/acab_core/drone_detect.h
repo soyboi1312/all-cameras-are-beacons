@@ -16,6 +16,22 @@
 #include "detection.h"
 #include <stddef.h>
 
+// Master on/off for the drone (Remote ID) detector. Default ON, persisted to NVS
+// so an app-set toggle survives a reboot (mirrors axon/tracker/glasses).
+void droneSetEnabled(bool enabled);
+bool droneIsEnabled();
+// Reload the persisted drone toggle on boot (NVS); defaultEnabled if never set.
+void droneRestoreEnabled(bool defaultEnabled);
+
+// Vendor-OUI fallback opt-in (default OFF, persisted to NVS "acab-drone" key "oui").
+// The RID path always runs; this only gates the lower-confidence OUI-match fallback,
+// which cannot tell a flying drone from a stationary drone-vendor gadget and so
+// false-positives. Gated under the master drone toggle. Mirrors axon persistence.
+void droneOuiSetEnabled(bool enabled);
+bool droneOuiIsEnabled();
+// Reload the persisted OUI-fallback opt-in on boot (NVS); defaultEnabled if never set.
+void droneOuiRestoreEnabled(bool defaultEnabled);
+
 // Look for Remote ID in a BLE advertisement. `payload` is the full advertising
 // payload (AD structures); we hunt for the ODID service-data block inside it.
 bool droneClassifyBLE(const uint8_t mac[6], const uint8_t* payload, size_t len,

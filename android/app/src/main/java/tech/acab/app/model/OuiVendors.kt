@@ -3,13 +3,32 @@ package tech.acab.app.model
 /** The IEEE-registered vendor for each Flock OUI the detector watches. Flock uses
  *  off-the-shelf modules, so most of these are chipset makers (Liteon, Espressif, USI,
  *  Silicon Labs) or consumer brands, not Flock itself. Shown on the detail screen to
- *  keep an OUI match honest — only b41e52 is actually Flock's. */
+ *  keep an OUI match honest - only b41e52 is actually Flock's. */
 val OUI_VENDORS: Map<String, String> = mapOf(
+    // Motorola Solutions' own MA-L blocks. All seven that the firmware's broad vendor proxy
+    // watches are in this map, but it is sorted by OUI, so they read scattered rather than
+    // grouped: 00047d, 001885, 001f92, 4ccc34, plus the Malaysia manufacturing entity 10746f,
+    // 9c862b, b8e28c. Motorola MOBILITY / Lenovo blocks are deliberately absent, that is the
+    // unrelated consumer phone business. A match here names the VENDOR honestly; what the device
+    // IS (radio, dock, camera, infrastructure) stays open, which is why the proxy scores only 45.
+    "00047d" to "Motorola Solutions",
+    // Utility Inc. "BodyWorn" body cams. Both blocks are MA-L, registrant "Utility, Inc." /
+    // "Utility Inc". Weak on their own - Utility makes other gear too - so the advertised
+    // "BodyWorn Remote" name is the strong match and the OUI is only the fallback.
+    "0009bc" to "Utility Inc",
+    "0016ed" to "Utility Inc",
     "00180a" to "Cisco Meraki",
+    "001885" to "Motorola Solutions",
+    "001f92" to "Motorola Solutions",
     "00236c" to "Apple",
+    // Axon's sole IEEE block. Named here so an Axon OUI hit reads the real vendor instead
+    // of falling back to the body-cam category's three-maker guess.
+    "0025df" to "Axon Enterprise",
     "00f48d" to "Liteon",
     "040d84" to "Silicon Labs",
     "083a88" to "USI",
+    // Motorola Solutions Malaysia Sdn. Bhd., their manufacturing entity, same corporate group.
+    "10746f" to "Motorola Solutions",
     "145afc" to "Liteon",
     "14b5cd" to "Liteon",
     "1c34f1" to "Silicon Labs",
@@ -24,6 +43,11 @@ val OUI_VENDORS: Map<String, String> = mapOf(
     "3c71bf" to "Espressif",
     "3c9180" to "Liteon",
     "4827ea" to "Samsung",
+    // Shared Motorola Solutions block (body cams, radios, and other LE/enterprise gear ride it),
+    // so a match here names the vendor, not a specific device. The one block that is actually
+    // field-observed on 2.4 GHz WiFi (own capture 2026-07-18), which is what establishes this
+    // vendor as detectable at all; the six siblings are the same product lines.
+    "4ccc34" to "Motorola Solutions",
     "5800e3" to "Liteon",
     "588e81" to "Silicon Labs",
     "5c93a2" to "Liteon",
@@ -41,6 +65,7 @@ val OUI_VENDORS: Map<String, String> = mapOf(
     "943469" to "Silicon Labs",
     "98f4ab" to "Espressif",
     "9c2f9d" to "Liteon",
+    "9c862b" to "Motorola Solutions",   // Motorola Solutions Malaysia Sdn. Bhd.
     "9c9c1f" to "Espressif",
     "a0c9a0" to "Murata",
     "a4cf12" to "Espressif",
@@ -48,6 +73,7 @@ val OUI_VENDORS: Map<String, String> = mapOf(
     "b41e52" to "Flock Safety",
     "b4e3f9" to "Silicon Labs",
     "b81ea4" to "Liteon",
+    "b8e28c" to "Motorola Solutions",   // Motorola Solutions Malaysia Sdn. Bhd.
     "bcddc2" to "Espressif",
     "c03532" to "Liteon",
     "c82b96" to "Espressif",
@@ -88,6 +114,9 @@ val Detection.methodLabel: String
         5 -> "SSID"
         6 -> "wildcard probe"
         7 -> "Remote ID"
+        8 -> "service data"
+        9 -> "manufacturer subtype"
+        10 -> "watchlist"
         else -> "unknown"
     }
 
@@ -100,10 +129,70 @@ val Detection.sourceLabel: String
         else -> "?"
     }
 
-/** True when only the OUI matched — the case that's prone to false positives. */
+/** True when only the OUI matched - the case that's prone to false positives. */
 val Detection.isOuiMatch: Boolean get() = method == 1
 
-/** Readable name for the ignore list and CSV export. */
+/** User-assigned names for specific MACs, shared so [displayName] can consult them WITHOUT every
+ *  composable threading the BLE manager down to the row that draws the label.
+ *
+ *  WHY A REGISTRY: a Detection is a value type built from a BLE notify; it has no idea the user
+ *  starred or muted that MAC. Resolving here means the custom name reaches the log row, the detail
+ *  screen, the map pin, the CSV export and notifications from one place. Rebuilt only when the
+ *  watched/ignored lists change (a tap), so a plain map is plenty.
+ *  Keys are ALWAYS lowercased MACs, matching how both lists store them. Mirrors iOS DeviceNames. */
+object DeviceNames {
+    @Volatile private var byMac: Map<String, String> = emptyMap()
+    fun label(mac: String): String? = byMac[mac.lowercase()]?.takeIf { it.isNotEmpty() }
+    /** Watched wins over ignored if a MAC somehow lands on both list files. */
+    fun rebuild(watchedPairs: List<Pair<String, String>>, ignoredPairs: List<Pair<String, String>>) {
+        val m = HashMap<String, String>(watchedPairs.size + ignoredPairs.size)
+        ignoredPairs.forEach { (mac, l) -> if (l.isNotEmpty()) m[mac.lowercase()] = l }
+        watchedPairs.forEach { (mac, l) -> if (l.isNotEmpty()) m[mac.lowercase()] = l }
+        byMac = m
+    }
+}
+
+/** A name the USER assigned to this exact MAC on the managed-devices screen (watched or ignored). */
+val Detection.customName: String? get() = DeviceNames.label(mac)
+
+/** Best label we have: the user's own name, else advertised name, else UAS serial, else device
+ *  class. Feeds the log row, the ignore list, and CSV export. Mirrors iOS Detection.displayName
+ *  exactly so the same record leads with the same label on both platforms. */
 val Detection.displayName: String
-    get() = name?.takeIf { it.isNotEmpty() }
-        ?: "${type.label} ${mac.filter { it != ':' && it != '-' }.takeLast(4).uppercase()}"
+    get() = customName
+        ?: name?.takeIf { it.isNotEmpty() }
+        ?: rid?.takeIf { it.isNotEmpty() }
+        ?: type.label
+
+/** Which body-cam signature actually fired. Body cam is the one category that carries
+ *  several makers' signatures at once, so the category alone cannot name a vendor: an Axon
+ *  payload tag and the broad Motorola proxy both arrive as t=3. The firmware distinguishes
+ *  them in the detail string, so that string is what we read. Raw values MUST match the
+ *  strings set in axon_detect.cpp and police_detect.cpp. Mirrors iOS BodyCamSignature. */
+enum class BodyCamSignature(val raw: String) {
+    AXON_PAYLOAD("BWC DEVICE"),
+    AXON_OUI("Axon OUI"),
+    UTILITY("Utility BodyWorn"),
+    MOTOROLA("Motorola Solutions OUI");
+
+    /** Who makes the device this signature fired on. Known exactly in every case, which
+     *  is the point: the category's guess would name three makers for all four. */
+    val vendor: String
+        get() = when (this) {
+            AXON_PAYLOAD, AXON_OUI -> "Axon Enterprise"
+            UTILITY                -> "Utility Inc"
+            MOTOROLA               -> "Motorola Solutions"
+        }
+
+    companion object {
+        fun from(raw: String): BodyCamSignature? = entries.firstOrNull { it.raw == raw }
+    }
+}
+
+/** The body-cam signature behind this hit, when the board reported one. null for every
+ *  other category, and for a pre-split board that sent no detail string. */
+val Detection.bodyCamSignature: BodyCamSignature?
+    get() {
+        if (type != DeviceType.BODY_CAM) return null
+        return detail?.let { BodyCamSignature.from(it) }
+    }

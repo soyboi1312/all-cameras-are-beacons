@@ -1,5 +1,14 @@
 package tech.acab.app.ui
 
+import android.Manifest
+import android.app.Activity
+import android.content.Context
+import android.content.Intent
+import android.net.Uri
+import android.os.Build
+import android.provider.Settings
+import androidx.activity.compose.BackHandler
+import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
@@ -11,31 +20,65 @@ import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.layout.statusBarsPadding
+import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.Bluetooth
+import androidx.compose.material.icons.filled.BluetoothDisabled
+import androidx.compose.material.icons.filled.ChevronRight
+import androidx.compose.material.icons.filled.Close
+import androidx.compose.material.icons.filled.Lock
+import androidx.compose.material.icons.filled.LocationOn
+import androidx.compose.material.icons.automirrored.filled.OpenInNew
+import androidx.compose.material.icons.automirrored.outlined.ListAlt
+import androidx.compose.material.icons.filled.Memory
+import androidx.compose.material.icons.filled.Radar
+import androidx.compose.material.icons.filled.ShoppingCart
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
+import androidx.compose.material3.CircularProgressIndicator
+import androidx.compose.material3.Icon
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
-import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.saveable.rememberSaveable
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clip
+import androidx.compose.ui.graphics.vector.ImageVector
+import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.LocalUriHandler
+import androidx.compose.ui.text.SpanStyle
+import androidx.compose.ui.text.buildAnnotatedString
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.style.TextAlign
+import androidx.compose.ui.text.withStyle
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import tech.acab.app.ble.AcabBleManager
 import tech.acab.app.ble.ConnState
 import tech.acab.app.ble.FoundBoard
+import tech.acab.app.ble.OtaPhase
+import tech.acab.app.ble.OtaProgress
 import tech.acab.app.model.Detection
+import tech.acab.app.model.DeviceType
 import tech.acab.app.ui.theme.Acab
 
 /**
- * The pre-connection screen: scan, connect (which starts bonding), then stream
- * detections. Once the link is up, the four-tab MainScreen takes over.
+ * The pre-connection / first-run screen: says what the beacon hears, explains the permissions
+ * before the OS asks, scans for a board, and offers a first-class "tour on sample data" path.
+ * Once the link is up, the four-tab MainScreen takes over.
  */
 @Composable
 fun AcabApp(
@@ -45,121 +88,365 @@ fun AcabApp(
 ) {
     val state by ble.state.collectAsState()
     val found by ble.found.collectAsState()
+    val ota by ble.otaProgress.collectAsState()
     val detections by ble.detections.collectAsState()
-    val status by ble.status.collectAsState()
-    val name by ble.deviceName.collectAsState()
+    val demoMode by ble.demoMode.collectAsState()
+    val uriHandler = LocalUriHandler.current
+    val context = LocalContext.current
+    val activity = context as? Activity
 
-    // Once linked, hand off to the four-tab shell.
+    // AcabBleManager keeps its auto-reconnect flag internal, but the transition is visible from
+    // here: a user connect enters CONNECTING from SCANNING/DISCONNECTED, while the unexpected-drop
+    // auto-reconnect is the only path that arrives at CONNECTING straight from READY (the OTA
+    // reboot-reconnect does too, but OtaWaitScreen owns that state below). Tracked above the
+    // early returns so the READY hand-off doesn't reset it.
+    var hadLink by remember { mutableStateOf(false) }
+    LaunchedEffect(state) {
+        when (state) {
+            ConnState.READY -> hadLink = true
+            ConnState.CONNECTING -> Unit    // hold: this is the reconnect window itself
+            else -> hadLink = false         // any other state ends the session for good
+        }
+    }
+
+    // Read-only path into the persisted log, no board needed (mirrors the iOS savedLogCard sheet).
+    var showSavedLog by remember { mutableStateOf(false) }
+
+    // "Don't allow" twice (or the OS auto-deny) makes the permission prompt return immediately
+    // with no dialog, which left the CTA a silent no-op forever. rationale == false only means
+    // "permanently denied" once we know we HAVE asked, so remember that across launches (the
+    // denial itself persists across launches too). Checked at composition for the relaunch case
+    // and re-checked on each CTA tap for the denied-twice-this-session case.
+    val prefs = remember { context.getSharedPreferences("acab_ui", Context.MODE_PRIVATE) }
+    var askedBefore by remember { mutableStateOf(prefs.getBoolean(KEY_PERMS_REQUESTED, false)) }
+    fun permanentlyDenied() = !permissionsGranted && askedBefore && activity != null &&
+        scanPermissions().none { activity.shouldShowRequestPermissionRationale(it) }
+    var showDeniedPanel by remember { mutableStateOf(permanentlyDenied()) }
+
+    // Once linked, hand off to the four-tab shell , but the FIRST time a real board connects,
+    // show the one-time orientation over it. This is the "I'm connected, now what?" moment new
+    // users were getting stuck at. Demo mode is excluded: the tour on sample data would spend the
+    // one-time moment on a fake board (mirrors iOS RootView).
     if (state == ConnState.READY) {
+        var tourDone by rememberSaveable { mutableStateOf(demoMode || FirstRunTour.hasSeen(context)) }
         MainScreen(ble)
+        if (!tourDone) {
+            FirstRunTourOverlay(onFinish = { FirstRunTour.markSeen(context); tourDone = true })
+        }
+        return
+    }
+
+    // An OTA reboot drops the link to non-READY while the update is still in flight. Show a locked
+    // "updating" screen instead of the interactive scan/connect UI, so the user can't fire a second
+    // connect that would collide with the post-reboot reconnect loop.
+    val otaActive = ota.phase != OtaPhase.IDLE && ota.phase != OtaPhase.DONE && ota.phase != OtaPhase.FAILED
+    if (otaActive) {
+        OtaWaitScreen(ota)
+        return
+    }
+
+    if (showSavedLog) {
+        SavedLogScreen(ble, onClose = { showSavedLog = false })
         return
     }
 
     Surface(modifier = Modifier.fillMaxSize(), color = Acab.bg) {
         Column(Modifier.fillMaxSize().padding(Acab.pad)) {
-            Header(connected = state == ConnState.READY, name = name, version = status?.version)
-            Spacer(Modifier.height(16.dp))
+            WordmarkHero()
+            Spacer(Modifier.height(22.dp))
 
-            Box(Modifier.weight(1f).fillMaxWidth()) {
-                when {
-                    !permissionsGranted ->
-                        PrimaryButton("Grant Bluetooth permission", onRequestPermissions)
-                    state == ConnState.READY ->
-                        DetectionList(detections, onDisconnect = { ble.disconnect() })
-                    state == ConnState.CONNECTING ->
-                        Centered("Connecting…")
-                    state == ConnState.BONDING ->
-                        Centered("Pairing…")
-                    else ->
-                        ScanSection(
-                            scanning = state == ConnState.SCANNING,
-                            found = found,
-                            onScan = { ble.startScan() },
-                            onConnect = { ble.connect(it) },
-                        )
+            LazyColumn(
+                Modifier.weight(1f).fillMaxWidth(),
+                verticalArrangement = Arrangement.spacedBy(16.dp),
+            ) {
+                item { BeaconHearsPanel() }
+
+                when (state) {
+                    ConnState.CONNECTING ->
+                        if (hadLink) item { ReconnectingPanel(onStop = { ble.disconnect() }) }
+                        else item { ConnectingRow("Connecting…", onCancel = { ble.disconnect() }) }
+                    ConnState.BONDING -> item { ConnectingRow("Pairing…", onCancel = { ble.disconnect() }) }
+                    ConnState.POWERED_OFF -> item { RadioOffPanel() }
+                    else -> {
+                        if (showDeniedPanel && !permissionsGranted) {
+                            // The OS will never show the prompt again; the app's Settings page
+                            // is the only way back in, so send the user straight there.
+                            item {
+                                PermissionDeniedPanel(onOpenSettings = {
+                                    context.startActivity(
+                                        Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS,
+                                            Uri.fromParts("package", context.packageName, null))
+                                    )
+                                })
+                            }
+                        } else {
+                            item {
+                                ScanCtaPanel(
+                                    permissionsGranted = permissionsGranted,
+                                    scanning = state == ConnState.SCANNING,
+                                    onAllowScan = {
+                                        when {
+                                            !permissionsGranted && permanentlyDenied() -> showDeniedPanel = true
+                                            !permissionsGranted -> {
+                                                prefs.edit().putBoolean(KEY_PERMS_REQUESTED, true).apply()
+                                                askedBefore = true
+                                                onRequestPermissions()
+                                            }
+                                            // The CTA is a stop/start toggle while a scan runs (iOS parity).
+                                            state == ConnState.SCANNING -> ble.stopScan()
+                                            else -> ble.startScan()
+                                        }
+                                    },
+                                )
+                            }
+                            if (found.isEmpty() && state == ConnState.SCANNING) {
+                                item {
+                                    Text("Looking for your board…", color = Acab.dim,
+                                        fontSize = 12.sp, fontFamily = Acab.mono)
+                                }
+                            }
+                            items(found) { board -> BoardRow(board, onConnect = { ble.connect(board) }) }
+                        }
+                    }
+                }
+
+                // Demo is a first-class path: explore the full app on sample data, no board needed.
+                if (state != ConnState.CONNECTING && state != ConnState.BONDING) {
+                    // The history on this phone stays reachable with no board and no Bluetooth: a
+                    // log that may be evidence must never be locked behind hardware that died or a
+                    // permission that was denied. Hidden during the tour so the sample store can
+                    // never be exported here (mirrors iOS savedLogCard).
+                    // ORDER MATTERS (2026-07-29, mirrors iOS): the tour used to sit under the saved
+                    // log and new users never found it, yet it is the best answer to "what does this
+                    // even do" because it IS the app on sample data. It leads now, and it is the only
+                    // filled card so it reads as the primary action for anyone stuck.
+                    item { DemoCard(onClick = { ble.seedDemoData() }) }
+                    if (!demoMode && detections.isNotEmpty()) {
+                        item { SavedLogCard(count = detections.size, onClick = { showSavedLog = true }) }
+                    }
+                    // No board yet? Point straight at the shop.
+                    item { GetBeaconCard(onClick = { uriHandler.openUri("https://soyboi.tech") }) }
+                    item { SoyboiLink(onClick = { uriHandler.openUri("https://soyboi.tech") }) }
                 }
             }
 
-            // Let a user (or App Review) explore the app with sample data, no board needed.
-            if (permissionsGranted && state != ConnState.READY &&
-                state != ConnState.CONNECTING && state != ConnState.BONDING) {
-                DemoButton(onClick = { ble.seedDemoData() })
-                Spacer(Modifier.height(12.dp))
-            }
             ScopeFootnote()
         }
     }
 }
 
+/** "Beacons" wordmark hero over the connect screen. */
 @Composable
-private fun Header(connected: Boolean, name: String?, version: String?) {
-    Row(verticalAlignment = Alignment.CenterVertically) {
-        Text("Beacons", color = Acab.text, fontSize = 22.sp, fontWeight = FontWeight.Bold,
-            fontFamily = Acab.mono)
-        Spacer(Modifier.weight(1f))
-        val label = when {
-            connected && version != null -> "LINKED v$version"
-            connected -> "LINKED"
-            else -> "OFFLINE"
-        }
-        Kicker(label, color = if (connected) Acab.accent else Acab.dim)
-    }
-    if (connected && name != null) {
-        Text(name, color = Acab.dim, fontSize = 11.sp, fontFamily = Acab.mono)
+private fun WordmarkHero() {
+    Column(
+        Modifier.fillMaxWidth(),
+        horizontalAlignment = Alignment.CenterHorizontally,
+        verticalArrangement = Arrangement.spacedBy(8.dp),
+    ) {
+        Text("beacons", color = Acab.text, fontSize = 40.sp, fontWeight = FontWeight.Bold,
+            fontFamily = Acab.display)
+        Kicker("ALL CAMERAS ARE BEACONS", color = Acab.faint)
     }
 }
 
+/** The five signatures the beacon listens for, as a row of glyph tiles. */
 @Composable
-private fun ScanSection(
-    scanning: Boolean,
-    found: List<FoundBoard>,
-    onScan: () -> Unit,
-    onConnect: (FoundBoard) -> Unit,
-) {
-    Column {
-        PrimaryButton(if (scanning) "Scanning…" else "Scan for boards", onScan)
-        Spacer(Modifier.height(12.dp))
-        LazyColumn(verticalArrangement = Arrangement.spacedBy(8.dp)) {
-            items(found) { board ->
-                Row(
-                    Modifier
-                        .fillMaxWidth()
-                        .clickable { onConnect(board) }
-                        .panel(),
-                    verticalAlignment = Alignment.CenterVertically,
+private fun BeaconHearsPanel() {
+    val hears = listOf(
+        DeviceType.FLOCK_CAMERA to "ALPR",
+        DeviceType.DRONE to "DRONES",
+        DeviceType.BODY_CAM to "BODY CAMS",
+        DeviceType.TRACKER to "TRACKERS",
+        DeviceType.GLASSES to "GLASSES",
+    )
+    Column(Modifier.fillMaxWidth().panel(), verticalArrangement = Arrangement.spacedBy(14.dp)) {
+        Kicker("WHAT YOUR BEACON CAN HEAR")
+        Row(Modifier.fillMaxWidth()) {
+            hears.forEach { (type, label) ->
+                Column(
+                    Modifier.weight(1f),
+                    horizontalAlignment = Alignment.CenterHorizontally,
+                    verticalArrangement = Arrangement.spacedBy(7.dp),
                 ) {
-                    Column(Modifier.weight(1f)) {
-                        Text(board.name, color = Acab.text, fontSize = 15.sp)
-                        Text(board.device.address, color = Acab.dim, fontSize = 11.sp,
-                            fontFamily = Acab.mono)
-                    }
-                    Text("${board.rssi}", color = Acab.dim, fontSize = 12.sp, fontFamily = Acab.mono)
+                    CatGlyph(type, size = 32, filled = true)
+                    Text(label, color = Acab.dim, fontSize = 8.5.sp, fontFamily = Acab.mono,
+                        maxLines = 1)
                 }
             }
         }
+        Text(
+            "a passive listener. it never jams, spoofs, or transmits, it writes down what's already shouting.",
+            color = Acab.dim, fontSize = 10.sp, fontFamily = Acab.mono, lineHeight = 15.sp,
+        )
+        Text(
+            "trackers and body cams are opt-in, switch them on in Device settings.",
+            color = Acab.faint, fontSize = 9.5.sp, fontFamily = Acab.mono, lineHeight = 14.sp,
+        )
+    }
+}
+
+/** Pre-permission rationale (shown before the OS prompt) + the primary Allow-and-scan CTA. */
+@Composable
+private fun ScanCtaPanel(permissionsGranted: Boolean, scanning: Boolean, onAllowScan: () -> Unit) {
+    Column(Modifier.fillMaxWidth().panel(), verticalArrangement = Arrangement.spacedBy(13.dp)) {
+        if (!permissionsGranted) {
+            Kicker("BEFORE THE SYSTEM ASKS")
+            RationaleRow(Icons.Filled.Bluetooth, "Bluetooth",
+                "pairs you to the beacon. The board does the listening, not your phone.")
+            RationaleRow(Icons.Filled.LocationOn, "Location",
+                "pins hits to the map. Nothing leaves this phone, no accounts, no cloud.")
+        }
+        val label = when {
+            !permissionsGranted -> "Allow & scan for boards"
+            scanning -> "Scanning…"
+            else -> "Scan for boards"
+        }
+        PrimaryButton(label, onAllowScan)
     }
 }
 
 @Composable
-private fun DetectionList(detections: List<Detection>, onDisconnect: () -> Unit) {
-    Column {
-        Row(verticalAlignment = Alignment.CenterVertically) {
-            Kicker("${detections.size} DETECTED", color = Acab.dim)
-            Spacer(Modifier.weight(1f))
-            TextButton(onClick = onDisconnect) { Text("Disconnect", color = Acab.accent) }
-        }
-        Spacer(Modifier.height(8.dp))
-        LazyColumn(verticalArrangement = Arrangement.spacedBy(8.dp)) {
-            items(detections) { d ->
-                Row(Modifier.fillMaxWidth().panel(), verticalAlignment = Alignment.CenterVertically) {
-                    Column(Modifier.weight(1f)) {
-                        Text(d.type.label, color = Acab.text, fontSize = 15.sp)
-                        Text("${d.mac}  ·  ${d.type.category}", color = Acab.dim,
-                            fontSize = 11.sp, fontFamily = Acab.mono)
-                    }
-                    Text("${d.rssi}", color = Acab.accent, fontSize = 13.sp, fontFamily = Acab.mono)
+private fun RationaleRow(icon: ImageVector, lead: String, rest: String) {
+    Row(verticalAlignment = Alignment.Top) {
+        Icon(icon, contentDescription = null, tint = Acab.accent, modifier = Modifier.size(18.dp))
+        Spacer(Modifier.width(11.dp))
+        Text(
+            buildAnnotatedString {
+                withStyle(SpanStyle(color = Acab.text, fontWeight = FontWeight.Bold)) { append(lead) }
+                withStyle(SpanStyle(color = Acab.dim)) { append(" $rest") }
+            },
+            fontSize = 11.5.sp, fontFamily = Acab.mono, lineHeight = 16.sp,
+        )
+    }
+}
+
+/** One discovered board: cpu glyph, name, firmware pill, short id, signal bars, RSSI (iOS anatomy). */
+@Composable
+private fun BoardRow(board: FoundBoard, onConnect: () -> Unit) {
+    Row(
+        Modifier.fillMaxWidth().clickable { onConnect() }.panel(),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        Icon(Icons.Filled.Memory, contentDescription = null, tint = Acab.accent,
+            modifier = Modifier.size(22.dp))
+        Spacer(Modifier.width(12.dp))
+        Column(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(2.dp)) {
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Text(board.name, color = Acab.text, fontSize = 14.sp, fontWeight = FontWeight.SemiBold,
+                    fontFamily = Acab.mono)
+                if (board.firmware != null) {
+                    Spacer(Modifier.width(6.dp))
+                    Text("v${board.firmware}", color = Acab.accent, fontSize = 9.sp,
+                        fontWeight = FontWeight.Bold, fontFamily = Acab.mono,
+                        modifier = Modifier
+                            .background(Acab.accent.copy(alpha = 0.15f), CircleShape)
+                            .padding(horizontal = 5.dp, vertical = 1.dp))
                 }
             }
+            Text(board.device.address, color = Acab.dim, fontSize = 10.sp, fontFamily = Acab.mono)
+        }
+        SignalBars(rssiBars(board.rssi), tint = Acab.accent)
+        Spacer(Modifier.width(8.dp))
+        Text("${board.rssi}", color = Acab.dim, fontSize = 11.sp, fontFamily = Acab.mono)
+    }
+}
+
+@Composable
+private fun ConnectingRow(text: String, onCancel: () -> Unit) {
+    Box(Modifier.fillMaxWidth().padding(vertical = 44.dp), contentAlignment = Alignment.Center) {
+        Column(
+            horizontalAlignment = Alignment.CenterHorizontally,
+            verticalArrangement = Arrangement.spacedBy(12.dp),
+        ) {
+            CircularProgressIndicator(color = Acab.accent, strokeWidth = 3.dp,
+                modifier = Modifier.size(28.dp))
+            Text(text, color = Acab.dim, fontSize = 13.sp, fontFamily = Acab.mono)
+            // A stuck bond/connect (a powered-off board still in the scan list, an OS pairing
+            // prompt dismissed) otherwise leaves this spinner with no way out but a cold launch.
+            // disconnect() tears down the pending client, including the never-linked case.
+            Spacer(Modifier.height(4.dp))
+            CancelConnectButton(onCancel)
+        }
+    }
+}
+
+/** Quiet outlined pill to bail out of a stuck Connecting / Pairing spinner (iOS copy + anatomy). */
+@Composable
+private fun CancelConnectButton(onClick: () -> Unit) {
+    Row(
+        Modifier
+            .clip(RoundedCornerShape(50))
+            .background(Acab.bg2, RoundedCornerShape(50))
+            .border(1.dp, Acab.line, RoundedCornerShape(50))
+            .clickable(onClick = onClick)
+            .padding(horizontal = 16.dp, vertical = 9.dp),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        Text("Stop and scan", color = Acab.dim, fontSize = 12.sp,
+            fontWeight = FontWeight.Bold, fontFamily = Acab.mono)
+    }
+}
+
+/** Shown while a pending auto-reconnect is armed (board unplugged / power-cycled). Says the
+ *  reconnect is automatic AND gives a way out: "Stop and scan" calls disconnect(), which cancels
+ *  the pending client and settles the state back to the scan panel. Without it a board that
+ *  never returns would trap the user behind a generic "Connecting…" forever (mirrors iOS). */
+@Composable
+private fun ReconnectingPanel(onStop: () -> Unit) {
+    Column(
+        Modifier.fillMaxWidth().panel().padding(horizontal = 4.dp, vertical = 26.dp),
+        horizontalAlignment = Alignment.CenterHorizontally,
+        verticalArrangement = Arrangement.spacedBy(14.dp),
+    ) {
+        CircularProgressIndicator(color = Acab.accent, strokeWidth = 3.dp,
+            modifier = Modifier.size(28.dp))
+        Text("Reconnecting to your board…", color = Acab.text, fontSize = 15.sp,
+            fontWeight = FontWeight.Bold, fontFamily = Acab.mono)
+        Text(
+            "It reconnects on its own the moment the board is back in range, even in the background. Keep waiting, or stop to scan for a different board.",
+            color = Acab.dim, fontSize = 11.5.sp, fontFamily = Acab.mono, lineHeight = 16.sp,
+            textAlign = TextAlign.Center,
+        )
+        PrimaryButton("Stop and scan", onStop)
+    }
+}
+
+/** The permissions were denied for good ("Don't allow" twice, or the OS auto-deny), so the
+ *  prompt will never show again and the CTA would be a silent no-op. iOS .unauthorized copy,
+ *  plus the deep link into the app's Settings page that Android can offer. */
+@Composable
+private fun PermissionDeniedPanel(onOpenSettings: () -> Unit) {
+    Column(
+        Modifier.fillMaxWidth().padding(vertical = 36.dp),
+        horizontalAlignment = Alignment.CenterHorizontally,
+        verticalArrangement = Arrangement.spacedBy(12.dp),
+    ) {
+        Icon(Icons.Filled.Lock, contentDescription = null, tint = Acab.dim,
+            modifier = Modifier.size(34.dp))
+        Text("Bluetooth not allowed", color = Acab.text, fontSize = 16.sp,
+            fontWeight = FontWeight.Bold, fontFamily = Acab.mono)
+        Text("Enable Bluetooth for beacons in Settings.", color = Acab.dim, fontSize = 12.sp,
+            fontFamily = Acab.mono, textAlign = TextAlign.Center)
+        Spacer(Modifier.height(2.dp))
+        PrimaryButton("Open Settings", onOpenSettings)
+    }
+}
+
+/** Radio-off screen, shown when the phone's Bluetooth is turned off (mirrors iOS). Recovers on
+ *  its own when the radio comes back, via the adapter receiver in AcabBleManager. */
+@Composable
+private fun RadioOffPanel() {
+    Box(Modifier.fillMaxWidth().padding(vertical = 40.dp), contentAlignment = Alignment.Center) {
+        Column(
+            horizontalAlignment = Alignment.CenterHorizontally,
+            verticalArrangement = Arrangement.spacedBy(12.dp),
+        ) {
+            Icon(Icons.Filled.BluetoothDisabled, contentDescription = null, tint = Acab.dim,
+                modifier = Modifier.size(34.dp))
+            Text("Bluetooth is off", color = Acab.text, fontSize = 16.sp,
+                fontWeight = FontWeight.Bold, fontFamily = Acab.mono)
+            Text("Turn on Bluetooth to find your board.", color = Acab.dim, fontSize = 12.sp,
+                fontFamily = Acab.mono, textAlign = TextAlign.Center)
         }
     }
 }
@@ -169,43 +456,184 @@ private fun PrimaryButton(label: String, onClick: () -> Unit) {
     Button(
         onClick = onClick,
         modifier = Modifier.fillMaxWidth(),
+        shape = RoundedCornerShape(Acab.radiusSm),
         colors = ButtonDefaults.buttonColors(containerColor = Acab.accent, contentColor = Acab.onAccent),
     ) { Text(label, fontWeight = FontWeight.Bold) }
 }
 
-/** Outlined button that seeds sample data so you can poke around without a board. */
+/** Read-only path into the persisted log, no board needed (mirrors the iOS savedLogCard). */
 @Composable
-private fun DemoButton(onClick: () -> Unit) {
-    Column(
+private fun SavedLogCard(count: Int, onClick: () -> Unit) {
+    Row(
         Modifier
             .fillMaxWidth()
             .border(1.dp, Acab.lineStrong, RoundedCornerShape(Acab.radiusSm))
             .clickable { onClick() }
-            .padding(vertical = 12.dp),
-        horizontalAlignment = Alignment.CenterHorizontally,
-        verticalArrangement = Arrangement.spacedBy(3.dp),
+            .padding(16.dp),
+        verticalAlignment = Alignment.CenterVertically,
     ) {
-        Text("Continue without pairing", color = Acab.text, fontSize = 13.sp,
-            fontWeight = FontWeight.Bold, fontFamily = Acab.mono)
-        Text("explore the app with sample data", color = Acab.dim, fontSize = 10.sp,
-            fontFamily = Acab.mono)
+        Icon(Icons.AutoMirrored.Outlined.ListAlt, contentDescription = null, tint = Acab.accent,
+            modifier = Modifier.size(18.dp))
+        Spacer(Modifier.width(12.dp))
+        Column(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(2.dp)) {
+            Text("View saved log ($count)", color = Acab.text, fontSize = 13.sp,
+                fontWeight = FontWeight.Bold, fontFamily = Acab.mono)
+            Text("history on this phone · browse and export, no board needed", color = Acab.dim,
+                fontSize = 10.sp, fontFamily = Acab.mono)
+        }
+        Icon(Icons.Filled.ChevronRight, contentDescription = null, tint = Acab.faint,
+            modifier = Modifier.size(20.dp))
     }
+}
+
+/** Outlined first-class demo path: full app on sample data, no board needed. */
+@Composable
+private fun DemoCard(onClick: () -> Unit) {
+    Row(
+        Modifier
+            .fillMaxWidth()
+            .background(Acab.accent.copy(alpha = 0.13f), RoundedCornerShape(Acab.radiusSm))
+            .border(1.dp, Acab.accent.copy(alpha = 0.55f), RoundedCornerShape(Acab.radiusSm))
+            .clickable { onClick() }
+            .padding(16.dp),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        Icon(Icons.Filled.Radar, contentDescription = null, tint = Acab.accent,
+            modifier = Modifier.size(18.dp))
+        Spacer(Modifier.width(12.dp))
+        Column(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(2.dp)) {
+            Text("See how it works", color = Acab.text, fontSize = 13.sp,
+                fontWeight = FontWeight.Bold, fontFamily = Acab.mono)
+            Text("the full app on sample data · no beacon needed", color = Acab.dim,
+                fontSize = 10.sp, fontFamily = Acab.mono)
+        }
+        Icon(Icons.Filled.ChevronRight, contentDescription = null, tint = Acab.accent,
+            modifier = Modifier.size(20.dp))
+    }
+}
+
+/** Outlined buy CTA: no board yet, get one. Opens the shop (soyboi.tech) in the browser. */
+@Composable
+private fun GetBeaconCard(onClick: () -> Unit) {
+    Row(
+        Modifier
+            .fillMaxWidth()
+            .border(1.dp, Acab.lineStrong, RoundedCornerShape(Acab.radiusSm))
+            .clickable { onClick() }
+            .padding(16.dp),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        Icon(Icons.Filled.ShoppingCart, contentDescription = null, tint = Acab.accent,
+            modifier = Modifier.size(18.dp))
+        Spacer(Modifier.width(12.dp))
+        Column(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(2.dp)) {
+            Text("Get a beacon", color = Acab.text, fontSize = 13.sp,
+                fontWeight = FontWeight.Bold, fontFamily = Acab.mono)
+            Text("the board that does the listening · soyboi.tech", color = Acab.dim,
+                fontSize = 10.sp, fontFamily = Acab.mono)
+        }
+        Icon(Icons.AutoMirrored.Filled.OpenInNew, contentDescription = null, tint = Acab.faint,
+            modifier = Modifier.size(18.dp))
+    }
+}
+
+/** Secondary text link to the same shop, for people who just want the plain URL. */
+@Composable
+private fun SoyboiLink(onClick: () -> Unit) {
+    Text(
+        "soyboi.tech",
+        color = Acab.accent,
+        fontSize = 10.5.sp,
+        fontFamily = Acab.mono,
+        textAlign = TextAlign.Center,
+        modifier = Modifier.fillMaxWidth().clickable { onClick() }.padding(top = 2.dp),
+    )
 }
 
 @Composable
 private fun ScopeFootnote() {
     Text(
-        "Passive detection only. Beacons never jams, spoofs, or interferes.",
+        "Passive detection only. beacons never jams, spoofs, or interferes.",
         color = Acab.dim,
         fontSize = 9.sp,
         fontFamily = Acab.mono,
-        modifier = Modifier.fillMaxWidth().padding(top = 4.dp),
+        modifier = Modifier.fillMaxWidth().padding(top = 8.dp),
+        textAlign = TextAlign.Center,
     )
 }
 
+/** Full-screen, board-less view of the persisted log (the Log tab is normally gated behind a
+ *  READY link). Everything inside is phone-local: view, mark seen, export CSV, clear; the
+ *  board-config writes no-op while disconnected. Mirrors the iOS savedLogCard sheet. */
 @Composable
-private fun Centered(text: String) {
-    Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
-        Text(text, color = Acab.dim, fontFamily = Acab.mono)
+private fun SavedLogScreen(ble: AcabBleManager, onClose: () -> Unit) {
+    var selected by remember { mutableStateOf<Detection?>(null) }
+    val uriHandler = LocalUriHandler.current
+    // System back peels the dossier first, then closes the saved log (not the app).
+    BackHandler { if (selected != null) selected = null else onClose() }
+    Surface(modifier = Modifier.fillMaxSize(), color = Acab.bg) {
+        Column(Modifier.fillMaxSize().statusBarsPadding()) {
+            Row(
+                Modifier.fillMaxWidth().padding(horizontal = Acab.pad, vertical = 10.dp),
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                Text("Saved log", color = Acab.text, fontSize = 16.sp,
+                    fontWeight = FontWeight.Bold, fontFamily = Acab.mono)
+                Spacer(Modifier.weight(1f))
+                Icon(Icons.Filled.Close, contentDescription = "Close saved log", tint = Acab.dim,
+                    modifier = Modifier
+                        .clip(CircleShape)
+                        .clickable(onClick = onClose)
+                        .padding(6.dp)
+                        .size(20.dp))
+            }
+            LogScreen(ble, onSelect = { selected = it })
+        }
+    }
+    // Dossier over the log, like MainScreen's compact overlay. "Open in map" has no Map tab to
+    // land on with no board linked, so hand the coordinate to the system maps app instead.
+    selected?.let { d ->
+        DetailScreen(d, ble, onBack = { selected = null }, onOpenInMap = { lat, lon ->
+            runCatching { uriHandler.openUri("geo:$lat,$lon?q=$lat,$lon") }
+        })
+    }
+}
+
+/** Prefs key: the permission prompt has been fired at least once (see the denied-for-good
+ *  detection in AcabApp; rationale == false is only meaningful after a real ask). */
+private const val KEY_PERMS_REQUESTED = "perms_requested"
+
+/** What MainActivity.requiredPermissions gates scanning on, duplicated here (it's private to
+ *  the activity) to ask "would the OS ever show the prompt again?". */
+private fun scanPermissions(): Array<String> =
+    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S)
+        arrayOf(Manifest.permission.BLUETOOTH_SCAN, Manifest.permission.BLUETOOTH_CONNECT)
+    else
+        arrayOf(Manifest.permission.ACCESS_FINE_LOCATION)
+
+/** Locked screen shown while an OTA is in flight but the link is down (the reboot/reconnect
+ *  window). No scan/connect controls, so the reconnect loop can finish uninterrupted. */
+@Composable
+private fun OtaWaitScreen(ota: OtaProgress) {
+    Surface(modifier = Modifier.fillMaxSize(), color = Acab.bg) {
+        Column(
+            Modifier.fillMaxSize().padding(Acab.pad),
+            horizontalAlignment = Alignment.CenterHorizontally,
+            verticalArrangement = Arrangement.Center,
+        ) {
+            CircularProgressIndicator(color = Acab.accent, strokeWidth = 3.dp)
+            Spacer(Modifier.height(20.dp))
+            Text("Updating firmware", color = Acab.text, fontSize = 18.sp,
+                fontWeight = FontWeight.Bold, fontFamily = Acab.mono)
+            Spacer(Modifier.height(8.dp))
+            Text(
+                ota.message.ifBlank { "The board is rebooting into the new firmware. Keep the app open, it reconnects on its own." },
+                color = Acab.dim, fontSize = 12.sp, fontFamily = Acab.mono,
+                textAlign = TextAlign.Center, modifier = Modifier.padding(horizontal = 24.dp),
+            )
+            Spacer(Modifier.height(6.dp))
+            Text("this can take up to a minute. don't unplug the board.",
+                color = Acab.faint, fontSize = 10.sp, fontFamily = Acab.mono, textAlign = TextAlign.Center)
+        }
     }
 }

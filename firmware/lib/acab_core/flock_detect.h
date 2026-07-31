@@ -14,6 +14,13 @@
 #include "detection.h"
 #include <stddef.h>
 
+// Master on/off for the Flock/ALPR detector. Default ON, persisted to NVS so an
+// app-set toggle survives a reboot (mirrors axon/tracker/glasses).
+void flockSetEnabled(bool enabled);
+bool flockIsEnabled();
+// Reload the persisted Flock toggle on boot (NVS); defaultEnabled if never set.
+void flockRestoreEnabled(bool defaultEnabled);
+
 // Classify a BLE advertisement. `adv` is the raw advertising payload (AD
 // structures, may be null). Returns true + fills `out` if it looks like a Flock
 // camera or Raven.

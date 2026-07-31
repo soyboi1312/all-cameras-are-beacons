@@ -15,7 +15,10 @@
  */
 #include "axon_detect.h"
 #include "axon_signatures.h"
+#include "acab_scanner.h"    // acabSanitizeAscii: clamp attacker-sourced names on ingest
+#include "ascii_match.h"     // shared acabBytesContainAscii (Axon "BWCDEVICE" tag, both byte orders)
 #include "desert_detect.h"   // Desert mode forces classification even when toggled off
+#include <Preferences.h>     // persist the body-cam toggle across reboots (NVS)
 #include <ctype.h>
 #include <stdio.h>
 #include <string.h>
@@ -32,6 +35,9 @@ static const AxonSignature AXON_PLACEHOLDER = {
 
 // Axon Enterprise's only IEEE OUI, 00:25:DF (cited in axon_signatures.h).
 // FIELD-VALIDATED 2026-06-17: real Axon body cams advertise on this public OUI.
+// Re-confirmed repeatedly since, always via the BWCDEVICE service-data tag at conf 90:
+// two airports 2026-07-21, three more 2026-07-23 (SAN/DFW/Destin), and two again on the
+// 2026-07-23 San Diego capture. This is the single best-evidenced signature in the tree.
 // OUI-only is the loose match (could be any Axon product); classify() also checks
 // for the "BWCDEVICE" service-data tag, and when it's there, confirms body cam and
 // raises confidence. Set usePayload=true here to REQUIRE the tag (strictest match).
@@ -51,8 +57,23 @@ void axonLoadSignature(const AxonSignature* sig) {
     gSig = sig ? *sig : AXON_PLACEHOLDER;
 }
 void axonUseRegistryCandidate(void) { gSig = AXON_REGISTRY_CANDIDATE; }
-void axonSetEnabled(bool enabled) { gEnabled = enabled; }
+// NVS-backed so an app-set body-cam toggle survives a reboot (mirrors tracker/glasses).
+// This is the CATEGORY switch: it covers Axon (OUI + the BWCDEVICE tag) and Utility
+// BodyWorn, and the broad Motorola proxy gates on it too. Motorola has its own persisted
+// sub-toggle on top (policeSetEnabled), so this no longer overwrites that choice.
+void axonSetEnabled(bool enabled) {
+    if (enabled == gEnabled) return;
+    gEnabled = enabled;
+    Preferences p; p.begin("acab-axon", false); p.putBool("on", enabled); p.end();
+}
 bool axonIsEnabled() { return gEnabled; }
+
+// Reload the persisted toggle on boot; if none saved yet, use defaultEnabled.
+void axonRestoreEnabled(bool defaultEnabled) {
+    Preferences p; p.begin("acab-axon", true);
+    gEnabled = p.getBool("on", defaultEnabled);
+    p.end();
+}
 
 // ---- local helpers (same AD parsing as flock_detect, kept separate) ----
 static bool ciContains(const char* hay, const char* needle) {
@@ -65,25 +86,8 @@ static bool ciContains(const char* hay, const char* needle) {
     return false;
 }
 
-// Case-insensitive search for an ASCII needle in a raw byte buffer, checking the
-// buffer both forward and reversed. BLE carries 128-bit UUIDs little-endian, so an
-// ASCII-encoded UUID (like Axon's "...BWCDEVICE") only reads right when reversed.
-static bool bytesContainAscii(const uint8_t* buf, uint8_t len, const char* needle) {
-    if (!buf || !needle || !*needle) return false;
-    size_t nl = strlen(needle);
-    if (len < nl) return false;
-    for (uint8_t i = 0; i + nl <= len; i++) {           // forward
-        size_t k = 0;
-        while (k < nl && tolower(buf[i+k]) == tolower((unsigned char)needle[k])) k++;
-        if (k == nl) return true;
-    }
-    for (uint8_t i = 0; i + nl <= len; i++) {           // reversed
-        size_t k = 0;
-        while (k < nl && tolower(buf[len-1-(i+k)]) == tolower((unsigned char)needle[k])) k++;
-        if (k == nl) return true;
-    }
-    return false;
-}
+// ASCII-in-bytes matching (Axon's "BWCDEVICE" service-data tag, checked in both byte
+// orders) now lives in the shared ascii_match.h -> acabBytesContainAscii().
 
 struct AxAdv {
     char     name[40]; bool haveName;
@@ -102,8 +106,9 @@ static void parseAdv(const uint8_t* adv, size_t len, AxAdv* f) {
         const uint8_t* data = &adv[i + 2];
         uint8_t dataLen = adLen - 1;
         if ((adType == 0x08 || adType == 0x09) && !f->haveName) {
-            uint8_t n = dataLen < sizeof(f->name) - 1 ? dataLen : sizeof(f->name) - 1;
-            memcpy(f->name, data, n); f->name[n] = 0; f->haveName = true;
+            // clamp the attacker-controlled advertised name to printable ASCII on ingest (same
+            // invariant as the other ingest paths), not a raw memcpy.
+            acabSanitizeAscii(f->name, data, dataLen, sizeof(f->name)); f->haveName = true;
         } else if (adType == 0xFF && dataLen >= 2 && !f->haveMfg) {
             f->mfgId = (uint16_t)data[0] | ((uint16_t)data[1] << 8);
             f->mfgData = data; f->mfgLen = dataLen; f->haveMfg = true;
@@ -159,23 +164,53 @@ bool axonClassifyBLE(const uint8_t mac[6], const uint8_t* adv, size_t advLen,
     }
     if (ok && gSig.usePayload && gSig.payload) {
         any = true;
-        if (!bytesContainAscii(f.svc, f.svcLen, gSig.payload)) ok = false;
+        if (!acabBytesContainAscii(f.svc, f.svcLen, gSig.payload)) ok = false;
     }
+    bool sigHit = any && ok;   // the configured OUI / mfg / name signature matched
 
-    if (!any || !ok) return false;
+    // Durable, MAC-INDEPENDENT signal: the "BWCDEVICE" service-data tag. Axon is
+    // moving to rotating BLE MACs, which breaks the OUI match - but the tag rides in
+    // the advert payload, so make it a STANDALONE match (not just a confidence bump on
+    // top of the OUI). A random-MAC Axon body cam still gets caught by its own tag.
+    bool tagHit = acabBytesContainAscii(f.svc, f.svcLen, AXON_BWC_PAYLOAD);
+
+    // Utility Inc. "BodyWorn" police body cam (a different brand, same body-cam category,
+    // so it rides this same detector + toggle). The advertised name is the strong, MAC-
+    // independent signal; the public OUI is the weaker fallback. Signatures (name + the
+    // OUI table) live in axon_signatures.h next to their citations.
+    bool utilName = ciContains(f.name, UTIL_BWC_NAME);
+    bool utilOui  = false;
+    if (!(mac[0] & 0x02)) {   // skip locally-administered / random MACs (no real OUI)
+        for (size_t i = 0; i < UTIL_BWC_OUI_COUNT && !utilOui; i++)
+            utilOui = (mac[0] == UTIL_BWC_OUI[i][0] && mac[1] == UTIL_BWC_OUI[i][1] &&
+                       mac[2] == UTIL_BWC_OUI[i][2]);
+    }
+    bool utilHit  = utilName || utilOui;
+
+    if (!sigHit && !tagHit && !utilHit) return false;
 
     acabInit(out, ACAB_AXON_BODYCAM, SRC_BLE, mac, (int16_t)rssi);
-    out->method = gSig.useMfgId ? M_MFG_ID : (gSig.useOui ? M_OUI : M_NAME);
     if (f.haveName) strncpy(out->name, f.name, sizeof(out->name) - 1);
 
-    // If the advert carries the "BWCDEVICE" service-data tag, confirm it's a body
-    // cam (vs dock / TASER / fleet) and give it higher confidence.
-    if (bytesContainAscii(f.svc, f.svcLen, AXON_BWC_PAYLOAD)) {
+    if (tagHit) {
+        // Axon, confirmed by its own broadcast tag - highest confidence, and it survives
+        // MAC randomization. Reported as service-data, not OUI.
+        out->method = M_SERVICE_DATA;
         out->confidence = gSig.baseConfidence < 90 ? 90 : gSig.baseConfidence;
         snprintf(out->detail, sizeof(out->detail), "BWC DEVICE");
-    } else {
+    } else if (sigHit) {
+        // Axon loose match: OUI / mfg / name only (could be any Axon product). Weaker; the
+        // OUI table only matches public MACs, so acabApplyDurability leaves it as-is.
+        out->method = gSig.useMfgId ? M_MFG_ID : (gSig.useOui ? M_OUI : M_NAME);
         out->confidence = gSig.baseConfidence;
         snprintf(out->detail, sizeof(out->detail), "Axon OUI");
+    } else {
+        // Utility BodyWorn (the only remaining reason we didn't bail). The "BodyWorn Remote"
+        // name is specific + MAC-independent, so it's a strong hit; OUI-only is the weak fallback
+        // (Utility makes other gear too). Third-party field-observed, not own-captured yet.
+        out->method = utilName ? M_NAME : M_OUI;
+        out->confidence = utilName ? 85 : 70;
+        snprintf(out->detail, sizeof(out->detail), "Utility BodyWorn");
     }
     return true;
 }

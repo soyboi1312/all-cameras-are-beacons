@@ -3,6 +3,8 @@ package tech.acab.app.ui
 import android.content.ClipData
 import android.content.ClipboardManager
 import android.content.Context
+import android.graphics.ColorMatrix
+import android.graphics.ColorMatrixColorFilter
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
@@ -12,26 +14,34 @@ import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.fillMaxHeight
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.filled.Check
+import androidx.compose.material.icons.filled.CheckBox
+import androidx.compose.material.icons.filled.CheckBoxOutlineBlank
 import androidx.compose.material.icons.filled.ContentCopy
 import androidx.compose.material.icons.filled.GpsFixed
 import androidx.compose.material.icons.filled.NotificationsOff
+import androidx.compose.material.icons.outlined.Info
+import androidx.compose.material.icons.filled.Star
+import androidx.compose.material.icons.filled.StarBorder
 import androidx.compose.material.icons.filled.Warning
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -39,41 +49,107 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.Path
 import androidx.compose.ui.graphics.drawscope.DrawScope
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.text.AnnotatedString
+import androidx.compose.ui.text.SpanStyle
+import androidx.compose.ui.text.buildAnnotatedString
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.style.TextAlign
+import androidx.compose.ui.text.withStyle
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.compose.ui.viewinterop.AndroidView
+import kotlin.math.roundToInt
 import kotlinx.coroutines.delay
-import org.osmdroid.config.Configuration
+import android.view.MotionEvent
 import org.osmdroid.tileprovider.tilesource.TileSourceFactory
 import org.osmdroid.util.GeoPoint
+import org.osmdroid.views.CustomZoomButtonsController
 import org.osmdroid.views.MapView
 import org.osmdroid.views.overlay.Marker
 import tech.acab.app.ble.AcabBleManager
 import tech.acab.app.model.Detection
+import tech.acab.app.model.DeviceType
+import tech.acab.app.net.AlprStore
+import tech.acab.app.model.TimeBasis
 import tech.acab.app.model.isOuiMatch
+import tech.acab.app.model.companyIdText
 import tech.acab.app.model.methodLabel
 import tech.acab.app.model.ouiVendor
 import tech.acab.app.model.sourceLabel
+import tech.acab.app.model.validCoord
+import tech.acab.app.model.vendor
 import tech.acab.app.ui.theme.Acab
 import tech.acab.app.ui.theme.tone
 
-/** Detection dossier: top bar, title block, live RSSI sparkline, a 2x2 stat grid,
- *  and an identity panel with first/last seen. Mirrors the iOS detail sheet. */
+/** Detection dossier: top bar, title block, match-quality verdict (with a confirm-it
+ *  checklist for weak hits), live RSSI + band, a slim stat pair, and an identity panel
+ *  with first/last seen. Mirrors the iOS detail sheet. */
 @Composable
-fun DetailScreen(d: Detection, ble: AcabBleManager, onBack: () -> Unit) {
+fun DetailScreen(
+    detection: Detection,
+    ble: AcabBleManager,
+    onBack: () -> Unit,
+    onOpenInMap: (Double, Double) -> Unit,
+) {
+    // The pushed-in dossier is a frozen snapshot, so shadow it with the live record
+    // from the feed; "seen N×" and friends keep updating while the screen is open.
+    // The id is hoisted once so the ~3 Hz scan below compares against a local rather than
+    // re-reading detection.id each pass.
+    val detections by ble.detections.collectAsState()
+    val targetId = remember(detection) { detection.id }
+    val d = detections.firstOrNull { it.id == targetId } ?: detection
     val tone = d.type.tone()
     val trend = ble.rssiTrend(d.id)
     val stale = ble.isStale(d.id)
+    // Buffered rows the board had no clock for carry an ordering key, not a time. Rendering that
+    // as an age reads "24 years ago" with total confidence, so say what we actually know instead.
+    val firstSeen = ble.firstSeen(d.id)
+    val lastSeen = ble.lastSeen(d.id)
+    val approxFirst = ble.isApproxTime(firstSeen)
+    // How this row's first-seen stamp was arrived at. Exact for a live sighting, in which case
+    // nothing below changes. The revision key is what makes a screen already open when a drain
+    // finishes pick up the bracketing it just did (see AcabBleManager.timeBasisRev).
+    val timeRev by ble.timeBasisRev.collectAsState()
+    val timeBasis = remember(d.id, timeRev) { ble.timeBasis(d.id) }
+    // The reconstructed / bracketed / unknown line, or null when the stamp is a plain clock
+    // reading and the existing relative age is the honest thing to show.
+    val firstSeenText = timeBasis.primaryText()
+        ?: if (approxFirst) APPROX_TIME else relativeAgo(firstSeen)
+    val watchedList by ble.watched.collectAsState()
+    val isWatched = watchedList.any { it.mac == d.mac.lowercase() }
+    // Confirm before starring a randomized address: it rotates, so the star may stop matching.
+    var showRandomWarn by remember { mutableStateOf(false) }
+    // A star refused at the firmware's 256-entry cap: surface it instead of the WATCH tap
+    // silently doing nothing (the manager's watchDevice returns without adding at the cap).
+    var showWatchlistFull by remember { mutableStateOf(false) }
+    var showRssiInfo by remember { mutableStateOf(false) }   // info dot next to SIGNAL explains the RSSI graph
+    // One watch/star toggle shared by the CONFIRM IT chip and the big button below.
+    val toggleWatch: () -> Unit = {
+        if (isWatched) {
+            ble.unwatch(d.mac)
+        } else if (watchedList.size >= WATCH_CAP) {
+            showWatchlistFull = true   // cap first, like the manager: say so rather than no-op
+        } else if (d.isRandomAddr) {
+            showRandomWarn = true   // confirm first: a rotating address may stop matching
+        } else {
+            ble.watchDevice(d)
+        }
+    }
 
-    Box(Modifier.fillMaxSize().background(Acab.bg)) {
+    // T2: cap the readable dossier width so tablets/landscape stop stretching one column edge to
+    // edge; at phone width the 640 cap is a no-op. The outer Box centers the capped content; the
+    // top bar and scrim below stay full-bleed. The map thumbnail rides inside the capped column.
+    Box(Modifier.fillMaxSize().background(Acab.bg), contentAlignment = Alignment.TopCenter) {
         Column(
             Modifier
-                .fillMaxSize()
+                .widthIn(max = 640.dp)
+                .fillMaxWidth()
+                .fillMaxHeight()
                 .verticalScroll(rememberScrollState())
                 .padding(horizontal = Acab.pad)
                 .padding(top = 64.dp, bottom = 24.dp),
@@ -81,82 +157,176 @@ fun DetailScreen(d: Detection, ble: AcabBleManager, onBack: () -> Unit) {
         ) {
             // ---- title: glyph, label, last 4 of the MAC ----
             Row(horizontalArrangement = Arrangement.spacedBy(14.dp)) {
-                CatGlyph(d.type, size = 54)
+                CatGlyph(d.type, size = 54, filled = true)
                 Column(verticalArrangement = Arrangement.spacedBy(7.dp)) {
-                    BadgePill("${d.type.category} · ${d.type.classLabel}", tone)
+                    // Category lowercased like iOS: the caps in the pill belong to the class
+                    // label, the category reads as content.
+                    BadgePill("${d.type.category.lowercase()} · ${d.type.classLabel}", tone)
                     Text("NODE ${nodeName(d.mac)}", color = Acab.text,
                         fontSize = 26.sp, fontWeight = FontWeight.SemiBold)
-                    Text(d.type.label, color = Acab.dim, fontSize = 11.sp, fontFamily = Acab.mono)
+                    // Deliberately d.vendor, NOT the OUI lookup: the OUI resolves a Flock
+                    // Falcon to its Liteon WiFi module and would head the ALPR dossier with
+                    // "Liteon" instead of "Flock Safety". The OUI reading still shows in the
+                    // identity panel below, where it is labelled as such.
+                    Text(d.vendor, color = Acab.dim,
+                        fontSize = 11.sp, fontFamily = Acab.mono)
                 }
             }
+
+            // ---- how good the match is: verdict, meter, plain-language explainer ----
+            MatchQualityPanel(d)
 
             // ---- heads-up that body-cam signatures aren't field-verified ----
             if (d.type.isExperimental) ExperimentalNote()
 
-            // ---- signal: big RSSI + sparkline, dimmed if stale ----
+            // ---- signal: big RSSI + band + sparkline, dimmed if stale ----
             Column(Modifier.fillMaxWidth().panel(), verticalArrangement = Arrangement.spacedBy(12.dp)) {
                 Row(verticalAlignment = Alignment.CenterVertically) {
                     Kicker(if (stale) "SIGNAL · STALE" else "SIGNAL · LIVE",
                         color = if (stale) Acab.dim else Acab.faint)
+                    Icon(Icons.Outlined.Info, contentDescription = "What the RSSI graph means",
+                        tint = Acab.dim, modifier = Modifier.padding(start = 6.dp).size(14.dp).clickable { showRssiInfo = !showRssiInfo })
                     Spacer(Modifier.weight(1f))
                     SignalBars(rssiBars(d.rssi), tint = tone)
                 }
-                Row(verticalAlignment = Alignment.Bottom, horizontalArrangement = Arrangement.spacedBy(3.dp)) {
-                    Text("${d.rssi}", color = Acab.text, fontSize = 30.sp,
-                        fontWeight = FontWeight.SemiBold, fontFamily = Acab.mono)
-                    Text("dBm", color = Acab.dim, fontSize = 11.sp,
-                        fontFamily = Acab.mono, modifier = Modifier.padding(bottom = 4.dp))
+                Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.Bottom) {
+                    Column(verticalArrangement = Arrangement.spacedBy(2.dp)) {
+                        Row(verticalAlignment = Alignment.Bottom, horizontalArrangement = Arrangement.spacedBy(3.dp)) {
+                            Text("${d.rssi}", color = Acab.text, fontSize = 30.sp,
+                                fontWeight = FontWeight.SemiBold, fontFamily = Acab.display)
+                            Text("dBm", color = Acab.dim, fontSize = 11.sp,
+                                fontFamily = Acab.mono, modifier = Modifier.padding(bottom = 4.dp))
+                        }
+                        Kicker("RSSI")
+                    }
+                    Spacer(Modifier.weight(1f))
+                    Column(horizontalAlignment = Alignment.End, verticalArrangement = Arrangement.spacedBy(2.dp)) {
+                        Text(d.sourceLabel, color = tone, fontSize = 20.sp,
+                            fontWeight = FontWeight.SemiBold, fontFamily = Acab.display)
+                        Kicker("BAND")
+                    }
                 }
                 Sparkline(trend, tone, stale, Modifier.fillMaxWidth().height(46.dp))
+                if (showRssiInfo) {
+                    Text("RSSI is signal strength, moment to moment. closer to 0 is stronger, so the line climbs as you get nearer the source and drops as you move away, use it to home in on a hit.",
+                        color = Acab.dim, fontSize = 11.5.sp, fontFamily = Acab.mono, lineHeight = 16.sp)
+                }
             }
 
-            // ---- 2x2 stat grid ----
+            // ---- slim stat pair: matched-on / confidence live in the panel above ----
             StatGrid(
                 listOf(
-                    "MATCHED ON" to d.methodLabel,
-                    "SOURCE" to d.sourceLabel,
-                    "CONFIDENCE" to "${d.confidence}%",
-                    "SIGHTINGS" to "${d.count}",
+                    "SIGNAL" to "${d.rssi} dBm · ${d.sourceLabel}",
+                    // A reconstructed first-sighting still has a real age, but it is an age
+                    // measured off a derived point, so it gets the "~" that marks it as one.
+                    // A bracketed row has no point to measure from, so it says so.
+                    "SIGHTINGS" to when {
+                        timeBasis is TimeBasis.Reconstructed -> "${d.count} · first ~${relativeAgo(firstSeen)}"
+                        timeBasis is TimeBasis.Bracketed -> "${d.count} · time bounded"
+                        approxFirst -> "${d.count} · time unknown"
+                        else -> "${d.count} · first ${relativeAgo(firstSeen)}"
+                    },
                 ),
-                confColor = confColor(d.confidence),
             )
 
-            if (d.isOuiMatch) FalsePositiveNote()
+            // ---- weak / chipset-only hits get a field checklist instead of a shrug ----
+            if (d.isOuiMatch || d.confidence < 50) {
+                // null firstSeen on an approx row drops the "over 18m" clause rather than
+                // quoting a span measured off the ordering key.
+                ConfirmItPanel(d, firstSeen = if (approxFirst) null else firstSeen,
+                    watched = isWatched, onWatch = toggleWatch)
+            }
 
             // ---- identity ----
             Column(Modifier.fillMaxWidth().panel()) {
                 Kicker("IDENTITY")
                 Spacer(Modifier.size(4.dp))
-                IdRow("Vendor", d.ouiVendor ?: d.type.label)
-                d.type.brand?.let { IdRow("Brand", it) }
-                IdRow("MAC", d.mac)
-                d.name?.takeIf { it.isNotEmpty() }?.let { IdRow("Name", it) }
-                d.rid?.takeIf { it.isNotEmpty() }?.let { IdRow("UAS ID", it) }
-                d.ridManufacturer?.let { IdRow("Manufacturer", it) }
-                d.detail?.takeIf { it.isNotEmpty() }?.let { IdRow("Detail", it) }
-                d.altitude?.let { IdRow("Altitude", "$it m") }
-                d.speedH?.let { IdRow("Speed", "$it m/s") }
-                d.speedV?.takeIf { it != 0 }?.let { IdRow("Vert. speed", "$it m/s") }
-                d.heading?.let { IdRow("Heading", "$it°") }
-                d.heightAGL?.let { IdRow("Height AGL", "$it m") }
-                d.pilotAlt?.let { IdRow("Operator alt", "$it m") }
-                d.ridStatusLabel?.let { IdRow("Status", it) }
-                IdRow("First seen", relativeAgo(ble.firstSeen(d.id)))
-                IdRow("Last seen", relativeAgo(ble.lastSeen(d.id)), last = true)
+                val rows = buildList {
+                    d.type.brand?.let { add("Brand" to it) }
+                    add("Vendor" to (d.ouiVendor ?: d.vendor))
+                    d.companyIdText?.let { add("Company ID" to it) }
+                    add("Identifier" to d.mac)
+                    add(FIRST_SEEN_LABEL to firstSeenText)
+                    // isApproxTime alone is not enough here. It screens Bracketed and Unknown,
+                    // which keep the pseudo stamp, but a Reconstructed row holds a REAL ms value,
+                    // so it passed straight through and rendered a bare "3h ago" as if the phone
+                    // had watched the clock. Qualify it: the instant is derived, and a device that
+                    // exists purely from the offline buffer has no live last-seen at all.
+                    // Asked per STAMP, not per row (iOS timeBasis(for:stamp:)): a device replayed
+                    // from the buffer and THEN heard live has a derived First seen and a genuine
+                    // Last seen, and each has to say so for itself. A live sighting advances
+                    // lastSeenAt past the drained stamp, so equality with firstSeen is what "this
+                    // stamp IS the reconstructed one" looks like from here.
+                    add("Last seen" to when {
+                        ble.isApproxTime(lastSeen) -> APPROX_TIME
+                        timeBasis is TimeBasis.Reconstructed && lastSeen == firstSeen ->
+                            "${relativeAgo(lastSeen)} · reconstructed"
+                        else -> relativeAgo(lastSeen)
+                    })
+                    d.name?.takeIf { it.isNotEmpty() }?.let { add("Name" to it) }
+                    d.rid?.takeIf { it.isNotEmpty() }?.let { add("UAS ID" to it) }
+                    d.ridManufacturer?.let { add("Manufacturer" to it) }
+                    d.detail?.takeIf { it.isNotEmpty() }?.let { add("Detail" to it) }
+                    // Numeric lat/lon alongside the mini-map: the coordinates are the actionable
+                    // datum in an evidence export, and the operator (pilot) fix is the whole point
+                    // of a drone detection, so show both as text, not only as a pin.
+                    run { val la = d.lat; val lo = d.lon
+                        if (la != null && lo != null && validCoord(la, lo)) add("Position" to "%.5f, %.5f".format(la, lo)) }
+                    d.altitude?.let { add("Altitude" to "$it m") }
+                    d.speedH?.let { add("Speed" to "$it m/s") }
+                    d.speedV?.takeIf { it != 0 }?.let { add("Vert. speed" to "$it m/s") }
+                    d.heading?.let { add("Heading" to "$it°") }
+                    d.heightAGL?.let { add("Height AGL" to "$it m") }
+                    run { val pla = d.pilotLat; val plo = d.pilotLon
+                        if (pla != null && plo != null && validCoord(pla, plo)) add("Operator pos" to "%.5f, %.5f".format(pla, plo)) }
+                    d.pilotAlt?.let { add("Operator alt" to "$it m") }
+                    d.ridStatusLabel?.let { add("Status" to it) }
+                }
+                rows.forEachIndexed { i, (label, value) ->
+                    IdRow(label, value, last = i == rows.lastIndex,
+                        // Only the first-seen row carries a derived time, so it is the only one
+                        // that has anything to qualify.
+                        note = if (label == FIRST_SEEN_LABEL) timeBasis.qualifierText() else null)
+                }
                 WhyFlagged(d, tone)
             }
 
             // ---- location: static map thumbnail centered on the sighting ----
-            ble.mapCoord(d)?.let { (lat, lon) -> LocationPanel(d, lat, lon) }
+            ble.mapCoord(d)?.let { (lat, lon) -> LocationPanel(d, lat, lon, onOpenInMap) }
 
             // ---- actions ----
             CopyMacButton(d.mac)
+            WatchButton(watched = isWatched, onToggle = toggleWatch)
             IgnoreButton { ble.ignoreDevice(d); onBack() }
         }
 
-        // ---- top bar: back arrow + centered kicker ----
+        // Randomized-address confirm sheet: star it anyway, but say plainly why it may lapse.
+        // One dialog, one body, picked by type inside, so a tracker never stacks a second prompt.
+        if (showRandomWarn) {
+            RandomAddrWarnDialog(
+                type = d.type,
+                onDismiss = { showRandomWarn = false },
+                // Re-check the cap on confirm: the list could have filled while the sheet sat open.
+                onConfirm = {
+                    showRandomWarn = false
+                    if (watchedList.size >= WATCH_CAP) showWatchlistFull = true
+                    else ble.watchDevice(d)
+                },
+            )
+        }
+
+        // Refused star at the cap, iOS "Watchlist full" alert word for word.
+        if (showWatchlistFull) {
+            WatchlistFullDialog { showWatchlistFull = false }
+        }
+
+        // ---- top bar: back arrow + centered kicker, on a bg->clear scrim like iOS ----
         Row(
-            Modifier.fillMaxWidth().padding(horizontal = Acab.pad).padding(top = 8.dp, bottom = 10.dp),
+            Modifier
+                .fillMaxWidth()
+                .background(Brush.verticalGradient(listOf(Acab.bg, Acab.bg.copy(alpha = 0f))))
+                .padding(horizontal = Acab.pad)
+                .padding(top = 8.dp, bottom = 10.dp),
             verticalAlignment = Alignment.CenterVertically,
         ) {
             Box(
@@ -193,24 +363,246 @@ private fun BadgePill(label: String, tone: Color) {
     }
 }
 
-/** Heads-up for OUI-only matches: the OUI only names the chipset vendor, which Flock
- *  shares with consumer gear, so these can be false positives. */
+/** MATCH QUALITY: verdict + 5-segment meter + a plain-language line about what actually
+ *  matched. Weak matches go loud amber; strong ones stay calm white. Crimson is reserved
+ *  for the category, never for certainty. */
 @Composable
-private fun FalsePositiveNote() {
+private fun MatchQualityPanel(d: Detection) {
+    val weak = d.confidence < 50
+    val shape = RoundedCornerShape(Acab.radius)
     Column(
-        Modifier.fillMaxWidth().panel(),
-        verticalArrangement = Arrangement.spacedBy(5.dp),
+        Modifier
+            .fillMaxWidth()
+            .background(Acab.bg2, shape)
+            .border(1.dp, if (weak) Acab.warn.copy(alpha = 0.4f) else Acab.line, shape)
+            .padding(Acab.pad),
+        verticalArrangement = Arrangement.spacedBy(10.dp),
     ) {
-        Row(
-            verticalAlignment = Alignment.CenterVertically,
-            horizontalArrangement = Arrangement.spacedBy(6.dp),
-        ) {
-            Icon(Icons.Filled.Warning, contentDescription = null,
-                tint = Acab.warn, modifier = Modifier.size(13.dp))
-            Kicker("POSSIBLE FALSE POSITIVE", color = Acab.warn)
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            Kicker("MATCH QUALITY")
+            Spacer(Modifier.weight(1f))
+            MethodChip(d)
         }
-        Text("OUI matches flag the chipset vendor, which Flock shares with plenty of consumer devices. Worth confirming before you trust it.",
-            color = Acab.dim, fontSize = 11.sp, fontFamily = Acab.mono)
+        Row(verticalAlignment = Alignment.Bottom, horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+            Text(verdictLabel(d.confidence), color = verdictColor(d.confidence),
+                fontSize = 22.sp, fontWeight = FontWeight.Bold, fontFamily = Acab.display)
+            Text("${d.confidence}%", color = Acab.dim, fontSize = 11.sp,
+                fontFamily = Acab.mono, modifier = Modifier.padding(bottom = 3.dp))
+        }
+        MatchMeter(d.confidence, weak)
+        Text(plainMatchLine(d), color = Acab.dim, fontSize = 11.sp, fontFamily = Acab.mono)
+    }
+}
+
+/** Top-right chip naming the match method. OUI-only is the false-positive-prone case,
+ *  so it gets the loud tinted-amber treatment; everything else stays neutral. */
+@Composable
+private fun MethodChip(d: Detection) {
+    val amber = d.isOuiMatch
+    val label = when {
+        // A body-cam OUI is the maker's OWN registered block (Axon, Utility, Motorola
+        // Solutions), not a chipset shared with unrelated gear, so "chipset only" would
+        // understate what we know. What's uncertain is which of the vendor's products
+        // this is, which is why it keeps the amber weak-match treatment.
+        d.method == 1 && d.bodyCamSigDetail != null -> "OUI · VENDOR ONLY"
+        d.method == 1 -> "OUI · CHIPSET ONLY"
+        d.method == 2 -> "NAME MATCH"
+        else -> d.methodLabel.lowercase()   // "manufacturer id", "service uuid", ... like iOS
+    }
+    val shape = RoundedCornerShape(4.dp)
+    Box(
+        Modifier
+            .background(if (amber) Acab.warn.copy(alpha = 0.14f) else Acab.bg3, shape)
+            .border(1.dp, if (amber) Acab.warn.copy(alpha = 0.4f) else Acab.line, shape)
+            .padding(horizontal = 6.dp, vertical = 3.dp),
+    ) {
+        Text(label, color = if (amber) Acab.warn else Acab.dim, fontSize = 8.5.sp,
+            letterSpacing = 1.sp, fontWeight = FontWeight.Bold, fontFamily = Acab.mono)
+    }
+}
+
+/** Five 6dp segments, filled = round(pct/20). Amber when weak, white otherwise. */
+@Composable
+private fun MatchMeter(pct: Int, weak: Boolean) {
+    val filled = (pct / 20.0).roundToInt().coerceIn(0, 5)
+    val fill = if (weak) Acab.warn else Acab.text
+    Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(4.dp)) {
+        repeat(5) { i ->
+            Box(
+                Modifier
+                    .weight(1f)
+                    .height(6.dp)
+                    .background(if (i < filled) fill else Acab.bg3, RoundedCornerShape(3.dp))
+            )
+        }
+    }
+}
+
+private fun verdictLabel(pct: Int): String = when {
+    pct < 50 -> "Weak match, verify"
+    pct < 80 -> "Partial match"
+    else -> "Strong match"
+}
+
+private fun verdictColor(pct: Int): Color = when {
+    pct < 50 -> Acab.warn
+    pct < 80 -> Acab.dim
+    else -> Acab.text
+}
+
+/** What actually matched, in plain language, composed from the method and OUI vendor.
+ *  Copy mirrors iOS matchExplainer word for word. */
+private fun plainMatchLine(d: Detection): AnnotatedString = buildAnnotatedString {
+    // Body cam covers four signatures of very different weight under one label, so the
+    // generic per-method line is too vague here (and its "shared chipset" wording is
+    // wrong for a vendor's own OUI block). Name the signature that fired instead.
+    val sig = d.bodyCamSigDetail
+    if (sig != null) {
+        appendSignatureExplainer(d, sig)
+        return@buildAnnotatedString
+    }
+    // Replayed from the offline buffer: the stored record (firmware det_log.h) has no detail
+    // field, so the signature is gone for a buffered body-cam hit even though the method and
+    // confidence survived. Do NOT fall through to the OUI branch below, which would
+    // confidently assert "shared chipset" wording that is simply wrong for a vendor's own
+    // OUI block, and flatly false if the original hit was the conf-90 BWC DEVICE payload
+    // tag. Say what we actually still know instead.
+    if (d.type == DeviceType.BODY_CAM) {
+        append("Matched a body-worn camera signature. This record came from the offline buffer, which doesn't keep which signature fired.")
+        return@buildAnnotatedString
+    }
+    when (d.method) {
+        1 -> {   // OUI: only the chipset vendor matched, the false-positive-prone case
+            val isFlock = d.type == DeviceType.FLOCK_CAMERA || d.type == DeviceType.FLOCK_RAVEN
+            val part = if (isFlock) "a part Flock shares with routers and home cameras"
+                       else "a part shared with routers and home cameras"
+            val vendor = d.ouiVendor
+            if (vendor != null) {
+                append("Only the radio chipset matched: ")
+                withStyle(SpanStyle(fontWeight = FontWeight.Bold)) { append(vendor) }
+                append(", $part. The name and service IDs didn't match.")
+            } else {
+                append("Only the radio chipset matched, $part. The name and service IDs didn't match.")
+            }
+        }
+        2 -> append("The name this device broadcasts matched a known signature.")
+        3 -> append("The manufacturer ID in the advertisement matched a known signature.")
+        4 -> append("The device advertises a service UUID tied to this hardware.")
+        5 -> append("The WiFi network name matched a known signature.")
+        6 -> append("The device probed for a network tied to this hardware.")
+        7 -> append("The aircraft identified itself over Remote ID.")
+        8 -> append("A service-data tag tied to this hardware matched.")
+        9 -> append("A decoded manufacturer-data subtype matched a known signature.")
+        10 -> append("You starred this exact device, so every sighting matches.")
+        else -> append("No match method was reported for this hit.")
+    }
+}
+
+/** The firmware detail strings for the four body-cam signatures, exactly as axon_detect.cpp
+ *  and police_detect.cpp write them. Membership is what upgrades the chip to VENDOR ONLY and
+ *  selects a per-signature explainer below. */
+private val BODY_CAM_SIGNATURES =
+    setOf("BWC DEVICE", "Axon OUI", "Utility BodyWorn", "Motorola Solutions OUI")
+
+/** The body-cam signature behind this hit, when the board reported one. Null for every other
+ *  category, and for a buffered record (the offline store keeps no detail field). */
+private val Detection.bodyCamSigDetail: String?
+    get() = detail?.takeIf { type == DeviceType.BODY_CAM && it in BODY_CAM_SIGNATURES }
+
+/** Which body-cam signature fired, and how much weight it carries. The four sources under
+ *  this one category range from Axon's own broadcast identifier to a vendor-block proxy, and
+ *  without this they all read as "Body camera". Says nothing about the numbers: the verdict,
+ *  meter, and percentage above already carry the strength. Copy mirrors iOS word for word. */
+private fun AnnotatedString.Builder.appendSignatureExplainer(d: Detection, sig: String) {
+    fun name() = withStyle(SpanStyle(fontWeight = FontWeight.Bold)) { append(sig) }
+    when (sig) {
+        "BWC DEVICE" -> {
+            append("Matched "); name()
+            append(", the tag Axon body cams broadcast about themselves. It rides in the advertisement rather than in the address, so it holds even when the device randomizes its MAC. This is the strongest body cam signature the board carries.")
+        }
+        "Axon OUI" -> {
+            append("Matched "); name()
+            append(" only. The address block is Axon Enterprise's, but the broadcast body cam tag never appeared, so this is Axon-made gear of some kind. They ship other products on the same block.")
+        }
+        "Utility BodyWorn" -> {
+            append("Matched "); name()
+            if (d.method == 2) {
+                append(" by broadcast name. The device announced itself as part of Utility's body cam system, which is a deliberate self-identification and a solid match, though a name is easy for anything to copy.")
+            } else {
+                append(" by address block only. The block is Utility Inc's, but the broadcast name didn't match and Utility ships other gear on it, so treat this as a maybe.")
+            }
+        }
+        "Motorola Solutions OUI" -> {
+            append("Matched "); name()
+            append(", a vendor proxy rather than a body cam signature. The block is Motorola Solutions' own, so the maker is right, but they also sell two-way radios, docks, and site infrastructure on it. Read this as their equipment nearby, not a confirmed camera.")
+        }
+    }
+}
+
+/** Field checklist for weak / chipset-only hits: what to look for, whether it sticks
+ *  around, and a one-tap star. The checkboxes are scratch state, local to this screen. */
+@Composable
+private fun ConfirmItPanel(d: Detection, firstSeen: Long?, watched: Boolean, onWatch: () -> Unit) {
+    var looked by remember(d.id) { mutableStateOf(false) }
+    var secondPass by remember(d.id) { mutableStateOf(false) }
+    Column(Modifier.fillMaxWidth().panel(), verticalArrangement = Arrangement.spacedBy(12.dp)) {
+        Kicker("CONFIRM IT", color = Acab.warn)   // amber header, iOS parity: this is a to-do, not chrome
+        CheckRow("Look around, pole-mounted camera, solar panel, small antenna?",
+            checked = looked) { looked = !looked }
+        val span = seenSpan(firstSeen)
+        CheckRow(
+            if (span != null) "Still here on a second pass? It's been seen ${d.count}× over $span so far."
+            else "Still here on a second pass? It's been seen ${d.count}× so far.",
+            checked = secondPass) { secondPass = !secondPass }
+        Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+            Icon(if (watched) Icons.Filled.Star else Icons.Filled.StarBorder,
+                contentDescription = null, tint = Acab.watchTone, modifier = Modifier.size(18.dp))
+            Text("Star it to get pinged every time this exact device shows up.",
+                color = Acab.dim, fontSize = 11.sp, fontFamily = Acab.mono,
+                modifier = Modifier.weight(1f))
+            WatchChip(watched, onWatch)
+        }
+    }
+}
+
+/** Tappable checkbox row; the check is just a field note for the user, nothing persists. */
+@Composable
+private fun CheckRow(text: String, checked: Boolean, onToggle: () -> Unit) {
+    Row(
+        Modifier.fillMaxWidth().clickable(onClick = onToggle).padding(vertical = 10.dp),
+        verticalAlignment = Alignment.Top,
+        horizontalArrangement = Arrangement.spacedBy(10.dp),
+    ) {
+        // iOS polarity: the UNREAD prompt is the bright one, a completed row dims, and the
+        // checked box goes amber. Brightening finished items made the pending work recede.
+        Icon(if (checked) Icons.Filled.CheckBox else Icons.Filled.CheckBoxOutlineBlank,
+            contentDescription = null, tint = if (checked) Acab.warn else Acab.faint,
+            modifier = Modifier.size(18.dp))
+        Text(text, color = if (checked) Acab.dim else Acab.text,
+            fontSize = 11.sp, fontFamily = Acab.mono, modifier = Modifier.weight(1f))
+    }
+}
+
+/** Small gold chip wired to the same watch/star action as the big button below. */
+@Composable
+private fun WatchChip(watched: Boolean, onClick: () -> Unit) {
+    val gold = Acab.watchTone
+    val shape = RoundedCornerShape(6.dp)
+    Row(
+        Modifier
+            .clip(shape)
+            .background(if (watched) gold else gold.copy(alpha = 0.14f), shape)
+            .border(1.dp, if (watched) Color.Transparent else gold.copy(alpha = 0.4f), shape)
+            .clickable(onClick = onClick)
+            .padding(horizontal = 10.dp, vertical = 6.dp),
+        verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.spacedBy(5.dp),
+    ) {
+        Icon(if (watched) Icons.Filled.Star else Icons.Filled.StarBorder,
+            contentDescription = null, tint = if (watched) Acab.onAccent else gold,
+            modifier = Modifier.size(12.dp))
+        Text(if (watched) "WATCHING" else "WATCH", color = if (watched) Acab.onAccent else gold,
+            fontSize = 10.sp, letterSpacing = 1.sp, fontWeight = FontWeight.Bold, fontFamily = Acab.mono)
     }
 }
 
@@ -244,16 +636,37 @@ private fun WhyFlagged(d: Detection, tone: Color) {
     }
 }
 
+/** Dark-mode tile filter for the light MAPNIK tiles: a color-matrix inversion
+ *  concatenated with a partial-saturation matrix, so the inverted land/water hues read
+ *  as muted dark surfaces instead of neon. The standard osmdroid dark-map approach. */
+// R4: the one shared dark-tile filter, used by both this mini-map and the full MapScreen so
+// the two surfaces render an identical tint (inversion first, then saturation).
+internal val osmDarkTileFilter: ColorMatrixColorFilter by lazy {
+    val inversion = ColorMatrix(
+        floatArrayOf(
+            -1f, 0f, 0f, 0f, 255f,
+            0f, -1f, 0f, 0f, 255f,
+            0f, 0f, -1f, 0f, 255f,
+            0f, 0f, 0f, 1f, 0f,
+        )
+    )
+    // Invert first, then pull chroma down to ~30% of the inverted result.
+    val adjust = ColorMatrix().apply { setSaturation(0.3f) }
+    adjust.preConcat(inversion)
+    ColorMatrixColorFilter(adjust)
+}
+
 /** Static map thumbnail centered on the sighting, with the device pin and (for drones)
- *  a separate operator marker. Mirrors the iOS location panel. */
+ *  a separate operator marker. Mirrors the iOS location panel. Tapping the thumbnail (it
+ *  never pans or zooms itself) jumps to the full Map tab centered close-in on this spot. */
 @Composable
-private fun LocationPanel(d: Detection, lat: Double, lon: Double) {
+private fun LocationPanel(d: Detection, lat: Double, lon: Double, onOpenInMap: (Double, Double) -> Unit) {
     val context = LocalContext.current
     val markers = rememberCategoryMarkers()
     val operatorMarker = rememberOperatorMarker()
 
-    // osmdroid needs a user agent set before its first tile fetch, or the tile server rejects it.
-    remember { Configuration.getInstance().userAgentValue = context.packageName }
+    // osmdroid setup (user agent + bounded tile cache) must land before the first tile fetch.
+    remember { configureOsmdroid(context) }
 
     Column(Modifier.fillMaxWidth().panel(), verticalArrangement = Arrangement.spacedBy(10.dp)) {
         Row(verticalAlignment = Alignment.CenterVertically) {
@@ -264,47 +677,134 @@ private fun LocationPanel(d: Detection, lat: Double, lon: Double) {
         }
         // When the board stamped this from a stale phone fix (offline / Desert mode), say how
         // old the position is so it isn't read as a live "here, now". The v1.7 headline.
-        d.locationAgeText?.let { age ->
-            Text("location as of $age", color = Acab.warn,
+        d.locationAgeDetail?.let { age ->
+            Text(age, color = Acab.warn,
                 fontSize = 11.sp, fontFamily = Acab.mono)
         }
-        AndroidView(
-            modifier = Modifier
+        // CORROBORATION, positive-only (mirrors iOS). An ALPR-type hit within ~150m of a
+        // community-mapped camera is strong confirmation, and names the mapped maker when known.
+        // We NEVER show a "no mapped camera" line: OSM lags installs and cruiser ALPR is meant to
+        // move, so absence is not evidence of a false positive (the confidence % chip is that tell).
+        if (d.type == DeviceType.FLOCK_CAMERA || d.type == DeviceType.FLOCK_RAVEN) {
+            AlprStore.getInstance(context).nearest(lat, lon)?.let { (meters, maker) ->
+                if (meters <= 150) {
+                    val m = meters.roundToInt()
+                    Text(
+                        if (maker.isEmpty()) "\u2713 matches a mapped camera · $m m"
+                        else "\u2713 matches a mapped $maker camera · $m m",
+                        color = Acab.flockTone, fontSize = 11.sp,
+                        fontWeight = FontWeight.Medium, fontFamily = Acab.mono,
+                    )
+                }
+            }
+        }
+        // The whole thumbnail is one tap target: the inner MapView refuses every touch at
+        // dispatch, so the clickable on this wrapper receives the tap and hands off to the
+        // real map, centered on this sighting.
+        Box(
+            Modifier
                 .fillMaxWidth()
                 .height(170.dp)
                 .clip(RoundedCornerShape(Acab.radiusSm))
-                .border(1.dp, Acab.line, RoundedCornerShape(Acab.radiusSm)),
-            factory = { ctx ->
-                MapView(ctx).apply {
-                    setTileSource(TileSourceFactory.MAPNIK)
-                    setMultiTouchControls(false)
-                    controller.setZoom(15.0)
-                    controller.setCenter(GeoPoint(lat, lon))
-                    overlays.add(
-                        Marker(this).apply {
-                            position = GeoPoint(lat, lon)
-                            icon = markers.getValue(d.type)
-                            setAnchor(Marker.ANCHOR_CENTER, Marker.ANCHOR_CENTER)
-                            title = d.type.category
-                        }
-                    )
-                    // drones broadcast the operator's position too; drop a pin for it
-                    val plat = d.pilotLat
-                    val plon = d.pilotLon
-                    if (plat != null && plon != null) {
+                .border(1.dp, Acab.line, RoundedCornerShape(Acab.radiusSm))
+                .clickable { onOpenInMap(lat, lon) },
+        ) {
+            AndroidView(
+                modifier = Modifier.fillMaxSize(),
+                factory = { ctx ->
+                    // A TRUE static thumbnail, the analog of iOS's .allowsHitTesting(false) on this
+                    // same panel: refuse every touch at dispatch so the gesture falls through to the
+                    // scrolling sheet instead of being half-eaten by a map that won't pan anyway.
+                    // The real map tab is for panning.
+                    object : MapView(ctx) {
+                        override fun dispatchTouchEvent(event: MotionEvent?): Boolean = false
+                    }.apply {
+                        setTileSource(TileSourceFactory.MAPNIK)
+                        // MAPNIK ships light-only tiles; invert + desaturate so the thumbnail
+                        // sits in the dark app instead of glowing like a flashlight.
+                        overlayManager.tilesOverlay.setColorFilter(osmDarkTileFilter)
+                        setMultiTouchControls(false)
+                        // With pinch off, osmdroid force-shows its +/- buttons as the "only zoom
+                        // affordance left" - on a static thumbnail they're clutter on top of the
+                        // OSM attribution (same overlap the main map hid them for).
+                        zoomController.setVisibility(CustomZoomButtonsController.Visibility.NEVER)
+                        controller.setZoom(15.0)
+                        controller.setCenter(GeoPoint(lat, lon))
                         overlays.add(
                             Marker(this).apply {
-                                position = GeoPoint(plat, plon)
-                                icon = operatorMarker
+                                position = GeoPoint(lat, lon)
+                                icon = markers.getValue(d.type)
                                 setAnchor(Marker.ANCHOR_CENTER, Marker.ANCHOR_CENTER)
-                                title = "Operator"
+                                title = d.type.category
                             }
                         )
+                        // drones broadcast the operator's position too; drop a pin for it
+                        val plat = d.pilotLat
+                        val plon = d.pilotLon
+                        if (plat != null && plon != null) {
+                            overlays.add(
+                                Marker(this).apply {
+                                    position = GeoPoint(plat, plon)
+                                    icon = operatorMarker
+                                    setAnchor(Marker.ANCHOR_CENTER, Marker.ANCHOR_CENTER)
+                                    title = "Operator"
+                                }
+                            )
+                        }
                     }
-                }
-            },
-            onRelease = { it.onDetach() },
-        )
+                },
+                // The screen live-shadows the row (~3 Hz), so the coordinates can move while the
+                // panel is up: a drone in flight, or a closest-approach migration on a stronger
+                // sighting. The header text and openOnMap already recompose with the new values;
+                // without this block the retained MapView kept the first composition's center and
+                // pins and the panel disagreed with itself. Signature-guarded so the 3 Hz feed
+                // doesn't churn osmdroid when nothing moved; zoom is deliberately untouched.
+                update = { map ->
+                    val sig = listOf(lat, lon, d.pilotLat, d.pilotLon)
+                    if (map.tag != sig) {
+                        map.tag = sig
+                        map.controller.setCenter(GeoPoint(lat, lon))
+                        val pins = map.overlays.filterIsInstance<Marker>()
+                        pins.firstOrNull { it.title != "Operator" }?.position = GeoPoint(lat, lon)
+                        val plat = d.pilotLat
+                        val plon = d.pilotLon
+                        val op = pins.firstOrNull { it.title == "Operator" }
+                        if (plat != null && plon != null) {
+                            if (op != null) {
+                                op.position = GeoPoint(plat, plon)
+                            } else {
+                                map.overlays.add(
+                                    Marker(map).apply {
+                                        position = GeoPoint(plat, plon)
+                                        icon = operatorMarker
+                                        setAnchor(Marker.ANCHOR_CENTER, Marker.ANCHOR_CENTER)
+                                        title = "Operator"
+                                    }
+                                )
+                            }
+                        } else if (op != null) {
+                            map.overlays.remove(op)
+                        }
+                        map.invalidate()
+                    }
+                },
+                onRelease = { it.onDetach() },
+            )
+            // Corner pill that makes the tap discoverable; the tap target is the whole
+            // thumbnail, not just the pill. Kicker-style mono caps on a dim scrim. Top-trailing
+            // like iOS, which also keeps it off the OSM attribution's bottom corner.
+            Box(
+                Modifier
+                    .align(Alignment.TopEnd)
+                    .padding(7.dp)
+                    .background(Acab.bg.copy(alpha = 0.8f), RoundedCornerShape(50))
+                    .border(1.dp, Acab.line, RoundedCornerShape(50))
+                    .padding(horizontal = 9.dp, vertical = 5.dp),
+            ) {
+                Text("OPEN IN MAP", color = Acab.dim, fontSize = 9.5.sp, letterSpacing = 1.sp,
+                    fontWeight = FontWeight.Bold, fontFamily = Acab.mono)
+            }
+        }
     }
 }
 
@@ -364,25 +864,105 @@ private fun IgnoreButton(onIgnore: () -> Unit) {
     }
 }
 
-/** 2x2 grid with hairline dividers; the confidence cell gets a tint. */
+/** Star toggle: add/remove this exact MAC from the watchlist. Filled + amber when active. */
 @Composable
-private fun StatGrid(cells: List<Pair<String, String>>, confColor: Color) {
-    Column(
+private fun WatchButton(watched: Boolean, onToggle: () -> Unit) {
+    val shape = RoundedCornerShape(Acab.radiusSm)
+    // R3: match iOS , watched fills gold with onAccent content ("STOP WATCHING"); unwatched
+    // is a gold-outlined bg2 button.
+    val content = if (watched) Acab.onAccent else Acab.watchTone
+    Row(
+        Modifier
+            .fillMaxWidth()
+            .background(if (watched) Acab.watchTone else Acab.bg2, shape)
+            .border(1.dp, if (watched) Color.Transparent else Acab.watchTone.copy(alpha = 0.4f), shape)
+            .clickable(onClick = onToggle)
+            .padding(vertical = 14.dp),
+        horizontalArrangement = Arrangement.Center,
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        Icon(if (watched) Icons.Filled.Star else Icons.Filled.StarBorder,
+            contentDescription = null, tint = content, modifier = Modifier.size(15.dp))
+        Spacer(Modifier.size(7.dp))
+        Text(if (watched) "STOP WATCHING" else "WATCH THIS DEVICE", color = content,
+            fontSize = 12.sp, letterSpacing = 0.5.sp, fontWeight = FontWeight.Bold, fontFamily = Acab.mono)
+    }
+}
+
+/** Honest heads-up before starring a randomized address: it rotates, so the star may lapse.
+ *  Exactly one body, chosen by type: a separated Find My tag holds its address for about a day
+ *  and rolls near 4am, a phone churns every few minutes, everything else gets the generic line.
+ *  Detection never uses the address, so rotation only costs you the star, never the hit. */
+@Composable
+private fun RandomAddrWarnDialog(type: DeviceType, onDismiss: () -> Unit, onConfirm: () -> Unit) {
+    val body = when (type) {
+        DeviceType.TRACKER -> "This tag's address holds for about a day, then changes around 4am. The star stops matching when it does. The tracker detector finds it either way."
+        DeviceType.NEARBY_DEVICE -> "Most phones change their address every few minutes, so this star will likely stop matching within the hour."
+        // No "trackers" here: TRACKER is handled one branch above, and a separated tag rotates
+        // about once a day, not every few minutes. Repeating the near-owner interval in the
+        // fallback would put the debunked claim straight back in front of the user.
+        else -> "This address looks randomized, so the star may stop matching this device."
+    }
+    androidx.compose.material3.AlertDialog(
+        onDismissRequest = onDismiss,
+        containerColor = Acab.bg2,
+        titleContentColor = Acab.text,
+        textContentColor = Acab.dim,
+        title = { Text("Watch a rotating address?", fontSize = 16.sp, fontWeight = FontWeight.SemiBold) },
+        text = {
+            Text(body, fontSize = 12.sp, fontFamily = Acab.mono)
+        },
+        confirmButton = {
+            Text("WATCH ANYWAY", color = Acab.warn, fontSize = 12.sp, fontWeight = FontWeight.Bold,
+                letterSpacing = 0.5.sp, fontFamily = Acab.mono,
+                modifier = Modifier.clickable(onClick = onConfirm).padding(8.dp))
+        },
+        dismissButton = {
+            Text("CANCEL", color = Acab.dim, fontSize = 12.sp, fontWeight = FontWeight.Bold,
+                letterSpacing = 0.5.sp, fontFamily = Acab.mono,
+                modifier = Modifier.clickable(onClick = onDismiss).padding(8.dp))
+        },
+    )
+}
+
+/** The firmware watchlist holds 256 MACs. Mirrors AcabBleManager.WATCH_CAP (private there);
+ *  checked here so a refused star gets the alert below instead of a silent no-op. */
+private const val WATCH_CAP = 256
+
+/** iOS's "Watchlist full" alert: the manager refuses a 257th star without a word, so the
+ *  screen has to say why the WATCH tap did nothing. */
+@Composable
+private fun WatchlistFullDialog(onDismiss: () -> Unit) {
+    androidx.compose.material3.AlertDialog(
+        onDismissRequest = onDismiss,
+        containerColor = Acab.bg2,
+        titleContentColor = Acab.text,
+        textContentColor = Acab.dim,
+        title = { Text("Watchlist full", fontSize = 16.sp, fontWeight = FontWeight.SemiBold) },
+        text = {
+            Text("You can watch up to 256 devices at once. Un-watch one before adding another.",
+                fontSize = 12.sp, fontFamily = Acab.mono)
+        },
+        confirmButton = {
+            Text("OK", color = Acab.dim, fontSize = 12.sp, fontWeight = FontWeight.Bold,
+                letterSpacing = 0.5.sp, fontFamily = Acab.mono,
+                modifier = Modifier.clickable(onClick = onDismiss).padding(8.dp))
+        },
+    )
+}
+
+/** Single row of stat cells with a hairline divider between them. */
+@Composable
+private fun StatGrid(cells: List<Pair<String, String>>) {
+    Row(
         Modifier
             .fillMaxWidth()
             .background(Acab.bg2, RoundedCornerShape(Acab.radius))
             .border(1.dp, Acab.line, RoundedCornerShape(Acab.radius)),
     ) {
-        Row(Modifier.fillMaxWidth()) {
-            StatCell(cells[0], Acab.text, Modifier.weight(1f))
-            VDivider()
-            StatCell(cells[1], Acab.text, Modifier.weight(1f))
-        }
-        HorizontalDivider(color = Acab.line)
-        Row(Modifier.fillMaxWidth()) {
-            StatCell(cells[2], confColor, Modifier.weight(1f))
-            VDivider()
-            StatCell(cells[3], Acab.text, Modifier.weight(1f))
+        cells.forEachIndexed { i, cell ->
+            if (i > 0) VDivider()
+            StatCell(cell, Acab.text, Modifier.weight(1f))
         }
     }
 }
@@ -404,7 +984,7 @@ private fun VDivider() {
 
 /** Identity label/value row, hairline under all but the last. */
 @Composable
-private fun IdRow(label: String, value: String, last: Boolean = false) {
+private fun IdRow(label: String, value: String, last: Boolean = false, note: String? = null) {
     Column {
         Row(
             Modifier.fillMaxWidth().padding(vertical = 9.dp),
@@ -413,8 +993,18 @@ private fun IdRow(label: String, value: String, last: Boolean = false) {
             Text(label, color = Acab.dim, fontSize = 11.sp, fontFamily = Acab.mono)
             Spacer(Modifier.weight(1f))
             Spacer(Modifier.size(16.dp))
-            Text(value, color = Acab.text, fontSize = 12.sp,
-                fontWeight = FontWeight.Medium, fontFamily = Acab.mono)
+            // [note] says how a derived value was arrived at, and it rides directly under that
+            // value rather than in a row of its own: split apart, a reader can pair the
+            // qualification with the wrong number, which is the whole failure it exists to stop.
+            Column(horizontalAlignment = Alignment.End) {
+                Text(value, color = Acab.text, fontSize = 12.sp,
+                    fontWeight = FontWeight.Medium, fontFamily = Acab.mono)
+                note?.let {
+                    Spacer(Modifier.size(3.dp))
+                    Text(it, color = Acab.dim, fontSize = 10.sp, fontFamily = Acab.mono,
+                        lineHeight = 13.sp, textAlign = TextAlign.End)
+                }
+            }
         }
         if (!last) HorizontalDivider(color = Acab.line)
     }
@@ -451,22 +1041,20 @@ private fun DrawScope.drawSparkline(values: List<Int>, tone: Color, alpha: Float
     drawPath(line, tone.copy(alpha = alpha), style = androidx.compose.ui.graphics.drawscope.Stroke(width = 2.dp.toPx()))
 }
 
-/** Confidence tint: dim under 50, amber under 80, crimson above. */
-private fun confColor(pct: Int): Color = when {
-    pct < 50 -> Acab.dim
-    pct < 80 -> Acab.warn
-    else -> Acab.accent
-}
-
 /** Last 4 hex of the MAC (colons stripped) for the NODE name. */
 private fun nodeName(mac: String): String {
     val hex = mac.filter { it != ':' && it != '-' }
     return hex.takeLast(4).uppercase().ifEmpty { "????" }
 }
 
+/** The identity row that carries a derived time, named once so the qualifier line under it and
+ *  the row itself can never drift apart. (APPROX_TIME and the rest of the time copy live in
+ *  Components.kt now, shared with the log rows.) */
+private const val FIRST_SEEN_LABEL = "First seen"
+
 /** Short "ago" string like "now", "12s ago", "4m ago", "1h ago", "3d ago".
- *  A dash if we don't know the time. */
-private fun relativeAgo(ms: Long?): String {
+ *  A dash if we don't know the time. (internal: the map-settings ALPR caption reuses it.) */
+internal fun relativeAgo(ms: Long?): String {
     if (ms == null) return "-"
     val secs = ((System.currentTimeMillis() - ms) / 1000).coerceAtLeast(0)
     return when {
@@ -475,5 +1063,19 @@ private fun relativeAgo(ms: Long?): String {
         secs < 3600 -> "${secs / 60}m ago"
         secs < 86_400 -> "${secs / 3600}h ago"
         else -> "${secs / 86_400}d ago"
+    }
+}
+
+/** Bare duration since a timestamp, for "seen 4× over 18m so far": "45s", "18m", "2h", "3d".
+ *  null when the first sighting time is unknown, so the caller can drop the clause. */
+private fun seenSpan(ms: Long?): String? {
+    if (ms == null) return null
+    // Floor of 1, like iOS: a fresh detection reads "over 1s", never "over 0s".
+    val secs = ((System.currentTimeMillis() - ms) / 1000).coerceAtLeast(1)
+    return when {
+        secs < 60 -> "${secs}s"
+        secs < 3600 -> "${secs / 60}m"
+        secs < 86_400 -> "${secs / 3600}h"
+        else -> "${secs / 86_400}d"
     }
 }

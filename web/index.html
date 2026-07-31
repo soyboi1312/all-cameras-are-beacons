@@ -4,8 +4,14 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>All Cameras Are Beacons · Firmware Flasher</title>
-<meta name="description" content="Browser-based firmware flasher for All Cameras Are Beacons, counter-surveillance detection for OUI-Spy and Mesh-Detect hardware.">
-<script type="module" src="https://unpkg.com/esp-web-tools@10/dist/web/install-button.js?module"></script>
+<meta name="description" content="Browser-based firmware flasher for All Cameras Are Beacons, counter-surveillance detection for the beacon board and the Colonel Panic OUI-Spy and Mesh-Detect boards.">
+<!-- esp-web-tools 10.2.1, self-hosted. Vendored from unpkg (the full ?module import graph,
+     27 JS chunks, with the ?module query stripped so each chunk resolves by plain relative
+     name); see web/vendor/esp-web-tools/. Self-hosting keeps the flasher off a third-party CDN
+     so a hijacked future unpkg publish can't inject code into the flash path. To refresh on an
+     esp-web-tools bump, re-run the vendor pull (README) and re-verify no bare/?module imports
+     remain. -->
+<script type="module" src="./vendor/esp-web-tools/install-button.js"></script>
 <style>
   :root{
     --bg:#0a0a0b; --panel:#141417; --line:#26262b; --ink:#ededf0;
@@ -29,6 +35,15 @@
   .note{margin:20px 0;border:1px solid var(--accent-dim);background:#1a0e0d;
     color:#f2c6c4;font-size:12.5px;padding:12px 14px;display:flex;gap:10px;align-items:flex-start}
   .note .x{color:var(--accent);font-weight:800}
+
+  .caution{margin:20px 0;border:1px solid #6b5410;background:#1a1405;color:#f0dca6;
+    font-size:12.5px;padding:12px 14px;display:flex;gap:10px;align-items:flex-start}
+  .caution .x{color:#e8b53a;font-weight:800}
+  .caution b{color:var(--ink)}
+  .caution ul{margin:6px 0 0;padding-left:16px;line-height:1.6;list-style:disc}
+  .disclaimer{margin:18px 0 0;font-size:11px;line-height:1.55;color:var(--dim);
+    border-top:1px solid var(--line);padding-top:12px}
+  .disclaimer b{color:var(--ink)}
 
   .grid{display:grid;grid-template-columns:1fr 1fr;gap:16px;margin-top:22px}
   @media(max-width:680px){.grid{grid-template-columns:1fr}.mark{font-size:34px;letter-spacing:6px}}
@@ -131,7 +146,7 @@
     <h3><span>!</span> Erasing will unpair Bluetooth</h3>
     <p>Erase wipes the board's stored Bluetooth bond. If this device was paired with your
       phone (the <b>All Cameras Are Beacons</b> app), you'll need to <b>remove the existing pairing</b> in
-      your phone's Bluetooth settings and pair again — otherwise the app won't reconnect.
+      your phone's Bluetooth settings and pair again, otherwise the app won't reconnect.
       A normal flash without erase keeps the pairing.</p>
     <div class="ed-act"><button id="eraseDialogOk" type="button" autofocus>Got it</button></div>
   </div>
@@ -142,7 +157,7 @@
   <header>
     <div class="mark"><b>A</b>C<b>A</b>B</div>
     <div class="expand">All&nbsp;Cameras&nbsp;Are&nbsp;Beacons</div>
-    <p class="lede">Counter-surveillance detection firmware for the
+    <p class="lede">Counter-surveillance detection firmware for the <b>beacon board</b> and the
       <a href="https://colonelpanic.tech/" target="_blank" rel="noopener">Colonel Panic
       <b>OUI-Spy</b> and <b>Mesh-Detect</b></a> boards (XIAO ESP32-S3). Plug the board
       into USB, pick a build, and flash it from this page. No toolchain is required.</p>
@@ -158,19 +173,19 @@
 
   <div class="grid">
     <div class="card">
-      <h2>OUI-Spy <span class="tag">APP</span></h2>
-      <p>An app-controlled scanner that streams detections to the All Cameras Are Beacons iOS app over BLE
-         and beeps a distinct tone for each target class.</p>
+      <h2>beacon firmware <span class="tag">APP</span></h2>
+      <p>An app-controlled scanner that streams detections to the All Cameras Are Beacons phone apps (iPhone and Android) over BLE
+         and beeps a distinct tone for each target class. Runs on the beacon board and on the Colonel Panic OUI-Spy (XIAO ESP32-S3).</p>
       <ul>
         <li>BLE + WiFi scanning</li>
         <li>ACAB GATT service</li>
         <li>buzzer / LED alerts</li>
       </ul>
-      <p class="steps">The board pairs with the <b>All Cameras Are Beacons</b> iPhone app for live detections
-         and controls. Get it free on TestFlight via the
-         <a href="https://github.com/soyboi1312/all-cameras-are-beacons#the-phone-app" target="_blank" rel="noopener">README</a>.</p>
+      <p class="steps">The board pairs with the <b>All Cameras Are Beacons</b> iPhone and Android apps for live detections
+         and controls. Get the iPhone beta free on TestFlight via the
+         <a href="https://github.com/soyboi1312/all-cameras-are-beacons#the-phone-apps" target="_blank" rel="noopener">README</a>.</p>
       <esp-web-install-button manifest="./manifest-oui-spy.json">
-        <button class="btn" slot="activate">FLASH OUI-SPY</button>
+        <button class="btn" slot="activate">FLASH FIRMWARE</button>
         <span slot="unsupported" class="unsupported">Browser not supported. Use Chrome or Edge.</span>
         <span slot="not-allowed" class="not-allowed">Must be served over HTTPS or localhost.</span>
       </esp-web-install-button>
@@ -207,6 +222,15 @@
     </div>
   </div>
 
+  <div class="caution">
+    <span class="x">!</span>
+    <span><b>Don't interrupt a flash.</b> Flash on a stable internet connection and leave the
+      board plugged in until it says done. Don't unplug it, power it off, or let your computer
+      sleep mid-flash. The firmware streams as it writes, so a dropped connection or a pulled
+      cable can leave the board half-written and unable to boot until you simply run the flasher
+      again.</span>
+  </div>
+
   <div class="targets">
     <h3>What it detects</h3>
     <div class="tline"><span class="n">Flock camera</span><span class="r">Flock Safety ALPR · BLE + WiFi</span><span class="s">ready</span></div>
@@ -214,14 +238,26 @@
     <div class="tline"><span class="n">Drone</span><span class="r">FAA Remote ID · BLE + WiFi</span><span class="s">ready</span></div>
     <div class="tline"><span class="n">Axon body camera</span><span class="r">Axon Enterprise · BLE</span><span class="s">ready</span></div>
     <div class="tline"><span class="n">Item tracker</span><span class="r">AirTag · Tile · SmartTag · BLE</span><span class="s opt">opt-in</span></div>
+    <div class="tline"><span class="n">Smart glasses</span><span class="r">Ray-Ban / Oakley Meta · Snap · Vuzix · BLE</span><span class="s">ready</span></div>
   </div>
 
   <footer>
-    <span>All Cameras Are Beacons v1.7</span>
+    <span>All Cameras Are Beacons v2.0.0</span>
     <a href="https://github.com/soyboi1312/all-cameras-are-beacons" id="repoLink">source</a>
     <span style="flex:1"></span>
     <span class="steps">After flashing: open a serial monitor at <code>115200</code> to watch detections.</span>
   </footer>
+
+  <p class="disclaimer">Flashing is at your own risk. This firmware is open source and provided
+    <b>as is, without warranty of any kind</b>; you are responsible for how you flash your board
+    and for the outcome. We can't be liable for a device that stops working, data loss, or any
+    recovery needed after a flash, especially one interrupted by an unstable connection or an
+    unplugged cable. An interrupted flash is almost always fixable by running the flasher again
+    on a stable connection.</p>
+
+  <p class="disclaimer">All Cameras Are Beacons is an independent project and is not affiliated with,
+    endorsed by, or sponsored by <b>Colonel Panic</b>. <b>OUI-Spy</b> and <b>Mesh-Detect</b> are
+    Colonel Panic's product names, used here only to identify compatible hardware.</p>
 
 </div>
 

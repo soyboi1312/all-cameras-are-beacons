@@ -6,7 +6,7 @@ import SwiftUI
 struct BrandMark: View {
     var size: CGFloat = 20
     var body: some View {
-        Text("Beacons")
+        Text("beacons")
             .font(ACABTheme.display(size, weight: .bold))
             .foregroundStyle(ACABTheme.text)
     }
@@ -17,7 +17,7 @@ struct ACABWordmark: View {
     var subtitle: String? = "ALL CAMERAS ARE BEACONS"
     var body: some View {
         VStack(spacing: 8) {
-            Text("Beacons")
+            Text("beacons")
                 .font(ACABTheme.display(46, weight: .bold))
                 .foregroundStyle(ACABTheme.text)
             if let subtitle { Kicker(subtitle, color: ACABTheme.faint) }
@@ -27,17 +27,21 @@ struct ACABWordmark: View {
 
 /// The board status pill: crimson dot + glow when connected, amber "DEMO" in sample-data mode.
 struct LinkChip: View {
-    var label: String = "ESP32"
+    var version: String? = nil
     var connected: Bool
     var demo: Bool = false
     var body: some View {
         let tone = demo ? ACABTheme.warn : (connected ? ACABTheme.accent : ACABTheme.faint)
+        // dot + CONNECTED / OFFLINE / DEMO, matching the Android LinkChip. The firmware
+        // version lives on the Device screen's firmware row; repeating it in the header chip
+        // was noise on a pill the user reads as "is my board there or not".
+        let label = demo ? "DEMO" : connected ? "CONNECTED" : "OFFLINE"
         return HStack(spacing: 6) {
             Circle().fill(tone)
                 .frame(width: 7, height: 7)
                 .shadow(color: demo ? ACABTheme.warn.opacity(0.6)
                                     : (connected ? ACABTheme.accentGlow : .clear), radius: 4)
-            Kicker(demo ? "DEMO" : label,
+            Kicker(label,
                    color: demo ? ACABTheme.warn : (connected ? ACABTheme.dim : ACABTheme.faint))
         }
         .padding(.horizontal, 11).padding(.vertical, 7)
@@ -110,7 +114,9 @@ struct RadarDot: Identifiable {
 struct RadarScope: View {
     let count: Int
     let dots: [RadarDot]
-    @State private var sweep = 0.0
+    /// False parks the beam. A scope that keeps sweeping with the radios off (or the nRF
+    /// dark) reads as scanning when nothing is.
+    var sweeping: Bool = true
 
     var body: some View {
         GeometryReader { geo in
@@ -127,16 +133,7 @@ struct RadarScope: View {
                 }
                 .stroke(ACABTheme.line, lineWidth: 1)
 
-                // rotating angular gradient fakes a radar sweep beam
-                Circle()
-                    .fill(AngularGradient(gradient: Gradient(stops: [
-                        .init(color: ACABTheme.accent.opacity(0.0),  location: 0.72),
-                        .init(color: ACABTheme.accent.opacity(0.40), location: 0.99),
-                        .init(color: ACABTheme.accent.opacity(0.0),  location: 1.0),
-                    ]), center: .center))
-                    .frame(width: s, height: s)
-                    .rotationEffect(.degrees(sweep))
-                    .blendMode(.screen)
+                if sweeping { SweepBeam(size: s) }
 
                 ForEach(dots) { dot in
                     Circle().fill(dot.tone)
@@ -151,15 +148,37 @@ struct RadarScope: View {
                         .font(ACABTheme.display(62, weight: .bold))
                         .foregroundStyle(ACABTheme.text)
                         .monospacedDigit()
-                    Kicker("DEVICES NEARBY")
+                    // "ACTIVE" is load-bearing: this count is filtered to recently-seen
+                    // devices, so it reads lower than the Log's whole-session total. Saying
+                    // "active" tells the user why Status < Log instead of looking like a bug.
+                    Kicker("ACTIVE NEARBY")
                 }
             }
             .frame(width: s, height: s)
             .frame(maxWidth: .infinity)
+        }
+    }
+}
+
+/// The rotating angular gradient that fakes a radar sweep beam. Its own view so the
+/// repeatForever animation lives and dies with it: parking the beam by removing the view
+/// stops the animation, and re-adding it restarts from onAppear.
+private struct SweepBeam: View {
+    let size: CGFloat
+    @State private var sweep = 0.0
+    var body: some View {
+        Circle()
+            .fill(AngularGradient(gradient: Gradient(stops: [
+                .init(color: ACABTheme.accent.opacity(0.0),  location: 0.72),
+                .init(color: ACABTheme.accent.opacity(0.40), location: 0.99),
+                .init(color: ACABTheme.accent.opacity(0.0),  location: 1.0),
+            ]), center: .center))
+            .frame(width: size, height: size)
+            .rotationEffect(.degrees(sweep))
+            .blendMode(.screen)
             .onAppear {
                 withAnimation(.linear(duration: 4.5).repeatForever(autoreverses: false)) { sweep = 360 }
             }
-        }
     }
 }
 
@@ -220,7 +239,7 @@ struct Sparkline: View {
 }
 
 extension Detection {
-    /// Last 4 hex of the MAC, uppercased — a short "node" handle.
+    /// Last 4 hex of the MAC, uppercased, a short "node" handle.
     var nodeName: String {
         String(mac.replacingOccurrences(of: ":", with: "").suffix(4)).uppercased()
     }
@@ -232,6 +251,10 @@ extension Detection {
         case .axonBodyCam:              return "Axon (unverified)"
         case .tracker:                  return "Item tracker"
         case .nearbyDevice:             return "Nearby device"
+        case .watched:                  return "Watched device"
+        case .recordingGlasses:         return "Camera glasses"
+        case .networkCamera:            return "Network camera"
+        case .unknown:                  return "Unknown device"   // future wire type this build can't name (Android's UNKNOWN parity)
         }
     }
     /// Short category label for the badge pill.
@@ -243,40 +266,61 @@ extension Detection {
         case .axonBodyCam: return "BODY CAMERA"
         case .tracker:     return "ITEM TRACKER"
         case .nearbyDevice:return "DEVICE"
+        case .watched:     return "STARRED"
+        case .recordingGlasses: return "SMART GLASSES"
+        case .networkCamera: return "NETWORK CAMERA"
+        case .unknown:     return "UNKNOWN"
         }
     }
 }
 
 // MARK: - Small reused bits
 
-struct Tag: View {
-    let text: String
-    var color: Color = ACABTheme.dim
+/// The one EXP tag for experimental detectors: tinted amber, matching on both platforms.
+/// Amber text on amber 14% fill with an amber 40% border, radius 4.
+struct ExpTag: View {
     var body: some View {
-        Text(text)
+        Text("EXP")
             .font(ACABTheme.mono(9, weight: .bold)).tracking(1)
-            .foregroundStyle(ACABTheme.onAccent)
+            .foregroundStyle(ACABTheme.warn)
             .padding(.horizontal, 5).padding(.vertical, 2)
-            .background(color, in: RoundedRectangle(cornerRadius: 4))
+            .background(ACABTheme.warn.opacity(0.14), in: RoundedRectangle(cornerRadius: 4))
+            .overlay(RoundedRectangle(cornerRadius: 4).strokeBorder(ACABTheme.warn.opacity(0.4), lineWidth: 1))
     }
 }
 
-/// Inline confidence %, colored by how high it is (dim / amber / crimson).
-struct ConfidenceBadge: View {
-    let value: Int
-    var experimental: Bool = false
+/// Marks a log row that was captured by the board while the phone was away and filed on
+/// reconnect. Same badge geometry as ExpTag, but a muted/neutral tone so it reads as
+/// metadata, not an alert.
+struct OfflineTag: View {
     var body: some View {
-        HStack(spacing: 4) {
-            if experimental { Image(systemName: "exclamationmark.triangle.fill").font(.system(size: 9)) }
-            Text("\(value)%").font(ACABTheme.mono(11, weight: .semibold))
-        }
-        .foregroundStyle(experimental ? ACABTheme.warn : color)
+        MetaTag("OFFLINE")
     }
-    private var color: Color {
-        switch value {
-        case ..<50: return ACABTheme.dim
-        case ..<80: return ACABTheme.warn
-        default:    return ACABTheme.accent
-        }
+}
+
+/// Says how a row's timestamp was arrived at, in the one word a dense list has room for:
+/// RECON for a time the board reconstructed from uptime, RANGE for one we could only bound,
+/// NO TIME for one we could not date at all. Nothing for a live row, which needs no caveat.
+/// Deliberately the same badge as OFFLINE and EXP rather than a new visual language: this is
+/// metadata about the row, in the same register as the other two.
+struct TimeBasisTag: View {
+    let basis: TimeBasis
+    var body: some View {
+        if let text = TimeBasisCopy.tag(for: basis) { MetaTag(text) }
+    }
+}
+
+/// The shared badge geometry behind OfflineTag and TimeBasisTag: ExpTag's shape in a muted
+/// tone, so a row's metadata chips line up instead of each inventing their own padding.
+private struct MetaTag: View {
+    let text: String
+    init(_ text: String) { self.text = text }
+    var body: some View {
+        Text(text)
+            .font(ACABTheme.mono(9, weight: .bold)).tracking(1)
+            .foregroundStyle(ACABTheme.dim)
+            .padding(.horizontal, 5).padding(.vertical, 2)
+            .background(ACABTheme.faint.opacity(0.12), in: RoundedRectangle(cornerRadius: 4))
+            .overlay(RoundedRectangle(cornerRadius: 4).strokeBorder(ACABTheme.line, lineWidth: 1))
     }
 }

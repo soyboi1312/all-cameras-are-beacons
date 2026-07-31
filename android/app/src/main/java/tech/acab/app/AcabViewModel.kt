@@ -9,6 +9,7 @@ import android.location.LocationManager
 import android.os.Bundle
 import androidx.lifecycle.AndroidViewModel
 import tech.acab.app.ble.AcabBleManager
+import tech.acab.app.net.FirmwareManifest
 
 /** Keeps the BLE manager alive across config changes (so the connection survives),
  *  and feeds it the phone's location for geotagging non-drone detections. */
@@ -16,6 +17,10 @@ class AcabViewModel(app: Application) : AndroidViewModel(app) {
     // Process singleton, so the Drive-mode foreground service and this ViewModel share one
     // link (the service keeps it alive when the app is backgrounded mid-drive).
     val ble = AcabBleManager.getInstance(app)
+
+    // The firmware manifest drives the "update available" nudge and the in-app OTA gate.
+    // Kick a background refresh on launch; it's non-blocking and no-ops if the cache is fresh.
+    val firmware = FirmwareManifest.getInstance(app).also { it.refresh() }
 
     private val locationManager =
         app.getSystemService(Context.LOCATION_SERVICE) as LocationManager

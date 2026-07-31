@@ -26,9 +26,17 @@ enum AcabDeviceType : uint8_t {
     ACAB_AXON_BODYCAM  = 3,   // body-worn camera (Axon 00:25:DF signature, field-validated)
     ACAB_DRONE         = 4,   // FAA Remote ID broadcasting UAS
     ACAB_TRACKER       = 5,   // BLE item tracker (AirTag/Find My, Tile, Samsung SmartTag)
-    ACAB_POLICE_GEAR   = 6,   // Motorola Solutions WiFi/BLE device (LE-equipment proxy; OUI match)
+    // 6 retired: was a Motorola/LE-equipment proxy type. Those OUI matches now report as
+    // ACAB_AXON_BODYCAM (folded into the body-cam category), so no detector emits 6. The
+    // value stays a reserved gap so ACAB_NEARBY_DEVICE / ACAB_WATCHED keep their wire
+    // numbering (the BLE t= field) stable and nothing renumbers.
     ACAB_NEARBY_DEVICE = 7,   // Desert mode: any device in range (no specific signature)
-    ACAB_TYPE_COUNT    = 8
+    ACAB_WATCHED       = 8,   // user-starred device: alert on this exact MAC even with no signature match
+    ACAB_GLASSES       = 9,   // smart/recording glasses (Ray-Ban/Oakley Meta, Snap Spectacles, Luxottica) by BLE mfg company ID
+    ACAB_NETCAM        = 10,  // branded IP camera on host WiFi (Hikvision/Dahua/Amcrest/Axis/Reolink OUI on an 802.11
+                              // frame). OPT-IN (default off): matches known IP-camera BRANDS, NOT "hidden cameras" - it
+                              // could be an NVR/doorbell/disclosed cam, and it cannot find every camera. See netcam_detect.cpp.
+    ACAB_TYPE_COUNT    = 11
 };
 
 // How we saw it on the radio.
@@ -47,7 +55,11 @@ enum AcabMethod : uint8_t {
     M_SERVICE_UUID= 4,   // service UUID (Raven services)
     M_SSID        = 5,   // WiFi SSID pattern
     M_PROBE       = 6,   // empty-SSID probe from a known OUI
-    M_REMOTE_ID   = 7    // decoded OpenDroneID message
+    M_REMOTE_ID   = 7,   // decoded OpenDroneID message
+    M_SERVICE_DATA= 8,   // ASCII tag in service data / 128-bit UUID (e.g. Axon "BWCDEVICE") - MAC-independent
+    M_MFG_SUBTYPE = 9,   // decoded manufacturer-data subtype (structured vendor frame)
+    M_WATCHLIST   =10    // exact-MAC user rule (starred device). Full-MAC match, NOT an OUI prefix, so
+                         // the durability policy leaves it alone (only M_OUI on a random MAC is down-capped).
 };
 
 // ---------------------------------------------------------------------------
@@ -61,6 +73,7 @@ struct AcabDetection {
 
     uint8_t        mac[6];         // transmitter address
     int16_t        rssi;
+    uint16_t       companyId;      // BLE mfg-specific company ID (SIG assigned #); 0 = none / not BLE
 
     char           id[40];         // RID UAS serial / operator id
     char           name[40];       // advertised device name (if any)
@@ -84,6 +97,17 @@ struct AcabDetection {
     uint32_t       firstSeen;      // millis() we first saw it
     uint32_t       lastSeen;       // millis() we last saw it
     uint16_t       count;          // sightings this session
+
+    // True when the transmitter address is randomized / locally-administered (a BLE
+    // private address or a randomized WiFi MAC). A real IEEE OUI implies a public
+    // address, so an OUI-only match on a random address isn't trustworthy - the
+    // durability policy (acabApplyDurability) down-weights it. Set in acabInit.
+    bool           randomAddr;
+
+    // Transient routing flag: true when this is a REPLAY of a stored record (nRF
+    // black-box dump). The app-notify still fires, but the buzzer + the live dedup
+    // table / gTotal / offline buffer are all skipped. Never serialized; defaults false.
+    bool           replay;
 };
 
 // ---------------------------------------------------------------------------
@@ -96,8 +120,10 @@ static inline const char* acabTypeLabel(AcabDeviceType t) {
         case ACAB_AXON_BODYCAM: return "Body camera";
         case ACAB_DRONE:        return "Drone";
         case ACAB_TRACKER:      return "Tracker";
-        case ACAB_POLICE_GEAR:  return "Police gear";
         case ACAB_NEARBY_DEVICE:return "Nearby device";
+        case ACAB_WATCHED:      return "Watched device";
+        case ACAB_GLASSES:      return "Recording glasses";
+        case ACAB_NETCAM:       return "Network camera";
         default:                return "Unknown";
     }
 }
@@ -110,8 +136,10 @@ static inline const char* acabTypeTag(AcabDeviceType t) {
         case ACAB_AXON_BODYCAM: return "BODYCAM";
         case ACAB_DRONE:        return "DRONE";
         case ACAB_TRACKER:      return "TRACKER";
-        case ACAB_POLICE_GEAR:  return "POLICE";
         case ACAB_NEARBY_DEVICE:return "NEARBY";
+        case ACAB_WATCHED:      return "WATCHED";
+        case ACAB_GLASSES:      return "GLASSES";
+        case ACAB_NETCAM:       return "CAMERA";
         default:                return "UNK";
     }
 }
@@ -134,6 +162,9 @@ static inline const char* acabMethodLabel(AcabMethod m) {
         case M_SSID:         return "ssid";
         case M_PROBE:        return "probe";
         case M_REMOTE_ID:    return "remote-id";
+        case M_SERVICE_DATA: return "svc-data";
+        case M_MFG_SUBTYPE:  return "mfg-subtype";
+        case M_WATCHLIST:    return "watchlist";
         default:             return "none";
     }
 }
@@ -145,13 +176,45 @@ static inline void acabInit(AcabDetection* d, AcabDeviceType type, AcabSource sr
     d->type = type;
     d->src  = src;
     d->rssi = rssi;
-    if (mac) memcpy(d->mac, mac, 6);
+    if (mac) {
+        memcpy(d->mac, mac, 6);
+        d->randomAddr = (mac[0] & 0x02) != 0;   // locally-administered / randomized address bit
+    }
+}
+
+// Durability policy: an OUI-only match on a randomized / locally-administered address
+// isn't trustworthy (a real IEEE OUI implies a global public address), so cap its
+// confidence. Service-data / mfg-subtype / UUID tag matches are MAC-independent and
+// keep their confidence - so detection degrades gracefully as vendors (e.g. Axon)
+// migrate to rotating BLE MACs, instead of an OUI prefix producing false hits.
+// Applied centrally (handleDetection) so it holds for every detector.
+static inline void acabApplyDurability(AcabDetection* d) {
+    if (d->method == M_OUI && d->randomAddr && d->confidence > 25) d->confidence = 25;
 }
 
 // Format a MAC into "aa:bb:cc:dd:ee:ff". buf needs >= 18 bytes.
 static inline void acabFormatMac(const uint8_t mac[6], char* buf) {
     snprintf(buf, 18, "%02x:%02x:%02x:%02x:%02x:%02x",
              mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+}
+
+// Pull the BLE manufacturer company ID (Bluetooth SIG assigned number) out of an advert:
+// the first two bytes of the AD type 0xFF (manufacturer-specific data) block, little-endian
+// on the wire. Returns 0 when there's no manufacturer data. The ID rides in the PAYLOAD, not
+// the MAC, so it survives BLE address randomization - the same reason the glasses/tracker
+// detectors key on it. Surfacing it lets the app show/log why a device did (or didn't) match.
+static inline uint16_t acabBleCompanyId(const uint8_t* adv, size_t advLen) {
+    if (!adv) return 0;
+    for (size_t i = 0; i + 1 < advLen; ) {
+        uint8_t l = adv[i];
+        if (l == 0 || i + 1 + (size_t)l > advLen) break;
+        uint8_t t = adv[i + 1];
+        if (t == 0xFF && l >= 3) {   // mfg-specific data with at least the 2 company-ID bytes
+            return (uint16_t)adv[i + 2] | ((uint16_t)adv[i + 3] << 8);   // little-endian
+        }
+        i += (size_t)l + 1;
+    }
+    return 0;
 }
 
 // ---------------------------------------------------------------------------

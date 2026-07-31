@@ -1,3 +1,4 @@
 <resources>
-    <string name="app_name">Beacons</string>
+    <string name="app_name">beacons</string>
+    <string name="widget_description">Today\'s detections at a glance</string>
 </resources>

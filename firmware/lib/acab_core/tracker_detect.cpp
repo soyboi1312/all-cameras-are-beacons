@@ -7,9 +7,12 @@
  *     broadcast - a tag away from its owner, i.e. the stalking-relevant one. We
  *     skip the shorter "nearby" form (ambient Apple gear) so we don't flag the
  *     user's own phone / earbuds.
- *   - Tile: 16-bit service UUID 0xFEED.
- *   - Samsung SmartTag: 16-bit service UUID 0xFD5A (Samsung offline finding).
- *     Lower confidence until verified against a real tag.
+ *   - Tile: 16-bit service DATA 0xFEED (with a payload, not a bare UUID-list entry).
+ *   - Samsung SmartTag: 16-bit service DATA 0xFD5A (Samsung offline finding).
+ *   Tile/Samsung are matched ONLY as SERVICE DATA (AD 0x16) carrying a real payload, and
+ *   at a confidence BELOW Apple's - NOT yet field-validated against a real tag. A lone
+ *   0xFEED/0xFD5A in a 0x02/0x03 UUID list is trivially spoofed and collides with random
+ *   consumer gear, so that path is deliberately not matched.
  *
  * AirTags rotate their MAC, so we match on payload, never OUI.
  */
@@ -24,6 +27,9 @@
 #define APPLE_COMPANY_ID   0x004C
 #define APPLE_FINDMY_TYPE  0x12
 #define FINDMY_OFFLINE_LEN 0x19   // separated-from-owner payload length
+// Min length of a 16-bit service-DATA element (2 UUID bytes + payload) to accept a
+// Tile/Samsung finding UUID - rejects a bare/empty entry a spoofer could trivially set.
+#define TRK_MIN_SD         4
 
 static bool gEnabled = false;
 
@@ -49,12 +55,13 @@ void trackerRestoreEnabled(bool defaultEnabled) {
     p.end();
 }
 
-// Pull out what we need: manufacturer data, and any 16-bit service UUID (from
-// the UUID lists 0x02/0x03 or from service data 0x16).
+// Pull out what we need: manufacturer data, and any 16-bit SERVICE DATA (AD 0x16)
+// element with its payload length. We do NOT harvest bare 0x02/0x03 UUID-list entries
+// for trackers - a lone finding UUID there is the spoof-prone case.
 struct TrkAdv {
     uint16_t mfgId;     bool haveMfg;
     const uint8_t* mfg; uint8_t mfgLen;
-    uint16_t svc16[12]; uint8_t svcCount;
+    uint16_t sd16[12];  uint8_t sdLen[12]; uint8_t sdCount;   // 16-bit service-data UUID + element length
 };
 
 static void parseAdv(const uint8_t* adv, size_t len, TrkAdv* f) {
@@ -69,11 +76,10 @@ static void parseAdv(const uint8_t* adv, size_t len, TrkAdv* f) {
         if (adType == 0xFF && dataLen >= 2 && !f->haveMfg) {
             f->mfgId = (uint16_t)data[0] | ((uint16_t)data[1] << 8);
             f->mfg = data; f->mfgLen = dataLen; f->haveMfg = true;
-        } else if (adType == 0x02 || adType == 0x03) {        // 16-bit UUID list
-            for (uint8_t k = 0; k + 1 < dataLen && f->svcCount < 12; k += 2)
-                f->svc16[f->svcCount++] = (uint16_t)data[k] | ((uint16_t)data[k+1] << 8);
-        } else if (adType == 0x16 && dataLen >= 2 && f->svcCount < 12) {  // 16-bit service data
-            f->svc16[f->svcCount++] = (uint16_t)data[0] | ((uint16_t)data[1] << 8);
+        } else if (adType == 0x16 && dataLen >= 2 && f->sdCount < 12) {  // 16-bit service data (UUID + payload)
+            f->sd16[f->sdCount]  = (uint16_t)data[0] | ((uint16_t)data[1] << 8);
+            f->sdLen[f->sdCount] = dataLen;   // includes the 2 UUID bytes
+            f->sdCount++;
         }
         i += 1 + adLen;
     }
@@ -99,11 +105,15 @@ bool trackerClassifyBLE(const uint8_t mac[6], const uint8_t* adv, size_t advLen,
         f.mfg[2] == APPLE_FINDMY_TYPE && f.mfg[3] == FINDMY_OFFLINE_LEN)
         return emit(out, mac, rssi, M_MFG_ID, 85, "Apple Find My (offline)");
 
-    for (uint8_t i = 0; i < f.svcCount; i++) {
-        if (f.svc16[i] == TILE_SVC)
-            return emit(out, mac, rssi, M_SERVICE_UUID, 88, "Tile");
-        if (f.svc16[i] == SAMSUNG_SMARTTAG)
-            return emit(out, mac, rssi, M_SERVICE_UUID, 75, "Samsung SmartTag");
+    // Tile / Samsung SmartTag - require the finding UUID to arrive as SERVICE DATA with a
+    // real payload (not a bare UUID-list entry), and keep confidence below Apple's until a
+    // real tag is validated in the field. See the header note.
+    for (uint8_t i = 0; i < f.sdCount; i++) {
+        if (f.sdLen[i] < TRK_MIN_SD) continue;
+        if (f.sd16[i] == TILE_SVC)
+            return emit(out, mac, rssi, M_SERVICE_DATA, 65, "Tile");
+        if (f.sd16[i] == SAMSUNG_SMARTTAG)
+            return emit(out, mac, rssi, M_SERVICE_DATA, 60, "Samsung SmartTag");
     }
     return false;
 }

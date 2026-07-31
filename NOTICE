@@ -4,8 +4,26 @@ Copyright 2026 soyboi
 This product includes software from the OpenDroneID project
 (opendroneid-core-c), licensed under the Apache License, Version 2.0.
 That component's license is retained alongside its source at
-firmware/lib/acab_core/opendroneid/LICENSE.
+firmware/lib/acab_core/opendroneid/LICENSE (a second copy, used by the
+host-side simulator, lives at firmware/src/odid-sim/ and carries SPDX
+Apache-2.0 headers in each file).
+
+The firmware binaries also include three permissively-licensed libraries linked
+at build time:
+  - NimBLE-Arduino (h2zero) - Apache License, Version 2.0
+  - ArduinoJson (Benoit Blanchon) - MIT License
+  - Adafruit SPIFlash - MIT License
+
+The web flasher (web/) redistributes the compiled ESP Web Tools bundle
+(esphome/esp-web-tools), licensed under the Apache License, Version 2.0. The
+bundle also compiles in Lit (BSD 3-Clause), Material Web (Apache-2.0),
+esptool-js (Apache-2.0), and the Improv WiFi SDK (Apache-2.0). The license
+text is retained alongside the bundle at web/vendor/esp-web-tools/LICENSE.
 
 This project runs on Colonel Panic's OUI-Spy hardware. Earlier releases ported
 detection code from oui-spy; the signatures have since been re-sourced from public
 registries and the classifiers re-derived from public standards. See CREDITS.md.
+
+All Cameras Are Beacons is an independent project and is not affiliated with,
+endorsed by, or sponsored by Colonel Panic. "OUI-Spy" and "Mesh-Detect" are Colonel
+Panic's product names, used here only to identify compatible hardware.

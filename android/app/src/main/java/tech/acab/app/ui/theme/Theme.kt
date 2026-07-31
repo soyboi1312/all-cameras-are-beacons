@@ -8,7 +8,7 @@ import androidx.compose.ui.unit.dp
 import tech.acab.app.R
 import tech.acab.app.model.DeviceType
 
-/** Display face (Space Grotesk) and data face (JetBrains Mono) — the same TTFs the
+/** Display face (Space Grotesk) and data face (JetBrains Mono), the same TTFs the
  *  iOS app bundles. Space Grotesk only ships three weights, so SemiBold reuses Bold. */
 val SpaceGrotesk = FontFamily(
     Font(R.font.space_grotesk_regular, FontWeight.Normal),
@@ -29,7 +29,7 @@ object Acab {
     val bg = Color(0xFF0C0A0B)
     val bg2 = Color(0xFF161214)
     val bg3 = Color(0xFF201A1D)
-    val line = Color(0x1FEC968C)        // rgb(236,150,140) @ ~11%
+    val line = Color(0x1CEC968C)        // rgb(236,150,140) @ 11%, matches iOS
     val lineStrong = Color(0x4DEE4034)  // crimson @ 30%
 
     val text = Color(0xFFF4EEF0)
@@ -45,14 +45,17 @@ object Acab {
     val droneTone = Color(0xFFF2B53C)
     val bodyCamTone = Color(0xFFCDC1C3)
     val trackerTone = Color(0xFF49C5B1)
-    val policeTone = Color(0xFF4F7FFF)
+    val glassesTone = Color(0xFFB07CFF)     // violet, matches iOS glassesTone
+    val watchTone = Color(0xFFE0A84B)       // gold, user-starred (watched) devices, matches iOS
+    val netcamTone = Color(0xFF3D8BFF)      // blue, network cameras (IP-camera OUI on wifi), distinct from the teal tracker + violet glasses, matches iOS
 
     val display = SpaceGrotesk          // default non-mono face
     val mono = JetBrainsMono            // data and label face
 
     val radius = 18.dp
     val radiusSm = 12.dp
-    val pad = 16.dp
+    val pad = 20.dp         // screen insets, matches the iOS 20pt spec
+    val padCard = 16.dp     // card interiors keep the tighter padding
 }
 
 /** The tone color for a detection type. */
@@ -61,7 +64,9 @@ fun DeviceType.tone(): Color = when (this) {
     DeviceType.DRONE -> Acab.droneTone
     DeviceType.BODY_CAM -> Acab.bodyCamTone
     DeviceType.TRACKER -> Acab.trackerTone
-    DeviceType.POLICE_GEAR -> Acab.policeTone
+    DeviceType.GLASSES -> Acab.glassesTone
     DeviceType.NEARBY_DEVICE -> Color(0xFFD1AB66)   // desert sand
+    DeviceType.WATCHED -> Acab.watchTone            // gold star, the user's own rule
+    DeviceType.NETWORK_CAMERA -> Acab.netcamTone    // blue, IP camera on wifi
     DeviceType.UNKNOWN -> Acab.dim
 }

@@ -10,7 +10,7 @@ extension Color {
     }
 }
 
-/// ACAB's look — the "Crimson" cyber-noir theme. Dark surfaces, one crimson accent,
+/// ACAB's look, the "Crimson" cyber-noir theme. Dark surfaces, one crimson accent,
 /// amber kept for drones.
 enum ACABTheme {
     // Surfaces
@@ -38,8 +38,11 @@ enum ACABTheme {
     static let droneTone = Color(hex: 0xF2B53C)
     static let axonTone  = Color(hex: 0xCDC1C3)
     static let trackerTone = Color(hex: 0x49C5B1)     // teal - BLE item trackers
+    static let watchTone   = Color(hex: 0xE0A84B)     // gold - user-starred (watched) devices
+    static let glassesTone = Color(hex: 0xB07CFF)     // violet - smart / recording glasses
+    static let netcamTone  = Color(hex: 0x3D8BFF)     // blue - branded IP / network cameras on WiFi
 
-    // Back-compat aliases — older views still reference these names.
+    // Back-compat aliases, older views still reference these names.
     static let black  = bg
     static let panel  = bg2
     static let ink    = text
@@ -103,6 +106,9 @@ extension View {
 }
 
 /// Small all-caps mono label ("kicker") for section headers and data captions.
+/// Deliberately NOT lowercased at the component: the caps + 1.6 tracking is what separates
+/// instrument chrome (labels) from content (device names, prose), and collapsing the two
+/// type roles into one flattens the whole screen.
 struct Kicker: View {
     let text: String
     var color: Color = ACABTheme.faint

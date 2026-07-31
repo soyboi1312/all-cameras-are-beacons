@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Cleartext traffic is refused app-wide: the manifest fetch and firmware image download
+     are both https-only, and the OTA download path also guards the URL scheme in code. -->
+<network-security-config>
+    <base-config cleartextTrafficPermitted="false" />
+</network-security-config>

@@ -32,7 +32,7 @@ struct ToggleDriveModeIntent: SetValueIntent {
         let running = Activity<DetectionActivityAttributes>.activities
         if value {
             if running.isEmpty {
-                let attrs = DetectionActivityAttributes(deviceName: "Beacons", sessionStart: .now)
+                let attrs = DetectionActivityAttributes(deviceName: "beacons", sessionStart: .now)
                 let content = ActivityContent(state: DetectionActivityAttributes.ContentState.empty,
                                               staleDate: Date().addingTimeInterval(8 * 60))
                 _ = try? Activity.request(attributes: attrs, content: content, pushType: nil)

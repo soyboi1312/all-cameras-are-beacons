@@ -24,8 +24,8 @@ android {
         applicationId = "tech.acab.app"
         minSdk = 26
         targetSdk = 35
-        versionCode = 16
-        versionName = "1.7"
+        versionCode = 17
+        versionName = "2.0.0"
     }
 
     signingConfigs {
@@ -41,7 +41,12 @@ android {
 
     buildTypes {
         release {
-            isMinifyEnabled = false
+            // R8 + resource shrink: Compose relies on R8 to finish its lambda/singleton
+            // optimizations (unminified release Compose is measurably jankier), and
+            // material-icons-extended is only shippable shrunk.
+            isMinifyEnabled = true
+            isShrinkResources = true
+            proguardFiles(getDefaultProguardFile("proguard-android-optimize.txt"), "proguard-rules.pro")
             // Signed only when the ACAB_* signing material is present.
             if (acabStoreFile != null) {
                 signingConfig = signingConfigs.getByName("release")
@@ -65,6 +70,13 @@ dependencies {
     implementation(composeBom)
 
     implementation("androidx.core:core-ktx:1.17.0")   // 1.17+ carries the Live Update promote APIs
+
+    // Nordic legacy-DFU client, for updating the nRF52840 co-processor over BLE. The nRF runs the
+    // Adafruit/Seeed bootloader, which speaks LEGACY Nordic DFU (service 0x1530), not secure DFU.
+    // BSD-3, so it stays F-Droid-clean.
+    implementation("no.nordicsemi.android:dfu:2.5.0")
+    // The DFU library's abort is driven over a local broadcast (DfuBaseService.BROADCAST_ACTION).
+    implementation("androidx.localbroadcastmanager:localbroadcastmanager:1.1.0")
     implementation("androidx.lifecycle:lifecycle-runtime-ktx:2.8.7")
     implementation("androidx.lifecycle:lifecycle-viewmodel-compose:2.8.7")
     implementation("androidx.activity:activity-compose:1.9.3")

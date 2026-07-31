@@ -7,16 +7,71 @@
  * signature value here - the BLE Service-Data UUID 0xFFFA and app code 0x0D, the
  * WiFi NAN multicast destination, the beacon vendor OUIs - is published in the
  * standard, not taken from anyone's firmware. See docs/signatures.md.
+ *
+ * FIELD-VALIDATED 2026-07-23 (San Diego), first real confirmation of this path end to end.
+ * A live airborne DJI returned a fully-populated ODID record over 216 sightings: UAS ID
+ * 1581F3YT7MC5003T0Z10, aircraft position, altitude 48m, height-AGL 34m, heading 216,
+ * operator position, and rid_status "Airborne". Confidence 99, matched_on "Remote ID".
+ * So the whole chain decodes correctly on real hardware, including the OPERATOR location,
+ * which is the part that had never been seen against a real flight before.
+ *
+ * NOTE WHAT THIS DOES NOT VALIDATE: the match fired on the ODID broadcast, NOT on the OUI
+ * table below. The aircraft's MAC did sit in the DJI block 60:60:1F, which corroborates that
+ * that entry names real DJI hardware, but it says nothing about the OUI path's FALSE-positive
+ * rate (DJI controllers, goggles and phones share those blocks and are not aircraft). The
+ * droneOui fallback therefore stays opt-in and default-off.
  */
 #include "drone_detect.h"
 #include "drone_signatures.h"
+#include "desert_detect.h"   // Desert mode forces classification even when toggled off
+#include "acab_scanner.h"    // acabSanitizeAscii: clamp attacker-sourced strings on ingest
 #include <Arduino.h>
+#include <Preferences.h>     // persist the drone toggle across reboots (NVS)
 #include <string.h>
 #include <stdio.h>
 
 extern "C" {
 #include "opendroneid/opendroneid.h"
 #include "opendroneid/odid_wifi.h"
+}
+
+// Master on/off (default ON). NVS-backed so an app-set drone toggle survives a
+// reboot (mirrors axon/tracker/glasses).
+static bool gEnabled = true;
+void droneSetEnabled(bool enabled) {
+    if (enabled == gEnabled) return;
+    gEnabled = enabled;
+    Preferences p; p.begin("acab-drone", false); p.putBool("on", enabled); p.end();
+}
+bool droneIsEnabled() { return gEnabled; }
+
+// Reload the persisted toggle on boot; if none saved yet, use defaultEnabled.
+void droneRestoreEnabled(bool defaultEnabled) {
+    Preferences p; p.begin("acab-drone", true);
+    gEnabled = p.getBool("on", defaultEnabled);
+    p.end();
+}
+
+// Vendor-OUI fallback opt-in (default OFF). The OUI fallback below cannot tell a
+// flying drone from a stationary gadget that happens to share a drone vendor's
+// IEEE block (e.g. a Parrot device sitting on a shelf), so it permanently
+// mislabels such a device a drone. Keep it off unless the user explicitly opts in.
+// NVS-backed in the same "acab-drone" namespace (key "oui") so the choice survives
+// a reboot - mirrors the master toggle and axon's persistence.
+static bool gEnabledOui = false;
+void droneOuiSetEnabled(bool enabled) {
+    if (enabled == gEnabledOui) return;
+    gEnabledOui = enabled;
+    Preferences p; p.begin("acab-drone", false); p.putBool("oui", enabled); p.end();
+}
+bool droneOuiIsEnabled() { return gEnabledOui; }
+
+// Reload the persisted OUI-fallback opt-in on boot; if none saved yet, use
+// defaultEnabled (callers pass false so the fallback stays off by default).
+void droneOuiRestoreEnabled(bool defaultEnabled) {
+    Preferences p; p.begin("acab-drone", true);
+    gEnabledOui = p.getBool("oui", defaultEnabled);
+    p.end();
 }
 
 // ---------------------------------------------------------------------------
@@ -93,12 +148,12 @@ static bool fillFromODID(const ODID_UAS_Data* uas, const uint8_t mac[6],
     // Pull this frame's fields out before locking - keep string work off the lock.
     char frameId[ODID_ID_SIZE + 1] = {0};
     if (uas->BasicIDValid[0])
-        strncpy(frameId, (const char*)uas->BasicID[0].UASID, ODID_ID_SIZE);
+        acabSanitizeAscii(frameId, (const uint8_t*)uas->BasicID[0].UASID, ODID_ID_SIZE, sizeof(frameId));   // clamp UAS-ID on ingest
 
     char opDetail[48] = {0};
     if (uas->OperatorIDValid) {
         char op[ODID_ID_SIZE + 1] = {0};
-        strncpy(op, (const char*)uas->OperatorID.OperatorId, ODID_ID_SIZE);
+        acabSanitizeAscii(op, (const uint8_t*)uas->OperatorID.OperatorId, ODID_ID_SIZE, sizeof(op));   // clamp operator id on ingest
         snprintf(opDetail, sizeof(opDetail), "op %s", op);
     }
 
@@ -113,8 +168,14 @@ static bool fillFromODID(const ODID_UAS_Data* uas, const uint8_t mac[6],
     t->lastSeen = now;
     if (frameId[0]) { strncpy(t->uasId, frameId, ODID_ID_SIZE); t->uasId[ODID_ID_SIZE] = 0; }
     if (uas->LocationValid) {
-        t->lat = uas->Location.Latitude;  t->lon = uas->Location.Longitude;
-        t->alt = (int32_t)uas->Location.AltitudeGeo;  t->haveLoc = true;
+        // Reject out-of-range coords before they reach the wire / raw log: the ODID decoder maps a
+        // garbage int32 to as much as +/-214 deg, and a bogus pin freezes the app map (MapKit /
+        // osmdroid spin on a non-finite Mercator projection). Keep the last good fix if this one is junk.
+        if (uas->Location.Latitude  >= -90.0  && uas->Location.Latitude  <= 90.0 &&
+            uas->Location.Longitude >= -180.0 && uas->Location.Longitude <= 180.0) {
+            t->lat = uas->Location.Latitude;  t->lon = uas->Location.Longitude;
+            t->alt = (int32_t)uas->Location.AltitudeGeo;  t->haveLoc = true;
+        }
         // flight telemetry - skip ODID's "invalid / no value" sentinels
         if (uas->Location.SpeedHorizontal < 255.0f)  t->speedH    = uas->Location.SpeedHorizontal;
         if (uas->Location.SpeedVertical   < 63.0f)   t->speedV    = uas->Location.SpeedVertical;
@@ -122,7 +183,9 @@ static bool fillFromODID(const ODID_UAS_Data* uas, const uint8_t mac[6],
         if (uas->Location.Height          > -1000.0f) t->heightAGL = uas->Location.Height;
         t->ridStatus = (uint8_t)uas->Location.Status;
     }
-    if (uas->SystemValid) {
+    if (uas->SystemValid &&
+        uas->System.OperatorLatitude  >= -90.0  && uas->System.OperatorLatitude  <= 90.0 &&
+        uas->System.OperatorLongitude >= -180.0 && uas->System.OperatorLongitude <= 180.0) {
         t->pilotLat = uas->System.OperatorLatitude;
         t->pilotLon = uas->System.OperatorLongitude;  t->haveOp = true;
         if (uas->System.OperatorAltitudeGeo > -1000.0f) t->pilotAlt = (int32_t)uas->System.OperatorAltitudeGeo;
@@ -146,19 +209,21 @@ static bool fillFromODID(const ODID_UAS_Data* uas, const uint8_t mac[6],
 // broadcasting Remote ID can still show its hand via its MAC OUI (one of the drone
 // vendor's own IEEE blocks) - a weak "vendor gear nearby" signal (controller / goggles
 // / the aircraft), so it only fires when the RID decode found nothing. drone_signatures.h.
-static bool droneVendorOui(const uint8_t mac[6]) {
-    for (size_t i = 0; i < DRONE_DJI_OUI_COUNT; i++)
-        if (mac[0] == DRONE_DJI_OUI[i][0] && mac[1] == DRONE_DJI_OUI[i][1] &&
-            mac[2] == DRONE_DJI_OUI[i][2]) return true;
-    return false;
+// Returns the vendor label on a hit, or nullptr when no OUI matched.
+static const char* droneVendorOui(const uint8_t mac[6]) {
+    if (mac[0] & 0x02) return nullptr; // skip randomized / locally-administered MACs (no real OUI), like flock/police
+    for (size_t i = 0; i < DRONE_VENDOR_OUI_COUNT; i++)
+        if (mac[0] == DRONE_VENDOR_OUI[i].oui[0] && mac[1] == DRONE_VENDOR_OUI[i].oui[1] &&
+            mac[2] == DRONE_VENDOR_OUI[i].oui[2]) return DRONE_VENDOR_OUI[i].vendor;
+    return nullptr;
 }
 
 static bool emitVendorOui(const uint8_t mac[6], int rssi, AcabSource src,
-                          AcabDetection* out) {
+                          const char* vendor, AcabDetection* out) {
     acabInit(out, ACAB_DRONE, src, mac, (int16_t)rssi);
     out->method     = M_OUI;
     out->confidence = DRONE_OUI_CONFIDENCE;
-    snprintf(out->detail, sizeof(out->detail), "DJI gear, no Remote ID");
+    snprintf(out->detail, sizeof(out->detail), "%s gear, no Remote ID", vendor);
     return true;
 }
 
@@ -203,8 +268,13 @@ static bool droneRidBLE(const uint8_t mac[6], const uint8_t* payload, size_t len
 // Public BLE classifier: Remote ID first, the vendor-OUI fallback only under it.
 bool droneClassifyBLE(const uint8_t mac[6], const uint8_t* payload, size_t len,
                       int rssi, AcabDetection* out) {
+    if (!gEnabled && !desertIsEnabled()) return false;
     if (droneRidBLE(mac, payload, len, rssi, out)) return true;
-    if (droneVendorOui(mac)) return emitVendorOui(mac, rssi, SRC_BLE, out);
+    // OUI fallback is opt-in (default OFF): it cannot distinguish a flying drone from
+    // a stationary drone-vendor gadget, so it false-positives. Only run it when the
+    // user opted in, or in Desert mode which deliberately surfaces everything.
+    if (!droneOuiIsEnabled() && !desertIsEnabled()) return false;
+    if (const char* v = droneVendorOui(mac)) return emitVendorOui(mac, rssi, SRC_BLE, v, out);
     return false;
 }
 
@@ -256,8 +326,13 @@ static bool droneRidWiFi(const uint8_t* frame, size_t len, int rssi,
 // transmitter address (addr2, frame bytes 10-15) when no RID was decoded.
 bool droneClassifyWiFi(const uint8_t* frame, size_t len, int rssi,
                        AcabDetection* out) {
+    if (!gEnabled && !desertIsEnabled()) return false;
     if (droneRidWiFi(frame, len, rssi, out)) return true;
-    if (frame && len >= 16 && droneVendorOui(frame + 10))
-        return emitVendorOui(frame + 10, rssi, SRC_WIFI, out);
+    // OUI fallback is opt-in (default OFF) - see droneClassifyBLE for the why. Desert
+    // mode still forces it on, matching how the master guard above treats desert.
+    if (!droneOuiIsEnabled() && !desertIsEnabled()) return false;
+    if (frame && len >= 16)
+        if (const char* v = droneVendorOui(frame + 10))
+            return emitVendorOui(frame + 10, rssi, SRC_WIFI, v, out);
     return false;
 }

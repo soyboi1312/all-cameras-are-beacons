@@ -2,7 +2,8 @@
  * ACAB - Offline detection buffer (det_log).
  *
  * Captures detections to a raw-flash ring while the app is disconnected, then
- * replays them (acknowledged, via INDICATE) when the app reconnects. Locked design
+ * replays them (unacknowledged NOTIFY; seq + hist:end count let the app spot drops
+ * and re-sync) when the app reconnects. Locked design
  * decisions (2026-06-20, after a full validation pass - see docs/ble-protocol.md):
  *
  *   - OPT-IN: default OFF, master switch persisted to NVS. The app turns it on.
@@ -60,7 +61,14 @@ struct DetLogReplay {
     AcabDetection d;       // unpacked back into the live detection shape
     uint32_t seq;          // wire "seq"
     uint32_t atUnix;       // absolute capture time (unix seconds), or 0 when approx
-    bool     approx;       // true => time unknown (prior boot / no epoch); order by seq
+    bool     approx;       // true => this boot was never anchored; the app brackets it
+    // Always populated, even when approx. The board has no RTC, so an absolute time is ALWAYS
+    // reconstructed as anchor.epochUnix - (anchor.atMs - whenMs). Sending the raw inputs lets the
+    // app verify that reconstruction, redo it against its own anchor history (which survives board
+    // reboots and factory resets), and bracket an unanchored boot between the neighbouring
+    // anchored ones instead of showing a bare "time unknown".
+    uint32_t whenMs;       // millis() at capture, relative to bootCount's boot
+    uint32_t bootCount;    // which boot session captured it
 };
 
 // --- lifecycle ---
@@ -69,9 +77,13 @@ void     detLogBegin();             // mount ring, scan for head (generation win
 void     detLogSetEnabled(bool on); // opt-in master switch (persisted to NVS)
 bool     detLogEnabled();
 
-// --- at-rest key: app-pushed on connect, RAM only, never persisted ---
+// --- at-rest key: app-pushed on connect. Held in RAM, and persisted to NVS while buffering
+// is enabled so a deploy-and-leave board survives a reboot (the TRADEOFF above). A truncated
+// SHA-256 of it is persisted UNCONDITIONALLY: buffered records outlive the key (a disable
+// erases the key but not the ring), and the fingerprint is what detects a different phone's
+// key arriving for them, which would otherwise decrypt them to noise that passes the CRC. ---
 void     detLogSetKey(const uint8_t key[32]);
-void     detLogClearKey();          // forget the key (e.g. when buffering is disabled)
+void     detLogClearKey();          // forget the key (e.g. when buffering is disabled); keeps the fingerprint
 bool     detLogHaveKey();
 
 // --- wall-clock anchor: app-pushed epoch for this boot (mirrors the GPS push) ---
@@ -82,15 +94,20 @@ void     detLogSetEpoch(uint32_t unixSec);
 // this boot (e->count == 0). ---
 void     detLogAppend(const AcabDetection& d);
 
-// --- replay: the BLE service owns the INDICATE stream and pulls records from here.
+// --- replay: the BLE service owns the NOTIFY stream and pulls records from here.
+// Delivery is UNACKNOWLEDGED notify; reliability is the per-record seq plus the {"hist":"end","n"}
+// count, which let the app spot a gap and re-sync (it is NOT an acknowledged INDICATE stream).
 // detLogStartDrain sets the cursor to the app's lastSeq; detLogNextForDrain decrypts
 // and unpacks the next record (returns false when the drain is complete). ---
 void     detLogStartDrain(uint32_t lastSeq);
 bool     detLogDraining();
+void     detLogStopDrain();   // abort an in-flight drain on a link drop; next {sync} re-arms it
 bool     detLogNextForDrain(DetLogReplay* out);
 
 // --- maintenance ---
-void     detLogClear();             // REAL sector erase of the whole ring region
+void     detLogClear();             // logical clear now; REAL erase of the whole ring deferred, chunked across loop ticks
 uint32_t detLogCount();             // stored record count (surfaced as status "buf")
+uint32_t detLogPendingDrain();      // records queued for the CURRENT drain (valid after
+                                    // detLogStartDrain; = what the replay will actually send)
 
 #endif // ACAB_DET_LOG_H

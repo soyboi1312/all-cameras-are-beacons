@@ -1,0 +1,13 @@
+<!-- Widget category glyph. RemoteViews cannot reach the Compose Material icons, so the
+     six strip glyphs (and the empty-state shield) are checked in as vectors. Shapes match the
+     app's own per-type icons so a body-cam count reads the same here as in the log. -->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="24dp" android:height="24dp"
+    android:viewportWidth="24" android:viewportHeight="24">
+    <path android:fillColor="#FFFFFF"
+        android:pathData="M12,10a2,2 0,1 0,0 4a2,2 0,1 0,0 -4z" />
+    <path android:fillColor="#FFFFFF"
+        android:pathData="M7.76,16.24l1.42,-1.41C8.45,14.1 8,13.1 8,12s0.45,-2.1 1.18,-2.83L7.76,7.76C6.67,8.84 6,10.34 6,12s0.67,3.16 1.76,4.24zM16.24,7.76l-1.42,1.41C15.55,9.9 16,10.9 16,12s-0.45,2.1 -1.18,2.83l1.42,1.41C17.33,15.16 18,13.66 18,12s-0.67,-3.16 -1.76,-4.24z" />
+    <path android:fillColor="#FFFFFF"
+        android:pathData="M5.27,19.14l1.41,-1.41a8,8 0,0 1,0 -11.46L5.27,4.86a10,10 0,0 0,0 14.28zM18.73,4.86l-1.41,1.41a8,8 0,0 1,0 11.46l1.41,1.41a10,10 0,0 0,0 -14.28z" />
+</vector>

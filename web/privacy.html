@@ -23,17 +23,17 @@
 <body>
 <div class="wrap">
   <h1>All Cameras Are Beacons Privacy Policy</h1>
-  <div class="sub">Last updated June 2026</div>
+  <div class="sub">Last updated July 2026</div>
 
   <div class="panel">
-    <p><b>Short version: All Cameras Are Beacons collects nothing.</b> No accounts, no analytics, no tracking. Your detections stay on your device. The only time the app uses the network is to load map tiles when you open the map.</p>
+    <p><b>Short version: All Cameras Are Beacons collects nothing.</b> No accounts, no analytics, no tracking. Your detections stay on your device. The app only uses the network to load map tiles, check for firmware updates, and (if you opt in) download the known-ALPR map layer. Nothing about where you are or what you detected is ever sent.</p>
   </div>
 
   <h2>What the app does</h2>
-  <p>All Cameras Are Beacons is a companion app for the OUI-Spy detection board. It connects to the board over Bluetooth and shows the public radio signals that nearby devices already broadcast.</p>
+  <p>All Cameras Are Beacons is a companion app for the soyboi beacon board and the OUI-Spy detection boards. It connects to the board over Bluetooth and shows the public radio signals that nearby devices already broadcast.</p>
 
   <h2>Bluetooth</h2>
-  <p>Bluetooth is used only to connect to your own OUI-Spy board and receive detections from it. The app does not connect to or control any other device.</p>
+  <p>Bluetooth is used only to connect to your own detection board and receive detections from it. The app does not connect to or control any other device.</p>
 
   <h2>Location</h2>
   <p>If you grant location access, your approximate position is used only on your device, to pin detections on the map and to fill in the location column when you choose to export a log. Your location is never sent to us or anyone else.</p>
@@ -44,8 +44,14 @@
   <h2>Data you export</h2>
   <p>You can export your detection log as a CSV file. That file is created on your device and shared only through your phone's standard share sheet, to wherever you choose to send it. The app does not upload it anywhere.</p>
 
+  <h2>Firmware updates</h2>
+  <p>The app fetches a small static version file from soyboi.tech to learn whether new firmware exists for your board, and downloads the firmware image if you choose to install it. These are plain file downloads from a static site: no identifiers, no account, and nothing about you or your detections is sent. The site host (GitHub Pages) sees the request the way any web server does.</p>
+
+  <h2>Known-ALPR map layer (opt-in)</h2>
+  <p>Off by default. If you turn on the "known cameras" layer, the app downloads one static dataset of community-mapped license-plate-reader locations from soyboi.tech and draws it on your map. It is a plain file download like the firmware check: your map viewport is never sent anywhere, there are no per-view lookups, and nothing about you leaves the device. The locations come from OpenStreetMap contributors (the registry the DeFlock project maintains), used under the ODbL.</p>
+
   <h2>Third parties</h2>
-  <p>The app has no advertising, no analytics, and no tracking. The only outside service it uses is the map provider that supplies map tiles, described above. It talks to no other server.</p>
+  <p>The app has no advertising, no analytics, and no tracking. The only outside services it uses are the map provider that supplies map tiles and the static soyboi.tech site (firmware + the opt-in ALPR dataset), both described above. It talks to no other server.</p>
 
   <h2>Contact</h2>
   <p>Questions? Open an issue at <a href="https://github.com/soyboi1312/all-cameras-are-beacons">github.com/soyboi1312/all-cameras-are-beacons</a>.</p>

@@ -1,17 +1,46 @@
 import SwiftUI
 import MapKit
 import UIKit
+import UniformTypeIdentifiers   // UTType for the localOnly/expiring pasteboard item
 
-/// Full detection detail — pushed from the dashboard and logbook, shown as a sheet
+/// Whether a full Map tab exists to receive the dossier's OPEN IN MAP handoff. ConnectView's
+/// board-less saved-log sheet sets this false: MainTabView isn't mounted while disconnected,
+/// so the tap would dead-end (nobody receives MapFocus.notification) and park a stale
+/// coordinate in MapFocus.pending that hijacks a later connect's first map open.
+private struct MapHandoffAvailableKey: EnvironmentKey { static let defaultValue = true }
+extension EnvironmentValues {
+    var mapHandoffAvailable: Bool {
+        get { self[MapHandoffAvailableKey.self] }
+        set { self[MapHandoffAvailableKey.self] = newValue }
+    }
+}
+
+/// Full detection detail, pushed from the dashboard and logbook, shown as a sheet
 /// from the map. Custom top bar, a live RSSI signal panel, stat grid, identity, and
 /// location.
 struct DetectionDetailView: View {
     let detection: Detection
+    /// True when hosted persistently in a two-pane (T3 iPad Log). Then we must NOT hide the
+    /// tab bar (that would trap the user in the Log tab) and the back chevron is meaningless.
+    var embedded: Bool = false
     @EnvironmentObject var ble: BLEManager
     @Environment(\.dismiss) private var dismiss
+    @Environment(\.mapHandoffAvailable) private var mapHandoffAvailable
     @State private var copied = false
 
-    private var d: Detection { detection }
+    // "Confirm it" checklist, per-visit UI state only, nothing persists.
+    @State private var lookedAround = false
+    @State private var secondPass = false
+    @State private var confirmRandomWatch = false   // R7: confirm dialog before starring a randomized MAC
+    @State private var showRssiInfo = false          // tap the info dot next to SIGNAL to explain the RSSI graph
+
+    /// Always re-read the live row: the captured `detection` is a value type with let fields,
+    /// so it can never update, and this screen sits next to id-keyed lookups that do (the
+    /// LIVE/STALE kicker, the sparkline). A frozen copy means the dBm readout never moves
+    /// beside a moving sparkline, and "seen 3x" in CONFIRM IT can never increment while you
+    /// walk back for a second pass, which is the whole point of that checklist. Falls back to
+    /// the captured copy once the row is evicted, so the dossier doesn't blank out.
+    private var d: Detection { ble.detection(for: detection.id) ?? detection }
     private var trend: [Int] { ble.rssiTrend(for: d.id) }
 
     var body: some View {
@@ -20,36 +49,56 @@ struct DetectionDetailView: View {
             ScrollView {
                 VStack(alignment: .leading, spacing: 16) {
                     titleBlock
+                    matchQualityPanel
                     if d.type.isExperimental { experimentalNote }
                     signalPanel
                     statGrid
-                    if d.method == .oui { falsePositiveNote }
+                    if showConfirmIt { confirmItPanel }
                     identityPanel
-                    if let coord = d.coordinate { locationPanel(coord) }
+                    // A drone's own broadcast fix when it has one, else the phone's captured
+                    // position at the sighting - the SAME resolution the Map tab pins with
+                    // (MapTabView.mapCoord), so fixed installs (ALPR / body cam / tracker)
+                    // get the LOCATION panel + OPEN IN MAP too, not just drones. Broadcast-GPS
+                    // rows keep their richer readout in the identity panel above.
+                    if let coord = d.coordinate ?? ble.capturedLocation(for: d.id) { locationPanel(coord) }
                     copyButton
+                    watchButton
                     ignoreButton
                     Spacer(minLength: 8)
                 }
                 .padding(.horizontal, ACABTheme.pad)
                 .padding(.top, 58)
                 .padding(.bottom, 24)
+                .frame(maxWidth: 640)
+                .frame(maxWidth: .infinity)
             }
             topBar
         }
         .navigationBarHidden(true)
-        .toolbar(.hidden, for: .tabBar)
+        .toolbar(embedded ? .visible : .hidden, for: .tabBar)
+        // A star refused at the firmware's 256-entry cap sets this on the manager; surface it here
+        // instead of the WATCH tap silently doing nothing.
+        .alert("Watchlist full", isPresented: $ble.watchlistFull) {
+            Button("OK", role: .cancel) {}
+        } message: {
+            Text("You can watch up to 256 devices at once. Un-watch one before adding another.")
+        }
     }
 
     // MARK: Top bar
 
     private var topBar: some View {
         HStack {
-            Button { dismiss() } label: {
-                Image(systemName: "chevron.left").font(.system(size: 16, weight: .semibold))
-                    .foregroundStyle(ACABTheme.text)
-                    .frame(width: 36, height: 36)
-                    .background(ACABTheme.bg2, in: Circle())
-                    .overlay(Circle().strokeBorder(ACABTheme.line, lineWidth: 1))
+            if embedded {
+                Color.clear.frame(width: 36, height: 36)   // no back button in the two-pane
+            } else {
+                Button { dismiss() } label: {
+                    Image(systemName: "chevron.left").font(.system(size: 16, weight: .semibold))
+                        .foregroundStyle(ACABTheme.text)
+                        .frame(width: 36, height: 36)
+                        .background(ACABTheme.bg2, in: Circle())
+                        .overlay(Circle().strokeBorder(ACABTheme.line, lineWidth: 1))
+                }
             }
             Spacer()
             Kicker("DETECTION")
@@ -74,6 +123,12 @@ struct DetectionDetailView: View {
                 badgePill
                 Text("NODE \(d.nodeName)")
                     .font(ACABTheme.display(26, weight: .semibold)).foregroundStyle(ACABTheme.text)
+                // Subtitle is the vendor, not the type label (F15), the badge pill
+                // above already names the category. Deliberately d.vendor, NOT
+                // displayVendor: displayVendor prefers the OUI lookup, which for a Flock
+                // Falcon resolves to its Liteon WiFi module and would head the ALPR
+                // dossier with "Liteon" instead of "Flock Safety". The OUI reading still
+                // shows in the identity panel below, where it is labelled as such.
                 Text(d.vendor).font(ACABTheme.mono(11)).foregroundStyle(ACABTheme.dim)
             }
             Spacer(minLength: 0)
@@ -82,7 +137,7 @@ struct DetectionDetailView: View {
 
     private var badgePill: some View {
         HStack(spacing: 5) {
-            Text(d.type.category)
+            Text(d.type.category.lowercased())
             Text("\u{00B7}").opacity(0.5)
             Text(d.classLabel)
         }
@@ -103,20 +158,245 @@ struct DetectionDetailView: View {
         .panel(strong: false, padding: 13)
     }
 
-    /// Shown for OUI-only matches: an OUI only names the chipset vendor, which Flock
-    /// shares with consumer gear, so these matches can be false positives.
-    private var falsePositiveNote: some View {
-        VStack(alignment: .leading, spacing: 5) {
-            HStack(spacing: 6) {
-                Image(systemName: "exclamationmark.triangle.fill")
-                    .foregroundStyle(ACABTheme.warn).font(.system(size: 11))
-                Kicker("POSSIBLE FALSE POSITIVE", color: ACABTheme.warn)
+    // MARK: Match quality (1d / F12)
+
+    /// Low certainty is loud amber, high certainty is calm white. Crimson is for
+    /// categories only, never for confidence.
+    private var isWeakMatch: Bool { d.confidence < 50 }
+
+    private var matchQualityPanel: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            HStack(alignment: .top) {
+                Kicker("MATCH QUALITY")
+                Spacer(minLength: 8)
+                methodChip
             }
-            Text("OUI matches flag the chipset vendor, which Flock shares with plenty of consumer devices. Worth confirming before you trust it.")
+            HStack(alignment: .firstTextBaseline, spacing: 8) {
+                Text(verdictText)
+                    .font(ACABTheme.display(22, weight: .bold))
+                    .foregroundStyle(verdictColor)
+                Text("\(d.confidence)%")
+                    .font(ACABTheme.mono(11)).foregroundStyle(ACABTheme.dim)
+            }
+            matchMeter
+            matchExplainer
                 .font(ACABTheme.mono(11)).foregroundStyle(ACABTheme.dim)
+                .fixedSize(horizontal: false, vertical: true)
         }
         .frame(maxWidth: .infinity, alignment: .leading)
-        .panel(strong: false, padding: 13)
+        .padding(16)
+        .background(ACABTheme.bg2, in: RoundedRectangle(cornerRadius: ACABTheme.radius, style: .continuous))
+        .overlay(RoundedRectangle(cornerRadius: ACABTheme.radius, style: .continuous)
+            .strokeBorder(isWeakMatch ? ACABTheme.warn.opacity(0.4) : ACABTheme.line, lineWidth: 1))
+    }
+
+    private var verdictText: String {
+        switch d.confidence {
+        case ..<50: return "Weak match, verify"
+        case ..<80: return "Partial match"
+        default:    return "Strong match"
+        }
+    }
+
+    private var verdictColor: Color {
+        switch d.confidence {
+        case ..<50: return ACABTheme.warn
+        case ..<80: return ACABTheme.dim
+        default:    return ACABTheme.text
+        }
+    }
+
+    /// How the signature hit: OUI-only gets the loud amber "chipset only" treatment,
+    /// everything else a neutral chip.
+    private var methodChip: some View {
+        let oui = d.method == .oui
+        return Text(methodChipLabel)
+            .font(ACABTheme.mono(9, weight: .bold)).tracking(1)
+            .foregroundStyle(oui ? ACABTheme.warn : ACABTheme.dim)
+            .padding(.horizontal, 7).padding(.vertical, 3)
+            .background(oui ? ACABTheme.warn.opacity(0.14) : ACABTheme.bg3,
+                        in: RoundedRectangle(cornerRadius: 4))
+            .overlay(RoundedRectangle(cornerRadius: 4)
+                .strokeBorder(oui ? ACABTheme.warn.opacity(0.4) : ACABTheme.line, lineWidth: 1))
+    }
+
+    private var methodChipLabel: String {
+        switch d.method {
+        // A body-cam OUI is the maker's OWN registered block (Axon, Utility, Motorola
+        // Solutions), not a chipset shared with unrelated gear, so "chipset only" would
+        // understate what we know. What's uncertain is which of the vendor's products
+        // this is, which is why it keeps the amber weak-match treatment.
+        case .oui where d.bodyCamSignature != nil: return "OUI \u{00B7} VENDOR ONLY"
+        case .oui:  return "OUI \u{00B7} CHIPSET ONLY"
+        case .name: return "NAME MATCH"
+        default:    return d.method.label.lowercased()   // "service UUID", "SSID", ...
+        }
+    }
+
+    /// 5-segment certainty meter: filled = round(confidence / 20).
+    private var matchMeter: some View {
+        let filled = Int((Double(d.confidence) / 20).rounded())
+        let tone = isWeakMatch ? ACABTheme.warn : ACABTheme.text
+        return HStack(spacing: 4) {
+            ForEach(0..<5, id: \.self) { i in
+                RoundedRectangle(cornerRadius: 3)
+                    .fill(i < filled ? tone : ACABTheme.bg3)
+                    .frame(height: 6)
+                    .frame(maxWidth: .infinity)
+            }
+        }
+    }
+
+    /// Plain-language line under the meter: what actually matched, in words.
+    /// Returns Text so the OUI vendor name can render semibold inside the dim line.
+    private var matchExplainer: Text {
+        // Body cam covers four signatures of very different weight under one label, so the
+        // generic per-method line is too vague here (and its "shared chipset" wording is
+        // wrong for a vendor's own OUI block). Name the signature that fired instead.
+        if let sig = d.bodyCamSignature { return signatureExplainer(sig) }
+        // Replayed from the offline buffer: StoredDet (firmware det_log.h) has no detail
+        // field, so bodyCamSignature is nil for a buffered body-cam hit even though the
+        // method and confidence survived. Do NOT fall through to the .oui branch below,
+        // which would confidently assert "shared chipset" wording that is simply wrong for
+        // a vendor's own OUI block, and flatly false if the original hit was the conf-90
+        // BWCDEVICE payload tag. Say what we actually still know instead.
+        if d.type == .axonBodyCam {
+            return Text("Matched a body-worn camera signature. This record came from the offline buffer, which doesn't keep which signature fired.")
+        }
+        switch d.method {
+        case .oui:
+            // An OUI only names the chipset vendor, which Flock shares with plenty
+            // of consumer gear, so spell out how thin the evidence is.
+            let isFlock = d.type == .flockCamera || d.type == .flockRaven
+            let part = isFlock ? "a part Flock shares with routers and home cameras"
+                               : "a part shared with routers and home cameras"
+            if let vendor = d.ouiVendor {
+                return Text("Only the radio chipset matched: ")
+                    + Text(vendor).font(ACABTheme.mono(11, weight: .semibold))
+                    + Text(", \(part). The name and service IDs didn't match.")
+            }
+            return Text("Only the radio chipset matched, \(part). The name and service IDs didn't match.")
+        case .name:        return Text("The name this device broadcasts matched a known signature.")
+        case .serviceUUID: return Text("The device advertises a service UUID tied to this hardware.")
+        case .mfgID:       return Text("The manufacturer ID in the advertisement matched a known signature.")
+        case .ssid:        return Text("The WiFi network name matched a known signature.")
+        case .probe:       return Text("The device probed for a network tied to this hardware.")
+        case .remoteID:    return Text("The aircraft identified itself over Remote ID.")
+        case .serviceData: return Text("A service-data tag tied to this hardware matched.")
+        case .mfgSubtype:  return Text("A decoded manufacturer-data subtype matched a known signature.")
+        case .watchlist:   return Text("You starred this exact device, so every sighting matches.")
+        case .none:        return Text("No match method was reported for this hit.")
+        }
+    }
+
+    /// Which body-cam signature fired, and how much weight it carries. The four sources
+    /// under this one category range from Axon's own broadcast identifier to a vendor-block
+    /// proxy, and without this they all read as "Body camera". Says nothing about the
+    /// numbers: the verdict, meter, and percentage above already carry the strength.
+    private func signatureExplainer(_ sig: BodyCamSignature) -> Text {
+        let name = Text(sig.rawValue).font(ACABTheme.mono(11, weight: .semibold))
+        switch sig {
+        case .axonPayload:
+            return Text("Matched ") + name + Text(", the tag Axon body cams broadcast about themselves. It rides in the advertisement rather than in the address, so it holds even when the device randomizes its MAC. This is the strongest body cam signature the board carries.")
+        case .axonOUI:
+            return Text("Matched ") + name + Text(" only. The address block is Axon Enterprise's, but the broadcast body cam tag never appeared, so this is Axon-made gear of some kind. They ship other products on the same block.")
+        case .utility:
+            if d.method == .name {
+                return Text("Matched ") + name + Text(" by broadcast name. The device announced itself as part of Utility's body cam system, which is a deliberate self-identification and a solid match, though a name is easy for anything to copy.")
+            }
+            return Text("Matched ") + name + Text(" by address block only. The block is Utility Inc's, but the broadcast name didn't match and Utility ships other gear on it, so treat this as a maybe.")
+        case .motorola:
+            return Text("Matched ") + name + Text(", a vendor proxy rather than a body cam signature. The block is Motorola Solutions' own, so the maker is right, but they also sell two-way radios, docks, and site infrastructure on it. Read this as their equipment nearby, not a confirmed camera.")
+        }
+    }
+
+    // MARK: Confirm it (1d)
+
+    /// Weak and OUI-only hits get an active checklist instead of a passive
+    /// false-positive note. Checkboxes are local UI state; the star row wires to the
+    /// real watch action.
+    private var showConfirmIt: Bool { d.method == .oui || d.confidence < 50 }
+
+    private var confirmItPanel: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            Kicker("CONFIRM IT", color: ACABTheme.warn).padding(.bottom, 6)
+            checkRow(isOn: $lookedAround,
+                     text: "Look around, pole-mounted camera, solar panel, small antenna?")
+            Rectangle().fill(ACABTheme.line).frame(height: 1)
+            checkRow(isOn: $secondPass, text: secondPassText)
+            Rectangle().fill(ACABTheme.line).frame(height: 1)
+            starRow
+        }
+        .panel()
+    }
+
+    private func checkRow(isOn: Binding<Bool>, text: String) -> some View {
+        Button { isOn.wrappedValue.toggle() } label: {
+            HStack(alignment: .top, spacing: 10) {
+                Image(systemName: isOn.wrappedValue ? "checkmark.square.fill" : "square")
+                    .font(.system(size: 16, weight: .medium))
+                    .foregroundStyle(isOn.wrappedValue ? ACABTheme.warn : ACABTheme.faint)
+                Text(text)
+                    .font(ACABTheme.mono(11))
+                    .foregroundStyle(isOn.wrappedValue ? ACABTheme.dim : ACABTheme.text)
+                    .multilineTextAlignment(.leading)
+                    .fixedSize(horizontal: false, vertical: true)
+                Spacer(minLength: 0)
+            }
+            .padding(.vertical, 10)
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+    }
+
+    private var secondPassText: String {
+        if let span = sightingSpan {
+            return "Still here on a second pass? It's been seen \(d.count)\u{00D7} over \(span) so far."
+        }
+        return "Still here on a second pass? It's been seen \(d.count)\u{00D7} so far."
+    }
+
+    /// Compact duration since the first sighting: "45s", "18m", "2h", "3d".
+    /// nil when the row has no instant to measure from: a bracketed or undateable buffered
+    /// record has no point in time, so the "over X" clause is dropped rather than measured off
+    /// its ordering key.
+    private var sightingSpan: String? {
+        let first = ble.firstSeenDate(for: d.id)
+        guard let first, !ble.timeBasis(for: d.id, stamp: first).hidesInstant else { return nil }
+        let secs = max(1, Int(Date().timeIntervalSince(first)))
+        switch secs {
+        case ..<60:      return "\(secs)s"
+        case ..<3600:    return "\(secs / 60)m"
+        case ..<86_400:  return "\(secs / 3600)h"
+        default:         return "\(secs / 86_400)d"
+        }
+    }
+
+    private var starRow: some View {
+        let on = ble.isWatched(d.mac)
+        return HStack(alignment: .center, spacing: 10) {
+            Image(systemName: on ? "star.fill" : "star")
+                .font(.system(size: 14, weight: .medium))
+                .foregroundStyle(ACABTheme.watchTone)
+            Text("Star it to get pinged every time this exact device shows up.")
+                .font(ACABTheme.mono(11)).foregroundStyle(ACABTheme.text)
+                .fixedSize(horizontal: false, vertical: true)
+            Spacer(minLength: 8)
+            Button {
+                toggleWatch()   // shared guard: this used to star directly, skipping the confirm
+            } label: {
+                Text(on ? "WATCHING" : "WATCH")
+                    .font(ACABTheme.mono(9.5, weight: .bold)).tracking(1)
+                    .foregroundStyle(on ? ACABTheme.onAccent : ACABTheme.watchTone)
+                    .padding(.horizontal, 10).padding(.vertical, 5)
+                    .background(on ? ACABTheme.watchTone : ACABTheme.watchTone.opacity(0.14),
+                                in: Capsule())
+                    .overlay(Capsule().strokeBorder(on ? Color.clear : ACABTheme.watchTone.opacity(0.4),
+                                                    lineWidth: 1))
+            }
+            .buttonStyle(.plain)
+        }
+        .padding(.vertical, 10)
     }
 
     // MARK: Signal
@@ -130,6 +410,11 @@ struct DetectionDetailView: View {
                 } else {
                     Kicker("SIGNAL \u{00B7} LIVE")
                 }
+                Button { withAnimation(.easeInOut(duration: 0.15)) { showRssiInfo.toggle() } } label: {
+                    Image(systemName: "info.circle").font(.system(size: 12)).foregroundStyle(ACABTheme.dim)
+                }
+                .buttonStyle(.plain)
+                .accessibilityLabel("What the RSSI graph means")
                 Spacer()
                 SignalBars(bars: d.signalBars, tint: d.type.tint)
             }
@@ -151,34 +436,50 @@ struct DetectionDetailView: View {
             }
             Sparkline(values: trend, tint: d.type.tint).frame(height: 46)
                 .opacity(stale ? 0.35 : 1)
+            if showRssiInfo {
+                Text("RSSI is signal strength, moment to moment. closer to 0 is stronger, so the line climbs as you get nearer the source and drops as you move away, use it to home in on a hit.")
+                    .font(ACABTheme.mono(11.5)).foregroundStyle(ACABTheme.dim)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
         }
         .panel()
     }
 
     // MARK: Stat grid
 
-    /// 2x2 grid: matched-on, source, confidence, sightings.
+    /// Two cells: signal and sightings. Matched-on and confidence live in the
+    /// match-quality panel above (1d).
     private var statGrid: some View {
-        let cells: [(String, String, Color)] = [
-            ("MATCHED ON",  d.method.label, ACABTheme.text),
-            ("SOURCE",      d.source.label, ACABTheme.text),
-            ("CONFIDENCE",  "\(d.confidence)%", confColor),
-            ("SIGHTINGS",   "\(d.count)", ACABTheme.text),
+        let firstDate = ble.firstSeenDate(for: d.id)
+        let sightings: String
+        // One line, so this cell says only how good the time is; the identity panel below carries
+        // the actual range and the explanation. The tilde is the same "derived" shorthand the log
+        // row's RECON tag stands for.
+        if let firstDate {
+            switch ble.timeBasis(for: d.id, stamp: firstDate) {
+            case .exact:         sightings = "\(d.count) \u{00B7} first \(relativeAgo(firstDate))"
+            case .reconstructed: sightings = "\(d.count) \u{00B7} first ~\(relativeAgo(firstDate))"
+            case .bracketed:     sightings = "\(d.count) \u{00B7} time bounded"
+            case .unknown:       sightings = "\(d.count) \u{00B7} time unknown"
+            }
+        } else {
+            sightings = "\(d.count)"
+        }
+        let cells: [(String, String)] = [
+            ("SIGNAL",    "\(d.rssi) dBm \u{00B7} \(d.source.label)"),
+            ("SIGHTINGS", sightings),
         ]
-        return LazyVGrid(columns: [GridItem(.flexible(), spacing: 0), GridItem(.flexible(), spacing: 0)], spacing: 0) {
+        return HStack(spacing: 0) {
             ForEach(Array(cells.enumerated()), id: \.offset) { i, c in
                 VStack(alignment: .leading, spacing: 5) {
                     Kicker(c.0)
-                    Text(c.1).font(ACABTheme.mono(14, weight: .medium)).foregroundStyle(c.2)
+                    Text(c.1).font(ACABTheme.mono(14, weight: .medium)).foregroundStyle(ACABTheme.text)
                         .lineLimit(1).minimumScaleFactor(0.7)
                 }
                 .frame(maxWidth: .infinity, alignment: .leading)
                 .padding(14)
                 .overlay(alignment: .trailing) {
-                    if i % 2 == 0 { Rectangle().fill(ACABTheme.line).frame(width: 1) }
-                }
-                .overlay(alignment: .top) {
-                    if i >= 2 { Rectangle().fill(ACABTheme.line).frame(height: 1) }
+                    if i == 0 { Rectangle().fill(ACABTheme.line).frame(width: 1) }
                 }
             }
         }
@@ -187,33 +488,31 @@ struct DetectionDetailView: View {
             .strokeBorder(ACABTheme.line, lineWidth: 1))
     }
 
-    private var confColor: Color {
-        switch d.confidence {
-        case ..<50: return ACABTheme.dim
-        case ..<80: return ACABTheme.warn
-        default:    return ACABTheme.accent
-        }
-    }
-
     // MARK: Identity
 
     private var identityPanel: some View {
         VStack(alignment: .leading, spacing: 0) {
             Kicker("IDENTITY").padding(.bottom, 4)
             if let brand = d.type.brand { idRow("Brand", brand) }
-            idRow("Vendor", d.ouiVendor ?? d.vendor)
+            idRow("Vendor", d.displayVendor)
+            if let cid = d.companyIdText { idRow("Company ID", cid) }
             idRow("Identifier", d.mac)
-            idRow("First seen", relativeAgo(ble.firstSeenDate(for: d.id)))
-            idRow("Last seen", relativeAgo(ble.lastSeenDate(for: d.id)))
+            timeRow("First seen", ble.firstSeenDate(for: d.id))
+            timeRow("Last seen", ble.lastSeenDate(for: d.id))
             if let n = d.name, !n.isEmpty { idRow("Name", n) }
             if let id = d.uasID, !id.isEmpty { idRow("UAS ID", id) }
             if let mfr = d.ridManufacturer { idRow("Manufacturer", mfr) }
             if let det = d.detail, !det.isEmpty { idRow("Detail", det) }
+            // Numeric lat/lon alongside the mini-map above: the coordinates are the actionable
+            // datum in an evidence export, and the operator (pilot) fix is the whole point of a
+            // drone detection, so show both as text, not only as a pin.
+            if let c = d.coordinate { idRow("Position", String(format: "%.5f, %.5f", c.latitude, c.longitude)) }
             if let alt = d.altitude { idRow("Altitude", "\(alt) m") }
             if let s = d.speedH { idRow("Speed", "\(s) m/s") }
             if let vs = d.speedV, vs != 0 { idRow("Vert. speed", "\(vs) m/s") }
             if let h = d.heading { idRow("Heading", "\(h)°") }
             if let hg = d.heightAGL { idRow("Height AGL", "\(hg) m") }
+            if let p = d.pilotCoordinate { idRow("Operator pos", String(format: "%.5f, %.5f", p.latitude, p.longitude)) }
             if let pa = d.pilotAlt { idRow("Operator alt", "\(pa) m") }
             if let st = d.ridStatusLabel { idRow("Status", st) }
             whyFlagged
@@ -233,7 +532,7 @@ struct DetectionDetailView: View {
     }
 
     /// Short "ago" string for a sighting: "now", "12s ago", "4m ago", "1h ago",
-    /// "3d ago" — or a dash if we don't know the time.
+    /// "3d ago", or a dash if we don't know the time.
     private func relativeAgo(_ date: Date?) -> String {
         guard let date else { return "-" }
         let secs = max(0, Int(Date().timeIntervalSince(date)))
@@ -244,6 +543,41 @@ struct DetectionDetailView: View {
         case ..<86_400:   return "\(secs / 3600)h ago"
         default:          return "\(secs / 86_400)d ago"
         }
+    }
+
+    /// A sighting time and, whenever it was not read off the phone's own clock, how it was
+    /// arrived at. The qualifier sits in the row rather than in a footnote because a derived
+    /// time printed on its own is read as a measured one, which is the whole failure this
+    /// screen has to avoid: these records get handed over as evidence.
+    /// Asked per STAMP, not per row: a device replayed from the buffer and THEN heard live has a
+    /// derived First seen and a genuine Last seen, and each has to say so for itself.
+    private func timeRow(_ label: String, _ date: Date?) -> some View {
+        let basis = ble.timeBasis(for: d.id, stamp: date)
+        return HStack(alignment: .top) {
+            Text(label).font(ACABTheme.mono(11)).foregroundStyle(ACABTheme.dim)
+            Spacer(minLength: 16)
+            VStack(alignment: .trailing, spacing: 3) {
+                Text(timeValue(basis, date))
+                    .font(ACABTheme.mono(12, weight: .medium)).foregroundStyle(ACABTheme.text)
+                    .multilineTextAlignment(.trailing).textSelection(.enabled)
+                if let note = TimeBasisCopy.note(for: basis) {
+                    Text(note)
+                        .font(ACABTheme.mono(10)).foregroundStyle(ACABTheme.dim)
+                        .multilineTextAlignment(.trailing)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+            }
+        }
+        .padding(.vertical, 9)
+        .overlay(alignment: .bottom) { Rectangle().fill(ACABTheme.line).frame(height: 1) }
+    }
+
+    /// A live stamp keeps the relative "4m ago" the rest of the screen speaks in. Anything
+    /// derived switches to an absolute reading or a range, because "4m ago" quietly asserts a
+    /// precision no reconstruction has.
+    private func timeValue(_ basis: TimeBasis, _ date: Date?) -> String {
+        if case .exact = basis { return relativeAgo(date) }
+        return TimeBasisCopy.value(for: basis, stamp: date)
     }
 
     private var whyFlagged: some View {
@@ -266,33 +600,100 @@ struct DetectionDetailView: View {
                 Text(String(format: "%.5f, %.5f", coord.latitude, coord.longitude))
                     .font(ACABTheme.mono(10)).foregroundStyle(ACABTheme.dim)
             }
-            if let age = d.locationAgeText {
+            if let age = d.locationAgeDetail {
                 // The board stamped this fix from a stale phone position (offline /
                 // Desert mode), so flag how old it is.
                 HStack(spacing: 7) {
                     Image(systemName: "clock.badge.exclamationmark")
                         .font(.system(size: 11)).foregroundStyle(ACABTheme.warn)
-                    Text("location as of \(age)")
+                    Text(age)
                         .font(ACABTheme.mono(11, weight: .medium)).foregroundStyle(ACABTheme.warn)
                     Spacer(minLength: 0)
                 }
             }
-            Map(initialPosition: .region(MKCoordinateRegion(
-                center: coord, span: MKCoordinateSpan(latitudeDelta: 0.008, longitudeDelta: 0.008)))) {
-                Annotation(d.type.shortTag, coordinate: coord) { miniPin }
-                if let pilot = d.pilotCoordinate {
-                    Marker("Operator", systemImage: "person.fill", coordinate: pilot).tint(ACABTheme.dim)
+            // CORROBORATION, positive-only. If this is an ALPR-type hit AND a community-mapped
+            // camera sits within ~150m, say so - a live detection landing on an independently
+            // mapped node is strong confirmation, and names the mapped maker when known.
+            // We NEVER show a "no mapped camera" line: OSM lags new installs and mobile cruiser
+            // ALPR is meant to move, so absence is not evidence of a false positive (the confidence
+            // % chip is the false-positive tell). Only shows when the ALPR layer is loaded.
+            if (d.type == .flockCamera || d.type == .flockRaven),
+               let hit = ALPRStore.shared.nearest(to: coord), hit.meters <= 150 {
+                HStack(spacing: 7) {
+                    Image(systemName: "checkmark.seal.fill")
+                        .font(.system(size: 11)).foregroundStyle(ACABTheme.flockTone)
+                    Text(hit.maker.isEmpty
+                         ? "matches a mapped camera · \(Int(hit.meters.rounded())) m"
+                         : "matches a mapped \(hit.maker) camera · \(Int(hit.meters.rounded())) m")
+                        .font(ACABTheme.mono(11, weight: .medium)).foregroundStyle(ACABTheme.flockTone)
+                    Spacer(minLength: 0)
                 }
+                .accessibilityLabel(hit.maker.isEmpty
+                     ? "matches a mapped camera about \(Int(hit.meters.rounded())) meters away"
+                     : "matches a mapped \(hit.maker) camera about \(Int(hit.meters.rounded())) meters away")
             }
-            .mapStyle(.standard(elevation: .flat, pointsOfInterest: .excludingAll))
-            .preferredColorScheme(.dark)
-            .frame(height: 168)
-            .clipShape(RoundedRectangle(cornerRadius: ACABTheme.radiusSm, style: .continuous))
-            .overlay(RoundedRectangle(cornerRadius: ACABTheme.radiusSm, style: .continuous)
-                .strokeBorder(ACABTheme.line, lineWidth: 1))
-            .allowsHitTesting(false)   // just a thumbnail; the real map tab is for panning
+            // The whole thumbnail is one tap target: close the dossier and hand the full
+            // Map tab a one-shot close-in focus on this coordinate (see MapFocus). The
+            // pill is just discoverability; the thumbnail itself stays static. In the
+            // board-less saved-log sheet no Map tab is mounted to receive the handoff, so
+            // the affordance is suppressed there: a plain thumbnail, no button, no pill.
+            if mapHandoffAvailable {
+                Button { openInMap(coord) } label: {
+                    mapThumbnail(coord)
+                        .overlay(alignment: .topTrailing) { openInMapPill }
+                        .clipShape(RoundedRectangle(cornerRadius: ACABTheme.radiusSm, style: .continuous))
+                        .overlay(RoundedRectangle(cornerRadius: ACABTheme.radiusSm, style: .continuous)
+                            .strokeBorder(ACABTheme.line, lineWidth: 1))
+                }
+                .buttonStyle(.plain)
+                .accessibilityLabel("Open in map")
+            } else {
+                mapThumbnail(coord)
+                    .clipShape(RoundedRectangle(cornerRadius: ACABTheme.radiusSm, style: .continuous))
+                    .overlay(RoundedRectangle(cornerRadius: ACABTheme.radiusSm, style: .continuous)
+                        .strokeBorder(ACABTheme.line, lineWidth: 1))
+            }
         }
         .panel()
+    }
+
+    /// The static mini-map itself, shared by both presentations of the panel above.
+    private func mapThumbnail(_ coord: CLLocationCoordinate2D) -> some View {
+        Map(initialPosition: .region(MKCoordinateRegion(
+            center: coord, span: MKCoordinateSpan(latitudeDelta: 0.008, longitudeDelta: 0.008)))) {
+            Annotation(d.type.shortTag, coordinate: coord) { miniPin }
+            if let pilot = d.pilotCoordinate {
+                Marker("Operator", systemImage: "person.fill", coordinate: pilot).tint(ACABTheme.dim)
+            }
+        }
+        .mapStyle(.standard(elevation: .flat, pointsOfInterest: .excludingAll))
+        .preferredColorScheme(.dark)
+        .frame(height: 168)
+        .allowsHitTesting(false)   // just a thumbnail; never pans, any wrapping button takes the tap
+    }
+
+    /// Corner chip on the map thumbnail so the tap is discoverable. Styled like the map
+    /// tab's own overlay chips (material capsule, hairline border).
+    private var openInMapPill: some View {
+        Text("OPEN IN MAP")
+            .font(ACABTheme.mono(9.5, weight: .bold)).tracking(1)
+            .foregroundStyle(ACABTheme.dim)
+            .padding(.horizontal, 9).padding(.vertical, 5)
+            .background(.ultraThinMaterial, in: Capsule())
+            .overlay(Capsule().strokeBorder(ACABTheme.line, lineWidth: 1))
+            .padding(7)
+    }
+
+    /// Close this dossier and hand the full Map tab a one-shot focus on the captured
+    /// coordinate. Same notification channel the Live Activity deep link rides for tab
+    /// switching; the coordinate sits in a static slot so a cold Map tab picks it up on
+    /// first appear and a warm one flies immediately.
+    private func openInMap(_ coord: CLLocationCoordinate2D) {
+        MapFocus.pending = coord
+        NotificationCenter.default.post(name: MapFocus.notification, object: nil)
+        // Sheets and pushes close here. The embedded two-pane has no dismissal and
+        // needs none: switching to the Map tab is itself the close.
+        dismiss()
     }
 
     private var miniPin: some View {
@@ -308,7 +709,12 @@ struct DetectionDetailView: View {
 
     private var copyButton: some View {
         Button {
-            UIPasteboard.general.string = d.mac
+            // localOnly keeps the MAC off Universal Clipboard (no sync to other devices) and the
+            // 60s expiry auto-clears it, so a copied surveillance-gear MAC doesn't linger on the
+            // pasteboard or leak to a paired Mac/iPad.
+            UIPasteboard.general.setItems([[UTType.utf8PlainText.identifier: d.mac]],
+                                          options: [.localOnly: true,
+                                                    .expirationDate: Date().addingTimeInterval(60)])
             withAnimation { copied = true }
         } label: {
             HStack(spacing: 7) {
@@ -320,6 +726,70 @@ struct DetectionDetailView: View {
             .background(ACABTheme.accent, in: RoundedRectangle(cornerRadius: ACABTheme.radiusSm, style: .continuous))
         }
         .buttonStyle(.plain)
+    }
+
+    /// Star / un-star this exact MAC. Watching and ignoring are exclusive, so starring
+    /// The ONE place star/unstar is decided, so every entry point gets the same guard. There are
+    /// two call sites (starRow in the header and watchButton below) and starRow used to call
+    /// ble.watchDevice(d) directly, skipping the confirm entirely. That bypass fired on exactly the
+    /// rows most likely to rotate: Desert nearby-device rows are confidence 0, so they always show
+    /// the ConfirmIt panel that hosts starRow. Android already funnelled both sites through one
+    /// closure; this brings iOS to parity.
+    private func toggleWatch() {
+        if ble.isWatched(d.mac) { ble.unwatch(d.mac); return }
+        if d.addressIsRandomized { confirmRandomWatch = true; return }   // ask first, mirror Android
+        ble.watchDevice(d)
+    }
+
+    /// Body copy for the star confirm, selected by type so the user gets the ONE fact that applies
+    /// to what they tapped. Order matters: tracker first, then Desert nearby-device, then the
+    /// generic randomized case, so exactly one message is chosen.
+    private var watchWarningBody: String {
+        switch d.type {
+        case .tracker:
+            // A SEPARATED tag holds its address ~24h (IETF DULT requires it, so that unwanted-
+            // tracking detectors can accumulate evidence), rolling around 4am. So the star DOES
+            // work, just not past the rollover. Do not repeat the "every few minutes" line here,
+            // that is the near-owner interval and it is wrong for the tags that matter.
+            return "This tag's address holds for about a day, then changes around 4am. The star stops matching when it does. The tracker detector finds it either way."
+        case .nearbyDevice:
+            return "Most phones change their address every few minutes, so this star will likely stop matching within the hour."
+        default:
+            // No "trackers" here: .tracker is handled above, and a separated tag rotates about
+            // once a day, not every few minutes. Repeating the near-owner interval in the fallback
+            // would put the debunked claim straight back in front of the user.
+            return "This address looks randomized, so the star may stop matching this device."
+        }
+    }
+
+    /// a currently-ignored device silently un-mutes it (handled in the manager).
+    private var watchButton: some View {
+        let on = ble.isWatched(d.mac)
+        return Button {
+            toggleWatch()
+        } label: {
+            HStack(spacing: 7) {
+                Image(systemName: on ? "star.fill" : "star").font(.system(size: 13, weight: .bold))
+                Text(on ? "STOP WATCHING" : "WATCH THIS DEVICE")
+                    .font(ACABTheme.mono(12, weight: .bold)).tracking(0.5)
+            }
+            .foregroundStyle(on ? ACABTheme.onAccent : ACABTheme.watchTone)
+            .frame(maxWidth: .infinity).padding(.vertical, 14)
+            .background(on ? ACABTheme.watchTone : ACABTheme.bg2,
+                        in: RoundedRectangle(cornerRadius: ACABTheme.radiusSm, style: .continuous))
+            .overlay(RoundedRectangle(cornerRadius: ACABTheme.radiusSm, style: .continuous)
+                .strokeBorder(on ? Color.clear : ACABTheme.watchTone.opacity(0.4), lineWidth: 1))
+        }
+        .buttonStyle(.plain)
+        // A randomized address rotates, so confirm before starring it. ONE dialog with a
+        // type-selected body, never two in a row: a tracker is almost always randomized too, so
+        // firing a generic prompt and then a tracker prompt would double up on the same tap.
+        .confirmationDialog("Watch a rotating address?", isPresented: $confirmRandomWatch, titleVisibility: .visible) {
+            Button("Watch anyway") { ble.watchDevice(d) }
+            Button("Cancel", role: .cancel) {}
+        } message: {
+            Text(watchWarningBody)
+        }
     }
 
     private var ignoreButton: some View {

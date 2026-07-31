@@ -3,11 +3,27 @@ import WidgetKit
 import SwiftUI
 import AppIntents
 
-// Widget-local presentation tokens for the four detection buckets. The shared
-// ActivityAttributes is intentionally Color-free, so the extension owns its own
-// symbol + tint map (mirrors the app's DeviceType, kept self-contained here).
+// Widget-local slice of the app's Crimson theme. The shared ActivityAttributes is
+// intentionally Color-free and the extension does not compile Theme.swift, so the
+// widget owns its own tokens. Fonts are bundled into the extension (see Info.plist
+// UIAppFonts): Space Grotesk Bold for digits, JetBrains Mono Medium for kickers.
+private enum WidgetTheme {
+    static let crimson = Color(red: 0xEE / 255, green: 0x40 / 255, blue: 0x34 / 255)
+    static let amber   = Color(red: 0xF2 / 255, green: 0xB5 / 255, blue: 0x3C / 255)
+    static let bodyCam = Color(red: 0xCD / 255, green: 0xC1 / 255, blue: 0xC3 / 255)
+    static let tracker = Color(red: 0x49 / 255, green: 0xC5 / 255, blue: 0xB1 / 255)
+    static let glasses = Color(red: 0xB0 / 255, green: 0x7C / 255, blue: 0xFF / 255)
+
+    /// Display face for digits: Space Grotesk Bold.
+    static func digits(_ size: CGFloat) -> Font { .custom("SpaceGrotesk-Bold", size: size) }
+    /// Data / kicker face: JetBrains Mono Medium.
+    static func mono(_ size: CGFloat) -> Font { .custom("JetBrainsMono-Medium", size: size) }
+}
+
+// Widget-local presentation tokens for the five detection buckets. The symbol map
+// mirrors the app's DeviceType, kept self-contained here.
 private enum DetCat: CaseIterable {
-    case alpr, drone, bodyCam, tracker
+    case alpr, drone, bodyCam, tracker, glasses
 
     var symbol: String {
         switch self {
@@ -15,14 +31,16 @@ private enum DetCat: CaseIterable {
         case .drone:   return "airplane"
         case .bodyCam: return "person.fill.viewfinder"
         case .tracker: return "dot.radiowaves.left.and.right"
+        case .glasses: return "eyeglasses"
         }
     }
     var tint: Color {
         switch self {
-        case .alpr:    return .red
-        case .drone:   return .orange
-        case .bodyCam: return Color(white: 0.62)
-        case .tracker: return .teal
+        case .alpr:    return WidgetTheme.crimson
+        case .drone:   return WidgetTheme.amber
+        case .bodyCam: return WidgetTheme.bodyCam
+        case .tracker: return WidgetTheme.tracker
+        case .glasses: return WidgetTheme.glasses
         }
     }
     var label: String {
@@ -31,6 +49,7 @@ private enum DetCat: CaseIterable {
         case .drone:   return "DRONE"
         case .bodyCam: return "BODY"
         case .tracker: return "TRACK"
+        case .glasses: return "GLASS"
         }
     }
     func count(_ s: DetectionActivityAttributes.DetectionState) -> Int {
@@ -39,17 +58,41 @@ private enum DetCat: CaseIterable {
         case .drone:   return s.drones
         case .bodyCam: return s.bodyCams
         case .tracker: return s.trackers
+        case .glasses: return s.glasses
         }
     }
 }
 
-// TODO(iOS27 — wire up after Xcode 27 GM ~Sept 2026; these need the iOS 27 SDK and
+/// Dynamic Island slots go to whichever buckets are actually firing: leading and
+/// trailing get the top two by live count, expanded bottom-left gets the third.
+/// Zero-count buckets never claim a slot, so all five (including glasses) are
+/// reachable; when everything is zero the first three fall back in fixed order.
+private func rankedCats(_ s: DetectionActivityAttributes.DetectionState) -> [DetCat] {
+    // Imperative on purpose: the chained tuple map/sort was too much for the type-checker.
+    var live: [(idx: Int, cat: DetCat, n: Int)] = []
+    for (idx, cat) in DetCat.allCases.enumerated() {
+        let n = cat.count(s)
+        if n > 0 { live.append((idx: idx, cat: cat, n: n)) }
+    }
+    live.sort { a, b in
+        if a.n != b.n { return a.n > b.n }
+        return a.idx < b.idx
+    }
+    if live.isEmpty { return Array(DetCat.allCases.prefix(3)) }
+    return live.map { $0.cat }
+}
+
+/// Tapping any Drive Mode surface deep-links into the app's Log tab with the NEW
+/// filter armed (RootView routes the URL, DetectionsView reads the pending flag).
+private let driveModeDeepLink = URL(string: "beacons://log/new")
+
+// TODO(iOS27, wire up after Xcode 27 GM ~Sept 2026; these need the iOS 27 SDK and
 // won't compile on stable Xcode 26.5, so they are intentionally NOT added yet):
 //   • @Environment(\.isDynamicIslandLimitedInWidth) in compactLeading/compactTrailing
 //     -> collapse to icon + number when the Island is width-limited (landscape mount).
 //   • @Environment(\.showsWidgetContainerBackground) in LockScreenView -> paint the
 //     panel edge-to-edge in StandBy (charging + landscape dock).
-// Landscape Dynamic Island rendering itself is automatic on iOS 27 — no code needed.
+// Landscape Dynamic Island rendering itself is automatic on iOS 27, no code needed.
 
 /// The Drive-mode detection counter, presented on the Lock Screen and in the
 /// Dynamic Island. One ActivityConfiguration drives both surfaces.
@@ -60,50 +103,59 @@ struct DetectionLiveActivity: Widget {
             // cell that iOS 26 auto-mirrors onto the CarPlay Dashboard (also the Watch
             // Smart Stack). The small family is declared below via supplementalActivityFamilies.
             DetectionActivityContent(state: context.state, deviceName: context.attributes.deviceName)
+                .widgetURL(driveModeDeepLink)
                 .activityBackgroundTint(Color.black.opacity(0.92))
                 .activitySystemActionForegroundColor(.white)
         } dynamicIsland: { context in
             let s = context.state
+            let ranked = rankedCats(s)
             return DynamicIsland {
-                DynamicIslandExpandedRegion(.leading) { StatBadge(cat: .alpr, state: s) }
-                DynamicIslandExpandedRegion(.trailing) { StatBadge(cat: .tracker, state: s) }
+                DynamicIslandExpandedRegion(.leading) {
+                    if ranked.count > 0 { StatBadge(cat: ranked[0], state: s) }
+                }
+                DynamicIslandExpandedRegion(.trailing) {
+                    if ranked.count > 1 { StatBadge(cat: ranked[1], state: s) }
+                }
                 DynamicIslandExpandedRegion(.center) {
                     VStack(spacing: 1) {
                         Text(s.connected ? "DRIVE MODE" : "RECONNECTING")
-                            .font(.system(size: 9, weight: .semibold)).tracking(1)
-                            .foregroundStyle(s.connected ? Color(white: 0.6) : Color.orange)
+                            .font(WidgetTheme.mono(9)).tracking(1.6)
+                            .foregroundStyle(s.connected ? Color.white.opacity(0.6) : WidgetTheme.amber)
                         Text("\(s.total)")
-                            .font(.system(size: 20, weight: .bold, design: .rounded))
+                            .font(WidgetTheme.digits(20))
                             .monospacedDigit()
                     }
+                    .widgetURL(driveModeDeepLink)
                 }
                 DynamicIslandExpandedRegion(.bottom) {
                     HStack(spacing: 12) {
-                        StatBadge(cat: .drone, state: s)
+                        if ranked.count > 2 { StatBadge(cat: ranked[2], state: s) }
                         Spacer(minLength: 4)
                         Group {
                             if s.total > 0 {
                                 Text("last \(s.lastKind) ").foregroundStyle(.secondary)
                                 + Text(s.lastSeen, style: .relative).foregroundStyle(.secondary)
+                                + Text(" ago").foregroundStyle(.secondary)
                             } else {
-                                Text("all clear").foregroundStyle(.secondary)
+                                Text("no detections").foregroundStyle(.secondary)
                             }
                         }
-                        .font(.system(size: 10))
+                        .font(WidgetTheme.mono(10))
                         Spacer(minLength: 4)
-                        StatBadge(cat: .bodyCam, state: s)
                     }
                 }
             } compactLeading: {
-                Image(systemName: s.connected ? "dot.radiowaves.left.and.right" : "arrow.triangle.2.circlepath")
-                    .foregroundStyle(s.total > 0 ? Color.red : Color(white: 0.6))
+                Image(systemName: s.connected ? "shield.lefthalf.filled" : "arrow.triangle.2.circlepath")
+                    .foregroundStyle(s.total > 0 ? WidgetTheme.crimson : Color.white.opacity(0.6))
+                    .widgetURL(driveModeDeepLink)
             } compactTrailing: {
-                Text("\(s.total)").monospacedDigit().fontWeight(.semibold)
+                Text("\(s.total)").font(WidgetTheme.digits(15)).monospacedDigit()
             } minimal: {
-                Text("\(s.total)").monospacedDigit().fontWeight(.semibold)
-                    .foregroundStyle(s.total > 0 ? Color.red : Color.white)
+                Text("\(s.total)").font(WidgetTheme.digits(15)).monospacedDigit()
+                    .foregroundStyle(s.total > 0 ? WidgetTheme.crimson : Color.white)
+                    .widgetURL(driveModeDeepLink)
             }
-            .keylineTint(.red)
+            .keylineTint(WidgetTheme.crimson)
         }
         // iOS 26 auto-mirrors the .small family onto the CarPlay Dashboard (no CarPlay
         // entitlement); also drives the Apple Watch Smart Stack. iOS 18+ API.
@@ -135,17 +187,23 @@ private struct SmallCell: View {
         HStack(spacing: 9) {
             Image(systemName: "shield.lefthalf.filled")
                 .font(.system(size: 19, weight: .semibold))
-                .foregroundStyle(state.total > 0 ? Color.red : Color(white: 0.6))
+                .foregroundStyle(state.total > 0 ? WidgetTheme.crimson : Color.white.opacity(0.6))
             VStack(alignment: .leading, spacing: 0) {
                 Text("\(state.total)")
-                    .font(.system(size: 22, weight: .bold, design: .rounded)).monospacedDigit()
-                Text(state.total > 0 ? (state.connected ? "detected" : "reconnecting") : "all clear")
-                    .font(.system(size: 9, weight: .semibold)).tracking(0.5)
-                    .foregroundStyle(Color(white: 0.6))
+                    .font(WidgetTheme.digits(22)).monospacedDigit()
+                Text(stateLabel)
+                    .font(WidgetTheme.mono(8)).tracking(0.8)
+                    .foregroundStyle(.white.opacity(0.6))
             }
             Spacer(minLength: 0)
         }
         .padding(.horizontal, 12).padding(.vertical, 8)
+    }
+
+    private var stateLabel: String {
+        guard state.connected else { return "reconnecting" }
+        guard state.total > 0 else { return "no detections" }
+        return "last · \(state.lastKind.lowercased())"
     }
 }
 
@@ -159,15 +217,15 @@ private struct LockScreenView: View {
         VStack(alignment: .leading, spacing: 10) {
             HStack(spacing: 6) {
                 Image(systemName: "shield.lefthalf.filled")
-                    .font(.system(size: 12, weight: .semibold)).foregroundStyle(.red)
+                    .font(.system(size: 13, weight: .semibold)).foregroundStyle(WidgetTheme.crimson)
                 Text("BEACONS · DRIVE MODE")
-                    .font(.system(size: 11, weight: .semibold)).tracking(1)
-                    .foregroundStyle(.white.opacity(0.85))
+                    .font(WidgetTheme.mono(10)).tracking(1.6)
+                    .foregroundStyle(.white.opacity(0.6))
                 Spacer()
                 if !state.connected {
                     Text("RECONNECTING")
-                        .font(.system(size: 9, weight: .semibold)).tracking(0.5)
-                        .foregroundStyle(.orange)
+                        .font(WidgetTheme.mono(9)).tracking(0.8)
+                        .foregroundStyle(WidgetTheme.amber)
                 }
                 Button(intent: EndDriveModeIntent()) {
                     Image(systemName: "xmark.circle.fill")
@@ -191,17 +249,18 @@ private struct LockScreenView: View {
                     ForEach(DetCat.allCases, id: \.self) { StatTile(cat: $0, state: state) }
                 }
                 HStack(spacing: 4) {
-                    Text(deviceName).font(.system(size: 10)).foregroundStyle(.white.opacity(0.5)).lineLimit(1)
+                    Text(deviceName).font(WidgetTheme.mono(9.5)).foregroundStyle(.white.opacity(0.33)).lineLimit(1)
                     Spacer(minLength: 6)
                     Group {
                         if state.total > 0 {
                             Text("last \(state.lastKind) ")
                             + Text(state.lastSeen, style: .relative)
+                            + Text(" ago")
                         } else {
-                            Text("nothing detected yet")
+                            Text("no detections")
                         }
                     }
-                    .font(.system(size: 10)).foregroundStyle(.white.opacity(0.5))
+                    .font(WidgetTheme.mono(9.5)).foregroundStyle(.white.opacity(0.33))
                 }
             }
         }
@@ -217,10 +276,10 @@ private struct StatTile: View {
             Image(systemName: cat.symbol).font(.system(size: 13))
                 .foregroundStyle(n > 0 ? cat.tint : .white.opacity(0.35))
             Text("\(n)")
-                .font(.system(size: 18, weight: .semibold, design: .rounded)).monospacedDigit()
+                .font(WidgetTheme.digits(18)).monospacedDigit()
                 .foregroundStyle(n > 0 ? .white : .white.opacity(0.4))
             Text(cat.label)
-                .font(.system(size: 8, weight: .semibold)).tracking(0.5)
+                .font(WidgetTheme.mono(8)).tracking(0.8)
                 .foregroundStyle(n > 0 ? cat.tint : .white.opacity(0.35))
         }
         .frame(maxWidth: .infinity)
@@ -236,8 +295,8 @@ private struct StatBadge: View {
         let n = cat.count(state)
         HStack(spacing: 4) {
             Image(systemName: cat.symbol).font(.system(size: 12))
-                .foregroundStyle(n > 0 ? cat.tint : Color(white: 0.6))
-            Text("\(n)").font(.system(size: 15, weight: .semibold)).monospacedDigit()
+                .foregroundStyle(n > 0 ? cat.tint : Color.white.opacity(0.6))
+            Text("\(n)").font(WidgetTheme.digits(15)).monospacedDigit()
         }
     }
 }

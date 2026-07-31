@@ -1,0 +1,19 @@
+<!-- Home-screen widget metadata. A ~4x2 glance tile: the per-category strip is six glyph+count
+     cells (~150dp laid out), which a 2-cell-wide tile cannot hold, so this widget is the analog
+     of the iOS MEDIUM face rather than the small one. It still degrades honestly when resized
+     narrower, because zero-count cells are hidden and a typical day shows only one or two.
+     updatePeriodMillis is the OS-driven
+     floor (30 min is the platform minimum); while the app process is alive it pushes fresher
+     updates on every detection and on connect/disconnect (AcabBleManager.updateWidget), so the
+     30-min tick only keeps the relative "ago" honest when the app is not running. -->
+<appwidget-provider xmlns:android="http://schemas.android.com/apk/res/android"
+    android:minWidth="250dp"
+    android:minHeight="110dp"
+    android:targetCellWidth="4"
+    android:targetCellHeight="2"
+    android:updatePeriodMillis="1800000"
+    android:initialLayout="@layout/widget_beacons"
+    android:previewLayout="@layout/widget_beacons"
+    android:description="@string/widget_description"
+    android:resizeMode="horizontal|vertical"
+    android:widgetCategory="home_screen" />

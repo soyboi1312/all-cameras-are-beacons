@@ -2,9 +2,16 @@
  * ACAB - Police / Motorola Solutions gear detector.
  *
  * OUI-only match on Motorola Solutions blocks (see police_signatures.h). Flags "a
- * Motorola Solutions device nearby" - a useful law-enforcement-equipment hint, but
- * broad (it catches any of their WiFi/BLE gear), so it is OFF by default and the
- * app / mesh turns it on.
+ * Motorola Solutions device nearby", a useful body-worn-equipment hint, but broad (it
+ * catches any of their WiFi/BLE gear), so it is folded into the body-cam category and
+ * sits behind its OWN sub-toggle underneath it: {"motorola":bool}, NVS-persisted,
+ * default ON on beacon-board/oui-spy and OFF on mesh-detect.
+ *
+ * SUB-toggle, not a peer: classification needs BOTH axonIsEnabled() (the category) and
+ * policeIsEnabled() (this broad-match opt-out). Turning the body-cam category off kills
+ * every body-cam signature; turning only this off leaves the conf-90 field-validated
+ * Axon BWCDEVICE tag and Utility BodyWorn running. Before the split these shared one
+ * switch, so quieting this broad match also silenced the best signature on the board.
  */
 #ifndef ACAB_POLICE_DETECT_H
 #define ACAB_POLICE_DETECT_H
@@ -12,9 +19,12 @@
 #include "detection.h"
 #include <stddef.h>
 
-// Master on/off. Default: OFF (opt-in, like the tracker detector).
+// Broad-match sub-toggle (NVS-persisted). Module default OFF; main.cpp restores the
+// persisted value at boot. Gated by the body-cam category on top of this - see above.
 void policeSetEnabled(bool enabled);
 bool policeIsEnabled();
+// Reload the persisted sub-toggle on boot (NVS); defaultEnabled if never set.
+void policeRestoreEnabled(bool defaultEnabled);
 
 // Match a Motorola Solutions OUI on a BLE advertiser's MAC.
 bool policeClassifyBLE(const uint8_t mac[6], const uint8_t* adv, size_t advLen,

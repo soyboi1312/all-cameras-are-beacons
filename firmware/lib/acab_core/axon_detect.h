@@ -69,6 +69,8 @@ void axonUseRegistryCandidate(void);
 // can flip it off.
 void axonSetEnabled(bool enabled);
 bool axonIsEnabled();
+// Reload the persisted body-cam toggle on boot (NVS); defaultEnabled if never set.
+void axonRestoreEnabled(bool defaultEnabled);
 
 // Classify a BLE advertisement. Returns true + fills `out` only when Axon
 // detection is on AND the active signature matches.

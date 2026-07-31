@@ -20,6 +20,10 @@
 void alertsInit();
 void alertsBootJingle();
 
+// Play the "app linked" chirp once when the BLE connection comes up, and arm the
+// first-contact "reveal" sting for this session. Call on the rising edge of a link.
+void alertsConnected();
+
 // Queue a non-blocking alert for a detection. Only `isNew` hits beep.
 void alertsSignal(AcabDeviceType type, bool isNew);
 
@@ -34,5 +38,11 @@ uint8_t alertsVolume();
 // Short preview beep at the current volume, so you can hear the level (the app
 // fires this when the volume slider is released). Silent while muted.
 void alertsBeepTest();
+
+// Onboard LED master on/off. On (default) = a slow idle "alive" heartbeat + the
+// detection flashes + the boot sweep, so a first-time board never looks dead. Off
+// ("lights out") = fully dark, for covert/stationary deploys. Persisted to NVS.
+void alertsSetLedEnabled(bool on);
+bool alertsLedEnabled();
 
 #endif // ACAB_ALERTS_H

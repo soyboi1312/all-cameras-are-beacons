@@ -3,22 +3,49 @@ import SwiftUI
 /// Device tab: OUI-Spy hardware status, scan radios, and alert controls.
 struct DeviceView: View {
     @EnvironmentObject var ble: BLEManager
+    @EnvironmentObject var manifest: FirmwareManifestStore
 
     @State private var master: Double = 72
+    @State private var pendingVolume = false   // hold the slider at the user's value while dragging + until the board confirms
+    @State private var flockOn = true
+    @State private var droneOn = true
     @State private var bodyCamOn = false
     @State private var trackerOn = false
-    @State private var pendingTracker = false   // just flipped; hold the value until the board confirms
+    @State private var glassesOn = true
+    @State private var droneOuiOn = false        // drone vendor-OUI fallback; sub-option of droneOn, off by default
+    @State private var netcamOn = false          // network-camera detector; opt-in, off by default (like droneOui)
+    @State private var motorolaOn = true         // broad Motorola-OUI match; sub-option of bodyCamOn, on by default
+    @State private var pendingFlock = false     // just flipped; hold the value until the board confirms
+    @State private var pendingDrone = false
+    @State private var pendingDroneOui = false
+    @State private var pendingTracker = false
     @State private var pendingBodyCam = false
+    @State private var pendingMotorola = false
+    @State private var pendingGlasses = false
+    @State private var pendingNetcam = false
     @State private var bleOn = true
     @State private var wifiOn = true
+    @State private var wifiEco = 0             // WiFi eco sleep seconds (0/3/7/15); battery SKU only
+    @State private var pendingWifiEco = false
+    @State private var pendingBle = false      // just flipped; hold until the board confirms
+    @State private var pendingWifi = false
     @State private var bufferOn = false
     @State private var pendingBuffer = false   // just flipped; hold until the board confirms
+    @State private var lightsOut = false       // "lights out": board LED fully dark
+    @State private var pendingLed = false
     @State private var desertOn = false
     @State private var pendingDesert = false
-    // Per-threat volumes are UI-only for now — the firmware has just one master level.
-    @AppStorage("vol.flock") private var flock: Double = 90
-    @AppStorage("vol.drone") private var drone: Double = 55
-    @AppStorage("vol.axon")  private var axon:  Double = 80
+    @State private var confirmEraseBuffer = false   // gate the destructive board-buffer erase
+    @State private var checkingForUpdate = false    // manual "check for updates" spinner
+    @State private var justChecked = false          // brief "checked" confirmation state
+    // Rename flow for a watched (starred) device.
+    @State private var renameMac: String?
+    @State private var renameText = ""
+    /// Which list the pencil was tapped in. One alert serves both cards; without this the Save
+    /// button would always call renameWatched and silently no-op on an ignored device.
+    @State private var renameIsIgnored = false
+    // T5: regular width lays the cards out two-up; compact stays a single column.
+    @Environment(\.horizontalSizeClass) private var hSize
 
     // Any mode but the buzzer dims the volume sliders.
     private var muted: Bool { ble.alertMode != .buzzer }
@@ -28,43 +55,357 @@ struct DeviceView: View {
             ZStack {
                 ACABTheme.bg.ignoresSafeArea()
                 ScrollView {
-                    VStack(alignment: .leading, spacing: 16) {
-                        header
-                        deviceHero
-                        firmwareCard
-                        radiosCard
-                        detectorsCard
-                        driveModeCard
-                        desertModeCard
-                        if !ble.ignored.isEmpty { ignoredCard }
-                        if ble.status?.isMeshDetect != true { buzzerCard }   // mesh board has no buzzer
-                        statsGrid
-                        disconnectButton
-                        aboutCard
-                        Spacer(minLength: 8)
+                    Group {
+                        if hSize == .regular {
+                            // R13: mirror the Android tablet split (>=840dp). The page header, the
+                            // hero, and the fault/firmware banners span the FULL content width; the
+                            // remaining slots split into two balanced columns in list order. The tall
+                            // config drawer lives in the left column (with stats + managed devices),
+                            // the rest goes right, so no row ever pairs the drawer with a lone card.
+                            VStack(alignment: .leading, spacing: 16) {
+                                header
+                                deviceHero
+                                if coprocFault { coprocFaultBanner } else if nrfUpdating { nrfUpdatingBanner }
+                                if updateExists { firmwareBanner }
+                                HStack(alignment: .top, spacing: 14) {
+                                    VStack(alignment: .leading, spacing: 14) {
+                                        statsGrid
+                                        configPanel
+                                        managedDevicesRow
+                                    }
+                                    .frame(maxWidth: .infinity, alignment: .top)
+                                    VStack(alignment: .leading, spacing: 14) {
+                                        disconnectButton
+                                        aboutFooter
+                                    }
+                                    .frame(maxWidth: .infinity, alignment: .top)
+                                }
+                                Spacer(minLength: 8)
+                            }
+                            .frame(maxWidth: 1000)
+                            .frame(maxWidth: .infinity)
+                        } else {
+                            VStack(alignment: .leading, spacing: 16) {
+                                settingsCards
+                                Spacer(minLength: 8)
+                            }
+                            .frame(maxWidth: 640)
+                            .frame(maxWidth: .infinity)
+                        }
                     }
                     .padding(.horizontal, ACABTheme.pad)
                     .padding(.top, 8)
                 }
             }
             .navigationBarHidden(true)
+            .confirmationDialog(
+                "Erase \(ble.status?.bufCount ?? 0) buffered detection\((ble.status?.bufCount ?? 0) == 1 ? "" : "s") on the board?",
+                isPresented: $confirmEraseBuffer, titleVisibility: .visible
+            ) {
+                Button("Erase", role: .destructive) { ble.clearBufferLog() }
+                Button("Cancel", role: .cancel) {}
+            } message: {
+                Text("This permanently wipes the board's offline log and can't be undone. Detections already synced to this phone stay in your log; anything not yet synced is lost.")
+            }
         }
         .onAppear(perform: sync)
         .onChange(of: ble.status) { _, _ in sync() }
+        // "moto" lives outside DeviceStatus, so a frame that changed only the Motorola sub-toggle
+        // (the board echoing our write back) wouldn't move `status` and wouldn't clear the pending
+        // hold. Watch it directly.
+        .onChange(of: ble.motorolaOn) { _, _ in sync() }
     }
 
     // copy board state into local UI vars; runs on appear and on every status update
     private func sync() {
         guard let s = ble.status else { return }
-        master = Double(s.volume)
+        // Hold the slider at the user's value while dragging + until the board echoes it back, so a
+        // status frame mid-drag can't snap it to the board's stale volume (same idea as the toggles).
+        if pendingVolume { if s.volume == Int(master.rounded()) { pendingVolume = false } } else { master = Double(s.volume) }
         // Hold a just-toggled switch at the user's value until the board confirms it,
         // so the ~5s status frame can't snap it back to off before then.
+        if pendingFlock { if s.flock == flockOn { pendingFlock = false } } else { flockOn = s.flock }
+        if pendingDrone { if s.drone == droneOn { pendingDrone = false } } else { droneOn = s.drone }
+        if pendingDroneOui { if s.droui == droneOuiOn { pendingDroneOui = false } } else { droneOuiOn = s.droui }
         if pendingBodyCam { if s.axon == bodyCamOn { pendingBodyCam = false } } else { bodyCamOn = s.axon }
+        // The Motorola sub-toggle rides "moto", which isn't part of DeviceStatus; BLEManager reads
+        // it off the status frame, so mirror from there instead of `s`. Same hold-until-confirmed.
+        if pendingMotorola { if ble.motorolaOn == motorolaOn { pendingMotorola = false } } else { motorolaOn = ble.motorolaOn }
         if pendingTracker { if s.tracker == trackerOn { pendingTracker = false } } else { trackerOn = s.tracker }
+        if pendingGlasses { if s.glasses == glassesOn { pendingGlasses = false } } else { glassesOn = s.glasses }
+        if pendingNetcam { if s.ncam == netcamOn { pendingNetcam = false } } else { netcamOn = s.ncam }
         if pendingBuffer { if s.bufferingOn == bufferOn { pendingBuffer = false } } else { bufferOn = s.bufferingOn }
+        if pendingLed { if (!s.ledEnabled) == lightsOut { pendingLed = false } } else { lightsOut = !s.ledEnabled }
         if pendingDesert { if s.desertMode == desertOn { pendingDesert = false } } else { desertOn = s.desertMode }
-        bleOn  = s.ble
-        wifiOn = s.wifi
+        // Scan radios get the same hold: a periodic status frame generated before the write
+        // lands would otherwise snap the switch back, inviting a duplicate tap and write.
+        if pendingBle { if s.ble == bleOn { pendingBle = false } } else { bleOn = s.ble }
+        if pendingWifi { if s.wifi == wifiOn { pendingWifi = false } } else { wifiOn = s.wifi }
+        if pendingWifiEco { if s.wifiEco == wifiEco { pendingWifiEco = false } } else { wifiEco = s.wifiEco }
+    }
+
+    // MARK: 1g composition
+    // Three content classes: glanceable state stays open (hero + trimmed stats),
+    // firmware promotes to a crimson banner when an update exists, and everything
+    // configurable folds into one single-open-at-a-time section panel. Watched/ignored
+    // and About push to sub-screens. The same builder feeds both the compact column
+    // and the regular two-up grid; the folded rows just flow into the grid unchanged.
+    @ViewBuilder
+    private var settingsCards: some View {
+        header
+        deviceHero
+        if coprocFault { coprocFaultBanner }        // dual-radio nRF fault, right under the hero
+        else if nrfUpdating { nrfUpdatingBanner }   // same slot, but the nRF is down on purpose
+        if updateExists { firmwareBanner }   // crimson banner directly under the hero
+        statsGrid                            // UPTIME + DETECTIONS (2-up)
+        configPanel                          // scan radios / detectors / alerts / drive / desert+buffer / LED
+        managedDevicesRow                    // -> watched + ignored sub-screen
+        disconnectButton
+        aboutFooter                          // -> about sub-screen
+    }
+
+    // Which config fold section is currently open. Exactly one at a time (nil = all closed).
+    // The firmware row/banner shares this state under `.firmware`, so opening it also
+    // collapses any open config section.
+    private enum ConfigSection: Hashable { case firmware, radios, detectors, alerts, drive, desert, led }
+    @State private var openSection: ConfigSection?
+
+    // An update "exists" whenever the board is behind the manifest, or an OTA is mid-flight
+    // / just finished. Drives banner-vs-fold-row for firmware. Same signals the card reads.
+    private var updateExists: Bool { outdated || ble.combinedState.isRunning || combinedTerminal }
+
+    // MARK: firmware banner (shown only when updateExists)
+    // Filled crimson header; tap expands today's firmwareCard verbatim (OTA progress /
+    // failed states keep their current UI, since it IS the same card).
+    private var firmwareBanner: some View {
+        let open = openSection == .firmware
+        return VStack(spacing: 12) {
+            Button {
+                withAnimation(.easeInOut(duration: 0.2)) { openSection = open ? nil : .firmware }
+            } label: {
+                HStack(spacing: 12) {
+                    VStack(alignment: .leading, spacing: 3) {
+                        Text("Firmware v\(latestVersion) ready")
+                            .font(ACABTheme.display(15, weight: .semibold)).foregroundStyle(ACABTheme.onAccent)
+                        Text("installed v\(ble.status?.version ?? "-") \u{00B7} updates over Bluetooth")
+                            .font(ACABTheme.mono(10.5)).tracking(1.0)
+                            .foregroundStyle(ACABTheme.onAccent.opacity(0.82))
+                    }
+                    Spacer(minLength: 8)
+                    Image(systemName: open ? "chevron.up" : "chevron.down")
+                        .font(.system(size: 14, weight: .semibold)).foregroundStyle(ACABTheme.onAccent)
+                }
+                .padding(16)
+                .background(ACABTheme.accent, in: RoundedRectangle(cornerRadius: ACABTheme.radiusSm, style: .continuous))
+                .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            if open { firmwareCard }   // today's card, unchanged
+        }
+    }
+
+    // MARK: config fold panel (one open section at a time)
+    private var configPanel: some View {
+        VStack(spacing: 0) {
+            // Firmware lives here as a plain fold row only when there's no banner (up to date).
+            if !updateExists {
+                foldRow(.firmware, glyph: "memorychip", title: "Firmware", kicker: firmwareRowKicker) { firmwareCard }
+                rowDivider
+            }
+            foldRow(.radios, glyph: "antenna.radiowaves.left.and.right",
+                    title: "Scan radios", kicker: radiosKicker) { radiosCard }
+            rowDivider
+            foldRow(.detectors, glyph: "scope",
+                    title: "Detectors", kicker: detectorsKicker) { detectorsCard }
+            if ble.status?.isMeshDetect != true {   // mesh board has no buzzer -> no Alerts row
+                rowDivider
+                foldRow(.alerts, glyph: "bell", title: "Alerts", kicker: alertsKicker) { buzzerCard }
+            }
+            rowDivider
+            // Board LED sits with Alerts (both are local feedback), above the situational modes.
+            foldRow(.led, glyph: "lightbulb", title: "Board LED", kicker: ledKicker) { lightsOutCard }
+            rowDivider
+            foldRow(.drive, glyph: "car", title: "drive mode", kicker: driveKicker) { driveModeCard }
+            rowDivider
+            foldRow(.desert, glyph: "mountain.2",
+                    title: "desert mode + buffer", kicker: desertKicker) {
+                VStack(spacing: 12) { desertModeCard; offlineBufferCard }
+            }
+        }
+        .background(ACABTheme.bg2, in: RoundedRectangle(cornerRadius: ACABTheme.radius, style: .continuous))
+        .clipShape(RoundedRectangle(cornerRadius: ACABTheme.radius, style: .continuous))
+        .overlay(RoundedRectangle(cornerRadius: ACABTheme.radius, style: .continuous)
+            .strokeBorder(ACABTheme.line, lineWidth: 1))
+    }
+
+    private var rowDivider: some View {
+        Rectangle().fill(ACABTheme.line).frame(height: 1).padding(.horizontal, 16)
+    }
+
+    // Hand-rolled disclosure row: glyph + title + live kicker + flipping chevron. Open ->
+    // accent-tinted glyph, flipped chevron, faint accent wash, and today's card verbatim below.
+    @ViewBuilder
+    private func foldRow<Content: View>(_ section: ConfigSection, glyph: String, title: String,
+                                        kicker: String, @ViewBuilder content: () -> Content) -> some View {
+        let open = openSection == section
+        VStack(alignment: .leading, spacing: 0) {
+            Button {
+                withAnimation(.easeInOut(duration: 0.2)) { openSection = open ? nil : section }
+            } label: {
+                HStack(spacing: 12) {
+                    Image(systemName: glyph)
+                        .font(.system(size: 16, weight: .medium))
+                        .foregroundStyle(open ? ACABTheme.accent : ACABTheme.dim)
+                        .frame(width: 22)
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text(title).font(ACABTheme.display(15, weight: .medium)).foregroundStyle(ACABTheme.text)
+                        Kicker(kicker)
+                    }
+                    Spacer(minLength: 8)
+                    Image(systemName: open ? "chevron.up" : "chevron.down")
+                        .font(.system(size: 13, weight: .semibold))
+                        .foregroundStyle(open ? ACABTheme.accent : ACABTheme.faint)
+                }
+                .padding(.vertical, 14)
+                .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            if open { content().padding(.bottom, 14) }
+        }
+        .padding(.horizontal, 16)
+        .background(open ? ACABTheme.accent.opacity(0.04) : Color.clear)
+    }
+
+    // MARK: managed devices row -> watched + ignored sub-screen
+    private var managedDevicesRow: some View {
+        NavigationLink { managedDevicesScreen } label: {
+            HStack(spacing: 12) {
+                Image(systemName: "star.fill")
+                    .font(.system(size: 16, weight: .medium)).foregroundStyle(ACABTheme.watchTone).frame(width: 22)
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("Managed devices").font(ACABTheme.display(15, weight: .medium)).foregroundStyle(ACABTheme.text)
+                    Kicker(managedKicker)
+                }
+                Spacer(minLength: 8)
+                Image(systemName: "chevron.right")
+                    .font(.system(size: 13, weight: .semibold)).foregroundStyle(ACABTheme.faint)
+            }
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .panel()
+    }
+
+    private var managedDevicesScreen: some View {
+        ZStack {
+            ACABTheme.bg.ignoresSafeArea()
+            ScrollView {
+                VStack(alignment: .leading, spacing: 16) {
+                    if !ble.watched.isEmpty { watchedCard }
+                    if !ble.ignored.isEmpty { ignoredCard }
+                    // Both lists empty: say so, or the pushed screen reads as a loading failure.
+                    if ble.watched.isEmpty && ble.ignored.isEmpty {
+                        Text("No watched or ignored devices yet.")
+                            .font(ACABTheme.mono(12)).foregroundStyle(ACABTheme.dim)
+                    }
+                    Spacer(minLength: 8)
+                }
+                .frame(maxWidth: 640).frame(maxWidth: .infinity)
+                .padding(.horizontal, ACABTheme.pad).padding(.top, 8)
+            }
+        }
+        .navigationTitle("Managed devices")
+        .navigationBarTitleDisplayMode(.inline)
+        // The rename alert MUST live here, not on the root Device screen: the pencil is in watchedCard,
+        // which only renders inside this pushed sub-screen. An alert attached to the covered root never
+        // presents, so tapping the pencil silently did nothing.
+        .alert("Rename device", isPresented: renameAlertBinding) {
+            TextField("Label", text: $renameText)
+            Button("Cancel", role: .cancel) { renameMac = nil }
+            Button("Save") {
+                if let mac = renameMac {
+                    let t = renameText.trimmingCharacters(in: .whitespaces)
+                    if renameIsIgnored { ble.renameIgnored(mac, to: t) } else { ble.renameWatched(mac, to: t) }
+                }
+                renameMac = nil
+            }
+        } message: {
+            Text("Name this device so you recognize it in the log.")
+        }
+    }
+
+    // MARK: about footer link -> about sub-screen
+    private var aboutFooter: some View {
+        NavigationLink { aboutScreen } label: {
+            Text("about \u{00B7} made by soyboi")
+                .font(ACABTheme.mono(10.5)).foregroundStyle(ACABTheme.faint)
+                .frame(maxWidth: .infinity, alignment: .center)
+                .padding(.vertical, 10)
+                .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+    }
+
+    private var aboutScreen: some View {
+        ZStack {
+            ACABTheme.bg.ignoresSafeArea()
+            ScrollView {
+                VStack(alignment: .leading, spacing: 16) { aboutCard }
+                    .frame(maxWidth: 640).frame(maxWidth: .infinity)
+                    .padding(.horizontal, ACABTheme.pad).padding(.top, 8)
+            }
+        }
+        .navigationTitle("About")
+        .navigationBarTitleDisplayMode(.inline)
+    }
+
+    // MARK: fold-row kickers (all live state, terse ALL-CAPS)
+    private var firmwareRowKicker: String {
+        // An nRF-only update leaves the S3 version current, so it lives in this fold row rather
+        // than the crimson banner; say "UPDATE READY" so the kicker isn't misleadingly "UP TO DATE".
+        "v\(ble.status?.version ?? latestVersion) \u{00B7} \(combinedStale ? "UPDATE READY" : "UP TO DATE")"
+    }
+
+    private var radiosKicker: String {
+        switch (bleOn, wifiOn) {
+        case (true, true):   return "BLE + WI-FI ON"
+        case (true, false):  return "BLE ON \u{00B7} WI-FI OFF"
+        case (false, true):  return "WI-FI ON \u{00B7} BLE OFF"
+        case (false, false): return "ALL RADIOS OFF"
+        }
+    }
+
+    private var detectorsKicker: String {
+        let onCount = [flockOn, droneOn, bodyCamOn, trackerOn, glassesOn, netcamOn].filter { $0 }.count
+        let expOn = [glassesOn].filter { $0 }.count
+        return "\(onCount) ON \u{00B7} \(expOn) EXP \u{00B7} TRACKERS \(trackerOn ? "ON" : "OFF")"
+    }
+
+    private var alertsKicker: String {
+        switch ble.alertMode {
+        case .buzzer:  return "BUZZER \u{00B7} VOLUME \(Int(master))"
+        case .vibrate: return "VIBRATE \u{00B7} PHONE BUZZES"
+        case .silent:  return "SILENT"
+        }
+    }
+
+    private var driveKicker: String {
+        "COUNTER \(ble.driveModeOn ? "ON" : "OFF") \u{00B7} LOCK SCREEN \(ble.redactLockScreen ? "HIDDEN" : "SHOWN")"
+    }
+
+    private var desertKicker: String {
+        switch (desertOn, bufferOn) {
+        case (false, false): return "BOTH OFF"
+        case (true, true):   return "BOTH ON"
+        case (true, false):  return "DESERT ON \u{00B7} BUFFER OFF"
+        case (false, true):  return "BUFFER ON \u{00B7} DESERT OFF"
+        }
+    }
+
+    private var ledKicker: String { lightsOut ? "LIGHTS OUT" : "HEARTBEAT ON" }
+
+    private var managedKicker: String {
+        "\(ble.watched.count) WATCHED \u{00B7} \(ble.status?.watchCount ?? 0) ON BOARD \u{00B7} \(ble.ignored.count) IGNORED"
     }
 
     // MARK: header
@@ -75,11 +416,18 @@ struct DeviceView: View {
                 Kicker(ble.demoMode ? "SAMPLE DATA" : "PAIRED OVER BLE")
             }
             Spacer()
-            Image(systemName: "arrow.triangle.2.circlepath")
-                .font(.system(size: 15, weight: .medium)).foregroundStyle(ACABTheme.dim)
-                .frame(width: 38, height: 38)
-                .background(ACABTheme.bg2, in: Circle())
-                .overlay(Circle().strokeBorder(ACABTheme.line, lineWidth: 1))
+            // Ask the board for a fresh status frame right now, instead of waiting
+            // for the next periodic notify.
+            Button { ble.otaRereadStatus() } label: {
+                Image(systemName: "arrow.triangle.2.circlepath")
+                    .font(.system(size: 15, weight: .medium)).foregroundStyle(ACABTheme.dim)
+                    .frame(width: 38, height: 38)
+                    .background(ACABTheme.bg2, in: Circle())
+                    .overlay(Circle().strokeBorder(ACABTheme.line, lineWidth: 1))
+                    .contentShape(Circle())
+            }
+            .buttonStyle(.plain)
+            .accessibilityLabel("Refresh device status")
         }
     }
 
@@ -94,63 +442,434 @@ struct DeviceView: View {
                     .shadow(color: ACABTheme.accentGlow, radius: 4).offset(x: -14, y: -9)
             }
             VStack(alignment: .leading, spacing: 4) {
-                Text(ble.connectedName?.contains("ACAB") == true
+                Text((ble.connectedName?.contains("ACAB") == true || ble.connectedName?.contains("beacon") == true)
                      ? "All Cameras Are Beacons" : (ble.connectedName ?? "ESP32 board"))
                     .font(ACABTheme.display(16, weight: .semibold)).foregroundStyle(ACABTheme.text)
                     .lineLimit(2).minimumScaleFactor(0.8).fixedSize(horizontal: false, vertical: true)
                 Text(ble.demoMode ? "SAMPLE DATA · no live board"
-                                  : "CONNECTED · \(ble.status?.firmware ?? "Beacons")")
+                                  : "CONNECTED · \(ble.status?.firmwareLabel ?? "beacons")\(boardRevSuffix)")
                     .font(ACABTheme.mono(10.5)).foregroundStyle(ACABTheme.dim)
             }
             Spacer()
+            if let bat = ble.status?.battery {
+                let charging = ble.status?.charging == true
+                HStack(spacing: 4) {
+                    Image(systemName: charging ? "battery.100.bolt" : batterySymbol(bat))
+                    Text("\(bat)%")
+                }
+                .font(ACABTheme.mono(11))
+                .foregroundStyle(charging ? ACABTheme.accent : (bat <= 15 ? ACABTheme.warn : ACABTheme.dim))
+            }
             ScanDot(color: ble.connectionState == .connected ? ACABTheme.accent : ACABTheme.faint)
         }
         .panel(strong: true)
     }
 
+    private func batterySymbol(_ p: Int) -> String {
+        switch p {
+        case ..<13: return "battery.0";   case ..<38: return "battery.25"
+        case ..<63: return "battery.50";  case ..<88: return "battery.75"
+        default:    return "battery.100"
+        }
+    }
+
+    // MARK: nRF radio fault (dual-radio beacon board only)
+    // The ESP32 only emits "co" when it's a dual-radio board; when it does and the value is
+    // false, the nRF co-processor stopped answering over UART, so the whole BLE-detection half
+    // is dark. Single-radio boards omit the key, so `coproc == nil` and this never fires.
+    // Except during a BLE-DFU window: the nRF sits in its bootloader on purpose, so "co" reads
+    // false for minutes at a time and the board flags that with "nrfup". Same dark radio, wholly
+    // different story, so the fault defers to it rather than crying wolf over a healthy update.
+    private var nrfUpdating: Bool { ble.status?.nrfUpdating == true }
+    // App-authoritative suppression: while the one-click flow is running we KNOW the nRF is being
+    // reset-pulsed / reflashed, so force the fault banner off regardless of what the firmware's
+    // `nrfup`/`co` happen to report this frame. OR-in the running flag here at the source.
+    private var coprocFault: Bool { ble.status?.coproc == false && !nrfUpdating && !ble.combinedState.isRunning }
+
+    /// The calm twin of coprocFaultBanner: same dark BLE half, on purpose and temporary.
+    private var nrfUpdatingBanner: some View {
+        HStack(alignment: .top, spacing: 12) {
+            ProgressView()
+                .progressViewStyle(.circular)
+                .scaleEffect(0.7)
+                .tint(ACABTheme.dim)
+                .frame(width: 22)
+            VStack(alignment: .leading, spacing: 3) {
+                Text("updating co-processor")
+                    .font(ACABTheme.display(15, weight: .semibold)).foregroundStyle(ACABTheme.text)
+                    .fixedSize(horizontal: false, vertical: true)
+                Text("the second radio is taking new firmware, so BLE gear won't be spotted until it comes back. Wi-Fi detection still runs. keep the board powered and stay close.")
+                    .font(ACABTheme.mono(10.5)).foregroundStyle(ACABTheme.dim)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            Spacer(minLength: 0)
+        }
+        .padding(16)
+        .background(ACABTheme.bg2, in: RoundedRectangle(cornerRadius: ACABTheme.radius, style: .continuous))
+        .overlay(RoundedRectangle(cornerRadius: ACABTheme.radius, style: .continuous)
+            .strokeBorder(ACABTheme.line, lineWidth: 1))
+    }
+
+    private var coprocFaultBanner: some View {
+        HStack(alignment: .top, spacing: 12) {
+            Image(systemName: "exclamationmark.triangle.fill")
+                .font(.system(size: 16, weight: .semibold)).foregroundStyle(ACABTheme.accent)
+                .frame(width: 22)
+            VStack(alignment: .leading, spacing: 3) {
+                Text("nRF radio fault - bluetooth detection offline")
+                    .font(ACABTheme.display(15, weight: .semibold)).foregroundStyle(ACABTheme.text)
+                    .fixedSize(horizontal: false, vertical: true)
+                Text("the second radio stopped answering, so BLE gear won't be spotted. Wi-Fi detection still runs. try a power cycle, and reflash if it sticks.")
+                    .font(ACABTheme.mono(10.5)).foregroundStyle(ACABTheme.dim)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            Spacer(minLength: 0)
+        }
+        .padding(16)
+        .background(ACABTheme.accentSoft, in: RoundedRectangle(cornerRadius: ACABTheme.radius, style: .continuous))
+        .overlay(RoundedRectangle(cornerRadius: ACABTheme.radius, style: .continuous)
+            .strokeBorder(ACABTheme.accent.opacity(0.5), lineWidth: 1))
+    }
+
     // MARK: firmware
+    // The board's fw label ("beacon board" etc.), used to look up its manifest entry.
+    private var fwLabel: String { ble.status?.firmwareLabel ?? "" }
+    // The manifest entry for this board, if the manifest lists it.
+    private var fwEntry: FirmwareManifest.Build? { manifest.entry(forFwLabel: fwLabel) }
+    // Carrier revision, shown next to the fw label so support can tell which board is in the case
+    // without opening it. Silent when the board does not report it (older/single-radio firmware) -
+    // an unlabelled board reads as "we were not told", not as rev-A.
+    private var boardRevSuffix: String {
+        guard let r = ble.status?.boardRev, r == "A" || r == "B" else { return "" }
+        return " · rev-\(r)"
+    }
+    // Belt-and-braces OTA revision gate. The PRIMARY defence is that rev-B firmware reports a
+    // distinct fw label ("beacon board rev-B", set in platformio.ini) and the manifest is KEYED by
+    // that label (FirmwareManifest.build(forFwLabel:) is a dictionary lookup), so a rev-B board
+    // cannot resolve the rev-A entry at all - and until the manifest gains a rev-B key it resolves
+    // nothing and falls back to the browser flasher. Both are fail-closed.
+    // This second check catches the case where someone re-unifies the labels or hand-edits the
+    // manifest: if the board TELLS us its revision, the key we are about to flash from has to agree.
+    // A wrong-image flash parks the unit after every boot and is USB-recovery only, so a false
+    // refusal is by far the cheaper error.
+    private var revisionMatchesManifest: Bool {
+        guard let rev = ble.status?.boardRev, rev == "A" || rev == "B" else { return true }  // not told = do not block
+        let entryIsRevB = fwLabel.lowercased().contains("rev-b")
+        return entryIsRevB == (rev == "B")
+    }
+    // Latest version from the manifest (falls back to the shipped constant when unlisted).
+    private var latestVersion: String { manifest.latestVersion(forFwLabel: fwLabel) }
+    // Installed firmware older than the manifest's latest?
+    private var outdated: Bool { ble.status?.updateAvailable(latest: latestVersion) ?? false }
+
+    /// Every condition that must hold for in-app OTA to be offered:
+    /// (1) the manifest lists this board, (2) it's marked OTA-capable, (3) it carries a
+    /// verifiable image (sha256 + size), (4) the connected board actually exposes the OTA
+    /// characteristic, (5) the installed version is strictly older than the manifest's,
+    /// (6) the manifest key matches the carrier revision the board reports (see below).
+    private var otaEligible: Bool {
+        guard let e = fwEntry, e.ota, e.hasVerifiableImage, ble.otaCapable, outdated,
+              revisionMatchesManifest else { return false }
+        return true
+    }
+
+    /// The flasher URL to send the user to when OTA isn't offered: manifest first, then the
+    /// baked-in default.
+    private var flasherURL: URL {
+        let fromManifest = (fwEntry?.flasher).flatMap(URL.init(string:)).flatMap { $0.scheme == "https" ? $0 : nil }
+        return fromManifest ?? URL(string: "https://soyboi1312.github.io/all-cameras-are-beacons/")!
+    }
+
     private var firmwareCard: some View {
         let installed = ble.status?.version
-        let outdated = ble.status?.updateAvailable ?? false
         return VStack(alignment: .leading, spacing: 12) {
             Kicker("FIRMWARE")
             HStack(alignment: .firstTextBaseline) {
                 VStack(alignment: .leading, spacing: 2) {
-                    Text(installed.map { "v\($0)" } ?? "\u{2014}")
+                    Text(installed.map { "v\($0)" } ?? "-")
                         .font(ACABTheme.display(20, weight: .semibold)).foregroundStyle(ACABTheme.text)
                     Kicker("INSTALLED")
                 }
                 Spacer()
                 VStack(alignment: .trailing, spacing: 2) {
-                    Text("v\(DeviceStatus.latestVersion)")
+                    Text("v\(latestVersion)")
                         .font(ACABTheme.display(20, weight: .semibold))
                         .foregroundStyle(outdated ? ACABTheme.warn : ACABTheme.dim)
                     Kicker("LATEST")
                 }
             }
             Divider().overlay(ACABTheme.line)
+
+            // One-click combined update: ONE button that flashes the board firmware (S3) and, when
+            // it applies, the co-processor (nRF) in a single determinate flow. The transfer engines
+            // are unchanged; BLEManager+CombinedUpdate sequences them and merges their progress.
+            if ble.combinedState.isRunning || combinedTerminal {
+                combinedProgressView                // running, or just finished (done / failed / partial)
+            } else if combinedStale {
+                combinedOfferView                   // either radio is behind: offer the single update
+            } else {
+                firmwareStatusLine                  // up to date, or outdated with browser guidance
+            }
+            // Manual refresh stays reachable except mid-update, so a stale cached manifest can be
+            // re-fetched even when an update already looks available.
+            if !ble.combinedState.isRunning {
+                checkForUpdatesButton
+            }
+        }
+        .panel()
+    }
+
+    // MARK: one-click combined update UI
+
+    /// Either the board firmware or the co-processor is behind and self-updatable.
+    private var combinedStale: Bool {
+        guard let e = fwEntry else { return false }
+        return ble.combinedUpdateStale(entry: e, latest: latestVersion)
+    }
+    /// The combined flow is at a terminal point we keep on screen (done / failed / partial).
+    private var combinedTerminal: Bool {
+        switch ble.combinedState { case .done, .failed, .partial: return true; default: return false }
+    }
+
+    private var combinedOfferView: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            HStack(spacing: 8) {
+                Image(systemName: "arrow.down.circle.fill")
+                    .font(.system(size: 13)).foregroundStyle(ACABTheme.accent)
+                Text("Update available: v\(latestVersion). You can install it here, over Bluetooth.")
+                    .font(ACABTheme.mono(11)).foregroundStyle(ACABTheme.dim)
+                    .fixedSize(horizontal: false, vertical: true)
+                Spacer(minLength: 0)
+            }
+            combinedUpdateButton(title: "update")
+            Text("Installs over Bluetooth and usually takes about 2-3 minutes. The board restarts on its own partway through. Keep this phone next to the beacon with the app open until it finishes.")
+                .font(ACABTheme.mono(10.5)).foregroundStyle(ACABTheme.faint)
+                .fixedSize(horizontal: false, vertical: true)
+        }
+    }
+
+    private func combinedUpdateButton(title: String) -> some View {
+        Button { if let e = fwEntry { ble.startCombinedUpdate(entry: e, fwLabel: fwLabel, latest: latestVersion) } } label: {
+            HStack(spacing: 8) {
+                Image(systemName: "arrow.down.to.line").font(.system(size: 14, weight: .semibold))
+                Text(title).font(ACABTheme.display(15, weight: .semibold))
+            }
+            .foregroundStyle(ACABTheme.onAccent)
+            .frame(maxWidth: .infinity).padding(.vertical, 13)
+            .background(ACABTheme.accent, in: RoundedRectangle(cornerRadius: ACABTheme.radiusSm, style: .continuous))
+        }
+        .buttonStyle(.plain)
+    }
+
+    private var combinedProgressView: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            HStack(spacing: 8) {
+                Image(systemName: combinedStatusSymbol)
+                    .font(.system(size: 13)).foregroundStyle(combinedStatusTone)
+                Text(combinedStatusLabel)
+                    .font(ACABTheme.display(14, weight: .medium)).foregroundStyle(ACABTheme.text)
+                Spacer(minLength: 0)
+                if ble.combinedState.isRunning {
+                    Text("\(Int((ble.combinedProgress * 100).rounded()))%")
+                        .font(ACABTheme.mono(12, weight: .semibold)).foregroundStyle(combinedStatusTone)
+                }
+            }
+            if ble.combinedState.isRunning {
+                ProgressView(value: min(max(ble.combinedProgress, 0), 1), total: 1).tint(ACABTheme.accent)
+                Text(combinedElapsedText)
+                    .font(ACABTheme.mono(10.5)).foregroundStyle(ACABTheme.faint)
+            }
+            if let detail = combinedDetailText {
+                Text(detail).font(ACABTheme.mono(10.5)).foregroundStyle(combinedStatusTone)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            if ble.combinedState.isRunning {
+                Text("Keep this phone next to the beacon with the app open. Don't lock it or leave this screen.")
+                    .font(ACABTheme.mono(10.5)).foregroundStyle(ACABTheme.faint)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            combinedControlButtons
+        }
+    }
+
+    @ViewBuilder
+    private var combinedControlButtons: some View {
+        if ble.combinedState.isRunning {
+            Button(role: .destructive) { ble.combinedCancel() } label: {
+                Text("Cancel").font(ACABTheme.display(14, weight: .semibold))
+                    .frame(maxWidth: .infinity).padding(.vertical, 11)
+                    .foregroundStyle(ACABTheme.accent)
+                    .background(ACABTheme.bg2, in: RoundedRectangle(cornerRadius: ACABTheme.radiusSm, style: .continuous))
+                    .overlay(RoundedRectangle(cornerRadius: ACABTheme.radiusSm).strokeBorder(ACABTheme.lineStrong, lineWidth: 1))
+            }
+            .buttonStyle(.plain)
+        } else if case .partial = ble.combinedState {
+            // S3 took; the second radio didn't finish. The same primary button re-offers just the
+            // nRF leg (the S3 is current now, so a fresh run does the co-processor only).
+            combinedUpdateButton(title: "finish second radio")
+            Button { ble.dismissCombinedUpdate() } label: {
+                Text("Not now").font(ACABTheme.display(14, weight: .semibold))
+                    .frame(maxWidth: .infinity).padding(.vertical, 11)
+                    .foregroundStyle(ACABTheme.dim)
+                    .background(ACABTheme.bg2, in: RoundedRectangle(cornerRadius: ACABTheme.radiusSm, style: .continuous))
+                    .overlay(RoundedRectangle(cornerRadius: ACABTheme.radiusSm).strokeBorder(ACABTheme.line, lineWidth: 1))
+            }
+            .buttonStyle(.plain)
+        } else {
+            Button { ble.dismissCombinedUpdate() } label: {
+                Text("Done").font(ACABTheme.display(14, weight: .semibold))
+                    .frame(maxWidth: .infinity).padding(.vertical, 11)
+                    .foregroundStyle(ACABTheme.dim)
+                    .background(ACABTheme.bg2, in: RoundedRectangle(cornerRadius: ACABTheme.radiusSm, style: .continuous))
+                    .overlay(RoundedRectangle(cornerRadius: ACABTheme.radiusSm).strokeBorder(ACABTheme.line, lineWidth: 1))
+            }
+            .buttonStyle(.plain)
+        }
+    }
+
+    private var combinedStatusLabel: String {
+        ble.combinedPhaseLabel.isEmpty ? "Updating" : ble.combinedPhaseLabel
+    }
+    private var combinedElapsedText: String {
+        let t = max(0, Int(ble.combinedElapsed)); return String(format: "elapsed %d:%02d", t / 60, t % 60)
+    }
+    private var combinedDetailText: String? {
+        switch ble.combinedState {
+        case .failed(let r): return r
+        case .partial:       return "Board updated. Second radio update didn't finish. Tap to finish the second radio, or dismiss - the button re-offers it on its own once the co-processor reports in."
+        case .done:          return ble.combinedNotice ?? "Your beacon is up to date."
+        default:             return ble.combinedNotice
+        }
+    }
+    private var combinedStatusSymbol: String {
+        switch ble.combinedState {
+        case .done:    return "checkmark.seal.fill"
+        case .failed:  return "exclamationmark.triangle.fill"
+        case .partial: return "exclamationmark.circle.fill"
+        default:       return "arrow.triangle.2.circlepath"
+        }
+    }
+    private var combinedStatusTone: Color {
+        switch ble.combinedState {
+        case .done:             return ACABTheme.accent
+        case .failed, .partial: return ACABTheme.warn
+        default:                return ACABTheme.dim
+        }
+    }
+
+    // Plain status line: on the latest, or outdated with a pointer to the browser flasher.
+    private var firmwareStatusLine: some View {
+        VStack(alignment: .leading, spacing: 10) {
             HStack(spacing: 8) {
                 Image(systemName: outdated ? "exclamationmark.triangle.fill" : "checkmark.seal.fill")
                     .font(.system(size: 13)).foregroundStyle(outdated ? ACABTheme.warn : ACABTheme.accent)
                 Text(outdated
-                     ? "Update available: reflash your ESP32 board to v\(DeviceStatus.latestVersion)."
+                     ? "Update available. Reflash your board to v\(latestVersion) in your browser."
                      : "You're on the latest firmware.")
                     .font(ACABTheme.mono(11)).foregroundStyle(outdated ? ACABTheme.warn : ACABTheme.dim)
+                    .fixedSize(horizontal: false, vertical: true)
                 Spacer(minLength: 0)
             }
+            if outdated {
+                Link(destination: flasherURL) {
+                    HStack(spacing: 8) {
+                        Image(systemName: "safari").font(.system(size: 13))
+                        Text("Open the browser flasher")
+                            .font(ACABTheme.display(14, weight: .semibold))
+                        Spacer(minLength: 0)
+                        Image(systemName: "arrow.up.right").font(.system(size: 12, weight: .semibold))
+                    }
+                    .foregroundStyle(ACABTheme.accent)
+                    .padding(.vertical, 11).padding(.horizontal, 13)
+                    .background(ACABTheme.bg2, in: RoundedRectangle(cornerRadius: ACABTheme.radiusSm, style: .continuous))
+                    .overlay(RoundedRectangle(cornerRadius: ACABTheme.radiusSm)
+                        .strokeBorder(ACABTheme.lineStrong, lineWidth: 1))
+                }
+                .buttonStyle(.plain)
+            }
         }
-        .panel()
+    }
+
+    // Manual "check for updates": forces a manifest refresh past the 6h TTL, then the view
+    // re-evaluates update availability off the fresh manifest (updateExists / outdated are
+    // computed from it). This is what lets a freshly-published version show up on demand.
+    private var checkForUpdatesButton: some View {
+        Button {
+            guard !checkingForUpdate else { return }
+            Task {
+                checkingForUpdate = true
+                justChecked = false
+                await manifest.refreshNow()
+                checkingForUpdate = false
+                justChecked = true
+                try? await Task.sleep(nanoseconds: 1_800_000_000)
+                justChecked = false
+            }
+        } label: {
+            HStack(spacing: 8) {
+                if checkingForUpdate {
+                    ProgressView().controlSize(.mini).tint(ACABTheme.dim)
+                } else {
+                    Image(systemName: (justChecked && !outdated) ? "checkmark" : "arrow.triangle.2.circlepath")
+                        .font(.system(size: 12, weight: .semibold))
+                }
+                // Don't claim "Up to date" if the refresh just revealed a newer version (the banner
+                // above then says an update is ready); show a neutral "Checked" instead.
+                Text(checkingForUpdate ? "Checking\u{2026}" : (justChecked ? (outdated ? "Checked" : "Up to date") : "Check for updates"))
+                    .font(ACABTheme.mono(11, weight: .bold)).tracking(0.5)
+                Spacer(minLength: 0)
+            }
+            .foregroundStyle((justChecked && !outdated) ? ACABTheme.accent : ACABTheme.dim)
+            .padding(.vertical, 9).padding(.horizontal, 12)
+            .frame(maxWidth: .infinity)
+            .background(ACABTheme.bg2, in: RoundedRectangle(cornerRadius: ACABTheme.radiusSm, style: .continuous))
+            .overlay(RoundedRectangle(cornerRadius: ACABTheme.radiusSm)
+                .strokeBorder(ACABTheme.line, lineWidth: 1))
+        }
+        .buttonStyle(.plain)
+        .disabled(checkingForUpdate)
     }
 
     // MARK: scan radios
     private var radiosCard: some View {
         VStack(alignment: .leading, spacing: 14) {
             Kicker("SCAN RADIOS")
-            radioToggle("Bluetooth LE", "ALPR \u{00B7} drone \u{00B7} trackers", isOn: Binding(
-                get: { bleOn }, set: { bleOn = $0; ble.setBLEScan($0) }))
+            radioToggle("bluetooth", "ALPR \u{00B7} drone \u{00B7} trackers", isOn: Binding(
+                get: { bleOn }, set: { bleOn = $0; pendingBle = true; ble.setBLEScan($0) }))
             Divider().overlay(ACABTheme.line)
             radioToggle("Wi-Fi", "2.4 GHz \u{00B7} ALPR \u{00B7} drone RID", isOn: Binding(
-                get: { wifiOn }, set: { wifiOn = $0; ble.setWiFiScan($0) }))
+                get: { wifiOn }, set: { wifiOn = $0; pendingWifi = true; ble.setWiFiScan($0) }))
+            // Eco: only on battery boards (the board reports "bat" only when it has the sense
+            // divider), and only meaningful while Wi-Fi is on. Duty-cycles the Wi-Fi RX to stretch
+            // runtime; Bluetooth is untouched. Honest about the tradeoff right below the pills.
+            if wifiOn, ble.status?.battery != nil {
+                Divider().overlay(ACABTheme.line)
+                VStack(alignment: .leading, spacing: 8) {
+                    HStack {
+                        Kicker("WI-FI ECO")
+                        Spacer()
+                        Text(wifiEco == 0 ? "always on" : "sleeps \(wifiEco)s / sweep")
+                            .font(ACABTheme.mono(10)).foregroundStyle(ACABTheme.dim)
+                    }
+                    HStack(spacing: 6) {
+                        ForEach([(0, "MAX"), (3, "3s"), (7, "7s"), (15, "15s")], id: \.0) { v, label in
+                            Button {
+                                wifiEco = v; pendingWifiEco = true; ble.setWifiEco(v)
+                            } label: {
+                                Text(label)
+                                    .font(ACABTheme.mono(11, weight: .bold)).tracking(0.5)
+                                    .foregroundStyle(wifiEco == v ? ACABTheme.onAccent : ACABTheme.dim)
+                                    .frame(maxWidth: .infinity).padding(.vertical, 7)
+                                    .background(wifiEco == v ? ACABTheme.accent : ACABTheme.bg2, in: Capsule())
+                                    .overlay(Capsule().strokeBorder(wifiEco == v ? .clear : ACABTheme.line, lineWidth: 1))
+                            }
+                            .buttonStyle(.plain)
+                        }
+                    }
+                    Text("stretches battery by sweeping Wi-Fi less often. you may miss a Wi-Fi-only camera between sweeps; Bluetooth detection is unaffected.")
+                        .font(ACABTheme.mono(9.5)).foregroundStyle(ACABTheme.faint)
+                }
+            }
         }
         .panel()
     }
@@ -159,14 +878,107 @@ struct DeviceView: View {
     private var detectorsCard: some View {
         VStack(alignment: .leading, spacing: 14) {
             Kicker("DETECTORS")
-            radioToggle("Body cams", "Axon signature \u{00B7} experimental", isOn: Binding(
-                get: { bodyCamOn }, set: { bodyCamOn = $0; pendingBodyCam = true; ble.setBodyCamEnabled($0) }), exp: true)
+            radioToggle("alpr (flock)", "Flock Safety \u{00B7} Raven ALPR cameras", isOn: Binding(
+                get: { flockOn }, set: { flockOn = $0; pendingFlock = true; ble.setFlockEnabled($0) }))
             Divider().overlay(ACABTheme.line)
-            radioToggle("Bluetooth trackers", "AirTag \u{00B7} Tile \u{00B7} SmartTag \u{00B7} opt-in", isOn: Binding(
+            radioToggle("drones (remote ID)", "FAA remote ID \u{00B7} operator location", isOn: Binding(
+                get: { droneOn }, set: { droneOn = $0; pendingDrone = true; ble.setDroneEnabled($0) }))
+            // Sub-option of the drone detector: the vendor-OUI fallback. Inset + disabled while the
+            // parent drone detector is off, to read as subordinate to the toggle above it. Off by
+            // default because an OUI match alone can't tell a stationary Parrot gadget from a drone.
+            radioToggle("non-broadcasting drones", "OUI match only, off by default, may false-positive", isOn: Binding(
+                get: { droneOuiOn }, set: { droneOuiOn = $0; pendingDroneOui = true; ble.setDroneOuiEnabled($0) }))
+                .padding(.leading, 22)
+                .disabled(!droneOn)
+                .opacity(droneOn ? 1 : 0.4)
+            Divider().overlay(ACABTheme.line)
+            // Names the whole category, not just Axon: post-split this covers Axon (payload tag
+            // + OUI), Utility BodyWorn, and the Motorola vendor proxy in the sub-row below. The
+            // old "Axon signature" copy read oddly directly above a Motorola control. Matches
+            // Android's DeviceScreen wording so the two platforms describe the switch the same way.
+            radioToggle("body cams", "Axon \u{00B7} Utility BodyWorn \u{00B7} Motorola vendor match", isOn: Binding(
+                get: { bodyCamOn }, set: { bodyCamOn = $0; pendingBodyCam = true; ble.setBodyCamEnabled($0) }))
+            // Sub-option of the body-cam detector, laid out like the drone-OUI one above: inset,
+            // and disabled while the parent category is off (classification needs both switches).
+            // The broad Motorola Solutions OUI is a vendor proxy, not a camera signature, so the
+            // same blocks cover their two-way radios and docks. Turning it off is the way to quiet
+            // that noise WITHOUT losing the Axon payload match, which is the whole point of the
+            // split. Hidden entirely on pre-split firmware, which has no such switch to write to.
+            if ble.motorolaSupported {
+                // "off keeps Axon running" read as a riddle: off WHAT, and why is Axon involved.
+                // Say what the switch matches and what it costs you, and let the parent row's
+                // "Axon · Utility BodyWorn · Motorola vendor match" carry the rest.
+                radioToggle("motorola solutions", "vendor match only \u{00B7} their radios and docks too", isOn: Binding(
+                    get: { motorolaOn }, set: { motorolaOn = $0; pendingMotorola = true; ble.setMotorolaEnabled($0) }))
+                    .padding(.leading, 22)
+                    .disabled(!bodyCamOn)
+                    .opacity(bodyCamOn ? 1 : 0.4)
+            }
+            Divider().overlay(ACABTheme.line)
+            radioToggle("bluetooth trackers", "AirTag \u{00B7} Tile \u{00B7} SmartTag \u{00B7} opt-in", isOn: Binding(
                 get: { trackerOn }, set: { trackerOn = $0; pendingTracker = true; ble.setTrackerEnabled($0) }))
             Divider().overlay(ACABTheme.line)
-            radioToggle("Store detections offline", "board buffers while away \u{00B7} replays on reconnect", isOn: Binding(
+            radioToggle("recording glasses", "Ray-Ban / Oakley Meta \u{00B7} Snap \u{00B7} Vuzix \u{00B7} Luxottica \u{00B7} experimental", isOn: Binding(
+                get: { glassesOn }, set: { glassesOn = $0; pendingGlasses = true; ble.setGlassesEnabled($0) }), exp: true)
+            Divider().overlay(ACABTheme.line)
+            // Opt-in, off by default: enabling it turns on the board's 802.11 DATA-frame
+            // source-MAC path (added CPU + 2.4GHz load), which is why it is gated. Honest copy:
+            // it matches known IP-camera BRANDS on the host WiFi and cannot find every camera.
+            radioToggle("network cameras", "known IP-camera brands on wifi, opt-in, cannot find every camera", isOn: Binding(
+                get: { netcamOn }, set: { netcamOn = $0; pendingNetcam = true; ble.setNetcamEnabled($0) }))
+        }
+        .panel()
+    }
+
+    // MARK: offline buffer
+    // Board-side flash buffer: record while the phone is away, replay on reconnect.
+    private var offlineBufferCard: some View {
+        VStack(alignment: .leading, spacing: 14) {
+            Kicker("OFFLINE BUFFER")
+            radioToggle("store detections offline", "board buffers while away \u{00B7} replays on reconnect", isOn: Binding(
                 get: { bufferOn }, set: { bufferOn = $0; pendingBuffer = true; ble.setBufferingEnabled($0) }))
+            if bufferOn {
+                Divider().overlay(ACABTheme.line)
+                HStack {
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text("buffered log").font(ACABTheme.display(14, weight: .medium))
+                            .foregroundStyle(ACABTheme.text)
+                        // While the board is still sweeping a deferred erase, say so rather than
+                        // inviting another erase against an about-to-be-zero count.
+                        Text(ble.bufferWiping ? "clearing buffer\u{2026}" : "erase what the board stored while away")
+                            .font(ACABTheme.mono(11)).foregroundStyle(ACABTheme.dim)
+                    }
+                    Spacer(minLength: 8)
+                    if ble.bufferWiping {
+                        Text("CLEARING").font(ACABTheme.mono(10, weight: .bold)).tracking(1)
+                            .foregroundStyle(ACABTheme.dim)
+                            .padding(.horizontal, 8).padding(.vertical, 5)
+                            .overlay(Capsule().strokeBorder(ACABTheme.line, lineWidth: 1))
+                    } else {
+                        Button { confirmEraseBuffer = true } label: {
+                            Text("ERASE").font(ACABTheme.mono(10, weight: .bold)).tracking(1)
+                                .foregroundStyle(ACABTheme.accent)
+                                .padding(.horizontal, 8).padding(.vertical, 5)
+                                .overlay(Capsule().strokeBorder(ACABTheme.lineStrong, lineWidth: 1))
+                        }
+                        .buttonStyle(.plain)
+                    }
+                }
+            }
+        }
+        .panel()
+    }
+
+    // Board LED: on by default (a slow idle heartbeat + detection flashes, so it visibly runs);
+    // "lights out" takes it fully dark for covert or stationary deploys. Persists on the board.
+    private var lightsOutCard: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            Kicker("BOARD LED")
+            radioToggle("lights out", "no LEDs \u{00B7} for covert or stationary deploys", isOn: Binding(
+                get: { lightsOut }, set: { lightsOut = $0; pendingLed = true; ble.setLedEnabled(!$0) }))
+            Text("On by default the board LED gives a slow heartbeat so you can see it's alive, and flashes on a hit. Lights out keeps it completely dark.")
+                .font(ACABTheme.mono(10.5)).foregroundStyle(ACABTheme.faint)
+                .fixedSize(horizontal: false, vertical: true)
         }
         .panel()
     }
@@ -175,17 +987,17 @@ struct DeviceView: View {
     private var driveModeCard: some View {
         VStack(alignment: .leading, spacing: 12) {
             Kicker("DRIVE MODE")
-            radioToggle("Live Activity counter",
-                        "Lock Screen + Dynamic Island \u{00B7} live count while you drive",
+            radioToggle("live activity counter",
+                        "lock screen + dynamic island \u{00B7} live count while you drive",
                         isOn: Binding(get: { ble.driveModeOn },
                                       set: { on in if on { ble.startDriveMode() } else { ble.endDriveMode() } }))
             Divider().overlay(ACABTheme.line)
-            radioToggle("Hide counts on Lock Screen",
+            radioToggle("hide counts on lock screen",
                         "show only \u{201C}Drive mode active\u{201D} when locked \u{00B7} counts stay in the Dynamic Island + app",
                         isOn: Binding(get: { ble.redactLockScreen },
                                       set: { ble.redactLockScreen = $0 }))
             if !ble.liveActivitiesEnabled {
-                Text("Turn on Live Activities for Beacons in Settings to use this.")
+                Text("Turn on live activities for beacons in Settings to use this.")
                     .font(ACABTheme.mono(10.5)).foregroundStyle(ACABTheme.warn)
                     .fixedSize(horizontal: false, vertical: true)
             }
@@ -197,7 +1009,7 @@ struct DeviceView: View {
     private var desertModeCard: some View {
         VStack(alignment: .leading, spacing: 12) {
             Kicker("DESERT MODE")
-            radioToggle("Report every device",
+            radioToggle("report every device",
                         "show + log ANY device nearby \u{00B7} best out in the open",
                         isOn: Binding(get: { desertOn },
                                       set: { desertOn = $0; pendingDesert = true; ble.setDesertMode($0) }))
@@ -219,7 +1031,7 @@ struct DeviceView: View {
             VStack(alignment: .leading, spacing: 2) {
                 HStack(spacing: 6) {
                     Text(name).font(ACABTheme.display(14, weight: .medium)).foregroundStyle(ACABTheme.text)
-                    if exp { Tag(text: "EXP", color: ACABTheme.warn) }
+                    if exp { ExpTag() }
                 }
                 Text(sub).font(ACABTheme.mono(10.5)).foregroundStyle(ACABTheme.faint)
             }
@@ -239,13 +1051,10 @@ struct DeviceView: View {
                 .fixedSize(horizontal: false, vertical: true)
 
             VStack(spacing: 14) {
-                slider("Master volume", value: $master, tone: ACABTheme.accent, bold: true) {
+                slider("Master volume", value: $master, tone: ACABTheme.accent, bold: true,
+                       onEditing: { editing in if editing { pendingVolume = true } }) {
                     ble.setVolume(Int(master), preview: true)
                 }
-                Kicker("PER THREAT").frame(maxWidth: .infinity, alignment: .leading)
-                threatSlider(.flockCamera, "ALPR", $flock)
-                threatSlider(.drone,       "DRONE", $drone)
-                threatSlider(.axonBodyCam, "BODY CAM", $axon)
             }
             .opacity(muted ? 0.4 : 1)
             .disabled(muted)
@@ -253,17 +1062,25 @@ struct DeviceView: View {
         .panel()
     }
 
-    // Themed 3-way switch: equal segments in a capsule, the active one filled with
-    // the accent. Rolled our own because a stock .segmented Picker won't match the theme.
+    // Themed 3-way switch: one joined capsule of equal segments split by hairlines,
+    // the active one filled with the accent. Rolled our own because a stock
+    // .segmented Picker won't match the theme. Same anatomy as Android.
     private var alertModePicker: some View {
-        HStack(spacing: 4) {
+        HStack(spacing: 0) {
             segment("Buzzer",  .buzzer)
+            segmentDivider
             segment("Vibrate", .vibrate)
+            segmentDivider
             segment("Silent",  .silent)
         }
-        .padding(4)
-        .background(ACABTheme.bg2, in: Capsule())
+        .frame(height: 36)
+        .background(ACABTheme.bg2)
+        .clipShape(Capsule())
         .overlay(Capsule().strokeBorder(ACABTheme.line, lineWidth: 1))
+    }
+
+    private var segmentDivider: some View {
+        Rectangle().fill(ACABTheme.line).frame(width: 1)
     }
 
     private func segment(_ label: String, _ mode: AlertMode) -> some View {
@@ -272,9 +1089,9 @@ struct DeviceView: View {
             Text(label)
                 .font(ACABTheme.mono(11.5, weight: .bold)).tracking(0.5)
                 .foregroundStyle(active ? ACABTheme.onAccent : ACABTheme.dim)
-                .frame(maxWidth: .infinity).padding(.vertical, 9)
-                .background(active ? ACABTheme.accent : .clear, in: Capsule())
-                .contentShape(Capsule())
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+                .background(active ? ACABTheme.accent : .clear)
+                .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
     }
@@ -282,13 +1099,14 @@ struct DeviceView: View {
     private var alertModeCaption: String {
         switch ble.alertMode {
         case .buzzer:  return "board beeps when it spots gear"
-        case .vibrate: return "board silent, this phone buzzes on new hits"
+        case .vibrate: return "board silent, this phone buzzes on new hits while the app is open. Use Drive mode for locked-screen alerts."
         case .silent:  return "board silent, no phone feedback"
         }
     }
 
     private func slider(_ label: String, value: Binding<Double>, tone: Color,
-                        bold: Bool = false, onCommit: @escaping () -> Void) -> some View {
+                        bold: Bool = false, onEditing: ((Bool) -> Void)? = nil,
+                        onCommit: @escaping () -> Void) -> some View {
         VStack(spacing: 6) {
             HStack {
                 Text(label).font(ACABTheme.display(14, weight: bold ? .medium : .regular)).foregroundStyle(ACABTheme.text)
@@ -296,39 +1114,26 @@ struct DeviceView: View {
                 Text(muted ? "-" : "\(Int(value.wrappedValue))")
                     .font(ACABTheme.mono(12, weight: .semibold)).foregroundStyle(tone)
             }
-            Slider(value: value, in: 0...100, step: 1) { editing in if !editing { onCommit() } }
+            Slider(value: value, in: 0...100, step: 1) { editing in
+                onEditing?(editing)
+                if !editing { onCommit() }
+            }
                 .tint(tone)
         }
     }
 
-    private func threatSlider(_ type: DeviceType, _ label: String, _ value: Binding<Double>) -> some View {
-        HStack(spacing: 10) {
-            CatGlyph(type: type, size: 26)
-            Text(label).font(ACABTheme.mono(11, weight: .medium)).foregroundStyle(ACABTheme.text)
-                .frame(width: 52, alignment: .leading)
-            Slider(value: value, in: 0...100, step: 1).tint(type.tint)
-            Text("\(Int(value.wrappedValue))")
-                .font(ACABTheme.mono(11, weight: .semibold)).foregroundStyle(ACABTheme.dim)
-                .frame(width: 26, alignment: .trailing)
-        }
-    }
-
     // MARK: stats
-    /// Quick stats: uptime, total detections, alert state, active radios.
+    /// Glanceable stats that stay open: uptime + total detections (2-up). Alert/scanning
+    /// state now lives in the fold-row kickers, so those tiles are gone.
+    /// DETECTIONS reads the board's session total (status "total"), not the phone-side log
+    /// count: this is the Device screen, and the phone's list starts empty per app launch
+    /// while the board has been counting since boot. Same source as Android's StatsGrid.
     private var statsGrid: some View {
         let cols = [GridItem(.flexible(), spacing: 12), GridItem(.flexible(), spacing: 12)]
         return LazyVGrid(columns: cols, spacing: 12) {
             statTile("UPTIME", ble.status.map(uptimeText) ?? "-")
-            statTile("DETECTIONS", "\(ble.detections.count)")
-            statTile("ALERTS", ble.alertMode == .buzzer ? "\(Int(master))%"
-                                                        : (ble.alertMode == .vibrate ? "Vibrate" : "Silent"))
-            statTile("SCANNING", scanningSummary)
+            statTile("DETECTIONS", ble.status.map { "\($0.total)" } ?? "-")
         }
-    }
-
-    private var scanningSummary: String {
-        let on = [bleOn ? "BLE" : nil, wifiOn ? "WiFi" : nil].compactMap { $0 }
-        return on.isEmpty ? "OFF" : on.joined(separator: "+")
     }
 
     private func statTile(_ kick: String, _ value: String) -> some View {
@@ -347,7 +1152,11 @@ struct DeviceView: View {
     }
 
     private var disconnectButton: some View {
-        Button(role: .destructive) { ble.demoMode ? ble.exitDemo() : ble.disconnect() } label: {
+        // Block Disconnect while an update is running: a mid-reboot teardown races the OTA reconnect
+        // (and can drop into a pending-connect cancel that fires no callback), so keep the link put
+        // until the flow reaches a terminal state. Sample data isn't an update, so it stays tappable.
+        let otaRunning = !ble.demoMode && (ble.otaState.isRunning || ble.combinedState.isRunning)
+        return Button(role: .destructive) { ble.demoMode ? ble.exitDemo() : ble.disconnect() } label: {
             Text(ble.demoMode ? "Exit sample data" : "Disconnect")
                 .font(ACABTheme.display(15, weight: .semibold))
                 .frame(maxWidth: .infinity).padding(.vertical, 13)
@@ -355,6 +1164,59 @@ struct DeviceView: View {
                 .background(ACABTheme.bg2, in: RoundedRectangle(cornerRadius: ACABTheme.radius, style: .continuous))
                 .overlay(RoundedRectangle(cornerRadius: ACABTheme.radius).strokeBorder(ACABTheme.lineStrong, lineWidth: 1))
         }
+        .disabled(otaRunning)
+        .opacity(otaRunning ? 0.5 : 1)
+    }
+
+    // MARK: watched (starred) devices
+
+    private var renameAlertBinding: Binding<Bool> {
+        Binding(get: { renameMac != nil }, set: { if !$0 { renameMac = nil } })
+    }
+
+    private var watchedCard: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            HStack {
+                Kicker("WATCHING", color: ACABTheme.watchTone)
+                Spacer()
+                // The board echoes how many MACs it's watching at the source.
+                if let n = ble.status?.watchCount, n > 0 {
+                    Kicker("\(n) ON BOARD", color: ACABTheme.dim)
+                }
+            }
+            ForEach(ble.watched) { dev in
+                HStack(spacing: 10) {
+                    Image(systemName: "star.fill").font(.system(size: 12)).foregroundStyle(ACABTheme.watchTone)
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text(dev.label.isEmpty ? "Unknown device" : dev.label)
+                            .font(ACABTheme.display(14, weight: .medium)).foregroundStyle(ACABTheme.text)
+                            .lineLimit(1)
+                        // MACs are stored lowercased; render uppercase, same as Android.
+                        Text(dev.mac.uppercased()).font(ACABTheme.mono(10.5)).foregroundStyle(ACABTheme.faint)
+                    }
+                    Spacer(minLength: 8)
+                    Button {
+                        renameText = dev.label
+                        renameIsIgnored = false
+                        renameMac = dev.mac
+                    } label: {
+                        Image(systemName: "pencil").font(.system(size: 13, weight: .semibold))
+                            .foregroundStyle(ACABTheme.dim)
+                            .frame(width: 28, height: 28)
+                    }
+                    .buttonStyle(.plain)
+                    Button { ble.unwatch(dev.mac) } label: {
+                        Text("UNSTAR").font(ACABTheme.mono(10, weight: .bold)).tracking(1)
+                            .foregroundStyle(ACABTheme.watchTone)
+                            .padding(.horizontal, 8).padding(.vertical, 5)
+                            .overlay(Capsule().strokeBorder(ACABTheme.watchTone.opacity(0.4), lineWidth: 1))
+                    }
+                    .buttonStyle(.plain)
+                }
+                if dev.id != ble.watched.last?.id { Divider().overlay(ACABTheme.line) }
+            }
+        }
+        .panel()
     }
 
     // MARK: ignored devices
@@ -375,9 +1237,22 @@ struct DeviceView: View {
                         Text(dev.label.isEmpty ? "Unknown device" : dev.label)
                             .font(ACABTheme.display(14, weight: .medium)).foregroundStyle(ACABTheme.text)
                             .lineLimit(1)
-                        Text(dev.mac).font(ACABTheme.mono(10.5)).foregroundStyle(ACABTheme.faint)
+                        // MACs are stored lowercased; render uppercase, same as Android.
+                        Text(dev.mac.uppercased()).font(ACABTheme.mono(10.5)).foregroundStyle(ACABTheme.faint)
                     }
                     Spacer(minLength: 8)
+                    // Naming a muted device matters as much as naming a starred one: six weeks on,
+                    // "my own AirTag" is the difference between trusting the mute and undoing it.
+                    Button {
+                        renameText = dev.label
+                        renameIsIgnored = true
+                        renameMac = dev.mac
+                    } label: {
+                        Image(systemName: "pencil").font(.system(size: 13, weight: .semibold))
+                            .foregroundStyle(ACABTheme.dim)
+                            .frame(width: 28, height: 28)
+                    }
+                    .buttonStyle(.plain)
                     Button { ble.unignore(dev.mac) } label: {
                         Text("UNMUTE").font(ACABTheme.mono(10, weight: .bold)).tracking(1)
                             .foregroundStyle(ACABTheme.accent)
@@ -396,21 +1271,26 @@ struct DeviceView: View {
     private var aboutCard: some View {
         VStack(alignment: .leading, spacing: 12) {
             Kicker("ABOUT")
-            Text("All Cameras Are Beacons is a companion app for counter-surveillance scanner firmware, built for Colonel Panic's OUI-Spy hardware.")
+            Text("built for the beacon. also works on the Colonel Panic hardware.")
                 .font(ACABTheme.mono(11)).foregroundStyle(ACABTheme.dim)
                 .fixedSize(horizontal: false, vertical: true)
             Divider().overlay(ACABTheme.line)
-            linkRow("Colonel Panic", "colonelpanic.tech \u{00B7} OUI-Spy hardware",
-                    URL(string: "https://colonelpanic.tech")!)
+            linkRow("soyboi.tech", "the beacon board",
+                    URL(string: "https://soyboi.tech")!)
+            Divider().overlay(ACABTheme.line)
+            linkRow("How it detects", "what it can and can't see",
+                    URL(string: "https://soyboi.tech/how-it-detects.html")!)
             Divider().overlay(ACABTheme.line)
             linkRow("Source on GitHub", "github.com/soyboi1312/all-cameras-are-beacons",
                     URL(string: "https://github.com/soyboi1312/all-cameras-are-beacons")!)
-            Divider().overlay(ACABTheme.line)
-            linkRow("Works with Mesh-Detect", "pairs with Mesh-Detect boards too",
-                    URL(string: "https://github.com/soyboi1312/all-cameras-are-beacons#the-phone-apps")!)
+            if !fwLabel.hasPrefix("beacon board") {
+                Divider().overlay(ACABTheme.line)
+                linkRow("Colonel Panic", "colonelpanic.tech \u{00B7} OUI-Spy hardware",
+                        URL(string: "https://colonelpanic.tech")!)
+            }
             Divider().overlay(ACABTheme.line)
             linkRow("Privacy", "no data leaves your device",
-                    URL(string: "https://soyboi1312.github.io/all-cameras-are-beacons/privacy.html")!)
+                    URL(string: "https://soyboi.tech/privacy.html")!)
             Link(destination: URL(string: "https://github.com/soyboi1312")!) {
                 Text("made by soyboi")
                     .font(ACABTheme.mono(10.5)).foregroundStyle(ACABTheme.faint)

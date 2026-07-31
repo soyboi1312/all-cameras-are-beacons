@@ -16,9 +16,10 @@
 #include "detection.h"
 #include <stddef.h>
 
-// Master on/off. Default: OFF (opt-in). trackerSetEnabled persists the choice to
-// NVS; trackerRestoreEnabled reloads it on boot so an app-set toggle survives a
-// reboot/power-cycle instead of reverting to the compile-time default.
+// Master on/off. Default is set by the caller's trackerRestoreEnabled(defaultEnabled):
+// beacon-board / oui-spy pass ON (since 2026-07-24); mesh-detect passes OFF (mesh uplink
+// bandwidth). trackerSetEnabled persists the choice to NVS; trackerRestoreEnabled reloads
+// it on boot so an app-set toggle survives a reboot instead of reverting to the default.
 void trackerSetEnabled(bool enabled);
 bool trackerIsEnabled();
 void trackerRestoreEnabled(bool defaultEnabled);

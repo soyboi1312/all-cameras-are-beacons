@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
-"""Check ACAB's detection signatures against their upstream sources, so the Flock
-OUI tables and the opendroneid decoder cannot silently drift out of date.
+"""Watch ACAB's one vendored dependency for upstream drift: the opendroneid decoder.
+The Flock OUI table is own-sourced (own field captures plus Flock's IEEE block) and is
+no longer diffed against any third-party curated list.
 
     python3 firmware/tools/check-signature-drift.py
 
@@ -17,12 +18,11 @@ import urllib.request
 # --- upstream sources (edit as they move) -----------------------------------
 LOCAL_FLOCK = "firmware/lib/acab_core/flock_detect.cpp"
 
-# Curated Flock OUI tables upstream. NOTE: point these at firmware/source files
-# that hold a hand-picked OUI list, NOT the full IEEE oui.txt registry. Add more
-# raw URLs here as you find them (e.g. an oui-spy-unified-blue flock source).
-UPSTREAM_FLOCK_URLS = [
-    "https://raw.githubusercontent.com/colonelpanichacks/flock-you/main/main.cpp",
-]
+# We no longer mirror any third-party curated Flock OUI list. The shipped Flock WiFi
+# OUIs are our own field captures plus Flock's own IEEE block (see docs/signatures.md).
+# This list stays empty on purpose: a curated upstream selection is not ours to track,
+# and matching it was the source of the field false positives we since dropped.
+UPSTREAM_FLOCK_URLS = []
 
 # opendroneid decoder: watch for a NEW upstream RELEASE instead of byte-diffing
 # master. core-c's last release is v2.0 (2022); everything on master since is
@@ -84,7 +84,7 @@ def check_flock():
         except Exception as exc:  # network / 404 / parse: warn but keep going
             print(f"   WARN could not fetch {url}: {exc}")
     if not upstream:
-        print("   (no upstream OUIs read; skipping comparison)")
+        print("   Flock OUIs are own-sourced; no third-party list is mirrored (see docs/signatures.md)")
         return 0
     missing = sorted(upstream - local)  # upstream has it, we don't -> drift risk
     extra = sorted(local - upstream)    # ours only -> additions from other sources

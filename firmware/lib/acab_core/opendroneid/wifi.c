@@ -538,6 +538,11 @@ int odid_wifi_build_message_pack_beacon_frame(ODID_UAS_Data *UAS_Data, char *mac
 int odid_message_process_pack(ODID_UAS_Data *UAS_Data, uint8_t *pack, size_t buflen)
 {
     ODID_MessagePack_encoded *msg_pack_enc = (ODID_MessagePack_encoded *) pack;
+    /* LOCAL SECURITY PATCH (vendored opendroneid): reject a buffer too short to even hold the
+     * pack header before dereferencing MsgPackSize, which otherwise reads out of bounds.
+     * Upstream this / pull a patched opendroneid. */
+    if (buflen < offsetof(ODID_MessagePack_encoded, Messages))
+        return -ENOMEM;
     size_t size = sizeof(*msg_pack_enc) - ODID_MESSAGE_SIZE * (ODID_PACK_MAX_MESSAGES - msg_pack_enc->MsgPackSize);
     if (size > buflen)
         return -ENOMEM;
@@ -606,7 +611,14 @@ int odid_wifi_receive_message_pack_nan_action_frame(ODID_UAS_Data *UAS_Data,
     len += sizeof(*nsda);
 
     si = (struct ODID_service_info *)(buf + len);
-    ret = odid_message_process_pack(UAS_Data, buf + len + sizeof(*si), buf_size - len - sizeof(*nsdea));
+    /* LOCAL SECURITY PATCH (vendored opendroneid): the original length passed here
+     * (buf_size - len - sizeof(*nsdea)) both underflowed for a short frame and subtracted
+     * the wrong struct. Require room for the service_info + the trailing extension attr up
+     * front, then hand process_pack exactly the bytes AFTER si (subtract sizeof(*si), the
+     * bytes actually skipped, not sizeof(*nsdea)). Upstream this / pull a patched opendroneid. */
+    if (buf_size < len + sizeof(*si) + sizeof(*nsdea))
+        return -EINVAL;
+    ret = odid_message_process_pack(UAS_Data, buf + len + sizeof(*si), buf_size - len - sizeof(*si));
     if (ret < 0)
         return -EINVAL;
     if (nsda->service_info_length != (sizeof(*si) + ret))

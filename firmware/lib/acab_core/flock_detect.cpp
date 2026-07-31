@@ -5,16 +5,39 @@
  */
 #include "flock_detect.h"
 #include "flock_signatures.h"
+#include "acab_scanner.h"    // acabSanitizeAscii: clamp attacker-sourced names on ingest
+#include "desert_detect.h"   // Desert mode forces classification even when toggled off
+#include <Preferences.h>     // persist the Flock/ALPR toggle across reboots (NVS)
 #include <ctype.h>
 #include <stdio.h>
 #include <string.h>
+
+// Master on/off (default ON, field-validated). NVS-backed so an app-set Flock/ALPR
+// toggle survives a reboot (mirrors axon/tracker/glasses).
+static bool gEnabled = true;
+void flockSetEnabled(bool enabled) {
+    if (enabled == gEnabled) return;
+    gEnabled = enabled;
+    Preferences p; p.begin("acab-flock", false); p.putBool("on", enabled); p.end();
+}
+bool flockIsEnabled() { return gEnabled; }
+
+// Reload the persisted toggle on boot; if none saved yet, use defaultEnabled.
+void flockRestoreEnabled(bool defaultEnabled) {
+    Preferences p; p.begin("acab-flock", true);
+    gEnabled = p.getBool("on", defaultEnabled);
+    p.end();
+}
 
 // ---------------------------------------------------------------------------
 // Signature tables now live in flock_signatures.h (public-sourced; see
 // docs/signatures.md). Retune detection by editing that header; this file is
 // matching logic only.
 // ---------------------------------------------------------------------------
-static bool gFlockExtendedOui = false;   // default: high-confidence OUIs only
+// Compile-time only: no setter, no NVS restore, no BLE toggle. ext=1 table entries are
+// therefore NOT a user-enableable tier - they are removed-until-validated candidates
+// kept in the tables purely as a provenance record.
+static bool gFlockExtendedOui = false;
 
 // True only for the vendor-specific Raven UUIDs (0x31xx-0x35xx), not the generic BT SIG ones.
 static bool isRavenVendorSvc(uint16_t u) {
@@ -44,8 +67,10 @@ static bool falconWifiOui(const uint8_t mac[6]) {
     if (mac[0] & 0x02) return false;
     for (size_t i = 0; i < FALCON_WIFI_OUI_COUNT; i++) {
         if (mac[0] == FALCON_WIFI_OUI[i].b[0] && mac[1] == FALCON_WIFI_OUI[i].b[1] &&
-            mac[2] == FALCON_WIFI_OUI[i].b[2])
+            mac[2] == FALCON_WIFI_OUI[i].b[2]) {
+            if (FALCON_WIFI_OUI[i].ext && !gFlockExtendedOui) continue;   // non-shipping candidate (compiled out; no runtime toggle)
             return true;
+        }
     }
     return false;
 }
@@ -61,16 +86,70 @@ static bool ciContains(const char* hay, const char* needle) {
     return false;
 }
 
-static bool nameMatch(const char* name) {
-    if (!name || !name[0]) return false;
-    for (size_t i = 0; i < FLOCK_NAME_COUNT; i++)
-        if (ciContains(name, FLOCK_NAME_PATTERNS[i])) return true;
+// case-insensitive prefix; returns the tail (name past the prefix) on a hit
+static const char* ciPrefix(const char* name, const char* prefix) {
+    const char* a = name; const char* b = prefix;
+    while (*a && *b && tolower((unsigned char)*a) == tolower((unsigned char)*b)) { a++; b++; }
+    return *b ? NULL : a;
+}
+
+// case-insensitive suffix test (e.g. an SSID ending in "-FALCON")
+static bool ciEndsWith(const char* s, const char* suf) {
+    if (!s || !suf) return false;
+    size_t ls = strlen(s), lf = strlen(suf);
+    if (lf == 0 || lf > ls) return false;
+    const char* a = s + (ls - lf); const char* b = suf;
+    while (*b && tolower((unsigned char)*a) == tolower((unsigned char)*b)) { a++; b++; }
+    return *b == 0;
+}
+
+// Anchored name matching (see FLOCK_NAME_PATTERNS in flock_signatures.h).
+//   NM_NONE     no pattern hit
+//   NM_LITERAL  "FS Ext Battery" - specific enough to rank strong on its own
+//   NM_ANCHORED "Penguin-"+digits / "FS-"+hex - the documented structural forms, but
+//               generic enough ("FS-100" is common white-label naming) that ranking
+//               strong needs a co-signal; hint-grade otherwise
+//   NM_LOOSE    bare "Flock" prefix - hint-grade unless a co-signal backs it
+// The substring-anywhere matching this replaces flagged any "FS-100" speaker or a
+// phone named "penguins fan" as a strong ALPR hit.
+enum { NM_NONE = 0, NM_LITERAL, NM_ANCHORED, NM_LOOSE };
+static int nameMatch(const char* name) {
+    if (!name || !name[0]) return NM_NONE;
+    for (size_t i = 0; i < FLOCK_NAME_COUNT; i++) {
+        const FlockNamePat& p = FLOCK_NAME_PATTERNS[i];
+        switch (p.form) {
+            case FLOCK_NAME_LITERAL:
+                if (ciContains(name, p.pat)) return NM_LITERAL;
+                break;
+            case FLOCK_NAME_PREFIX_DIGITS: {
+                const char* t = ciPrefix(name, p.pat);
+                if (t && *t) {
+                    bool ok = true;
+                    for (; *t; t++) if (!isdigit((unsigned char)*t)) { ok = false; break; }
+                    if (ok) return NM_ANCHORED;
+                }
+                break;
+            }
+            case FLOCK_NAME_PREFIX_HEX: {
+                const char* t = ciPrefix(name, p.pat);
+                if (t && *t) {
+                    bool ok = true;
+                    for (; *t; t++) if (!isxdigit((unsigned char)*t)) { ok = false; break; }
+                    if (ok) return NM_ANCHORED;
+                }
+                break;
+            }
+            case FLOCK_NAME_PREFIX:
+                if (ciPrefix(name, p.pat)) return NM_LOOSE;
+                break;
+        }
+    }
     // Bare 10-digit-name matching removed 2026-06-18: in the field it false-
     // positived on rotating/private BLE addresses with placeholder numeric names (a
     // phone advertising "0102000000", not a camera). The specific Flock signatures
     // (Penguin / FS / 0x09C8 / Flock- SSID / b4:1e:52) stay. To bring 10-digit
     // matching back safely, gate it on a public (non-random) BLE address.
-    return false;
+    return NM_NONE;
 }
 
 // ---------------------------------------------------------------------------
@@ -101,9 +180,9 @@ static void parseAdv(const uint8_t* adv, size_t len, AdvFields* f) {
             case 0x08: // shortened local name
             case 0x09: // complete local name
                 if (!f->haveName) {
-                    uint8_t n = dataLen < sizeof(f->name) - 1 ? dataLen : sizeof(f->name) - 1;
-                    memcpy(f->name, data, n);
-                    f->name[n] = 0;
+                    // clamp the attacker-controlled advertised name to printable ASCII on ingest
+                    // (same invariant as the other ingest paths), not a raw memcpy.
+                    acabSanitizeAscii(f->name, data, dataLen, sizeof(f->name));
                     f->haveName = true;
                 }
                 break;
@@ -164,6 +243,8 @@ static const char* estimateRavenFW(const AdvFields* f) {
 // ---------------------------------------------------------------------------
 bool flockClassifyBLE(const uint8_t mac[6], const uint8_t* adv, size_t advLen,
                       int rssi, AcabDetection* out) {
+    if (!gEnabled && !desertIsEnabled()) return false;
+
     AdvFields f;
     if (adv && advLen) parseAdv(adv, advLen, &f);
     else memset(&f, 0, sizeof(f));
@@ -182,27 +263,46 @@ bool flockClassifyBLE(const uint8_t mac[6], const uint8_t* adv, size_t advLen,
         return true;
     }
 
+    // --- Flock camera: advertised-name pattern (checked before the mfg-ID hint so a
+    //     named Flock beacon reports the strong name match, not the weak shared-silicon
+    //     one) ---
+    int nm = f.haveName ? nameMatch(f.name) : NM_NONE;
+    if (nm != NM_NONE) {
+        acabInit(out, ACAB_FLOCK_CAMERA, SRC_BLE, mac, (int16_t)rssi);
+        out->method = M_NAME;
+        // Only the "FS Ext Battery" literal ranks strong on its own. The anchored
+        // prefix forms and the loose "Flock" prefix rank strong only with a co-signal:
+        // a public (non-random) BLE address - real Flock beacons don't rotate - or the
+        // 0x09C8 mfg id. Without one they stay hint-grade (70), so a consumer gadget
+        // named "FS-100" on a rotating address never draws a strong ALPR verdict.
+        // Mirrors the public-address gate prescribed for the removed 10-digit pattern
+        // (see nameMatch).
+        bool mfgHit = false;
+        for (size_t i = 0; f.haveMfg && i < FLOCK_MFG_COUNT; i++)
+            if (f.mfgId == FLOCK_MFG_IDS[i]) { mfgHit = true; break; }
+        bool cosignal = !(mac[0] & 0x02) || mfgHit;
+        out->confidence = (nm == NM_LITERAL || cosignal) ? 80 : 70;
+        strncpy(out->name, f.name, sizeof(out->name) - 1);
+        return true;
+    }
+
     // --- Flock camera: manufacturer ID (XUNTONG) ---
     if (f.haveMfg) {
         for (size_t i = 0; i < FLOCK_MFG_COUNT; i++) {
             if (f.mfgId == FLOCK_MFG_IDS[i]) {
                 acabInit(out, ACAB_FLOCK_CAMERA, SRC_BLE, mac, (int16_t)rssi);
                 out->method = M_MFG_ID;
-                out->confidence = 85;
+                // 0x09C8 is a SHARED-silicon company ID (registered to XUNTONG, seen on Flock
+                // BT beacons but not exclusive to them) AND unverified against the current SIG
+                // registry. Held below 50 so both apps draw their weak-match "verify this"
+                // treatment: a bare hit is a hint, not an assertion, and other XUNTONG-module
+                // gear would otherwise false-positive as a mid-confidence ALPR camera.
+                out->confidence = 45;
                 if (f.haveName) strncpy(out->name, f.name, sizeof(out->name) - 1);
                 snprintf(out->detail, sizeof(out->detail), "mfg 0x%04X", f.mfgId);
                 return true;
             }
         }
-    }
-
-    // --- Flock camera: advertised-name pattern ---
-    if (f.haveName && nameMatch(f.name)) {
-        acabInit(out, ACAB_FLOCK_CAMERA, SRC_BLE, mac, (int16_t)rssi);
-        out->method = M_NAME;
-        out->confidence = 80;
-        strncpy(out->name, f.name, sizeof(out->name) - 1);
-        return true;
     }
 
     // --- Flock camera: known OUI (weakest signal - OUIs drift over time) ---
@@ -223,6 +323,7 @@ bool flockClassifyBLE(const uint8_t mac[6], const uint8_t* adv, size_t advLen,
 // ---------------------------------------------------------------------------
 bool flockClassifyWiFi(const uint8_t* frame, size_t len, int rssi,
                        AcabDetection* out) {
+    if (!gEnabled && !desertIsEnabled()) return false;
     if (!frame || len < 24) return false;
 
     uint8_t ftype    = (frame[0] >> 2) & 0x3;   // 0 = management
@@ -234,20 +335,36 @@ bool flockClassifyWiFi(const uint8_t* frame, size_t len, int rssi,
 
     // Pull the SSID IE (id 0) if this frame carries one (beacon / probe-resp /
     // probe-req). Read up front, because the SSID is now the primary signal.
+    //
+    // The IEs do NOT start at the same offset for every subtype, and getting this
+    // wrong is silent: a probe request (0x4) has no fixed body, so its IEs begin
+    // right after the 24-byte header, but a beacon (0x8) and a probe response (0x5)
+    // carry a 12-byte fixed body (timestamp / beacon-interval / capability) first,
+    // so theirs begin at 36. Walking a beacon from 24 parses the free-running TSF
+    // timestamp as an IE header and random-walks the rest of the frame, which
+    // matched a real "Flock-<mac>" AP well under 1% of the time (it only looked fine
+    // in the field because the two OUI paths below are probe-request-only, where 24
+    // is correct). Do NOT flatten this to a single offset in either direction.
+    // Other mgmt subtypes put their IEs somewhere else again (assoc-req 28, auth 30,
+    // reassoc-req 34) and none of them carries a Flock-relevant SSID, so skip them
+    // outright rather than walk them at an offset that is wrong for them too.
+    // desert_detect.cpp does the same offset split on the same buffer.
     char ssid[33] = {0};
     bool sawSSID = false, emptySSID = false;
-    for (size_t ie = 24; ie + 2 <= len; ) {
-        uint8_t id = frame[ie], l = frame[ie + 1];
-        if (ie + 2 + l > len) break;
-        if (id == 0) {                       // SSID element
-            sawSSID = true;
-            emptySSID = (l == 0);
-            uint8_t n = l < 32 ? l : 32;
-            memcpy(ssid, &frame[ie + 2], n);
-            ssid[n] = 0;
-            break;
+    if (subtype == 0x4 || subtype == 0x5 || subtype == 0x8) {
+        for (size_t ie = (subtype == 0x4) ? 24 : 36; ie + 2 <= len; ) {
+            uint8_t id = frame[ie], l = frame[ie + 1];
+            if (ie + 2 + l > len) break;
+            if (id == 0) {                       // SSID element
+                sawSSID = true;
+                emptySSID = (l == 0);
+                uint8_t n = l < 32 ? l : 32;
+                memcpy(ssid, &frame[ie + 2], n);
+                ssid[n] = 0;
+                break;
+            }
+            ie += 2 + l;
         }
-        ie += 2 + l;
     }
 
     // --- Primary: the "Flock-<partial MAC>" AP name is the strong WiFi signature
@@ -258,6 +375,19 @@ bool flockClassifyWiFi(const uint8_t* frame, size_t len, int rssi,
         acabInit(out, ACAB_FLOCK_CAMERA, SRC_WIFI, addr2, (int16_t)rssi);
         out->method = M_SSID;
         out->confidence = 88;
+        strncpy(out->name, ssid, sizeof(out->name) - 1);
+        return true;
+    }
+
+    // --- Primary too: Falcon cameras also stand up per-function networks named
+    //     "PROBE-FALCON" / "DATA-FALCON" (own drive capture 2026-07-24). Match any
+    //     "*-FALCON" SSID by name - Flock-specific, no OUI gate needed, and unlike the
+    //     probe-only OUI path it catches a Falcon in beacon / associated mode too
+    //     (which is how a 24:B2:B9 "DATA-FALCON" unit slipped the OUI gate). ---
+    if (sawSSID && !emptySSID && ciEndsWith(ssid, FLOCK_SSID_FALCON_SUFFIX)) {
+        acabInit(out, ACAB_FLOCK_CAMERA, SRC_WIFI, addr2, (int16_t)rssi);
+        out->method = M_SSID;
+        out->confidence = 85;
         strncpy(out->name, ssid, sizeof(out->name) - 1);
         return true;
     }

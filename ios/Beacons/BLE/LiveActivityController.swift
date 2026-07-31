@@ -45,6 +45,10 @@ final class LiveActivityController {
     /// whether the activity actually started (request can fail silently).
     @discardableResult
     func start(deviceName: String, state: DetectionActivityAttributes.DetectionState) -> Bool {
+        // A handle the system already ended/dismissed must not satisfy the guard below: it
+        // would return true ("already running") without requesting anything, so Drive mode
+        // showed on with no Live Activity anywhere. Drop the corpse first.
+        dropIfInactive()
         guard isAvailable, activity == nil else { return activity != nil }
         latest = state
         let attrs = DetectionActivityAttributes(deviceName: deviceName, sessionStart: .now)
@@ -56,10 +60,26 @@ final class LiveActivityController {
 
     /// Re-attach to an activity still running from a previous launch, so a relaunch
     /// mid-drive resumes it instead of orphaning it. Returns whether one was adopted.
+    ///
+    /// Only a LIVE (.active/.stale) activity is adoptable. A user-dismissed activity lingers
+    /// in Activity.activities in the .dismissed state until the app ends it, so taking .first
+    /// blindly could adopt a dead handle - isActive stayed false while start()'s
+    /// activity == nil guard then reported "already running", leaving Drive mode on with no
+    /// visible surface. The corpses get ended here so they can't be re-adopted on every call
+    /// (or shadow a live second entry).
     @discardableResult
     func adoptExisting() -> Bool {
-        guard activity == nil, let a = Activity<DetectionActivityAttributes>.activities.first
-        else { return isActive }
+        guard activity == nil else { return isActive }
+        var adopted: Activity<DetectionActivityAttributes>?
+        for a in Activity<DetectionActivityAttributes>.activities {
+            switch a.activityState {
+            case .active, .stale:
+                if adopted == nil { adopted = a }
+            default:
+                Task { await a.end(nil, dismissalPolicy: .immediate) }   // dead orphan: finish it off
+            }
+        }
+        guard let a = adopted else { return false }
         activity = a
         latest = a.content.state
         observe(a)
@@ -72,6 +92,9 @@ final class LiveActivityController {
         Task { @MainActor [weak self] in
             for await s in a.activityStateUpdates where s == .ended || s == .dismissed {
                 self?.handleInactive(id: id)
+                // A dismissed activity stays in Activity.activities until the app ends it, and
+                // a lingering corpse is what adoptExisting used to re-adopt. Finish it here.
+                if s == .dismissed { await a.end(nil, dismissalPolicy: .immediate) }
                 return
             }
         }
@@ -80,7 +103,13 @@ final class LiveActivityController {
     /// The system ended/dismissed the activity: drop our handle and tell the owner so it
     /// can sync its Drive-mode toggle off. Runs on the main thread.
     private func handleInactive(id: String) {
-        if activity?.id == id { pending?.cancel(); pending = nil; activity = nil }
+        // Only the CURRENT activity's terminal event may clear state and fire the callback.
+        // end() never cancels the observe Task, so after a quick Drive off -> on the OLD
+        // activity's .ended still arrives here; an unconditional onInactive then flipped the
+        // toggle off and killed the freshly started session (the owner's handler syncs
+        // driveModeOn = false and stops location, unconditionally). A stale id is a no-op.
+        guard activity?.id == id else { return }
+        pending?.cancel(); pending = nil; activity = nil
         onInactive?()
     }
 

@@ -13,10 +13,28 @@ attributes:
   LastUpgradeCheck: "2650"
   LastSwiftUpdateCheck: "2650"
 
+# Nordic's iOS DFU library, for updating the nRF52840 co-processor over BLE. The nRF runs the
+# Adafruit/Seeed bootloader (LEGACY Nordic DFU, service 0x1530), which the library speaks. BSD-3.
+# Product is `NordicDFU` in 4.x. import NordicDFU; drive it with DFUServiceInitiator.
+packages:
+  NordicDFU:
+    url: https://github.com/NordicSemiconductor/IOS-DFU-Library
+    from: "4.13.0"
+
 settings:
   base:
-    MARKETING_VERSION: "1.7"
-    CURRENT_PROJECT_VERSION: "5"
+    MARKETING_VERSION: "2.0.0"
+    # BUMP THIS (then `xcodegen generate`) BEFORE EVERY ARCHIVE, and leave "Automatically manage
+    # version and build number" UNCHECKED in Xcode's Distribute flow. If Xcode manages it, it bumps
+    # the build at UPLOAD time and never writes it back here - so every archive on disk reads the same
+    # stale number while TestFlight climbs, and a crash report can then only be matched to its dSYM by
+    # UUID. Builds 7-14 were lost that way. App Store Connect rejects duplicates, so this must EXCEED
+    # the highest already uploaded (14 as of 2026-07-16).
+    # DO NOT edit the build number in Xcode's General tab: the project is generated, so the edit is
+    # clobbered on the next regen AND it only touches the app target, leaving BeaconsWidget behind ->
+    # "extension version must match parent app". Both targets read $(CURRENT_PROJECT_VERSION), so
+    # editing it HERE keeps app + widget in lockstep automatically.
+    CURRENT_PROJECT_VERSION: "17"
     SWIFT_VERSION: "5.0"
     CODE_SIGN_STYLE: Automatic
     DEVELOPMENT_TEAM: "49B9T69XPF"        # baked in so `xcodegen generate` keeps signing
@@ -31,10 +49,24 @@ targets:
     dependencies:
       - target: BeaconsWidget
         embed: true
+      - package: NordicDFU
+        product: NordicDFU
+    # App Group shared with the widget extension. The home-screen widget runs in its own
+    # process and can't read app memory, so the app mirrors a tiny detection summary into
+    # UserDefaults(suiteName: "group.tech.beacons.app") and the widget reads it. XcodeGen
+    # generates the .entitlements file and wires CODE_SIGN_ENTITLEMENTS. NOTE: for a device
+    # or TestFlight build the App Group capability must also exist on the provisioning
+    # profile; automatic signing usually creates it on first archive, but confirm the group
+    # id matches on both targets in the portal.
+    entitlements:
+      path: Beacons/Beacons.entitlements
+      properties:
+        com.apple.security.application-groups:
+          - group.tech.beacons.app
     info:
       path: Beacons/Resources/Info.plist
       properties:
-        CFBundleDisplayName: "Beacons"
+        CFBundleDisplayName: "beacons"
         # Drive version/build from the MARKETING_VERSION / CURRENT_PROJECT_VERSION
         # build settings (XcodeGen otherwise bakes a literal 1.0/1 into the plist,
         # which then wins because GENERATE_INFOPLIST_FILE is NO).
@@ -48,8 +80,8 @@ targets:
         # App uses only standard/exempt encryption (BLE, HTTPS), declared so
         # TestFlight/App Store Connect stops asking for export compliance each build.
         ITSAppUsesNonExemptEncryption: false
-        NSBluetoothAlwaysUsageDescription: "This app connects to your ESP32 board over Bluetooth to receive detections."
-        NSLocationWhenInUseUsageDescription: "This app tags each detection with your approximate location so the exported log shows where devices were seen."
+        NSBluetoothAlwaysUsageDescription: "This app connects to your beacon board over Bluetooth to receive detections."
+        NSLocationWhenInUseUsageDescription: "Used only on your device to map detections, including in the background during a Drive session so hits stay pinned while your screen is off. Never sent anywhere."
         NSFocusStatusUsageDescription: "This app checks whether a Focus or Do Not Disturb is active so it can stay silent and skip the vibrate alert while you have one on."
         UIBackgroundModes:
           - bluetooth-central
@@ -62,6 +94,12 @@ targets:
           - JetBrainsMono-Medium.ttf
           - JetBrainsMono-SemiBold.ttf
           - JetBrainsMono-Bold.ttf
+        # Custom scheme so the Drive Mode Live Activity (widgetURL beacons://log/new)
+        # can deep-link into the Log tab. Handled in RootView's onOpenURL.
+        CFBundleURLTypes:
+          - CFBundleURLName: tech.beacons.app
+            CFBundleURLSchemes:
+              - beacons
         UILaunchScreen: {}
         UIApplicationSceneManifest:
           UIApplicationSupportsMultipleScenes: false
@@ -89,14 +127,27 @@ targets:
       - BeaconsWidget
       - path: Beacons/Shared/DetectionActivityAttributes.swift
       - path: Beacons/Shared/DriveModeIntents.swift
+      # Brand fonts for the Live Activity surfaces (Space Grotesk digits, JetBrains
+      # Mono kickers). Same TTFs the app bundles; declared in UIAppFonts below.
+      - path: Beacons/Resources/Fonts/SpaceGrotesk-Bold.ttf
+      - path: Beacons/Resources/Fonts/JetBrainsMono-Medium.ttf
+    # Same App Group as the app target, so the widget can read the shared detection summary.
+    entitlements:
+      path: BeaconsWidget/BeaconsWidget.entitlements
+      properties:
+        com.apple.security.application-groups:
+          - group.tech.beacons.app
     info:
       path: BeaconsWidget/Info.plist
       properties:
-        CFBundleDisplayName: "Beacons"
+        CFBundleDisplayName: "beacons"
         CFBundleShortVersionString: "$(MARKETING_VERSION)"
         CFBundleVersion: "$(CURRENT_PROJECT_VERSION)"
         NSExtension:
           NSExtensionPointIdentifier: com.apple.widgetkit-extension
+        UIAppFonts:
+          - SpaceGrotesk-Bold.ttf
+          - JetBrainsMono-Medium.ttf
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: tech.beacons.app.widget

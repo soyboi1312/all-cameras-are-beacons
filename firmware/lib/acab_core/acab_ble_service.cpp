@@ -6,12 +6,115 @@
 #include "police_detect.h"
 #include "desert_detect.h"
 #include "tracker_detect.h"
+#include "glasses_detect.h"
+#include "flock_detect.h"
+#include "drone_detect.h"
+#include "netcam_detect.h"
 #include "acab_scanner.h"
 #include "det_log.h"
+#include "ota_update.h"
 
 #include <Arduino.h>
 #include <NimBLEDevice.h>
 #include <ArduinoJson.h>
+#include <freertos/FreeRTOS.h>
+#include <freertos/semphr.h>
+#include <string.h>
+
+// acab_core-internal loop pumps and hooks driven from acabBleDrainTick below (every build's
+// loop() already calls it each pass): the det_log deferred-wipe chunker + drain-resume cursor
+// (det_log.cpp) and the scanner's deferred nRF ignore-list mirror (acab_scanner.cpp). Kept out
+// of the public headers - the mains never call these directly, this tick is their only driver.
+void     detLogEraseTick();
+bool     detLogWipePending();
+uint32_t detLogDrainFrom();
+void     acabScannerMirrorTick();
+
+// ---- outgoing-JSON scratch pool (PERF-6) ----------------------------------------------------
+// Every outgoing notify (detection, 5 s status, each drained record) used to heap-allocate and
+// free a fresh ArduinoJson pool. That is a lot of malloc/free churn (and fragmentation risk) on
+// the hot path. Route all of them through ONE fixed static byte pool via a custom ArduinoJson 7
+// Allocator, so building a document does ZERO heap alloc/free.
+//
+// The pool is bump-allocated and reset before each document build; deallocate is a no-op (the
+// whole pool is rewound at the next build). reallocate copies via a per-block size header so the
+// pool can grow correctly. These builders run on DIFFERENT tasks (the scanner sink task, loop(),
+// and the NimBLE host task all produce JSON), so a single shared pool needs mutual exclusion:
+// gJsonMux serializes access. The lock is held only across the (microsecond-scale) build +
+// serializeJson into a caller-owned char buffer, never across a BLE notify() call.
+alignas(8) static uint8_t gJsonPoolBuf[4096];   // one 128-slot variant pool + strings, with margin
+static SemaphoreHandle_t  gJsonMux = nullptr;
+
+class BumpAllocator : public ArduinoJson::Allocator {
+  public:
+    BumpAllocator(uint8_t* buf, size_t cap) : buf_(buf), cap_(cap), off_(0) {}
+    void reset() { off_ = 0; }
+    void* allocate(size_t size) override {
+        size_t need = kHdr + align8(size);
+        if (off_ + need > cap_) return nullptr;      // pool exhausted -> ArduinoJson marks overflow
+        uint8_t* base = buf_ + off_;
+        *reinterpret_cast<size_t*>(base) = size;     // remember the block size for reallocate()
+        off_ += need;
+        return base + kHdr;
+    }
+    void deallocate(void*) override {}               // bulk-rewound in reset() before each build
+    void* reallocate(void* ptr, size_t new_size) override {
+        if (!ptr) return allocate(new_size);
+        size_t old = *reinterpret_cast<size_t*>(static_cast<uint8_t*>(ptr) - kHdr);
+        void* np = allocate(new_size);
+        if (np && old) memcpy(np, ptr, old < new_size ? old : new_size);
+        return np;
+    }
+  private:
+    static size_t align8(size_t n) { return (n + 7) & ~size_t(7); }
+    static const size_t kHdr = 8;                    // 8-byte, 8-aligned size header per block
+    uint8_t* buf_; size_t cap_; size_t off_;
+};
+static BumpAllocator gJsonPool(gJsonPoolBuf, sizeof(gJsonPoolBuf));
+
+// RAII lock + rewind for the shared JSON pool. Construct it, build a JsonDocument with .alloc(),
+// serialize into a local char buffer, then let it fall out of scope to release. Before the mutex
+// exists (only possible ahead of acabBleBegin, when no notify path runs) it degrades to no lock.
+struct JsonPoolLock {
+    bool locked = false;
+    JsonPoolLock() {
+        if (gJsonMux && xSemaphoreTake(gJsonMux, portMAX_DELAY) == pdTRUE) locked = true;
+        gJsonPool.reset();
+    }
+    ~JsonPoolLock() { if (locked) xSemaphoreGive(gJsonMux); }
+    ArduinoJson::Allocator* alloc() { return &gJsonPool; }
+};
+
+// Serializes every characteristic setValue()+notify() PAIR (det/stat/ota) across the tasks that
+// emit them: the scanner sink task (live detection), loop() core1 + CfgCb::onWrite core0 (status),
+// the OTA host task (ota progress), and loop()'s drain tick (history). Without it two tasks can
+// realloc/memcpy the same NimBLEAttValue at once -> torn notify or heap UAF. Created in acabBleBegin
+// the same way gJsonMux is. CRITICAL: this lock is taken ONLY around a setValue+notify pair, and
+// ONLY after any JsonPoolLock has already been released, so the two mutexes are never held at once
+// (no lock-order inversion, no deadlock). notify() does not re-enter these paths, so holding across
+// it is safe.
+static SemaphoreHandle_t gNotifyMux = nullptr;
+struct NotifyLock {
+    bool locked = false;
+    NotifyLock() { if (gNotifyMux && xSemaphoreTake(gNotifyMux, portMAX_DELAY) == pdTRUE) locked = true; }
+    ~NotifyLock() { if (locked) xSemaphoreGive(gNotifyMux); }
+};
+
+// nRF app-version hook: real on the dual-radio board (last "V<n>" heard), -1 everywhere else.
+__attribute__((weak)) int acabNrfVersion() { return -1; }
+
+// "nRF is mid BLE DFU" hook: real on the dual-radio board (true for a window after a DFU trigger),
+// false everywhere else. Lets the status doc emit "nrfup" so the app mutes the co-proc fault banner
+// (the nRF legitimately goes silent while it reboots into its bootloader).
+__attribute__((weak)) bool acabNrfDfuActive() { return false; }
+
+// {"nrfdfu":true} request latch. Set on the NimBLE host task, drained from loop() so the S3
+// forwards the DFU trigger off the host task (see acabBleTakeNrfDfuRequest). Plain non-atomic
+// read-clear: the only writer that sets it is the config-write callback and the only reader that
+// clears it is loop(); a set racing the clear just services one loop later, harmless for a manual
+// one-shot. Left non-atomic deliberately.
+static volatile bool gNrfDfuReq = false;
+bool acabBleTakeNrfDfuRequest() { bool r = gNrfDfuReq; gNrfDfuReq = false; return r; }
 
 // The buzzer (alerts) is OUI-Spy hardware; the Mesh-Detect board has none. These
 // weak no-ops let this shared service link on a buzzer-less build - oui-spy's
@@ -21,6 +124,10 @@ __attribute__((weak)) bool    alertsBuzzerEnabled()         { return false; }
 __attribute__((weak)) void    alertsSetVolume(uint8_t)      {}
 __attribute__((weak)) uint8_t alertsVolume()                { return 0; }
 __attribute__((weak)) void    alertsBeepTest()              {}
+// LED master switch: oui-spy/beacon-board override in alerts.cpp, mesh-detect in its main.cpp.
+// A build with neither reports the default (on) and ignores the toggle harmlessly.
+__attribute__((weak)) void    alertsSetLedEnabled(bool)     {}
+__attribute__((weak)) bool    alertsLedEnabled()            { return true; }
 
 // Latest phone GPS the app pushed over the config characteristic (0 = none yet).
 static volatile double   gPhoneLat = 0, gPhoneLon = 0;
@@ -32,25 +139,138 @@ static portMUX_TYPE      gGpsMux = portMUX_INITIALIZER_UNLOCKED;
 
 // Build label for the status "fw" string (oui-spy vs mesh-detect). Set in acabBleBegin.
 static const char* gFwLabel = "ACAB-ouispy";
+static int gBatteryPct = -1;   // battery %; stays -1 until a sense-divider board reports it
+static bool gCharging = false; // battery charging (dual-radio "chg"); set by acabBleSetCharging
 
 static NimBLEServer*         gServer = nullptr;
 static NimBLECharacteristic* gDetChar = nullptr;
 static NimBLECharacteristic* gCfgChar = nullptr;
 static NimBLECharacteristic* gStatChar = nullptr;
+static NimBLECharacteristic* gOtaChar = nullptr;
 static volatile bool         gConnected = false;
 static uint32_t              gHistSent  = 0;     // records sent so far in the current replay drain
+static bool                  gHistBeginSent = false;  // whether this drain's {"hist":"begin","n":N} lead-in went out
+// Replay back-pressure. notify() is void in NimBLE 1.4.x (can't report a drop), so we pace the
+// drain by the mbuf pool instead: only push a frame while os_msys_num_free() has headroom.
+// Blasting into a full pool silently loses records -> seq gaps -> the app re-syncs and the drain
+// never converges in a crowd. Gating on free mbufs paces us to the link's real capacity AND makes
+// the drain yield to the live-notify traffic that draws from the same pool.
+extern "C" int os_msys_num_free(void);
+static const int             DRAIN_MBUF_MIN = 6;   // hold this many mbufs free for the live path
+// Records per loop pass while the pool keeps headroom. One-per-tick pinned the replay to the
+// loop rate (~50/s at delay(20): a full ring took 8-10 minutes of screen-on syncing); a bounded
+// burst drains it in about a minute, and the per-notify mbuf re-check in the burst loop still
+// yields to live traffic the moment the pool tightens.
+static const int             DRAIN_BURST_MAX = 8;
 
-// Max ATT payload one notify can carry at our negotiated MTU (setMTU(247) -> 247-3). We
-// serialize into a larger scratch buffer so a fully-populated drone record never gets
-// silently truncated into invalid JSON; if it still exceeds this, we skip that one frame
-// (the app sees a seq gap and can re-sync) rather than push something unparseable.
-static const size_t          NOTIFY_MAX = 244;
+// Push an OTA progress/result JSON to the app (the ota_update module calls this).
+static void otaNotify(const char* json) {
+    if (!gOtaChar) return;
+    NotifyLock nl;   // serialize the setValue+notify pair against the other characteristic writers
+    gOtaChar->setValue((uint8_t*)json, strlen(json));
+    if (gConnected) gOtaChar->notify();
+}
+
+// While an OTA is streaming, quiet the radios so flash writes don't fight the scan load, then
+// put them back the way the user had them.
+//
+// RESTORE, never force-on: only the success path reboots (otaFinish OK). Six failure paths
+// resume in place - disconnect mid-update, a write/begin/finish error, an explicit abort, the
+// stall watchdog - and an unconditional resume silently switches radios ON for a user who had
+// turned them off. gOtaPaused also makes the resume a no-op when nothing was paused, so a
+// stray un-quiesce can't do it either.
+//
+// The BLE half goes through acabScannerSetBLE rather than poking "S0"/"S1" directly, so
+// gBleEnabled and the co-processor command cannot diverge: on the beacon board cfg.enableBLE
+// is false, gScan is never created, and that command is the ONLY BLE gate, so a raw send
+// restarts the nRF scan while the status the app reads still says BLE is off. Disabling the
+// BLE *scan* does not touch the GATT link the update itself rides on.
+//
+// Returns whether this call actually changed the pause state, and the begin path must honour
+// that. A duplicate "begin" arriving while an update is already streaming quiesces nothing (the
+// saved state belongs to the live update and must not be clobbered), otaBegin then answers
+// OTA_ERR_BUSY, and un-quiescing from that error branch would switch the LIVE update's radios
+// back on. Only un-quiesce from an error path that did the quiescing itself.
+static bool gOtaPaused    = false;
+static bool gOtaSavedBle  = true;
+static bool gOtaSavedWifi = true;
+
+static bool otaQuiesce(bool pause) {
+    if (pause) {
+        if (gOtaPaused) return false;                // already quiesced: don't clobber the saved state
+        gOtaSavedBle  = acabScannerBLEEnabled();
+        gOtaSavedWifi = acabScannerWiFiEnabled();
+        gOtaPaused    = true;
+        acabScannerSetWiFi(false);
+        acabScannerSetBLE(false);                    // also stops the nRF's scan ("S0") on the dual board
+    } else {
+        if (!gOtaPaused) return false;               // nothing to restore
+        gOtaPaused = false;
+        acabScannerSetWiFi(gOtaSavedWifi);
+        acabScannerSetBLE(gOtaSavedBle);
+    }
+    return true;
+}
+
+// Cap on the JSON we put in one notify. Raised past the old 244 (247-MTU) limit because the
+// status frame grew (every detector toggle + the diagnostics) past it: we now negotiate a 512
+// MTU (setMTU below + the apps' requestMtu) and cap at 500, which fits the 512-byte scratch
+// buffers and the 509-byte wire limit of MTU 512 (and the 512-byte attribute cap) with margin,
+// carrying the status and a fully-populated drone/history record. A record over the cap is
+// skipped (the app sees a seq gap and re-syncs) rather than sent truncated and unparseable.
+static const size_t          NOTIFY_MAX = 500;
+
+// Live negotiated ATT MTU with the connected peer. Starts at the BLE default 23 and is updated
+// on the MTU-exchange callback (ServerCb::onMTUChange); reset to 23 on each new connect. Every
+// notify path caps its frame at notifyCap() below, so a peer that negotiates a small MTU (e.g.
+// iPhone 185) gets frames sized to what it can actually receive instead of a silently dropped
+// notify. The status READ path stays fresh regardless (setValue is unconditional there).
+static volatile uint16_t     gPeerMtu = 23;
+
+// Per-notify size cap: the smaller of NOTIFY_MAX and the peer's usable payload (MTU - 3 bytes of
+// ATT notify header). gPeerMtu is always >= 23 so (gPeerMtu - 3) >= 20.
+static size_t notifyCap() {
+    size_t mtuCap = (gPeerMtu > 3) ? (size_t)(gPeerMtu - 3) : 0;
+    return (mtuCap < NOTIFY_MAX) ? mtuCap : NOTIFY_MAX;
+}
+
+// Chunked ignore/watch staging. The app may split a long list across several config writes:
+// a non-final chunk carries {"more":true} and is appended here WITHOUT committing; the final
+// chunk (no "more", or "more":false) appends then commits the whole staged list to the scanner.
+// A single small write with no "more" stages then immediately commits, i.e. behaves as before.
+// Config writes are serialized on the BLE host task, so plain file-scope state is safe here.
+// Reset on every connect/disconnect (see ServerCb) so an interrupted chunk sequence can't leak
+// stale MACs into the next connection's committed list. NOTE: a chunked write carries at most ONE
+// of ignore/watch (the apps split only one list per write), so the single "more" flag is unambiguous.
+static uint8_t  gIgnoreStage[256][6];
+static int      gIgnoreStageN = 0;
+static uint8_t  gWatchStage[256][6];
+static int      gWatchStageN  = 0;
 
 // ---- server connection lifecycle ----
 class ServerCb : public NimBLEServerCallbacks {
-    void onConnect(NimBLEServer*) override { gConnected = true; }
+    void onConnect(NimBLEServer*) override {
+        gConnected = true;
+        gPeerMtu = 23;   // reset to the BLE default; the MTU exchange bumps it right after connect
+        gIgnoreStageN = 0; gWatchStageN = 0;   // fresh connection: drop any half-staged chunk sequence
+    }
+    // Track the negotiated MTU so every notify path can size to what the peer accepts (see
+    // notifyCap). Fires after connect once the client exchanges MTU.
+    void onMTUChange(uint16_t mtu, ble_gap_conn_desc*) override {
+        gPeerMtu = mtu;
+        Serial.printf("[ACAB] MTU negotiated: %u\n", (unsigned)mtu);
+    }
     void onDisconnect(NimBLEServer*) override {
         gConnected = false;
+        gIgnoreStageN = 0; gWatchStageN = 0;   // drop any half-staged chunk sequence on link drop
+        // A link drop mid-update must not leave OTA stuck BUSY with the radios paused:
+        // abort the session and un-quiesce so the next connect can start fresh.
+        if (otaInProgress()) { otaAbort(); otaQuiesce(false); }
+        // Abort any in-flight replay drain. gDraining/gHistBeginSent survive a link drop, so a
+        // reconnect that races ahead of the app's re-arming {sync} would resume streaming hist
+        // frames from the stale cursor with NO fresh {"hist":"begin"} lead-in (orphan records
+        // outside any begin/end envelope). Force the next drain to wait for a {sync}.
+        detLogStopDrain(); gHistBeginSent = false;
         acabScannerReArmCapture();                 // app left: re-arm offline capture
         NimBLEDevice::getAdvertising()->start();   // become discoverable again
     }
@@ -82,6 +302,69 @@ static bool hexToBytes(const char* hex, uint8_t* out, size_t n) {
     return true;
 }
 
+// ---- OTA image bytes from the app (raw, write-no-response for throughput) ----
+class OtaCb : public NimBLECharacteristicCallbacks {
+    void onWrite(NimBLECharacteristic* c) override {
+        std::string v = c->getValue();
+        if (v.empty()) return;
+        OtaResult r = otaWrite((const uint8_t*)v.data(), v.size());
+        if (r != OTA_OK) {
+            char j[64]; snprintf(j, sizeof(j), "{\"ota\":\"err\",\"e\":\"%s\"}", otaResultStr(r));
+            otaNotify(j);
+            otaQuiesce(false);   // failed mid-stream: bring the radios back
+        }
+    }
+};
+
+// Handle the {"ota":{...}} control object from a config write. Kept out of CfgCb::onWrite
+// for readability; returns after acting.
+static void handleOtaControl(JsonObject o) {
+    // Detached image signature (hex DER), pushed on its OWN control message BEFORE begin to
+    // keep each JSON small. Store it now; otaFinish verifies it against the baked-in pubkey.
+    // Independent of begin/end/abort/confirm - handled first so order on the wire is free.
+    if (o["sig"].is<const char*>()) {
+        const char* hex = o["sig"].as<const char*>();
+        size_t hlen = hex ? strlen(hex) : 0;
+        uint8_t der[80];                          // P-256 DER sig is ~70-72 B; bounds it
+        if (hlen > 0 && (hlen % 2) == 0 && (hlen / 2) <= sizeof(der) &&
+            hexToBytes(hex, der, hlen / 2)) {
+            otaSetSignature(der, hlen / 2);
+        }
+    }
+    if (o["begin"].is<bool>() && o["begin"].as<bool>()) {
+        uint32_t size = o["size"] | 0u;
+        uint32_t crc  = o["crc"].is<const char*>()
+                          ? (uint32_t)strtoul(o["crc"].as<const char*>(), nullptr, 16) : 0u;
+        const char* ver = o["ver"] | "";
+        bool force = o["force"] | false;
+        bool quiescedHere = otaQuiesce(true);
+        OtaResult r = otaBegin(size, crc, ver, force);
+        if (r != OTA_OK) {
+            char j[64]; snprintf(j, sizeof(j), "{\"ota\":\"err\",\"e\":\"%s\"}", otaResultStr(r));
+            otaNotify(j);
+            // Only when this begin owns the quiesce. On OTA_ERR_BUSY the radios belong to the
+            // update already streaming, and resuming them here would un-quiesce it mid-flash.
+            if (quiescedHere) otaQuiesce(false);
+        }
+    } else if (o["end"].is<bool>() && o["end"].as<bool>()) {
+        OtaResult r = otaFinish();
+        // A late-arriving final chunk may still be queued behind this control on the SAME host task.
+        // otaFinish returns OTA_PENDING in that case: leave the session (and the radio quiesce) intact
+        // and do nothing - the trailing otaWrite completes the image, or the loop watchdog fails it.
+        if (r == OTA_PENDING) return;
+        if (r == OTA_OK) { delay(250); ESP.restart(); }   // boot the new image
+        char j[64]; snprintf(j, sizeof(j), "{\"ota\":\"err\",\"e\":\"%s\"}", otaResultStr(r));
+        otaNotify(j);
+        otaQuiesce(false);
+    } else if (o["abort"].is<bool>() && o["abort"].as<bool>()) {
+        otaAbort();
+        otaQuiesce(false);
+    } else if (o["confirm"].is<bool>() && o["confirm"].as<bool>()) {
+        otaMarkHealthy();
+        otaNotify("{\"ota\":\"ok\"}");
+    }
+}
+
 // ---- config writes from the app ----
 class CfgCb : public NimBLECharacteristicCallbacks {
     void onWrite(NimBLECharacteristic* c) override {
@@ -97,13 +380,50 @@ class CfgCb : public NimBLECharacteristicCallbacks {
                                                 : doc["axon"].as<bool>();
             if (on) axonUseRegistryCandidate();   // load 00:25:DF so it actually fires
             axonSetEnabled(on);
-            policeSetEnabled(on);                 // Motorola/LE-gear rides the body-cam toggle (merged into the body-cam category)
+            // NOTE: deliberately does NOT touch policeSetEnabled. The broad Motorola
+            // match is a SUB-toggle ({"motorola"}) underneath this category, so the
+            // category switch no longer clobbers the user's broad-match preference.
+            // police_detect gates on axonIsEnabled() anyway, so turning the category
+            // off still silences Motorola - it just does not FORGET the sub-setting.
             Serial.printf("[ACAB] Body-cam detector %s\n", on ? "ENABLED" : "disabled");
+        }
+        // Broad Motorola Solutions OUI match: sub-toggle of the body-cam category.
+        // Lets a user quiet the noisy corporate-OUI proxy while keeping the conf-90
+        // Axon BWCDEVICE tag and Utility BodyWorn running.
+        if (doc["motorola"].is<bool>()) {
+            bool on = doc["motorola"].as<bool>();
+            policeSetEnabled(on);
+            Serial.printf("[ACAB] Motorola broad-OUI match %s\n", on ? "on" : "off");
         }
         if (doc["tracker"].is<bool>()) {
             bool on = doc["tracker"].as<bool>();
             trackerSetEnabled(on);
             Serial.printf("[ACAB] Tracker detector %s\n", on ? "on" : "off");
+        }
+        if (doc["glasses"].is<bool>()) {      // recording-glasses detector (BLE mfg company ID)
+            bool on = doc["glasses"].as<bool>();
+            glassesSetEnabled(on);
+            Serial.printf("[ACAB] Glasses detector %s\n", on ? "on" : "off");
+        }
+        if (doc["flock"].is<bool>()) {        // Flock/ALPR detector (BLE + WiFi)
+            bool on = doc["flock"].as<bool>();
+            flockSetEnabled(on);
+            Serial.printf("[ACAB] Flock/ALPR detector %s\n", on ? "on" : "off");
+        }
+        if (doc["drone"].is<bool>()) {        // drone Remote ID detector (BLE + WiFi)
+            bool on = doc["drone"].as<bool>();
+            droneSetEnabled(on);
+            Serial.printf("[ACAB] Drone detector %s\n", on ? "on" : "off");
+        }
+        if (doc["droneoui"].is<bool>()) {     // drone vendor-OUI fallback opt-in (default OFF; may false-positive on stationary drone-vendor gear)
+            bool on = doc["droneoui"].as<bool>();
+            droneOuiSetEnabled(on);
+            Serial.printf("[ACAB] Drone OUI fallback %s\n", on ? "on" : "off");
+        }
+        if (doc["netcam"].is<bool>()) {       // network-camera opt-in (default OFF; widens WiFi to data frames, see netcam_detect.cpp)
+            bool on = doc["netcam"].as<bool>();
+            netcamSetEnabled(on);
+            Serial.printf("[ACAB] Network-camera detector %s\n", on ? "on" : "off");
         }
         if (doc["desert"].is<bool>()) {       // Desert mode: report EVERY device in range
             bool on = doc["desert"].as<bool>();
@@ -114,6 +434,11 @@ class CfgCb : public NimBLECharacteristicCallbacks {
             bool on = doc["buzzer"].as<bool>();
             alertsSetBuzzerEnabled(on);
             Serial.printf("[ACAB] Buzzer %s\n", on ? "on" : "off");
+        }
+        if (doc["led"].is<bool>()) {
+            bool on = doc["led"].as<bool>();
+            alertsSetLedEnabled(on);
+            Serial.printf("[ACAB] LED %s\n", on ? "on" : "off (lights out)");
         }
         if (doc["volume"].is<int>()) {
             int v = doc["volume"].as<int>();
@@ -132,18 +457,45 @@ class CfgCb : public NimBLECharacteristicCallbacks {
             acabScannerSetWiFi(on);
             Serial.printf("[ACAB] WiFi scan %s\n", on ? "on" : "off");
         }
+        if (doc["wifiEco"].is<int>()) {   // 0/3/7/15 s of WiFi RX sleep between sweeps (battery SKU)
+            int sec = doc["wifiEco"].as<int>();
+            acabScannerSetWifiEco(sec);
+            Serial.printf("[ACAB] WiFi eco = %ds\n", acabScannerWifiEco());
+        }
         if (doc["beep"].is<bool>() && doc["beep"].as<bool>()) {
             alertsBeepTest();             // volume preview at the level just set above
         }
+        // Ignore list. Supports chunking: {"ignore":[...],"more":true} stages more MACs without
+        // committing; a chunk with "more" absent/false appends then commits the whole staged list.
+        // A single small write with no "more" stages then commits immediately (unchanged behavior).
         if (doc["ignore"].is<JsonArray>()) {
-            static uint8_t macs[256][6];   // static: config writes are serialized; keeps 1.5KB off the BLE-task stack
-            int n = 0;
             for (JsonVariant v : doc["ignore"].as<JsonArray>()) {
-                if (n >= 256) break;
-                if (parseMac6(v.as<const char*>(), macs[n])) n++;
+                if (gIgnoreStageN >= 256) break;
+                if (parseMac6(v.as<const char*>(), gIgnoreStage[gIgnoreStageN])) gIgnoreStageN++;
             }
-            acabScannerSetIgnoreList(macs, n);
-            Serial.printf("[ACAB] ignore list: %d device(s)\n", n);
+            if (doc["more"].is<bool>() && doc["more"].as<bool>()) {
+                Serial.printf("[ACAB] ignore list: staged %d device(s), awaiting more\n", gIgnoreStageN);
+            } else {
+                acabScannerSetIgnoreList(gIgnoreStage, gIgnoreStageN);
+                Serial.printf("[ACAB] ignore list: %d device(s)\n", gIgnoreStageN);
+                gIgnoreStageN = 0;
+            }
+        }
+        // Watchlist: inverse of the ignore list. Same MAC string format, same 256 cap, same chunked
+        // "more" protocol. The app pushes it right after the ignore push on connect; a starred MAC
+        // alerts every time it is seen even with no signature match.
+        if (doc["watch"].is<JsonArray>()) {
+            for (JsonVariant v : doc["watch"].as<JsonArray>()) {
+                if (gWatchStageN >= 256) break;
+                if (parseMac6(v.as<const char*>(), gWatchStage[gWatchStageN])) gWatchStageN++;
+            }
+            if (doc["more"].is<bool>() && doc["more"].as<bool>()) {
+                Serial.printf("[ACAB] watch list: staged %d device(s), awaiting more\n", gWatchStageN);
+            } else {
+                acabScannerSetWatchList(gWatchStage, gWatchStageN);
+                Serial.printf("[ACAB] watch list: %d device(s)\n", gWatchStageN);
+                gWatchStageN = 0;
+            }
         }
         // Phone GPS from the app: where we are, stamped onto detections + the mesh line.
         if (doc["lat"].is<float>() && doc["lon"].is<float>()) {
@@ -168,15 +520,26 @@ class CfgCb : public NimBLECharacteristicCallbacks {
             detLogClear();
             Serial.println("[ACAB] Offline buffer erased");
         }
-        if (doc["sync"].is<uint32_t>()) { gHistSent = 0; detLogStartDrain(doc["sync"].as<uint32_t>()); }
+        if (doc["sync"].is<uint32_t>()) { gHistSent = 0; gHistBeginSent = false; detLogStartDrain(doc["sync"].as<uint32_t>()); }
+        // Dual-radio black box on the nRF: replay its records, or wipe it (seizure-aware).
+        if (doc["bbdump"].is<bool>()  && doc["bbdump"].as<bool>())  acabScannerSendCoProcCmd("DUMP");
+        if (doc["bbclear"].is<bool>() && doc["bbclear"].as<bool>()) acabScannerSendCoProcCmd("BCLR");
+        // Kick the companion nRF into BLE OTA DFU (dual board; no-op elsewhere). Just latch the
+        // request here - loop() forwards the "DFU" trigger over UART off the NimBLE host task.
+        if (doc["nrfdfu"].is<bool>() && doc["nrfdfu"].as<bool>()) gNrfDfuReq = true;
+        // Firmware update control. Handled last: an {"ota":{"end"}} reboots the board.
+        if (doc["ota"].is<JsonObject>()) handleOtaControl(doc["ota"].as<JsonObject>());
         acabBleUpdateStatus();
     }
 };
 
 void acabBleBegin(const char* deviceName, const char* fwLabel) {
     gFwLabel = fwLabel ? fwLabel : "ACAB-ouispy";
+    if (!gJsonMux) gJsonMux = xSemaphoreCreateMutex();   // guards the shared JSON scratch pool
+    if (!gNotifyMux) gNotifyMux = xSemaphoreCreateMutex();   // serializes every setValue+notify pair
+
     NimBLEDevice::init(deviceName ? deviceName : "ACAB");
-    NimBLEDevice::setMTU(247);   // fit a detection JSON in one notify
+    NimBLEDevice::setMTU(512);   // roomy ATT payload: the status + rich drone JSON outgrew 247 (see NOTIFY_MAX)
     // Encrypted, bonded link for the whole service, so a stranger can't silence the
     // scanner (config write) or watch what you're detecting (detection/status stream).
     // Pairing is "Just Works" (no passkey) because the board has no display/keypad, so
@@ -200,7 +563,20 @@ void acabBleBegin(const char* deviceName, const char* fwLabel) {
                     NIMBLE_PROPERTY::WRITE | NIMBLE_PROPERTY::WRITE_ENC);
     gStatChar = svc->createCharacteristic(ACAB_BLE_STAT_UUID,
                     NIMBLE_PROPERTY::READ | NIMBLE_PROPERTY::NOTIFY | NIMBLE_PROPERTY::READ_ENC);
+    // UAF guard: pre-grow gStatChar's value buffer to NOTIFY_MAX now, before any client can connect.
+    // NimBLE's setValue reallocs-to-grow OUTSIDE its read critical section, so a growth realloc racing a
+    // peer ATT READ is a use-after-free. Ratcheting capacity to the max here means every later status
+    // frame (all <= NOTIFY_MAX) overwrites in place and never reallocs. The placeholder is valid empty
+    // JSON ("{}" + trailing spaces) so a read landing before the first real status still decodes clean.
+    { uint8_t warm[NOTIFY_MAX]; memset(warm, ' ', sizeof(warm)); warm[0] = '{'; warm[1] = '}';
+      gStatChar->setValue(warm, sizeof(warm)); }
+    // OTA: image bytes arrive here (write-no-response, encrypted); progress notifies back.
+    gOtaChar  = svc->createCharacteristic(ACAB_BLE_OTA_UUID,
+                    NIMBLE_PROPERTY::WRITE_NR | NIMBLE_PROPERTY::WRITE |
+                    NIMBLE_PROPERTY::WRITE_ENC | NIMBLE_PROPERTY::NOTIFY);
+    gOtaChar->setCallbacks(new OtaCb());
     gCfgChar->setCallbacks(new CfgCb());
+    otaSetNotifier(otaNotify);
     svc->start();
 
     NimBLEAdvertising* adv = NimBLEDevice::getAdvertising();
@@ -225,13 +601,16 @@ void acabBleBegin(const char* deviceName, const char* fwLabel) {
 }
 
 // Build a detection record into `buf` (returns length). For replay set hist=true and
-// pass seq + atUnix (atUnix==0 -> "approx":true). NOTE: mirrors the field set in
+// pass seq + atUnix (atUnix==0 -> "approx":true), plus whenMs/bootCount so the app can verify or
+// redo the time reconstruction and bracket an unanchored boot. NOTE: mirrors the field set in
 // acabBleNotifyDetection below - keep the two in sync (or consolidate later).
 static size_t serializeDetection(const AcabDetection& d, bool isNew, char* buf, size_t bufsz,
-                                 bool hist, uint32_t seq, uint32_t atUnix) {
+                                 bool hist, uint32_t seq, uint32_t atUnix,
+                                 uint32_t whenMs = 0, uint32_t bootCount = 0) {
     char macStr[18];
     acabFormatMac(d.mac, macStr);
-    JsonDocument doc;
+    JsonPoolLock jp;
+    JsonDocument doc(jp.alloc());
     doc["t"]    = (int)d.type;
     doc["s"]    = (int)d.src;
     doc["meth"] = (int)d.method;
@@ -257,31 +636,103 @@ static size_t serializeDetection(const AcabDetection& d, bool isNew, char* buf, 
         doc["hist"] = true;
         doc["seq"]  = seq;
         if (atUnix) doc["at"] = atUnix; else doc["approx"] = true;
+        // The raw reconstruction inputs, sent whether or not the board could resolve "at" itself.
+        // "at" is never a clock reading: the board has no RTC, so it is always derived from a
+        // per-boot anchor. Shipping the inputs lets the app verify that derivation, redo it against
+        // its own anchor history (which outlives board reboots and factory resets), and bracket a
+        // record whose boot was never anchored instead of showing a bare "time unknown".
+        doc["ms"]   = whenMs;
+        doc["boot"] = bootCount;
     }
     return serializeJson(doc, buf, bufsz);
 }
 
-// Drive the offline-buffer replay: one record per call, paced by loop(). On {sync}
+// Drive the offline-buffer replay: a bounded burst per call, paced by loop(). On {sync}
 // the app starts a drain; we stream each stored record tagged hist/seq/at, then a
 // {"hist":"end","n":N} sentinel so the app can spot drops and re-sync from its lastSeq.
+// Also pumps the acab_core deferred work that must run off the NimBLE host task.
 void acabBleDrainTick() {
+    // Pumps first, BEFORE the connectivity guard: a latched buffer wipe must finish even if
+    // the phone that triggered it walks away (one 64KB block per pass), and an in-flight nRF
+    // ignore-mirror stream must complete after a disconnect too.
+    detLogEraseTick();
+    acabScannerMirrorTick();
+
     if (!gDetChar || !gConnected || !detLogDraining()) return;
-    char buf[320];
+    // Wait for the MTU exchange before draining. At the 23-byte default gPeerMtu, notifyCap() is
+    // 20 bytes - smaller than any replay frame (and the hist:begin lead-in) - so every record would
+    // fail the len <= notifyCap() gate below AND be consumed anyway (detLogNextForDrain commits
+    // ++gDrain before we can inspect it), draining the whole buffer as skips and emitting
+    // hist:begin(n=large)/hist:end(n=0). The app always negotiates 512; this just waits for it.
+    if (gPeerMtu <= 23) return;
+    // Back-pressure: only push a replay frame while the mbuf pool has headroom, so we never blast
+    // into a full pool where notify() would silently drop the record. This also yields to live
+    // notifies (which draw from the same pool), so a crowd just slows the drain instead of breaking
+    // it. If we're low, skip this tick and let the pool drain (delay(20) in loop paces the retry).
+    if (os_msys_num_free() < DRAIN_MBUF_MIN) return;
+
+    char buf[512];
     DetLogReplay r;
-    if (detLogNextForDrain(&r)) {
-        size_t len = serializeDetection(r.d, false, buf, sizeof(buf), true, r.seq, r.atUnix);
-        if (len > 0 && len <= NOTIFY_MAX) {          // skip an over-MTU record; never send truncated JSON
-            gDetChar->setValue((uint8_t*)buf, len);
-            gDetChar->notify();
-            gHistSent++;
+    if (!gHistBeginSent) {
+        // Lead-in so the app can show a determinate "X of N". N is the exact pending count (not
+        // status "buf", which is total ring occupancy). The {"hist":"end","n":N} sentinel closes it.
+        // "from" is the resume point (first seq this drain will send): after a board-side wipe
+        // reset the seq generation, the app rebases its persisted cursor to from-1 so the
+        // end-of-drain checkpoint lands in the new generation instead of re-replaying forever.
+        gHistBeginSent = true;
+        size_t len;
+        { JsonPoolLock jp; JsonDocument doc(jp.alloc());
+          doc["hist"] = "begin";
+          doc["n"]    = detLogPendingDrain();
+          doc["from"] = detLogDrainFrom();
+          len = serializeJson(doc, buf, sizeof(buf)); }
+        { NotifyLock nl; gDetChar->setValue((uint8_t*)buf, len); gDetChar->notify(); }
+        return;
+    }
+    // Burst: up to DRAIN_BURST_MAX records per pass. Re-check the mbuf headroom before EVERY
+    // notify - one 200-500B frame can consume several ~292B msys blocks, so a single up-front
+    // check could still blast the pool - and re-check the connection/drain state each
+    // iteration, since a disconnect callback on the NimBLE host task can land mid-burst.
+    // NotifyLock stays per-record so live detections and OTA notifies interleave with the burst.
+    for (int i = 0; i < DRAIN_BURST_MAX; i++) {
+        if (!gConnected || !detLogDraining()) return;
+        if (os_msys_num_free() < DRAIN_MBUF_MIN) return;
+        if (detLogNextForDrain(&r)) {
+            size_t len = serializeDetection(r.d, false, buf, sizeof(buf), true, r.seq, r.atUnix,
+                                            r.whenMs, r.bootCount);
+            if (len > 0 && len <= notifyCap()) {     // skip an over-MTU record; never send truncated JSON
+                { NotifyLock nl; gDetChar->setValue((uint8_t*)buf, len); gDetChar->notify(); }
+                gHistSent++;
+            }
+        } else {
+            size_t len;
+            { JsonPoolLock jp; JsonDocument doc(jp.alloc());
+              doc["hist"] = "end";
+              doc["n"]    = gHistSent;
+              len = serializeJson(doc, buf, sizeof(buf)); }
+            { NotifyLock nl; gDetChar->setValue((uint8_t*)buf, len); gDetChar->notify(); }
+            return;
         }
-    } else {
-        JsonDocument doc;
-        doc["hist"] = "end";
-        doc["n"]    = gHistSent;
-        size_t len = serializeJson(doc, buf, sizeof(buf));
-        gDetChar->setValue((uint8_t*)buf, len);
-        gDetChar->notify();
+    }
+}
+
+// OTA stall watchdog. Belt-and-suspenders to the disconnect handler: if a session sits
+// idle (no otaBegin/otaWrite) longer than the timeout - a stalled uploader, a drop the
+// callback missed - abort it and bring the radios back so OTA can't wedge BUSY forever.
+void acabBleOtaWatchdog() {
+    // A deferred finish (end arrived before the last chunk) whose grace window lapsed without the
+    // straggler completing the image: fail it here off the host task, bring the radios back, and
+    // report the size error the end handler deferred.
+    if (otaPendingFinishExpired()) {
+        otaQuiesce(false);
+        otaNotify("{\"ota\":\"err\",\"e\":\"size\"}");
+        return;
+    }
+    static const uint32_t kOtaStallMs = 30000;
+    if (otaInProgress() && otaIdleMs() > kOtaStallMs) {
+        otaAbort();
+        otaQuiesce(false);
+        otaNotify("{\"ota\":\"err\",\"e\":\"stall\"}");
     }
 }
 
@@ -292,62 +743,137 @@ void acabBleNotifyDetection(const AcabDetection& d, bool isNew) {
     char macStr[18];
     acabFormatMac(d.mac, macStr);
 
-    JsonDocument doc;
-    doc["t"]    = (int)d.type;
-    doc["s"]    = (int)d.src;
-    doc["meth"] = (int)d.method;
-    doc["c"]    = d.confidence;
-    doc["mac"]  = macStr;
-    doc["rssi"] = d.rssi;
-    if (d.name[0])   doc["name"] = d.name;
-    if (d.id[0])     doc["id"]   = d.id;
-    if (d.detail[0]) doc["det"]  = d.detail;
-    if (d.lat || d.lon)           { doc["lat"]  = d.lat;  doc["lon"]  = d.lon; }
-    if (d.gpsAgeMs)               doc["gage"] = (uint32_t)(d.gpsAgeMs / 1000);   // GPS fix age (s)
-    if (d.pilotLat || d.pilotLon) { doc["plat"] = d.pilotLat; doc["plon"] = d.pilotLon; }
-    if (d.altitude)  doc["alt"]  = d.altitude;
-    if (d.speedH)    doc["spd"]  = (int)d.speedH;
-    if (d.speedV)    doc["vspd"] = (int)d.speedV;
-    if (d.heading)   doc["hdg"]  = (int)d.heading;
-    if (d.heightAGL) doc["hgt"]  = (int)d.heightAGL;
-    if (d.pilotAlt)  doc["palt"] = d.pilotAlt;
-    if (d.ridStatus) doc["sta"]  = d.ridStatus;
-    doc["n"]   = d.count;
-    doc["new"] = isNew;
-
-    char buf[320];
-    size_t len = serializeJson(doc, buf, sizeof(buf));
-    if (len == 0 || len > NOTIFY_MAX) return;        // don't emit a truncated, unparseable frame
-    gDetChar->setValue((uint8_t*)buf, len);
-    gDetChar->notify();
+    char buf[512];
+    size_t len;
+    {
+        JsonPoolLock jp;
+        JsonDocument doc(jp.alloc());
+        doc["t"]    = (int)d.type;
+        doc["s"]    = (int)d.src;
+        doc["meth"] = (int)d.method;
+        doc["c"]    = d.confidence;
+        doc["mac"]  = macStr;
+        doc["rssi"] = d.rssi;
+        if (d.name[0])   doc["name"] = d.name;
+        if (d.id[0])     doc["id"]   = d.id;
+        if (d.detail[0]) doc["det"]  = d.detail;
+        if (d.companyId) doc["cid"]  = d.companyId;   // BLE mfg company ID (SIG #); app shows/logs it
+        if (d.lat || d.lon)           { doc["lat"]  = d.lat;  doc["lon"]  = d.lon; }
+        if (d.gpsAgeMs)               doc["gage"] = (uint32_t)(d.gpsAgeMs / 1000);   // GPS fix age (s)
+        if (d.pilotLat || d.pilotLon) { doc["plat"] = d.pilotLat; doc["plon"] = d.pilotLon; }
+        if (d.altitude)  doc["alt"]  = d.altitude;
+        if (d.speedH)    doc["spd"]  = (int)d.speedH;
+        if (d.speedV)    doc["vspd"] = (int)d.speedV;
+        if (d.heading)   doc["hdg"]  = (int)d.heading;
+        if (d.heightAGL) doc["hgt"]  = (int)d.heightAGL;
+        if (d.pilotAlt)  doc["palt"] = d.pilotAlt;
+        if (d.ridStatus) doc["sta"]  = d.ridStatus;
+        doc["n"]   = d.count;
+        doc["new"] = isNew;
+        len = serializeJson(doc, buf, sizeof(buf));
+    }
+    if (len == 0) return;
+    if (len > notifyCap()) {
+        // Over the peer's usable MTU budget: a small-MTU link (e.g. an iPhone that negotiates 185) can't
+        // carry a big detection (a fully-populated drone RemoteID record). We skip rather than send
+        // truncated JSON, but unlike the drain path the live notify has no seq/resync, so this DROPS the
+        // sighting. Count + warn (throttled) so the gap is visible on bring-up instead of silent.
+        static uint32_t sDropped = 0, sLastWarn = 0;
+        sDropped++;
+        if (millis() - sLastWarn > 5000) {
+            sLastWarn = millis();
+            Serial.printf("[ACAB] detection %uB over MTU cap %u - notify skipped (%u dropped, peer MTU %u)\n",
+                          (unsigned)len, (unsigned)notifyCap(), (unsigned)sDropped, (unsigned)gPeerMtu);
+        }
+        return;
+    }
+    { NotifyLock nl; gDetChar->setValue((uint8_t*)buf, len); gDetChar->notify(); }
 }
+
+void acabBleSetBatteryPct(int pct) { gBatteryPct = pct; }
+void acabBleSetCharging(bool charging) { gCharging = charging; }
 
 // Rebuild the status JSON and update the characteristic (notify if connected).
 void acabBleUpdateStatus() {
     if (!gStatChar) return;
-    JsonDocument doc;
-    static char fwbuf[40];
+    char buf[512];
+    size_t len;
+    {
+    JsonPoolLock jp;
+    JsonDocument doc(jp.alloc());
+    char fwbuf[40];
     snprintf(fwbuf, sizeof(fwbuf), "%s %s", gFwLabel, ACAB_FW_VERSION);
     doc["fw"]     = fwbuf;
     doc["up"]     = (uint32_t)(millis() / 1000);
     doc["total"]  = acabScannerTotalDetections();
     doc["ble"]    = acabScannerBLEEnabled();
     doc["wifi"]   = acabScannerWiFiEnabled();
-    doc["axon"]   = axonIsEnabled();
-    doc["bodycam"]= axonIsEnabled();
+    doc["wifiEco"]= acabScannerWifiEco();   // 0/3/7/15 s WiFi-sweep sleep; apps show the eco picker
+
+    doc["axon"]   = axonIsEnabled();   // body-cam toggle state; both apps read this (iOS "axon", Android falls back to it)
+    doc["moto"]   = policeIsEnabled(); // broad Motorola-OUI sub-toggle; apps treat an absent key as true (pre-split firmware)
     doc["tracker"]= trackerIsEnabled();
+    doc["glasses"]= glassesIsEnabled();
+    doc["flock"]  = flockIsEnabled();  // Flock/ALPR toggle state; apps treat an absent key as true
+    doc["drone"]  = droneIsEnabled();  // drone Remote ID toggle state; absent key = true
+    doc["droui"]  = droneOuiIsEnabled();  // drone vendor-OUI fallback opt-in state; absent key = false (default off)
+    doc["ncam"]   = netcamIsEnabled();  // network-camera opt-in state; absent key = false (default off)
     doc["buzzer"] = alertsBuzzerEnabled();
     doc["vol"]    = alertsVolume();
+    if (!alertsLedEnabled()) doc["ledon"] = false;   // only when off; absent = on (default), saves MTU bytes
     doc["gps"]    = (gPhoneGpsMs != 0) && (millis() - gPhoneGpsMs < 60000);
     doc["buf"]    = detLogCount();          // stored offline records
     doc["bufon"]  = detLogEnabled();        // buffering opt-in state
+    if (detLogWipePending()) doc["wiping"] = true;   // deferred buffer erase still sweeping; absent = idle
     doc["desert"] = desertIsEnabled();      // Desert mode (report every device in range)
     doc["ign"]    = acabScannerIgnoreCount();  // ignore-list size, for app reconciliation
+    doc["wat"]    = acabScannerWatchCount();    // watchlist size, for app reconciliation
+    doc["wseen"]  = acabScannerWifiSeen();      // two-radio diag: 802.11 mgmt frames seen
+    doc["bseen"]  = acabScannerBleSeen();       // BLE adverts ingested (= the nRF's forwards in dual mode)
+    if (acabScannerHasCoProc()) doc["nbb"] = acabScannerCoProcBbCount();  // nRF black-box record count
+    if (gBatteryPct >= 0)       doc["bat"] = gBatteryPct;                 // battery %, sense-divider boards only
+#ifdef ACAB_DUAL_RADIO
+    // Co-processor (nRF) liveness for the app's "bluetooth detection offline" warning. Always
+    // emitted on the dual board: the app only warns when it is present AND false, so an absent
+    // key (older firmware / single-radio) never trips it. See the cross-target contract.
+    doc["co"]  = acabScannerCoProcAlive();
+    // Companion nRF app version, for the app's "nRF update available" check (BLE DFU). Emit only
+    // once heard (>=0) so single-radio builds and a not-yet-announced nRF never send a stray -1.
+    { int nrfv = acabNrfVersion(); if (nrfv >= 0) doc["nrfv"] = nrfv; }
+    // Carrier revision so the app (and support) can see which board is in the case without opening
+    // it: "A" = the first 250 (slide switch), "B" = button power + VBUS sense. Auto-detected.
+    doc["rev"] = acabBoardIsRevB() ? "B" : "A";   // was `if (acabBoardIsRevB)`: a function-ADDRESS
+                                                  // truthiness test, never false, so the guard did
+                                                  // nothing. The emit is unconditional by design.
+    // "nRF is updating over BLE DFU" - emit only while true. The app uses it to show "updating
+    // co-processor" instead of the co-proc fault banner during the window the nRF is in DFU.
+    if (acabNrfDfuActive()) doc["nrfup"] = true;
+    // Battery charging: emit only when true (absent = draining/unknown = normal battery UI), to
+    // keep this JSON compact under the ATT budget.
+    if (gCharging) doc["chg"] = true;
+#endif
+    // The nRF's detailed view (adv/fwd/scan) rides the [diag] serial line, not the status
+    // notify, to keep this JSON safely under the BLE ATT MTU.
 
-    char buf[200];
-    size_t len = serializeJson(doc, buf, sizeof(buf));
-    gStatChar->setValue((uint8_t*)buf, len);
-    if (gConnected) gStatChar->notify();
+    len = serializeJson(doc, buf, sizeof(buf));
+    }   // release the JSON pool before touching the BLE stack below
+    // Update the characteristic value UNCONDITIONALLY, before the notify guard: the status is
+    // READable, and the apps poll it (~every 5 s) as a fallback, so a READ must always return the
+    // freshest status even when the notify below is skipped for a small negotiated MTU.
+    // Notify only a connected peer (no client = nothing to notify, and no misleading "skipped" spam on a
+    // USB-only bench). A fuller status must never ride out truncated past the peer's negotiated MTU, which
+    // would hand the app invalid JSON; skip only the notify then - the READ value set above stays fresh and
+    // the apps' ~5 s status poll covers it. The setValue+notify pair is serialized against the other
+    // characteristic writers (see NotifyLock); the setValue stays unconditional so a READ is always fresh.
+    if (len > 0) {
+        NotifyLock nl;
+        gStatChar->setValue((uint8_t*)buf, len);
+        if (gConnected && len <= notifyCap()) gStatChar->notify();
+    }
+    if (gConnected && len > 0 && len > notifyCap()) {
+        Serial.printf("[ACAB] status JSON %u B over MTU cap %u - notify skipped (peer MTU %u)\n",
+                      (unsigned)len, (unsigned)notifyCap(), (unsigned)gPeerMtu);
+    }
 }
 
 bool acabBleClientConnected() { return gConnected; }

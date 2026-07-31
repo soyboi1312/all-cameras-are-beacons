@@ -1,6 +1,7 @@
 package tech.acab.app
 
 import android.Manifest
+import android.content.Intent
 import android.content.pm.PackageManager
 import android.os.Build
 import android.os.Bundle
@@ -27,12 +28,10 @@ class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         syncPermissionState()
-        // Ask for anything still missing (this also catches upgrades where Bluetooth
-        // was granted but location was never asked for). Fresh launches only, so a
-        // rotation doesn't nag again.
-        if (savedInstanceState == null && !requestedPermissions().all { hasPermission(it) }) {
-            requestPermissions.launch(requestedPermissions())
-        }
+        handleDeepLink(intent)
+        // The permission prompt is NOT fired here anymore. The connect screen shows a
+        // "before the system asks" rationale first, and its CTA calls onRequestPermissions,
+        // so the OS prompt only appears after the user has seen why we ask.
         setContent {
             // Space Grotesk is the default face for any non-mono Text, like the iOS
             // app. Doesn't touch component colors.
@@ -48,6 +47,34 @@ class MainActivity : ComponentActivity() {
         }
     }
 
+    // Re-sync when returning from system Settings, so granting there updates the UI without
+    // needing a relaunch (previously the onCreate auto-request covered this path).
+    override fun onResume() {
+        super.onResume()
+        syncPermissionState()
+    }
+
+    // launchMode=singleTask: a drive-mode notification tap lands here when the activity
+    // already exists, instead of relaunching it.
+    override fun onNewIntent(intent: Intent) {
+        super.onNewIntent(intent)
+        handleDeepLink(intent)
+    }
+
+    /** Drive-mode notification tap: raise the "open the Log tab, NEW filter" signal that
+     *  MainScreen consumes once it's on screen. The extra is stripped after reading so a
+     *  recreation replaying the same intent doesn't re-trigger the jump; a launch from
+     *  recents after process death re-delivers the original intent (extra intact), so the
+     *  HISTORY flag guards that replay too. */
+    private fun handleDeepLink(intent: Intent?) {
+        if (intent == null) return
+        if (intent.flags and Intent.FLAG_ACTIVITY_LAUNCHED_FROM_HISTORY != 0) return
+        if (intent.getBooleanExtra(EXTRA_OPEN_LOG_NEW, false)) {
+            openLogNew.value = true
+            intent.removeExtra(EXTRA_OPEN_LOG_NEW)
+        }
+    }
+
     /** Recheck whether we can scan/connect, and kick off location if allowed. */
     private fun syncPermissionState() {
         permissionsGranted = requiredPermissions().all { hasPermission(it) }
@@ -55,7 +82,7 @@ class MainActivity : ComponentActivity() {
     }
 
     // Everything we ask for in one prompt: BLE plus location for the map. On Android
-    // 12+ you have to request COARSE alongside FINE or the FINE request is ignored —
+    // 12+ you have to request COARSE alongside FINE or the FINE request is ignored -
     // that's why the location prompt used to never show up.
     private fun requestedPermissions(): Array<String> = buildList {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
@@ -87,4 +114,15 @@ class MainActivity : ComponentActivity() {
 
     private fun hasPermission(p: String) =
         checkSelfPermission(p) == PackageManager.PERMISSION_GRANTED
+
+    companion object {
+        /** Intent extra set by the drive-mode notification's contentIntent (AcabLinkService). */
+        const val EXTRA_OPEN_LOG_NEW = "open_log_new"
+
+        /** Pending deep link, as observable state rather than a MainScreen parameter:
+         *  AcabApp sits between the activity and the tab shell, and the tap can arrive while
+         *  the app is already composed. It stays raised until MainScreen is actually on
+         *  screen (READY link) to consume it. */
+        val openLogNew = mutableStateOf(false)
+    }
 }

@@ -5,6 +5,19 @@ firmware/.pio/
 # Local reference copies of the upstream oui-spy repo (not part of ACAB)
 _reference/
 
+# Private hardware design (dual-radio board, enclosure, BOM); kept local, NOT published.
+# The open-source project is the apps + firmware only; the hardware stays proprietary.
+hardware/
+
+# nRF co-processor firmware for the dual-radio board; kept local with the hardware.
+# Its README spells out the board's pinout / UART wiring / block diagram, which is part
+# of the proprietary design, so it stays out of the public repo.
+firmware/nrf-ble-scan/
+
+# OTA design note describes the proprietary dual-chip update path (S3 reflashing the
+# nRF52840 over SWD, image embedding, UF2 recovery). Hardware-internal, so it stays local.
+firmware/OTA.md
+
 # OS / editor cruft
 .DS_Store
 *.swp
@@ -14,8 +27,12 @@ _reference/
 # Logs
 *.log
 
-# NOTE: web/firmware/*.bin ARE committed on purpose - the flasher serves them.
+# NOTE: web/firmware/*.bin ARE committed on purpose: the flasher serves them.
 
 # XcodeGen generates these from ios/project.yml (run `xcodegen generate`)
 ios/*.xcodeproj/
 ios/Beacons/Resources/Info.plist
+
+# OTA image-signing PRIVATE keys: keep offline, NEVER commit. Only the public key
+# (lib/acab_core/ota_pubkey.h) ships. Losing this key just means re-keying + a web-flash.
+firmware/tools/ota_signing/*.pem

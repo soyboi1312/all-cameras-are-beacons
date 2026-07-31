@@ -33,28 +33,31 @@ static const size_t FLOCK_OUI_COUNT = sizeof(FLOCK_OUI) / sizeof(FLOCK_OUI[0]);
 // WiFi client OUIs (Falcon cameras) - PROBE-REQUEST matched
 // ---------------------------------------------------------------------------
 // Falcon cams join a network as WiFi clients (no "Flock-" AP of their own) and give
-// themselves away with probe requests from a Liteon WiFi module. These specific Liteon
-// OUIs were seen on deflock-confirmed Falcons in the field (own field captures, 2026-06).
-// Liteon is shared silicon, so these are matched on PROBE REQUESTS ONLY (see
-// flockClassifyWiFi) to hold false positives down; grow the list from more field captures.
-struct FalconWifiOui { uint8_t b[3]; };
+// themselves away with probe requests from a Liteon WiFi module. Liteon is shared
+// silicon (one of the biggest laptop WiFi-NIC suppliers), so these are matched on
+// PROBE REQUESTS ONLY (see flockClassifyWiFi) - but note that gate distinguishes APs
+// from clients, NOT cameras from laptops: probe requests are exactly what a
+// not-yet-associated laptop emits, and Windows ships MAC randomization off, so the
+// real OUI is on the air. Only OUIs field-validated AT a live Falcon ship (ext=0).
+// Earlier unconfirmed candidates that came from community OUI lists were removed for
+// clean-room provenance. Re-add / promote an OUI only after confirming it at a live
+// Falcon in our own capture.
+// ext=1 = NON-SHIPPING candidate: compiled out of every build (gFlockExtendedOui in
+// flock_detect.cpp is compile-time false with no setter, NVS restore, or BLE toggle),
+// kept only as a provenance record until validated at a live Falcon.
+struct FalconWifiOui { uint8_t b[3]; uint8_t ext; };
 static const FalconWifiOui FALCON_WIFI_OUI[] = {
-    // Own field captures (deflock-confirmed Falcons, 2026-06):
-    {{0xD8,0xF3,0xBC}},  // D8:F3:BC:7D:D4:CF
-    {{0xC0,0x35,0x32}},  // C0:35:32:AF:A3:7D
-    {{0x24,0xB2,0xB9}},  // 24:B2:B9:F5:D0:43
-    {{0xF4,0x6A,0xDD}},  // F4:6A:DD:62:38:5D / :5E:3A:F3
-    // Additional candidate Liteon "Flock WiFi" OUIs (pending own-capture confirmation).
-    // All IEEE-registered to Liteon Technology - the same module family as the four
-    // above. Probe-req gated like the rest, so the shared-silicon FP risk stays bounded.
-    {{0x70,0xC9,0x4E}},
-    {{0x3C,0x91,0x80}},
-    {{0x80,0x30,0x49}},
-    {{0x14,0x5A,0xFC}},
-    {{0x74,0x4C,0xA1}},
-    {{0x9C,0x2F,0x9D}},
-    {{0x94,0x08,0x53}},
-    {{0xE4,0xAA,0xEA}},
+    // Shipped (ext=0): field-validated at a live Falcon over probe requests.
+    //   D8:F3:BC / C0:35:32 were 2026-06 near-Falcon-only candidates (held out as a
+    //   bystander-laptop risk); PROMOTED 2026-07-24 after our own drive recaptured
+    //   BOTH broadcasting "PROBE-FALCON" / "DATA-FALCON" SSIDs (a Flock-specific name
+    //   no bystander laptop emits), which pins the OUI to a Falcon. The probe-req gate
+    //   in flockClassifyWiFi still holds shared-silicon false positives down, and the
+    //   FLOCK_SSID_FALCON_SUFFIX name match is the stronger, safer primary signal.
+    {{0xD8,0xF3,0xBC}, 0},  // D8:F3:BC  own capture 2026-06 + 2026-07-24 (DATA-FALCON SSID)
+    {{0xC0,0x35,0x32}, 0},  // C0:35:32  own capture 2026-06 + 2026-07-24 (PROBE/DATA-FALCON SSID)
+    {{0x24,0xB2,0xB9}, 0},  // 24:B2:B9:F5:D0:43               own capture; field-validated at a live Falcon
+    {{0xF4,0x6A,0xDD}, 0},  // F4:6A:DD:62:38:5D / :5E:3A:F3   own capture; field-validated
 };
 static const size_t FALCON_WIFI_OUI_COUNT = sizeof(FALCON_WIFI_OUI) / sizeof(FALCON_WIFI_OUI[0]);
 
@@ -67,20 +70,50 @@ static const size_t FALCON_WIFI_OUI_COUNT = sizeof(FALCON_WIFI_OUI) / sizeof(FAL
 //   src: ryanohoro "Spotting Flock Safety's Falcon Cameras"; GainSec WiFi research.
 #define FLOCK_SSID_PREFIX  "Flock-"
 
+// Falcon cameras also stand up per-function networks named "PROBE-FALCON" and
+// "DATA-FALCON" (own drive capture 2026-07-24, seen on the C0:35:32 / D8:F3:BC
+// Falcon OUIs below). Match any "*-FALCON" SSID: like the "Flock-" AP name it is a
+// strong, Flock-specific WiFi signal, and being name-based it needs no probe-req
+// gate, so it catches a Falcon in beacon / associated mode too (where the OUI path,
+// which is probe-request-only, cannot). Anchored as a SUFFIX so consumer names like
+// "Atlanta-Falcons" or "Millennium Falcon" do not match (see ciEndsWith use).
+#define FLOCK_SSID_FALCON_SUFFIX  "-FALCON"
+
 // ---------------------------------------------------------------------------
-// BLE advertised-name patterns  (case-insensitive substring)
+// BLE advertised-name patterns  (ANCHORED - see nameMatch in flock_detect.cpp)
 // ---------------------------------------------------------------------------
-//   "FS Ext Battery", "Penguin"  -> ryanohoro (external-battery health beacons)
-//   "FS-"                        -> own field capture (e.g. FS-BEC46A, 2026-06)
-//   "Flock"                      -> brand string, public
+// Substring-anywhere matching false-positives on consumer gear ("FS-" is a generic
+// white-label model prefix; any name containing "penguin"/"flock" matched), so each
+// pattern is anchored to the form the sources actually document:
+//   FLOCK_NAME_LITERAL       case-insensitive substring; specific enough to rank
+//                            strong (80) on its own
+//   FLOCK_NAME_PREFIX_DIGITS name starts with the pattern + a 1+ decimal-digit tail
+//   FLOCK_NAME_PREFIX_HEX    name starts with the pattern + a 1+ hex-digit tail
+//   FLOCK_NAME_PREFIX        name starts with the pattern (no structural tail)
+// The PREFIX forms rank strong (80) only when a co-signal backs them - a public
+// (non-random) BLE address (real Flock beacons don't rotate) or the 0x09C8 mfg id -
+// and stay hint-grade (70) otherwise, so an "FS-100" gadget on a rotating address
+// never draws a strong ALPR verdict. See nameMatch in flock_detect.cpp.
+//   "FS Ext Battery"             -> ryanohoro (external-battery health beacons)
+//   "Penguin-" + digits          -> ryanohoro (Penguin-##########)
+//   "FS-" + hex                  -> own field capture (FS-BEC46A, 2026-06; one capture,
+//                                   so the tail requires hex but not a fixed length)
+//   "Flock" prefix               -> brand string, public; loosest of the four
 // (A bare 10-digit name is a documented post-Mar-2025 Flock pattern but is NOT
 // matched here: in the field it false-positived on phones broadcasting placeholder
 // numeric names like "0102000000". Re-add only behind a public-BLE-address gate.)
-static const char* FLOCK_NAME_PATTERNS[] = {
-    "FS Ext Battery",
-    "Penguin",
-    "FS-",
-    "Flock",
+enum FlockNameForm : uint8_t {
+    FLOCK_NAME_LITERAL,
+    FLOCK_NAME_PREFIX_DIGITS,
+    FLOCK_NAME_PREFIX_HEX,
+    FLOCK_NAME_PREFIX,
+};
+struct FlockNamePat { const char* pat; uint8_t form; };
+static const FlockNamePat FLOCK_NAME_PATTERNS[] = {
+    { "FS Ext Battery", FLOCK_NAME_LITERAL },
+    { "Penguin-",       FLOCK_NAME_PREFIX_DIGITS },
+    { "FS-",            FLOCK_NAME_PREFIX_HEX },
+    { "Flock",          FLOCK_NAME_PREFIX },
 };
 static const size_t FLOCK_NAME_COUNT =
     sizeof(FLOCK_NAME_PATTERNS) / sizeof(FLOCK_NAME_PATTERNS[0]);
@@ -88,8 +121,12 @@ static const size_t FLOCK_NAME_COUNT =
 // ---------------------------------------------------------------------------
 // BLE manufacturer company ID
 // ---------------------------------------------------------------------------
-// 0x09C8 on Flock BT health beacons; ryanohoro attributes it to "XUNTONG".
-// TODO before shipping: confirm 0x09C8's registrant in the current Bluetooth SIG
+// 0x09C8 on Flock BT health beacons; ryanohoro attributes it to "XUNTONG" (a silicon/module
+// vendor, not Flock), so it's SHARED and unverified. It's matched at a deliberately low
+// confidence (45, see flock_detect.cpp) - below the apps' weak-match threshold (50), so a
+// hit renders as "weak match, verify" rather than a calm partial match - because a hit is
+// a hint, not an assertion, until a field capture confirms it. TODO before trusting it
+// higher: confirm 0x09C8's registrant + exclusivity in the current Bluetooth SIG
 // assigned-numbers company-identifier list.
 static const uint16_t FLOCK_MFG_IDS[] = { 0x09C8 };
 static const size_t FLOCK_MFG_COUNT = sizeof(FLOCK_MFG_IDS) / sizeof(FLOCK_MFG_IDS[0]);

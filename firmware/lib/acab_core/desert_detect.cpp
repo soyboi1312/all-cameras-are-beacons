@@ -2,6 +2,7 @@
  * ACAB - "Desert mode" catch-all detector implementation. See desert_detect.h.
  */
 #include "desert_detect.h"
+#include "acab_scanner.h"   // acabSanitizeAscii: clamp attacker-sourced strings on ingest
 #include <string.h>
 #include <stdio.h>
 
@@ -26,8 +27,7 @@ static void bleName(const uint8_t* adv, size_t advLen, char* name, size_t outSz)
         if (t == 0x08 || t == 0x09) {                 // shortened / complete local name
             size_t n = (size_t)l - 1;
             if (n >= outSz) n = outSz - 1;
-            memcpy(name, adv + i + 2, n);
-            name[n] = 0;
+            acabSanitizeAscii(name, adv + i + 2, n, outSz);   // clamp to printable ASCII on ingest
             return;
         }
         i += (size_t)l + 1;
@@ -61,8 +61,7 @@ bool desertClassifyWiFi(const uint8_t* frame, size_t len, int rssi, AcabDetectio
         uint8_t sl = frame[ie + 1];
         if (sl > 0 && sl <= 32 && ie + 2 + (size_t)sl <= len) {
             size_t n = sl < sizeof(out->name) ? sl : sizeof(out->name) - 1;
-            memcpy(out->name, frame + ie + 2, n);
-            out->name[n] = 0;
+            acabSanitizeAscii(out->name, frame + ie + 2, n, sizeof(out->name));   // clamp SSID on ingest
         }
     }
     snprintf(out->detail, sizeof(out->detail), "%s",

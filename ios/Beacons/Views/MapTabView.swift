@@ -1,79 +1,215 @@
 import SwiftUI
 import MapKit
 
+/// One-shot handoff from a detection dossier's location thumbnail to the full map tab.
+/// The tap stashes the coordinate here and posts the notification; MainTabView switches
+/// tabs on it and MapTabView consumes the slot exactly once (onAppear when the tab was
+/// cold, the notification when it is already alive). A static slot rather than the
+/// UserDefaults channel the Live Activity deep link uses: this handoff never outlives
+/// the session, and a stale persisted coordinate must not hijack a later launch's
+/// first map open.
+enum MapFocus {
+    static var pending: CLLocationCoordinate2D?
+    static let notification = Notification.Name("acabFocusMap")
+}
+
 /// Located detections on a dark map, filterable by category. Fixed installs
 /// (Flock/body-cam/tracker) sit at our position when we heard them; drones plot
 /// their own broadcast position plus the operator's.
 struct MapTabView: View {
     @EnvironmentObject var ble: BLEManager
+    @EnvironmentObject var alpr: ALPRStore        // known-ALPR reference layer (opt-in, OSM/DeFlock)
     @State private var filter: String?           // category key: ALPR / DRONE / BODY CAM / TRACKER
-    @State private var camera: MapCameraPosition = .userLocation(fallback: .automatic)
+    // NEVER fall back to .automatic: it re-frames the camera to fit the CONTENT, and the ALPR dots are
+    // themselves computed FROM the camera region (onMapCameraChange -> refreshALPRVisible -> alprVisible
+    // -> Annotations -> content changed -> .automatic re-frames -> camera changed -> ...). That closes an
+    // unbounded render loop that pegs the main thread (a cpu_resource spin, not a crash). A fixed fallback
+    // region breaks the content->camera edge; the recenter button below drives the camera explicitly.
+    @State private var camera: MapCameraPosition = .userLocation(fallback: .region(MapTabView.fallbackRegion))
+    static let fallbackRegion = MKCoordinateRegion(
+        center: CLLocationCoordinate2D(latitude: 32.7157, longitude: -117.1611),   // San Diego
+        span: MKCoordinateSpan(latitudeDelta: 0.08, longitudeDelta: 0.08))
     @State private var selected: Detection?
     @State private var cluster: Cluster?         // tapped multi-member bubble (drives the picker sheet)
+    @State private var showALPRInfo = false      // tapped a known-ALPR dot: show the shared credit callout (one overlay, never a per-dot popover)
+    @State private var tappedALPRMaker = ""      // the maker of the last-tapped dot ("" = unknown), shown in that callout
     @State private var span: MKCoordinateSpan = .init(latitudeDelta: 0.02, longitudeDelta: 0.02)
+    @State private var region = MKCoordinateRegion(center: .init(latitude: 0, longitude: 0),
+                                                   span: .init(latitudeDelta: 0.02, longitudeDelta: 0.02))
     @State private var emptyDismissed = false
+    @State private var legendExpanded = false     // F18: legend rests as a small info chip
+    @AppStorage("map.showBreadcrumbs") private var showBreadcrumbs = true    // tracker trails on the map (persisted)
+    @AppStorage("map.showLabels") private var showLabels = false             // pin captions, off for a cleaner map (persisted)
+    @State private var mapSettingsOpen = false    // the on-map settings dropdown
+    @State private var alprChecking = false       // manual "check for updates" in flight (double-tap guard)
+    @State private var alprJustChecked = false    // brief window after a manual check: row shows the outcome
+    @Environment(\.horizontalSizeClass) private var hSize   // T5: dossier as inspector on regular width
+
+    /// Known ALPR camera points to draw right now: only when the layer is on and the map is
+    /// zoomed in enough to be useful, culled to the viewport and capped for performance.
+    /// Held in @State (not recomputed in body): body re-evaluates ~3 Hz off every detection
+    /// publish, and the underlying nodes(in:) is a linear scan of the whole dataset. We refresh
+    /// it only where its inputs actually change (camera move, layer toggle, dataset load).
+    @State private var alprVisible: [ALPRPoint] = []
+
+    /// Recompute the viewport-culled ALPR points. Called on the events that change its inputs,
+    /// never in body. Clears out when the layer is off or the map is zoomed too far out.
+    private func refreshALPRVisible() {
+        // HYSTERESIS, not a single cliff. A lone 0.35 threshold can flip-flop across the boundary
+        // (dots appear -> content grows -> zoom crosses back -> dots vanish -> ...), re-invalidating
+        // body forever. Separate on/off thresholds make that physically impossible.
+        let limit = alprVisible.isEmpty ? 0.30 : 0.40
+        guard alpr.enabled, span.latitudeDelta < limit else {
+            if !alprVisible.isEmpty { alprVisible = [] }   // only WRITE when it actually changes
+            return
+        }
+        let next = alpr.nodes(in: region, cap: 500).map { ALPRPoint(coord: $0.coord, maker: $0.maker) }
+        // ALPRPoint is Equatable: an unchanged viewport costs zero @State writes / zero invalidations.
+        if next != alprVisible { alprVisible = next }
+    }
+
+    /// A one-line hint when the ALPR layer is on but drawing nothing, so "off" is never confused
+    /// with "failed to load" or "zoomed out too far". Keyed to the ACTUAL draw state plus the
+    /// hysteresis "appear" threshold (0.30) rather than a third cutoff: a lone 0.35 here both
+    /// showed the hint while dots were still drawn ([0.35, 0.40)) and went silent in the dead
+    /// band where nothing drew yet ([0.30, 0.35)).
+    private var alprHint: String? {
+        guard alpr.enabled, !alpr.loading else { return nil }
+        if alpr.nodes.isEmpty { return "couldn't load camera data \u{00B7} check your connection" }
+        if alprVisible.isEmpty && span.latitudeDelta >= 0.30 { return "zoom in to see mapped cameras" }
+        return nil
+    }
 
     /// Where the pin goes: a drone's own broadcast coordinate if it has one, else
-    /// the phone's position when we first heard it (Flock / body-cam / tracker —
-    /// the board has no GPS).
+    /// the phone's position at our closest pass to it (strongest signal we got);
+    /// Flock / body-cam / tracker, the board has no GPS.
     private func mapCoord(for d: Detection) -> CLLocationCoordinate2D? {
         d.coordinate ?? ble.capturedLocation(for: d.id)
     }
 
-    private var located: [Detection] {
-        ble.detections.filter { mapCoord(for: $0) != nil && (filter == nil || $0.type.category == filter) }
+    /// Nearby devices, item trackers, and the rotating-MAC accumulators (recording glasses,
+    /// network cameras, which can mint hundreds of same-spot rows over days) accumulate into
+    /// count bubbles. Surveillance infrastructure (Flock ALPR, Raven, drone, body cam, watched)
+    /// ALWAYS renders as an individual marker, so a camera is never lost inside a clump. (A
+    /// tracker later flagged as "following" will promote back to an individual marker.)
+    private func clusterable(_ d: Detection) -> Bool {
+        d.type == .nearbyDevice || d.type == .tracker
+            || d.type == .recordingGlasses || d.type == .networkCamera
     }
-    private var totalLocated: Int { ble.detections.filter { mapCoord(for: $0) != nil }.count }
-    private func count(_ cat: String) -> Int {
-        ble.detections.filter { mapCoord(for: $0) != nil && $0.type.category == cat }.count
+
+    /// Hard cap on individually-pinned infra annotations, newest-first so a fresh sighting
+    /// always draws. Android's MapScreen.kt caps all markers at 600; infra is the only
+    /// unbounded set left here after the viewport cull (a city-wide zoom can legitimately
+    /// hold the whole persisted store).
+    private static let infraPinCap = 300
+    /// Above this many visible pins the per-pin repeatForever ping animation is dropped:
+    /// hundreds of independent Core Animation loops with shadows peg older devices on
+    /// their own, cull or no cull.
+    private static let animatedPinCap = 40
+
+    /// A located detection with its map coordinate resolved once. `id` forwards the row's
+    /// stored id (ForEach reads it per row; see the ALPRPoint note on computed-id cost).
+    private struct LocatedPin: Identifiable {
+        let detection: Detection
+        let coord: CLLocationCoordinate2D
+        var id: String { detection.id }
     }
 
-    /// Only generic Desert-mode "nearby device" hits and item trackers accumulate into
-    /// count bubbles — the noisy, low-stakes mass. Surveillance infrastructure (Flock
-    /// ALPR, Raven, drone, body cam) ALWAYS renders as an individual marker, so a camera
-    /// is never lost inside a clump. (A tracker later flagged as "following" will promote
-    /// back to an individual marker.)
-    private func clusterable(_ d: Detection) -> Bool { d.type == .nearbyDevice || d.type == .tracker }
+    /// Everything one body eval needs from the store, computed in a SINGLE pass. located /
+    /// totalLocated / count(cat) / the per-layer splits used to be independent computed
+    /// properties, each an O(store) filter resolving mapCoord per row, and body read them
+    /// ~17x per eval at the ~3 Hz publish cadence. Infra pins also get the viewport cull +
+    /// cap the cluster path and ALPR layer already had.
+    private struct MapSnapshot {
+        let totalLocated: Int
+        let counts: [String: Int]   // located per category, unfiltered (feeds the chips)
+        let drones: [Detection]
+        let infra: [LocatedPin]     // viewport-culled, capped newest-first
+        let clusters: [Cluster]
+        let trackerTrails: [Detection]   // trackers with >= 2 crumbs; trail geometry, NOT viewport-culled
+        let pinsAnimated: Bool      // ping rings only under animatedPinCap
+    }
 
-    /// Drones: individual pins (they own flight-path overlays + an operator tether).
-    private var droneDetections: [Detection] { located.filter { $0.type == .drone } }
+    private func makeSnapshot() -> MapSnapshot {
+        var total = 0
+        var counts: [String: Int] = [:]
+        var drones: [Detection] = []
+        var infra: [LocatedPin] = []
+        var trackerTrails: [Detection] = []
+        var clusterPoints: [(d: Detection, c: CLLocationCoordinate2D)] = []
+        for d in ble.detections {
+            guard let c = mapCoord(for: d) else { continue }
+            total += 1
+            counts[d.type.category, default: 0] += 1
+            guard filter == nil || d.type.category == filter else { continue }
+            if d.type == .drone {
+                // NOT viewport-culled: droneOverlay draws flight-path polylines and operator
+                // tethers whose geometry can cross the viewport while the pin itself is
+                // outside it, and drone counts are tiny.
+                drones.append(d)
+            } else if clusterable(d) {
+                // A tracker that has walked with us gets a breadcrumb trail. NOT viewport-culled
+                // (same reasoning as drones: the trail can cross the viewport while the pin is
+                // outside it); the set is tiny since crumbs need real movement to accumulate.
+                if d.type == .tracker, ble.crumbTrail(for: d.id).count >= 2 { trackerTrails.append(d) }
+                if inViewport(c) { clusterPoints.append((d, c)) }
+            } else if inViewport(c) {
+                infra.append(LocatedPin(detection: d, coord: c))
+            }
+        }
+        if infra.count > Self.infraPinCap {
+            infra.sort {
+                (ble.lastSeenDate(for: $0.id) ?? .distantPast) > (ble.lastSeenDate(for: $1.id) ?? .distantPast)
+            }
+            infra.removeSubrange(Self.infraPinCap...)
+        }
+        let clusters = buildClusters(clusterPoints)
+        let pins = drones.count + infra.count + clusters.count
+        return MapSnapshot(totalLocated: total, counts: counts, drones: drones, infra: infra,
+                           clusters: clusters, trackerTrails: trackerTrails,
+                           pinsAnimated: pins <= Self.animatedPinCap)
+    }
 
-    /// Surveillance infrastructure that always pins individually (located, non-drone,
-    /// non-clusterable): Flock ALPR, Raven, body cam.
-    private var infraDetections: [Detection] { located.filter { $0.type != .drone && !clusterable($0) } }
+    /// Inside the current viewport (plus a 20% margin so bubbles don't pop at the edges while panning).
+    private func inViewport(_ c: CLLocationCoordinate2D) -> Bool {
+        abs(c.latitude  - region.center.latitude)  <= region.span.latitudeDelta  * 0.6 &&
+        abs(c.longitude - region.center.longitude) <= region.span.longitudeDelta * 0.6
+    }
 
-    /// Grid-clustered bubbles for ONLY the clusterable hits (nearby devices + trackers).
-    /// Cell size scales with the current zoom (span / 14), so zooming in splits dense
-    /// Desert-mode clumps apart and zooming out merges them.
-    private var clusters: [Cluster] {
-        let points = located.filter { clusterable($0) }
+    /// Grid-clustered bubbles for ONLY the clusterable hits. Cell size scales with the
+    /// current zoom (span / 14), so zooming in splits dense Desert-mode clumps apart and
+    /// zooming out merges them.
+    private func buildClusters(_ points: [(d: Detection, c: CLLocationCoordinate2D)]) -> [Cluster] {
+        // Points arrive VIEWPORT-CULLED from the snapshot pass. Without that cull every located
+        // point in the whole store becomes a bucket, so a deep Desert-mode log hands MapKit
+        // thousands of Annotations rebuilt on every publish (~3 Hz) and pegs the main thread.
+        // Same culling refreshALPRVisible already does for the ALPR dots.
         guard !points.isEmpty else { return [] }
         let cell = max(span.latitudeDelta, span.longitudeDelta) / 14
-        guard cell > 0 else {
-            return points.compactMap { d in mapCoord(for: d).map { Cluster(coord: $0, members: [d]) } }
-        }
-        var buckets: [String: [Detection]] = [:]
-        for d in points {
-            guard let c = mapCoord(for: d) else { continue }
-            let gx = (c.latitude / cell).rounded(.down)
-            let gy = (c.longitude / cell).rounded(.down)
-            buckets["\(gx):\(gy)", default: []].append(d)
+        guard cell > 0 else { return points.map { Cluster(coord: $0.c, members: [$0.d]) } }
+        var buckets: [String: [(d: Detection, c: CLLocationCoordinate2D)]] = [:]
+        for p in points {
+            let gx = (p.c.latitude / cell).rounded(.down)
+            let gy = (p.c.longitude / cell).rounded(.down)
+            buckets["\(gx):\(gy)", default: []].append(p)
         }
         return buckets.map { key, members in
             // Average the members so the bubble sits in the middle of the clump.
-            let lat = members.compactMap { mapCoord(for: $0)?.latitude }.reduce(0, +) / Double(members.count)
-            let lon = members.compactMap { mapCoord(for: $0)?.longitude }.reduce(0, +) / Double(members.count)
-            return Cluster(id: key, coord: CLLocationCoordinate2D(latitude: lat, longitude: lon), members: members)
+            let lat = members.reduce(0) { $0 + $1.c.latitude } / Double(members.count)
+            let lon = members.reduce(0) { $0 + $1.c.longitude } / Double(members.count)
+            return Cluster(id: key, coord: CLLocationCoordinate2D(latitude: lat, longitude: lon),
+                           members: members.map(\.d))
         }
     }
 
     var body: some View {
+        let snap = makeSnapshot()   // ONE store pass per body eval; every layer below reads this
         NavigationStack {
             ZStack(alignment: .top) {
-                map
+                map(snap)
                 VStack(spacing: 12) {
-                    header
-                    filterBar
+                    header(snap)
+                    filterBar(snap)
                 }
                 .padding(.horizontal, ACABTheme.pad)
                 .padding(.top, 8)
@@ -82,15 +218,72 @@ struct MapTabView: View {
                                    startPoint: .top, endPoint: .bottom)
                         .ignoresSafeArea(edges: .top)
                 )
-                if totalLocated == 0 && !emptyDismissed {
+                if snap.totalLocated == 0 && !emptyDismissed {
                     emptyBanner.transition(.opacity)
                 }
             }
             .overlay(alignment: .bottomLeading) {
                 legend.padding(ACABTheme.pad).padding(.bottom, 6)
             }
+            // Tap-away scrim: present ONLY while the settings menu is open. Layered above the
+            // map (and the legend) but below the controls VStack that follows, so a tap anywhere
+            // off the dropdown closes the menu (true tap-away, unlike the legend's tap-the-panel).
+            .overlay {
+                if mapSettingsOpen {
+                    Color.clear.contentShape(Rectangle())
+                        .onTapGesture { withAnimation(.easeOut(duration: 0.2)) { mapSettingsOpen = false } }
+                        .ignoresSafeArea()
+                }
+            }
+            .overlay(alignment: .bottomTrailing) {
+                VStack(alignment: .trailing, spacing: 10) {
+                    if mapSettingsOpen {
+                        mapSettingsPanel
+                            .transition(.opacity.combined(with: .move(edge: .bottom)))
+                    }
+                    settingsButton
+                    recenterButton
+                }
+                .padding(ACABTheme.pad).padding(.bottom, 6)
+                .animation(.easeOut(duration: 0.2), value: mapSettingsOpen)
+            }
+            .overlay(alignment: .bottom) {
+                if let hint = alprHint {
+                    Text(hint)
+                        .font(ACABTheme.mono(10)).foregroundStyle(ACABTheme.dim)
+                        .padding(.horizontal, 12).padding(.vertical, 7)
+                        .background(.ultraThinMaterial, in: Capsule())
+                        .overlay(Capsule().strokeBorder(ACABTheme.line, lineWidth: 1))
+                        .padding(.bottom, 26)
+                        .transition(.opacity)
+                }
+            }
+            // Tapped a known-ALPR dot: one shared credit callout (tap it to dismiss). Sits above
+            // the alprHint slot so the two never collide in the narrow zoom band where both apply.
+            .overlay(alignment: .bottom) {
+                if showALPRInfo {
+                    Button { withAnimation(.easeOut(duration: 0.15)) { showALPRInfo = false } } label: {
+                        HStack(spacing: 6) {
+                            Circle().strokeBorder(ACABTheme.flockTone.opacity(0.95), lineWidth: 2)
+                                .frame(width: 9, height: 9)
+                            Text(tappedALPRMaker.isEmpty
+                                 ? "known ALPR · sourced from DeFlock"
+                                 : "\(tappedALPRMaker) · known ALPR, via DeFlock")
+                                .font(ACABTheme.mono(10.5)).foregroundStyle(ACABTheme.dim)
+                        }
+                        .padding(.horizontal, 12).padding(.vertical, 7)
+                        .background(.ultraThinMaterial, in: Capsule())
+                        .overlay(Capsule().strokeBorder(ACABTheme.line, lineWidth: 1))
+                    }
+                    .buttonStyle(.plain)
+                    .padding(.bottom, 60)
+                    .transition(.opacity)
+                }
+            }
             .navigationBarHidden(true)
-            .sheet(item: $selected) { DetectionDetailView(detection: $0).environmentObject(ble) }
+            // T5: regular width shows the tapped dossier in a trailing inspector (pin stays
+            // visible); compact keeps today's full sheet. Exactly one is active per size class.
+            .modifier(DossierPresentation(selected: $selected, regular: hSize == .regular))
             .sheet(item: $cluster) { c in
                 ClusterListSheet(cluster: c) { d in
                     cluster = nil
@@ -101,40 +294,86 @@ struct MapTabView: View {
                 .environmentObject(ble)
                 .presentationDetents([.medium, .large])
             }
+            // Dossier "OPEN IN MAP" handoff. Cold tab: the stash is consumed on first
+            // compose. Warm tab (including a dossier opened from this very map): drop
+            // our own presented dossier so it isn't in the way, then fly. The sheet
+            // dismisses itself, but the regular-width inspector has no dismiss of its
+            // own, so the clear here is what closes it.
+            .onAppear { consumePendingFocus() }
+            .onReceive(NotificationCenter.default.publisher(for: MapFocus.notification)) { _ in
+                selected = nil
+                consumePendingFocus()
+            }
         }
     }
 
-    private var map: some View {
+    /// City-block zoom for the dossier handoff, roughly 600 m across.
+    private static let focusSpan = MKCoordinateSpan(latitudeDelta: 0.006, longitudeDelta: 0.006)
+
+    /// Consume the one-shot dossier handoff, if any: fly the camera to the stashed
+    /// coordinate at city-block zoom. Called from onAppear (cold tab) and the MapFocus
+    /// notification (warm tab); the nil-out makes it exactly-once.
+    private func consumePendingFocus() {
+        guard let coord = MapFocus.pending else { return }
+        MapFocus.pending = nil
+        withAnimation(.easeInOut(duration: 0.6)) {
+            camera = .region(MKCoordinateRegion(center: coord, span: Self.focusSpan))
+        }
+    }
+
+    private func map(_ snap: MapSnapshot) -> some View {
         Map(position: $camera) {
             UserAnnotation()                       // the phone's live position
+            // Known ALPR cameras (opt-in reference layer), drawn UNDER the live pins so a
+            // live hit always sits on top. Quiet hollow rings, not the animated detection pins.
+            // Tap one for the shared DeFlock credit callout: a Button (cheap) flips ONE @State
+            // that a single bottom overlay reads - never a per-dot popover (see ALPRDot).
+            ForEach(alprVisible) { p in
+                Annotation("", coordinate: p.coord) {
+                    Button {
+                        tappedALPRMaker = p.maker
+                        withAnimation(.easeOut(duration: 0.15)) { showALPRInfo = true }
+                    } label: { ALPRDot() }
+                        .buttonStyle(.plain)
+                }
+            }
+            // Tracker breadcrumb trails: the phone's path while a separated tracker stayed with
+            // us. Drawn UNDER the live pins (like the ALPR layer) so the tracker's own pin sits on
+            // top, and DASHED teal so it reads distinct from the SOLID amber drone flight paths.
+            // Hidden when the "breadcrumb trail" setting is off.
+            if showBreadcrumbs {
+                ForEach(snap.trackerTrails) { d in
+                    trackerTrail(d)
+                }
+            }
             // Drones: their own pins, flight paths, and operator tethers.
-            ForEach(droneDetections) { d in
+            ForEach(snap.drones) { d in
                 droneOverlay(d)
                 if let coord = mapCoord(for: d) {
-                    Annotation(d.type.shortTag, coordinate: coord) {
-                        Button { selected = d } label: { MapPin(type: d.type) }
+                    Annotation(showLabels ? d.type.shortTag : "", coordinate: coord) {
+                        Button { selected = d } label: { MapPin(type: d.type, animated: snap.pinsAnimated) }
                             .buttonStyle(.plain)
                     }
                 }
                 if let pilot = d.pilotCoordinate {
-                    Annotation("OP", coordinate: pilot) { OperatorPin() }
+                    Annotation(showLabels ? "OP" : "", coordinate: pilot) { OperatorPin() }
                 }
             }
             // Surveillance infrastructure: always an individual marker, never bubbled.
-            ForEach(infraDetections) { d in
-                if let coord = mapCoord(for: d) {
-                    Annotation(d.type.shortTag, coordinate: coord) {
-                        Button { selected = d } label: { MapPin(type: d.type) }
-                            .buttonStyle(.plain)
+            ForEach(snap.infra) { p in
+                Annotation(showLabels ? p.detection.type.shortTag : "", coordinate: p.coord) {
+                    Button { selected = p.detection } label: {
+                        MapPin(type: p.detection.type, animated: snap.pinsAnimated)
                     }
+                    .buttonStyle(.plain)
                 }
             }
-            // Nearby devices + trackers: grid-clustered bubbles. A lone member renders as
-            // a normal pin; a clump renders one count bubble so a dense log stays legible.
-            ForEach(clusters) { c in
-                Annotation(c.shortTag, coordinate: c.coord) {
+            // Clusterable hits: grid-clustered bubbles. A lone member renders as a normal
+            // pin; a clump renders one count bubble so a dense log stays legible.
+            ForEach(snap.clusters) { c in
+                Annotation(showLabels ? c.shortTag : "", coordinate: c.coord) {
                     if let only = c.single {
-                        Button { selected = only } label: { MapPin(type: only.type) }
+                        Button { selected = only } label: { MapPin(type: only.type, animated: snap.pinsAnimated) }
                             .buttonStyle(.plain)
                     } else {
                         Button { cluster = c } label: { ClusterBubble(cluster: c) }
@@ -143,10 +382,34 @@ struct MapTabView: View {
                 }
             }
         }
+        // Captions follow the "icon labels" setting: each Annotation title is empty "" (no
+        // caption, cleaner map) unless showLabels is on, when it carries the pin's short tag.
+        // (Map has no .annotationTitles modifier; the empty title is the supported way to
+        // suppress the caption, same as the ALPR dots, which always stay uncaptioned.)
         .mapStyle(.standard(elevation: .flat, pointsOfInterest: .excludingAll))
-        .mapControls { MapUserLocationButton(); MapCompass() }   // tap the button to recenter on me
+        // MapUserLocationButton is deliberately NOT here: .mapControls renders at the map's top-trailing,
+        // which on this full-bleed map sits UNDER our own header badge - invisible and untappable. The
+        // custom recenterButton (bottom-trailing, styled like the rest of the app) replaces it.
+        .mapControls { MapCompass() }
         .preferredColorScheme(.dark)
-        .onMapCameraChange(frequency: .onEnd) { ctx in span = ctx.region.span }
+        .onMapCameraChange(frequency: .onEnd) { ctx in
+            // MKCoordinateRegion/MKCoordinateSpan have NO Equatable conformance, so SwiftUI cannot dedupe
+            // these @State writes for us: without this guard every callback invalidates body
+            // unconditionally, even when the region is bit-identical. Required independently of the
+            // .automatic fix above. (Android already does this - MapScreen.kt writes only on a flip.)
+            let r = ctx.region, eps = 1e-6
+            guard abs(r.center.latitude  - region.center.latitude)  > eps
+               || abs(r.center.longitude - region.center.longitude) > eps
+               || abs(r.span.latitudeDelta  - region.span.latitudeDelta)  > eps
+               || abs(r.span.longitudeDelta - region.span.longitudeDelta) > eps else { return }
+            span = r.span; region = r
+            refreshALPRVisible()   // viewport changed: re-cull the drawn ALPR points
+        }
+        // refresh on the other two inputs: the layer toggling on/off, and the dataset finishing
+        // its (opt-in) load. nodes.count is a cheap Equatable proxy for "the dataset changed".
+        .onChange(of: alpr.enabled) { _, _ in refreshALPRVisible() }
+        .onChange(of: alpr.nodes.count) { _, _ in refreshALPRVisible() }
+        .onAppear { refreshALPRVisible() }
         .ignoresSafeArea()
     }
 
@@ -160,7 +423,7 @@ struct MapTabView: View {
                 .stroke(ACABTheme.droneTone.opacity(0.85), lineWidth: 2.5)
         }
         if let launch = track.first {
-            Annotation("LAUNCH", coordinate: launch) {
+            Annotation(showLabels ? "LAUNCH" : "", coordinate: launch) {
                 Image(systemName: "arrow.up.circle.fill")
                     .font(.system(size: 13))
                     .foregroundStyle(ACABTheme.droneTone)
@@ -179,36 +442,239 @@ struct MapTabView: View {
         }
     }
 
+    /// A tracker's breadcrumb trail: the phone's path while a separated tag stayed with us.
+    /// Dashed teal, distinct from the solid amber drone flight paths that use the same MapPolyline.
+    @MapContentBuilder
+    private func trackerTrail(_ d: Detection) -> some MapContent {
+        let crumbs = ble.crumbTrail(for: d.id)
+        if crumbs.count >= 2 {
+            MapPolyline(coordinates: crumbs)
+                .stroke(ACABTheme.trackerTone.opacity(0.85),
+                        style: StrokeStyle(lineWidth: 3, dash: [6, 6]))
+        }
+    }
+
     /// Rough RSSI → distance in metres for the no-GPS ring. Log-distance path-loss
-    /// model, deliberately fuzzy — just a "somewhere around here" hint.
+    /// model, deliberately fuzzy, just a "somewhere around here" hint.
     private func rssiRadiusMeters(_ rssi: Int) -> Double {
         let d = pow(10.0, (-50.0 - Double(rssi)) / 25.0)   // assumes TxPower -50 dBm, path-loss n ~ 2.5
         return min(max(d, 5), 600)
     }
 
-    private var header: some View {
+    private func header(_ snap: MapSnapshot) -> some View {
         HStack(alignment: .firstTextBaseline) {
             VStack(alignment: .leading, spacing: 3) {
                 Text("Map").font(ACABTheme.display(26, weight: .semibold)).foregroundStyle(ACABTheme.text)
-                Kicker("\(totalLocated) SIGHTING\(totalLocated == 1 ? "" : "S")")
+                Kicker("\(snap.totalLocated) SIGHTING\(snap.totalLocated == 1 ? "" : "S")")
             }
             Spacer()
-            LinkChip(connected: ble.connectionState == .connected, demo: ble.demoMode)
+            LinkChip(version: ble.status?.version, connected: ble.connectionState == .connected, demo: ble.demoMode)
         }
     }
 
-    /// Scrolling category chips; tap one to narrow the pins.
-    private var filterBar: some View {
+    /// Scrolling category chips; tap one to narrow the pins. The ALL chip, the known-ALPR
+    /// layer toggle, and their divider are ALWAYS present; the category chips after them are
+    /// dynamic (see `shownCategories`).
+    private func filterBar(_ snap: MapSnapshot) -> some View {
         ScrollView(.horizontal, showsIndicators: false) {
             HStack(spacing: 8) {
-                chip(nil, "ALL", totalLocated)
-                chip("ALPR", "ALPR", count("ALPR"))
-                chip("DRONE", "DRONE", count("DRONE"))
-                chip("BODY CAM", "BODY CAM", count("BODY CAM"))
-                chip("TRACKER", "TRACKER", count("TRACKER"))
+                chip(nil, "ALL", snap.totalLocated)
+                cameraLayerChip   // known-camera layer sits up front (after ALL) so it is found without scrolling
+                Rectangle().fill(ACABTheme.line).frame(width: 1, height: 18).padding(.horizontal, 2)   // divider: layer toggle vs category filters
+                ForEach(shownCategories(snap)) { c in
+                    chip(c.key, c.chipLabel, snap.counts[c.key] ?? 0)
+                }
             }
             .padding(.bottom, 2)
         }
+    }
+
+    /// Which category chips to actually render: a category with at least one LOCATED detection
+    /// this session, OR the currently-active filter even at count 0. The active-filter exception
+    /// is REQUIRED: if the user has filtered to a category and its located count momentarily drops
+    /// to 0 (eviction / staleness), the chip must NOT vanish out from under them, or the filter
+    /// breaks silently with no visible way back to ALL.
+    private func shownCategories(_ snap: MapSnapshot) -> [DetectionCategory] {
+        detectionCategories.filter { (snap.counts[$0.key] ?? 0) > 0 || filter == $0.key }
+    }
+
+    /// Recenter on the phone's position. Replaces Apple's MapUserLocationButton, which lands under our
+    /// header badge on this full-bleed map. Drives the camera EXPLICITLY, which is also why the fallback
+    /// above can stay a fixed region instead of .automatic (see the loop note on `camera`).
+    private var recenterButton: some View {
+        Button {
+            // The tap-away scrim sits BELOW this control (it has to, or the buttons stop taking
+            // taps), so a tap here never reaches it and the open menu would stay up while the map
+            // flew away under it. Close it here too.
+            if mapSettingsOpen { withAnimation(.easeOut(duration: 0.2)) { mapSettingsOpen = false } }
+            withAnimation(.easeInOut(duration: 0.35)) {
+                camera = .userLocation(fallback: .region(MapTabView.fallbackRegion))
+            }
+        } label: {
+            Image(systemName: "location.fill")
+                .font(.system(size: 13, weight: .bold))
+                .foregroundStyle(ACABTheme.text)
+                .frame(width: 38, height: 38)
+                .background(.ultraThinMaterial, in: Circle())
+                .overlay(Circle().strokeBorder(ACABTheme.line, lineWidth: 1))
+        }
+        .accessibilityLabel("Center on my location")
+    }
+
+    /// Cog companion to the recenter/legend controls: opens the map settings dropdown. Its
+    /// collapsed look matches the legend's info chip (small dark circular chip).
+    private var settingsButton: some View {
+        Button {
+            withAnimation(.easeOut(duration: 0.2)) { mapSettingsOpen.toggle() }
+        } label: {
+            Image(systemName: "gearshape.fill")
+                .font(.system(size: 13, weight: .semibold))
+                .foregroundStyle(mapSettingsOpen ? ACABTheme.text : ACABTheme.dim)
+                .frame(width: 34, height: 34)
+                .background(.ultraThinMaterial, in: Circle())
+                .overlay(Circle().strokeBorder(ACABTheme.line, lineWidth: 1))
+        }
+        .buttonStyle(.plain)
+        .accessibilityLabel("Map settings")
+    }
+
+    /// The map settings dropdown: persisted toggles plus the known-ALPR layer row, styled like
+    /// `legendPanel`. Opened by `settingsButton`; the tap-away scrim in `body` closes it on a
+    /// tap off the card. The ALPR toggle here and the filter-bar chip drive the same store, so
+    /// they can never disagree.
+    private var mapSettingsPanel: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            Toggle(isOn: $showBreadcrumbs) {
+                Text("breadcrumb trail").font(ACABTheme.mono(11)).foregroundStyle(ACABTheme.dim)
+            }
+            Toggle(isOn: $showLabels) {
+                Text("icon labels").font(ACABTheme.mono(11)).foregroundStyle(ACABTheme.dim)
+            }
+            Toggle(isOn: Binding(get: { alpr.enabled }, set: { alpr.setEnabled($0) })) {
+                Text("known ALPR").font(ACABTheme.mono(11)).foregroundStyle(ACABTheme.dim)
+            }
+            if alpr.enabled {
+                VStack(alignment: .leading, spacing: 7) {
+                    Text(alprStatusLine)
+                        .font(ACABTheme.mono(8.5)).foregroundStyle(ACABTheme.faint)
+                        .fixedSize(horizontal: false, vertical: true)
+                    alprCheckRow
+                }
+            }
+        }
+        .tint(ACABTheme.accent)
+        .frame(width: 172, alignment: .leading)   // constrain so the switch and label separate cleanly
+        .padding(11)
+        .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: ACABTheme.radiusSm, style: .continuous))
+        .overlay(RoundedRectangle(cornerRadius: ACABTheme.radiusSm, style: .continuous)
+            .strokeBorder(ACABTheme.line, lineWidth: 1))
+    }
+
+    /// Status caption under the known-ALPR toggle: how many cameras we hold, the dataset's
+    /// publish date, and when the manifest was last checked. Same middle-dot separators as
+    /// the rest of the map overlays.
+    private var alprStatusLine: String {
+        let checked = alpr.lastChecked.map { "checked \(checkedAgo($0))" } ?? "never checked"
+        guard !alpr.nodes.isEmpty else { return "no dataset yet \u{00B7} \(checked)" }
+        var parts = ["\(alpr.nodes.count.formatted()) camera\(alpr.nodes.count == 1 ? "" : "s")"]
+        if let u = alpr.updated { parts.append("dataset \(datasetDate(u))") }
+        parts.append(checked)
+        return parts.joined(separator: " \u{00B7} ")
+    }
+
+    /// Manual dataset refresh, mirroring the firmware "check for updates" row in Settings at
+    /// panel scale: spinner while the manifest check + conditional download run, then a brief
+    /// inline outcome before the label resets. Disabled while any fetch is in flight.
+    private var alprCheckRow: some View {
+        Button {
+            guard !alprChecking else { return }
+            Task {
+                alprChecking = true
+                alprJustChecked = false
+                await alpr.refreshNow()
+                alprChecking = false
+                alprJustChecked = true
+                try? await Task.sleep(nanoseconds: 2_500_000_000)
+                alprJustChecked = false
+            }
+        } label: {
+            HStack(spacing: 6) {
+                if alprChecking || alpr.loading {
+                    ProgressView().controlSize(.mini).tint(ACABTheme.dim)
+                } else {
+                    Image(systemName: alprCheckSucceeded ? "checkmark" : "arrow.triangle.2.circlepath")
+                        .font(.system(size: 10, weight: .semibold))
+                }
+                Text(alprCheckLabel).font(ACABTheme.mono(10, weight: .bold)).tracking(0.5)
+            }
+            .foregroundStyle(alprCheckSucceeded ? ACABTheme.accent : ACABTheme.dim)
+        }
+        .buttonStyle(.plain)
+        .disabled(alprChecking || alpr.loading)
+    }
+
+    /// True in the brief post-check window when the check actually completed (fresh data or
+    /// confirmed current), coloring the row; a failed check keeps the resting look.
+    private var alprCheckSucceeded: Bool {
+        guard alprJustChecked, let o = alpr.lastOutcome else { return false }
+        return o != .failed
+    }
+
+    private var alprCheckLabel: String {
+        if alprChecking || alpr.loading { return "checking" }   // store-driven too, so an automatic on-enable refresh reads the same as a tap (parity with Android)
+        if alprJustChecked {
+            switch alpr.lastOutcome {
+            case .updated(let n): return "updated \u{00B7} \(n.formatted()) camera\(n == 1 ? "" : "s")"
+            case .upToDate:       return "up to date"
+            default:              return "couldn't check"
+            }
+        }
+        return "check for updates"
+    }
+
+    /// Short "checked X ago" tail, same buckets the detail screen's relativeAgo speaks in.
+    private func checkedAgo(_ date: Date) -> String {
+        let secs = max(0, Int(Date().timeIntervalSince(date)))
+        switch secs {
+        case ..<60:       return "just now"
+        case ..<3600:     return "\(secs / 60)m ago"
+        case ..<86_400:   return "\(secs / 3600)h ago"
+        default:          return "\(secs / 86_400)d ago"
+        }
+    }
+
+    /// "2026-07-27" (the manifest's `updated`) -> "Jul 27", with the year kept only when it
+    /// isn't this year. Fixed POSIX formats, per the TimeBasisCopy rule.
+    private func datasetDate(_ ymd: String) -> String {
+        let inFmt = DateFormatter()
+        inFmt.locale = Locale(identifier: "en_US_POSIX")
+        inFmt.dateFormat = "yyyy-MM-dd"
+        guard let d = inFmt.date(from: ymd) else { return ymd }
+        let out = DateFormatter()
+        out.locale = Locale(identifier: "en_US_POSIX")
+        out.dateFormat = Calendar.current.isDate(d, equalTo: Date(), toGranularity: .year) ? "MMM d" : "MMM d yyyy"
+        return out.string(from: d)
+    }
+
+    /// Toggle for the known-ALPR reference layer. Distinct from the category filters (it adds a
+    /// layer rather than narrowing pins). First tap opts in and downloads the dataset.
+    private var cameraLayerChip: some View {
+        Button { alpr.setEnabled(!alpr.enabled); if alpr.enabled { alpr.refresh() } } label: {
+            HStack(spacing: 5) {
+                if alpr.loading {
+                    ProgressView().controlSize(.mini).tint(alpr.enabled ? ACABTheme.onAccent : ACABTheme.dim)
+                } else {
+                    Image(systemName: alpr.enabled ? "mappin.circle.fill" : "mappin.circle")
+                        .font(.system(size: 11, weight: .bold))
+                }
+                Text("ALPR MAP").font(ACABTheme.mono(10.5, weight: .bold)).tracking(0.5)
+            }
+            .foregroundStyle(alpr.enabled ? ACABTheme.onAccent : ACABTheme.dim)
+            .padding(.horizontal, 11).padding(.vertical, 7)
+            .background(alpr.enabled ? ACABTheme.flockTone : ACABTheme.bg2, in: Capsule())
+            .overlay(Capsule().strokeBorder(alpr.enabled ? .clear : ACABTheme.line, lineWidth: 1))
+        }
+        .buttonStyle(.plain)
     }
 
     private func chip(_ cat: String?, _ label: String, _ n: Int) -> some View {
@@ -234,17 +700,77 @@ struct MapTabView: View {
         case "DRONE":    return ACABTheme.droneTone
         case "BODY CAM": return ACABTheme.axonTone
         case "TRACKER":  return ACABTheme.trackerTone
+        case "GLASSES":  return ACABTheme.glassesTone
+        case "CAMERA":   return ACABTheme.netcamTone
         default:         return ACABTheme.accent
         }
     }
 
+    /// F18: whether the legend is open. Manual expansion aside, it auto-expands while the
+    /// ALPR layer is downloading so the data credit is visible during the first load.
+    /// Keyed to `downloading`, NOT `loading`: `loading` also covers the manifest freshness
+    /// check that runs on every enable, so binding to it flashed the panel open and shut
+    /// for a network round-trip that usually early-returns with the cache already drawn.
+    private var legendOpen: Bool { legendExpanded || alpr.downloading }
+
+    /// Collapsed by default: a small circular info chip. Tap to expand the full legend;
+    /// tap the panel to tuck it away again.
     private var legend: some View {
+        Group {
+            if legendOpen {
+                Button {
+                    withAnimation(.easeOut(duration: 0.2)) { legendExpanded = false }
+                } label: { legendPanel }
+                .buttonStyle(.plain)
+                .accessibilityLabel("Collapse map legend")
+            } else {
+                Button {
+                    withAnimation(.easeOut(duration: 0.2)) { legendExpanded = true }
+                } label: {
+                    Image(systemName: "info")
+                        .font(.system(size: 13, weight: .semibold))
+                        .foregroundStyle(ACABTheme.dim)
+                        .frame(width: 34, height: 34)
+                        .background(.ultraThinMaterial, in: Circle())
+                        .overlay(Circle().strokeBorder(ACABTheme.line, lineWidth: 1))
+                }
+                .buttonStyle(.plain)
+                .accessibilityLabel("Map legend")
+            }
+        }
+        .animation(.easeOut(duration: 0.2), value: legendOpen)
+    }
+
+    private var legendPanel: some View {
         VStack(alignment: .leading, spacing: 7) {
             legendRow(ACABTheme.flockTone, "ALPR")
             legendRow(ACABTheme.droneTone, "Drone")
             legendRow(ACABTheme.axonTone,  "Body cam")
             legendRow(ACABTheme.trackerTone, "Tracker")
+            legendRow(ACABTheme.glassesTone, "Glasses")
+            HStack(spacing: 7) {
+                Image(systemName: "web.camera.fill")
+                    .font(.system(size: 9, weight: .bold)).foregroundStyle(ACABTheme.netcamTone)
+                    .frame(width: 8, height: 8)
+                Text("Network camera").font(ACABTheme.mono(11)).foregroundStyle(ACABTheme.dim)
+            }
+            if alpr.enabled {
+                // NOT a bare Divider: dividers are width-greedy and would balloon the
+                // panel to the full overlay width. The hairline rides the row instead.
+                HStack(spacing: 7) {
+                    Circle().strokeBorder(ACABTheme.flockTone.opacity(0.95), lineWidth: 2)
+                        .frame(width: 9, height: 9)
+                    Text("Known ALPR").font(ACABTheme.mono(11)).foregroundStyle(ACABTheme.dim)
+                }
+                .padding(.top, 6)
+                .overlay(alignment: .top) {
+                    Rectangle().fill(ACABTheme.line).frame(height: 1)
+                }
+                Text("cameras: OpenStreetMap ODbL · DeFlock")
+                    .font(ACABTheme.mono(8.5)).foregroundStyle(ACABTheme.faint)
+            }
         }
+        .fixedSize(horizontal: true, vertical: false)   // hug content, never the whole screen
         .padding(11)
         .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: ACABTheme.radiusSm, style: .continuous))
         .overlay(RoundedRectangle(cornerRadius: ACABTheme.radiusSm, style: .continuous)
@@ -263,7 +789,7 @@ struct MapTabView: View {
             Image(systemName: "mappin.slash").font(.system(size: 28)).foregroundStyle(ACABTheme.faint)
             Text("No located detections yet")
                 .font(ACABTheme.display(14, weight: .medium)).foregroundStyle(ACABTheme.dim)
-            Text("ALPR, body-cam and tracker hits use your phone's position; drones report their own.")
+            Text("ALPR, body cam, glasses, network camera and tracker hits use your phone's position; drones report their own.")
                 .font(ACABTheme.mono(11)).foregroundStyle(ACABTheme.faint)
                 .multilineTextAlignment(.center).frame(maxWidth: 250)
         }
@@ -289,14 +815,46 @@ struct MapTabView: View {
     }
 }
 
-/// Animated category pin: filled dot with a glyph and a slow ping ring.
+/// T5: on regular width the tapped dossier rides in a trailing `.inspector` (the map + pin
+/// stay on screen); on compact it stays the full-height `.sheet`. Only one is ever active.
+/// SwiftUI ships only `inspector(isPresented:)`, so presentation is derived from the item.
+private struct DossierPresentation: ViewModifier {
+    @Binding var selected: Detection?
+    let regular: Bool
+    @EnvironmentObject private var ble: BLEManager
+
+    func body(content: Content) -> some View {
+        if regular {
+            content.inspector(isPresented: Binding(
+                get: { selected != nil },
+                set: { if !$0 { selected = nil } }
+            )) {
+                if let d = selected {
+                    DetectionDetailView(detection: d)
+                        .environmentObject(ble)
+                        .inspectorColumnWidth(min: 320, ideal: 380, max: 480)
+                }
+            }
+        } else {
+            content.sheet(item: $selected) { DetectionDetailView(detection: $0).environmentObject(ble) }
+        }
+    }
+}
+
+/// Animated category pin: filled dot with a glyph and a slow ping ring. `animated: false`
+/// (set once per body pass when the visible pin count crosses animatedPinCap) drops the
+/// repeatForever ping entirely, so hundreds of independent Core Animation loops never
+/// coexist on a dense map.
 private struct MapPin: View {
     let type: DeviceType
+    var animated = true
     @State private var ping = false
     var body: some View {
         ZStack {
-            Circle().stroke(type.tint, lineWidth: 2).frame(width: 28, height: 28)
-                .scaleEffect(ping ? 1.9 : 0.9).opacity(ping ? 0 : 0.7)
+            if animated {
+                Circle().stroke(type.tint, lineWidth: 2).frame(width: 28, height: 28)
+                    .scaleEffect(ping ? 1.9 : 0.9).opacity(ping ? 0 : 0.7)
+            }
             Circle().fill(type.tint).frame(width: 28, height: 28)
                 .overlay(Circle().strokeBorder(ACABTheme.bg, lineWidth: 2.5))
                 .shadow(color: type.tint.opacity(0.7), radius: 6)
@@ -304,19 +862,75 @@ private struct MapPin: View {
                 .foregroundStyle(ACABTheme.bg)
         }
         .onAppear {
+            guard animated else { return }
             withAnimation(.easeOut(duration: 2).repeatForever(autoreverses: false)) { ping = true }
         }
     }
 }
 
 /// Muted person icon for a drone's operator, kept distinct from the device pin.
+/// Tap it for a one-line explanation: remote ID broadcasts the pilot's location.
 private struct OperatorPin: View {
+    @State private var showInfo = false
     var body: some View {
-        Image(systemName: "person.fill").font(.system(size: 11, weight: .bold))
-            .foregroundStyle(ACABTheme.text)
-            .padding(6)
-            .background(ACABTheme.bg3, in: Circle())
-            .overlay(Circle().strokeBorder(ACABTheme.line, lineWidth: 1))
+        Button { showInfo = true } label: {
+            Image(systemName: "person.fill").font(.system(size: 11, weight: .bold))
+                .foregroundStyle(ACABTheme.text)
+                .padding(6)
+                .background(ACABTheme.bg3, in: Circle())
+                .overlay(Circle().strokeBorder(ACABTheme.line, lineWidth: 1))
+        }
+        .buttonStyle(.plain)
+        .accessibilityLabel("Drone operator")
+        .popover(isPresented: $showInfo) {
+            Text("operator. this drone broadcasts its pilot's location in its remote ID, so this pin is roughly where it's being flown from.")
+                .font(ACABTheme.mono(12)).foregroundStyle(ACABTheme.text)
+                .fixedSize(horizontal: false, vertical: true)
+                .padding(12).frame(width: 230)
+                .presentationCompactAdaptation(.popover)
+        }
+    }
+}
+
+/// A known-ALPR camera point (opt-in reference layer). Identity is the coordinate so panning
+/// the map doesn't rebuild markers that didn't change.
+/// Equatable so refreshALPRVisible can early-out when the culled set is unchanged: without it every
+/// camera callback rewrites @State and invalidates body even when nothing moved. `id` is stored, not
+/// computed - it's read per-row by ForEach, and interpolating a String there is the same trap that
+/// made Detection.id expensive.
+private struct ALPRPoint: Identifiable, Equatable {
+    let coord: CLLocationCoordinate2D
+    let maker: String
+    let id: String
+    init(coord: CLLocationCoordinate2D, maker: String) {
+        self.coord = coord
+        self.maker = maker
+        self.id = "\(coord.latitude),\(coord.longitude)"
+    }
+    // id is coord-derived, so a viewport that hasn't moved still costs zero @State churn; two dots
+    // never share a location, so folding maker out of == is safe (it can't differ at equal id).
+    static func == (a: ALPRPoint, b: ALPRPoint) -> Bool { a.id == b.id }
+}
+
+/// Quiet hollow ring for a known/mapped ALPR camera (opt-in reference layer). Deliberately
+/// un-animated and low-contrast so a mapped location never reads as a live detection.
+/// The dot itself stays a plain shape with NO @State and NO .popover of its own: up to 500 are
+/// on screen and the Map content closure rebuilds ~3 Hz off every detection publish, so a per-dot
+/// popover would mean up to 500 presentation hosts torn down and rebuilt 3x a second - a main-thread
+/// stall on its own, independent of any camera loop. Tapping is handled ONE level up: the call site
+/// wraps this in a Button that flips a single shared @State (showALPRInfo), and one bottom overlay
+/// renders the DeFlock credit callout. (The provenance is also credited permanently in the legend.)
+private struct ALPRDot: View {
+    var body: some View {
+        Circle()
+            .fill(ACABTheme.flockTone.opacity(0.20))
+            .frame(width: 14, height: 14)
+            .overlay(Circle().strokeBorder(ACABTheme.flockTone.opacity(0.95), lineWidth: 2.2))
+            .accessibilityLabel("Known ALPR camera")
+        // Bolder 2026-07-29 (user: rings washed out on the map). Still a HOLLOW STATIC ring -
+        // the "never reads as a live detection" rule holds because detections are filled +
+        // animated, not because this was faint. Keep in lockstep with Android rememberAlprMarker
+        // and the legend swatch below.
     }
 }
 
@@ -346,7 +960,7 @@ struct Cluster: Identifiable {
     var shortTag: String { members.count == 1 ? (members.first?.type.shortTag ?? "") : "\(members.count)" }
 }
 
-/// A count bubble for a multi-member cluster — sized up a touch for bigger clumps.
+/// A count bubble for a multi-member cluster, sized up a touch for bigger clumps.
 private struct ClusterBubble: View {
     let cluster: Cluster
     private var n: Int { cluster.members.count }
@@ -408,7 +1022,9 @@ private struct ClusterListSheet: View {
                     .padding(.bottom, 12)
                     VStack(spacing: 0) {
                         ForEach(Array(members.enumerated()), id: \.element.id) { i, d in
-                            Button { onPick(d) } label: { DetectionRow(detection: d) }
+                            Button { onPick(d) } label: {
+                                DetectionRow(detection: d, timeBasis: ble.timeBasis(for: d.id))
+                            }
                                 .buttonStyle(.plain)
                             if i < members.count - 1 { Divider().overlay(ACABTheme.line) }
                         }
