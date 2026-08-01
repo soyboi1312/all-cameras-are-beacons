@@ -18,8 +18,8 @@ it is a **passive listener** on two bands, WiFi and bluetooth. surveillance gear
 **what it catches**
 - flock / ALPR license-plate cameras, plus flock's raven audio sensors
 - drones overhead: the FAA remote ID broadcast is the main tell, and DJI, Parrot, Skydio, Autel, and Yuneec craft are also flagged by their own radio hardware when they aren't broadcasting it
-- body-worn cameras in range (Axon; also flags other Motorola Solutions gear by its signature, a broad match that rides the body-cam toggle, on by default, and switches off there, shown under body cam)
-- BLE item trackers riding along with you (AirTag / Find My, Tile, SmartTag; off by default, and a tracker has to stay with you 5 seconds before it alerts, so one you walk past stays quiet)
+- body-worn cameras in range (Axon, matched on its own registered hardware address and on its device tag. a broader Motorola Solutions vendor match sits on its own switch under body cam, opt-in and off by default: in our own capture every one of those hits was fixed equipment, not anything worn, so it reads as a weak match to verify rather than a confirmed camera)
+- BLE item trackers riding along with you (AirTag / Find My, Tile, SmartTag; off by default. your phone sees a tracker from the first sighting, and the buzzer holds quiet for that tracker's first minute, so one you merely walk past never sounds)
 - smart / recording glasses on the people around you (Ray-Ban / Oakley Meta, Snap Spectacles, Vuzix; honest "possible glasses" call, since the Meta signature can also be a VR headset)
 - network cameras on the WiFi you're on (opt-in, off by default; branded IP-camera OUIs like Hikvision, Dahua, Amcrest, Axis, Reolink on the host network. it matches known camera brands, not every camera, and is never a hidden-camera claim)
 
@@ -33,7 +33,7 @@ it is a **passive listener** on two bands, WiFi and bluetooth. surveillance gear
 
 **free app, paid hardware.** the iOS and android apps are free and open source, and so is the firmware, read every line before you trust it. the beacon hardware is what we sell. buy the beacon, own the data: no accounts, no cloud, no telemetry, every detection stays on your device.
 
-**get one.** everything about the beacon lives at [soyboi.tech](https://soyboi.tech). preorder on [tindie](https://www.tindie.com/stores/soyboitech/) or [etsy](https://soyboitech.etsy.com).
+**get one.** everything about the beacon lives at [soyboi.tech](https://soyboi.tech). preorder on [tindie](https://www.tindie.com/stores/soyboitech/).
 
 **honest about limits.** silent gear stays invisible: wired cameras and purely optical systems emit no radio and won't show up. this is not an SDR or a bug sweeper, it listens to two bands for known signatures, nothing more. a quiet screen means nothing announced itself, not that you're unwatched.
 
@@ -43,11 +43,11 @@ it is a **passive listener** on two bands, WiFi and bluetooth. surveillance gear
 |---|---|---|
 | **Flock cameras** (automated license-plate readers) | Bluetooth + WiFi | very reliable |
 | **Flock Raven** (their audio / gunshot sensor) | Bluetooth | very reliable |
-| **Drones** broadcasting FAA Remote ID | Bluetooth + WiFi | very reliable; DJI, Parrot, Skydio, Autel, and Yuneec also flagged by hardware signature when Remote ID is silent |
+| **Drones** broadcasting FAA Remote ID | Bluetooth + WiFi | very reliable. a separate opt-in fallback, off by default, flags DJI, Parrot, Skydio, Autel and Yuneec hardware when Remote ID is silent; that one means vendor gear nearby, which may be a controller rather than an aircraft |
 | **Axon body cameras** | Bluetooth | field-validated June 2026; on by default |
-| **BLE item trackers** (AirTag / Find My, Tile, Samsung SmartTag) | Bluetooth | off by default; must stay with you 5 seconds before it alerts; flip it on from the app when you want it |
+| **BLE item trackers** (AirTag / Find My, Tile, Samsung SmartTag) | Bluetooth | off by default, flip it on from the app; the buzzer holds quiet for a tracker's first minute in range, so one you walk past never sounds, while the sighting still reaches the app straight away |
 | **Smart / recording glasses** (Ray-Ban / Oakley Meta, Snap Spectacles, Vuzix) | Bluetooth | on by default; capture-pending, reports as "possible glasses" since the Meta signature can also be a VR headset |
-| **Network cameras** (branded IP cameras: Hikvision, Dahua, Amcrest, Axis, Reolink) | WiFi | opt-in, off by default; matches camera-brand OUIs on the host WiFi at ~65 confidence; matches known brands, cannot find every camera, never a hidden-camera claim |
+| **Network cameras** (branded IP cameras: Hikvision, Dahua, Amcrest, Axis, Reolink) | WiFi | opt-in, off by default; the board never joins a network, it listens promiscuously and matches camera-brand OUIs in frames already on the air, at ~65 confidence; known brands only, cannot find every camera, never a hidden-camera claim. now 43 vendor blocks including Ring, Wyze and Anker/eufy, where a hit may be another product from the same maker |
 
 Flock and Raven detection is built from publicly documented signatures, the IEEE OUI registry, Bluetooth SIG assigned numbers, and independent Flock research, all mapped out in [docs/signatures.md](docs/signatures.md). Drone detection reads the public FAA / ASTM Remote ID broadcast via the open-source [OpenDroneID](https://github.com/opendroneid/opendroneid-core-c) decoder, with a secondary hardware-signature fallback for DJI, Parrot, Skydio, Autel, and Yuneec when a craft isn't broadcasting Remote ID. BLE tracker detection is opt-in; Axon body-cam detection is field-validated (notes in [docs/axon.md](docs/axon.md)). Smart/recording-glasses detection keys off Bluetooth SIG company IDs and is capture-pending (notes in [docs/glasses.md](docs/glasses.md)).
 
@@ -57,7 +57,7 @@ It depends on *how* a device matched, and the app tells you. ACAB flags things b
 
 ## Flashing
 
-**Got a beacon?** It ships pre-flashed and ready to pair. New firmware installs over-the-air from the app over Bluetooth, or in one click from your browser at [soyboi.tech/flash](https://soyboi.tech/flash.html), no cable needed. The DIY flasher below is for rolling your own, you don't need it.
+**Got a beacon?** It ships pre-flashed and ready to pair. New firmware installs over-the-air from the app over Bluetooth with no cable, or in one click from your browser at [soyboi.tech/flash](https://soyboi.tech/flash.html) with a USB-C cable. The DIY flasher below is for rolling your own, you don't need it.
 
 **Building your own** oui-spy or mesh-detect on a bare XIAO board? No tools to install, there's a one-click flasher hosted online:
 
@@ -146,10 +146,12 @@ Firmware updates are handled two ways: the one-click browser flasher, and over-t
 
 Still on the list:
 - Getting the iPhone app onto the App Store and the Android app onto the Play Store
-- Finishing the dual-radio v2 beacon board bring-up. The board is in hand, and its two
-  radios, power, and over-the-air ESP32-S3 updates are proven on it. The companion nRF
-  updates over Bluetooth DFU; the board-side trigger is in place, with the in-app DFU flow
-  and a bench test still to do. The day-one checklist is in [firmware/nrf-ble-scan/BRINGUP.md](firmware/nrf-ble-scan/BRINGUP.md).
+- Field-proving the newer detectors. The dual-radio board is done and shipping: both
+  radios, power, and over-the-air updates for BOTH processors are proven on hardware, the
+  ESP32-S3 over its own OTA and the companion nRF over Bluetooth DFU from inside the app.
+  What is still open is ground truth, not code: the glasses signatures have one capture
+  behind them and the WiFi body-cam path has none. The bring-up checklist is in
+  [firmware/nrf-ble-scan/BRINGUP.md](firmware/nrf-ble-scan/BRINGUP.md).
 
 ## Thanks to
 
