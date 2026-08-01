@@ -24,8 +24,8 @@ android {
         applicationId = "tech.acab.app"
         minSdk = 26
         targetSdk = 35
-        versionCode = 17
-        versionName = "2.0.0"
+        versionCode = 19
+        versionName = "2.0.2"
     }
 
     signingConfigs {
@@ -60,6 +60,19 @@ android {
     kotlinOptions {
         jvmTarget = "17"
     }
+    // Lint policy, made explicit. NOTE these mostly RESTATE AGP defaults, they are documentation,
+    // NOT the gate. The actual gate is the `:app:lintRelease` step in .github/workflows/
+    // android-release.yml, because assembleRelease only triggers lintVitalRelease (the "fatal"
+    // subset) and that PROVABLY misses real errors: with the bare <View> reintroduced in the
+    // RemoteViews widget layout, lintVitalRelease still reported BUILD SUCCESSFUL (tested
+    // 2026-07-30). Do not delete the CI step and assume this block covers you.
+    // Warnings stay non-fatal, there are ~90 and triaging them should not block a release.
+    lint {
+        abortOnError = true
+        warningsAsErrors = false
+        checkReleaseBuilds = true
+    }
+
     buildFeatures {
         compose = true
     }

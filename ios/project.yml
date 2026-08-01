@@ -23,7 +23,7 @@ packages:
 
 settings:
   base:
-    MARKETING_VERSION: "2.0.0"
+    MARKETING_VERSION: "2.0.2"
     # BUMP THIS (then `xcodegen generate`) BEFORE EVERY ARCHIVE, and leave "Automatically manage
     # version and build number" UNCHECKED in Xcode's Distribute flow. If Xcode manages it, it bumps
     # the build at UPLOAD time and never writes it back here - so every archive on disk reads the same

@@ -86,17 +86,26 @@ enum DeviceType: Int, CaseIterable, Identifiable, Codable {
         }
     }
 
-    /// Whether the drive-mode surfaces speak this bucket: the five counters plus a starred
-    /// device (a star pinging the drive surface is the point of starring). Desert-mode
-    /// .nearbyDevice and opt-in .networkCamera rows fill no tile, so letting them set the
-    /// "last ..." line would name a category the surface never shows. The home widget is
-    /// separate state and deliberately keeps all six categories.
+    /// Whether the drive-mode surfaces speak this bucket: the six counters plus a starred
+    /// device (a star pinging the drive surface is the point of starring).
+    ///
+    /// .networkCamera joined 2026-07-31. It was excluded while the Live Activity had a fixed five
+    /// columns, because letting it set the "last ..." line would have named a category with no
+    /// tile. Now that the columns follow the board's toggles it gets a tile exactly when the
+    /// opt-in is on, so the reason is gone. LEAVING IT OUT WAS AN ACTIVE BUG for one revision:
+    /// the same change started folding cameras into DetectionState.total, and the widget gates
+    /// its footer on total > 0 while only onDriveSurface writes lastLiveKind, so a camera-only
+    /// drive rendered "last <blank> 2h ago" with an age measured from app launch.
+    ///
+    /// Desert-mode .nearbyDevice still fills no tile and would make "last ..." meaningless.
+    /// Mirrors Android DeviceType.onDriveSurface. The home widget is separate state and keeps
+    /// all six categories regardless.
     var onDriveSurface: Bool {
         switch self {
         case .flockCamera, .flockRaven, .drone, .axonBodyCam, .tracker,
-             .recordingGlasses, .watched:
+             .recordingGlasses, .watched, .networkCamera:
             return true
-        case .nearbyDevice, .networkCamera, .unknown:
+        case .nearbyDevice, .unknown:
             return false
         }
     }
@@ -133,6 +142,47 @@ enum DeviceType: Int, CaseIterable, Identifiable, Codable {
     /// (confidence 90) was field-validated against a visually confirmed scene. Keep in
     /// step with Android DeviceType.isExperimental and the EXP counter on both platforms.
     var isExperimental: Bool { self == .recordingGlasses }
+
+    /// The noun the "experimental detector" banner names, so that banner can never again
+    /// describe a category other than the one on screen. It hardcoded "Body-cam signatures"
+    /// and kept saying so after body cam graduated on 2026-07-19 and isExperimental moved to
+    /// glasses, which put a body-cam warning on every glasses detection (seen in the field
+    /// 2026-07-31). Deriving it from the type is what stops that recurring.
+    var experimentalNoun: String {
+        switch self {
+        case .recordingGlasses: return "Recording-glasses"
+        case .axonBodyCam:      return "Body-cam"
+        case .networkCamera:    return "Network-camera"
+        case .flockCamera, .flockRaven: return "ALPR"
+        case .drone:            return "Drone"
+        case .tracker:          return "Tracker"
+        case .nearbyDevice, .watched, .unknown: return "These"
+        }
+    }
+
+    /// First line of the "Confirm it" checklist: what to physically look for to verify THIS
+    /// kind of device. Was one hardcoded ALPR string ("pole-mounted camera, solar panel, small
+    /// antenna"), which is the wrong instruction on every other category and was showing on
+    /// glasses detections in the field 2026-07-31. A checklist that names the wrong object is
+    /// worse than none: it invites the user to confirm a false negative.
+    var confirmPrompt: String {
+        switch self {
+        case .flockCamera, .flockRaven:
+            return "Look around, pole-mounted camera, solar panel, small antenna?"
+        case .axonBodyCam:
+            return "Look around, anyone with a camera worn on the chest or shoulder?"
+        case .recordingGlasses:
+            return "Look around, anyone in glasses with a lens or LED in the frame?"
+        case .networkCamera:
+            return "Look around, a doorbell camera, or one under an eave or on a wall?"
+        case .drone:
+            return "Look up, anything hovering or circling?"
+        case .tracker:
+            return "Check your bag, pockets, and car for a tag that isn't yours."
+        case .nearbyDevice, .watched, .unknown:
+            return "Look around, anything nearby that could be transmitting?"
+        }
+    }
 
     /// Which home-screen-widget bucket this type falls into, or nil for types the widget does not
     /// break out. ALPR folds flockCamera + flockRaven the same way the Log and Status tiles do.

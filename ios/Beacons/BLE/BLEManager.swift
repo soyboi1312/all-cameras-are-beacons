@@ -369,6 +369,15 @@ final class BLEManager: NSObject, ObservableObject {
     }
 
     private let liveActivity = LiveActivityController()   // Dynamic Island / Lock Screen counter
+    /// Per-category phone notifications (see DetectionNotifier). Independent of alertMode.
+    let notifier = DetectionNotifier()
+    /// Enabled-detector set as last pushed to the Live Activity, so a status frame only forces an
+    /// activity update when the toggles actually changed (see ingestStatus).
+    ///
+    /// MUST be cleared when a link is (re)established. Otherwise the first status frame of the next connection
+    /// compares equal to this stale value, the push is suppressed, and the drive surface stays on
+    /// the fallback five columns for the rest of the session.
+    private var lastPushedEnabled: [String]?
     // Drive-mode link-loss grace. A live disconnect flips the Live Activity to
     // "Reconnecting…" and keeps it up briefly, so a transient BLE dropout mid-drive (a
     // parking structure, the board two cars back at a light) doesn't tear Drive mode down -
@@ -382,7 +391,7 @@ final class BLEManager: NSObject, ObservableObject {
     private let driveLinkGraceInterval: TimeInterval = 120
     // Per-category live counts, maintained in publishDetections() so the Live Activity
     // snapshot is O(1) instead of re-scanning the store on every detection notify.
-    private var liveCounts = (alpr: 0, drones: 0, body: 0, trackers: 0, glasses: 0)
+    private var liveCounts = (alpr: 0, drones: 0, body: 0, trackers: 0, glasses: 0, cameras: 0)
     // The most recent live detection's category + time, remembered so foreground
     // reconciles and setting toggles don't wipe the activity's "last ALPR 2m ago" footer.
     private var lastLiveKind = ""
@@ -455,10 +464,16 @@ final class BLEManager: NSObject, ObservableObject {
         // Resume the parked connect scan when the user comes back to it.
         NotificationCenter.default.addObserver(forName: UIApplication.willEnterForegroundNotification,
                                                object: nil, queue: .main) { [weak self] _ in
-            guard let self, self.connectionState == .scanning else { return }
+            guard let self else { return }
+            // Re-read notification permission on EVERY foreground, not just at launch. A user who
+            // grants it in iOS Settings mid-session would otherwise stay silently unauthorized for
+            // the whole process, with green toggles over a dead feature.
+            self.notifier.refreshAuthorization()
+            guard self.connectionState == .scanning else { return }
             self.startScan()
         }
         if liveActivity.adoptExisting() { driveModeOn = true }
+        notifier.refreshAuthorization()   // trust the system's answer, not our own last request
         alertMode = AlertMode(rawValue: UserDefaults.standard.string(forKey: alertModeKey) ?? "") ?? .buzzer
         if alertMode == .vibrate { requestFocusAuthIfNeeded() }
         central = CBCentralManager(delegate: self, queue: nil)
@@ -585,13 +600,14 @@ final class BLEManager: NSObject, ObservableObject {
     /// Drop the log from memory only, leaving the on-disk history alone. This half exists so
     /// paths that just need a clean store (exiting the tour) can't cost the user real records.
     private func resetDetectionState() {
+        notifier.reset()   // a new session may alert on the same devices again
         publishTimer?.invalidate(); publishTimer = nil   // drop any queued coalesced republish
         liveCheckpointTimer?.invalidate(); liveCheckpointTimer = nil   // and any queued disk write of the store we're dropping
         store.removeAll(); lastSeen.removeAll(); rssiHistory.removeAll()
         trackHistory.removeAll(); crumbHistory.removeAll(); lastCrumbAt.removeAll()
         firstSeenAt.removeAll(); capturedLoc.removeAll(); bestRssi.removeAll(); detections = []
         histBasis.removeAll(); histAnchoredBoots.removeAll()
-        liveCounts = (0, 0, 0, 0, 0)
+        liveCounts = (0, 0, 0, 0, 0, 0)
         lastLiveKind = ""; lastLiveSeen = Date()
     }
 
@@ -685,6 +701,29 @@ final class BLEManager: NSObject, ObservableObject {
         }
     }
 
+    /// WidgetCategory rawValues for the detectors the BOARD reports switched on, which is what
+    /// decides the drive-mode columns. Read off the live status rather than any app-side mirror,
+    /// so a toggle flipped from the mesh or another phone is reflected too.
+    ///
+    /// Returns nil (NOT []) when no status has arrived yet: the widget reads nil as "unknown" and
+    /// falls back to the historical five columns, while [] means every detector is genuinely off
+    /// and draws none. Those two need opposite handling, which is the whole reason this is
+    /// Optional; see DetectionActivityAttributes.enabled.
+    private func enabledWidgetCategories() -> [String]? {
+        // nil, NOT [], when no status has arrived. [] now means "every detector is off" and makes
+        // the surface draw no columns at all; returning it here would blank the drive surface for
+        // the whole window before the first status frame.
+        guard let s = status else { return nil }
+        var out: [String] = []
+        if s.flock   { out.append(WidgetCategory.alpr.rawValue) }
+        if s.drone   { out.append(WidgetCategory.drone.rawValue) }
+        if s.axon    { out.append(WidgetCategory.body.rawValue) }
+        if s.tracker { out.append(WidgetCategory.tracker.rawValue) }
+        if s.glasses { out.append(WidgetCategory.glasses.rawValue) }
+        if s.ncam    { out.append(WidgetCategory.camera.rawValue) }
+        return out
+    }
+
     /// Snapshot the live store into the Live Activity's per-category counts. Mirrors the
     /// dashboard tiles exactly (ALPR = flockCamera + flockRaven; no police bucket).
     private func liveState() -> DetectionActivityAttributes.DetectionState {
@@ -692,10 +731,11 @@ final class BLEManager: NSObject, ObservableObject {
         // store for the sort), not re-scanned here on every detection notify.
         return .init(alpr: liveCounts.alpr, drones: liveCounts.drones,
                      bodyCams: liveCounts.body, trackers: liveCounts.trackers,
-                     glasses: liveCounts.glasses,
+                     glasses: liveCounts.glasses, cameras: liveCounts.cameras,
                      lastKind: lastLiveKind, lastSeen: lastLiveSeen,
                      connected: connectionState == .connected || demoMode,
-                     redact: redactLockScreen)
+                     redact: redactLockScreen,
+                     enabled: enabledWidgetCategories())
     }
 
     // MARK: - Home-screen widget summary (App Group shared store)
@@ -965,16 +1005,21 @@ final class BLEManager: NSObject, ObservableObject {
     /// Rename an ignored device. Same contract as renameWatched: an empty string is ignored so a
     /// cleared field can't blank the label and leave an unidentifiable row on the managed screen.
     func renameIgnored(_ mac: String, to label: String) {
-        let trimmed = label.trimmingCharacters(in: .whitespaces)
+        let trimmed = label.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty, let i = ignored.firstIndex(where: { $0.mac == mac.lowercased() }) else { return }
         ignored[i].label = trimmed
         persistIgnored()   // label is app-side only; the board only needs the MAC list
     }
 
+    /// Rename a starred device. Trims and rejects an empty label, so clearing the field cannot
+    /// blank the name and leave an unidentifiable row. renameIgnored's comment already claimed
+    /// "same contract as renameWatched", but this side had neither the trim nor the guard, so a
+    /// cleared field silently wiped the label and the log row fell back to the device class.
     func renameWatched(_ mac: String, to label: String) {
+        let trimmed = label.trimmingCharacters(in: .whitespacesAndNewlines)
         let m = mac.lowercased()
-        guard let i = watched.firstIndex(where: { $0.mac == m }) else { return }
-        watched[i].label = label
+        guard !trimmed.isEmpty, let i = watched.firstIndex(where: { $0.mac == m }) else { return }
+        watched[i].label = trimmed
         persistWatched()   // label is app-side only; the board only needs the MAC list
     }
 
@@ -1158,7 +1203,7 @@ final class BLEManager: NSObject, ObservableObject {
         // 3 Hz ceiling and re-rendered every mounted tab once per replayed record.
         if offlineSyncCount != histReceived { offlineSyncCount = histReceived }
 
-        var a = 0, dr = 0, b = 0, tr = 0, gl = 0
+        var a = 0, dr = 0, b = 0, tr = 0, gl = 0, nc = 0
         for d in store.values {
             switch d.type {
             case .flockCamera, .flockRaven: a += 1
@@ -1166,11 +1211,12 @@ final class BLEManager: NSObject, ObservableObject {
             case .axonBodyCam:              b += 1
             case .tracker:                  tr += 1
             case .recordingGlasses:         gl += 1
-            case .nearbyDevice, .watched, .networkCamera, .unknown:
-                break   // Desert-mode, starred, opt-in network-camera, and unrecognized-type hits don't fill the drive-mode buckets
+            case .networkCamera:            nc += 1   // counted since 2026-07-31: the Live Activity renders this column only when the opt-in is on
+            case .nearbyDevice, .watched, .unknown:
+                break   // Desert-mode, starred and unrecognized-type hits don't fill the drive-mode buckets
             }
         }
-        liveCounts = (a, dr, b, tr, gl)
+        liveCounts = (a, dr, b, tr, gl, nc)
         // Newest-first on lastSeen. A bracketed row's lastSeen is the ordering key
         // resolveBracketedHistory() derived from the boots on either side of it, so it lands
         // between them instead of at the epoch; only a row nothing could bound still sorts down
@@ -1306,7 +1352,11 @@ final class BLEManager: NSObject, ObservableObject {
         // it: a reader who takes detected_at without them is reading a derived time as a clock
         // reading, which is the misuse this export exists to prevent. Header must stay
         // byte-identical to Android's.
-        var rows = ["detected_at,time_basis,time_precision_s,type,mac,rssi,source,matched_on,confidence,sightings,approx_lat,approx_lon,company_id,uas_id,drone_lat,drone_lon,altitude_m,speed_ms,heading_deg,height_agl_m,operator_lat,operator_lon,operator_alt_m,rid_status"]
+        // `maker` is appended LAST so an existing parser keyed on column order still reads every
+        // field it knew about. Byte-identical to Android's, which is why it moves in the same
+        // commit or not at all: the UI now names a manufacturer, and the evidence file has to be
+        // able to say the same thing.
+        var rows = ["detected_at,time_basis,time_precision_s,type,mac,rssi,source,matched_on,confidence,sightings,approx_lat,approx_lon,company_id,uas_id,drone_lat,drone_lon,altitude_m,speed_ms,heading_deg,height_agl_m,operator_lat,operator_lon,operator_alt_m,rid_status,maker"]
         func f6(_ v: Double?) -> String { v.map { String(format: "%.6f", $0) } ?? "" }
         func iStr(_ v: Int?) -> String { v.map { "\($0)" } ?? "" }
         for r in snapshot {
@@ -1350,7 +1400,8 @@ final class BLEManager: NSObject, ObservableObject {
                          csvSafe(d.uasID ?? ""), f6(dc?.latitude), f6(dc?.longitude),
                          iStr(d.altitude), iStr(d.speedH), iStr(d.heading), iStr(d.heightAGL),
                          f6(pc?.latitude), f6(pc?.longitude), iStr(d.pilotAlt),
-                         csvSafe(d.ridStatusLabel ?? "")].joined(separator: ","))
+                         csvSafe(d.ridStatusLabel ?? ""),
+                         csvSafe(d.maker ?? "")].joined(separator: ","))
         }
         return rows.joined(separator: "\n")
     }
@@ -1471,6 +1522,55 @@ final class BLEManager: NSObject, ObservableObject {
 
     /// Master audio on/off.
     func setBuzzerEnabled(_ on: Bool) { writeConfig(["buzzer": on]) }
+
+    /// Re-assert attempts made since the app and board last agreed on the buzzer. Reset on every
+    /// fresh connection (see the connect path) so a stale value can't skip the grace period.
+    private var buzzerReassertAttempts = 0
+    private static let maxBuzzerReasserts = 3
+
+    /// Reconcile the alert mode against what the board actually reports.
+    ///
+    /// THE BUG THIS FIXES (reported 2026-07-31): turn Desert mode on, then off, and the app showed
+    /// sound ON while the board stayed silent. `alertMode` was optimistic local state: setAlertMode()
+    /// assigned it, persisted it and fired writeConfig(["buzzer":]) without checking the result,
+    /// while ingestStatus reconciled `bufferingOn` and `ledOn` from status but never the buzzer.
+    /// Any lost config write left the two diverged with nothing to heal it. Desert is where it shows
+    /// because setDesertMode is the only path firing TWO config writes back to back.
+    ///
+    /// THREE THINGS THE FIRST VERSION OF THIS GOT WRONG, all found in re-review:
+    ///  1. Mesh-Detect boards have NO buzzer hardware. `alertsBuzzerEnabled()` is a weak stub
+    ///     returning false forever and buzzer writes are discarded, so want(true) != report(false)
+    ///     could never converge, and the reconciler wrote .silent into the SHARED preference, which
+    ///     then muted the user's real beacon board on its next connect. Hence the isMeshDetect bail.
+    ///  2. It collapsed three alert modes onto a Bool and could write back only .buzzer or .silent,
+    ///     so a .vibrate user could be silently promoted to .buzzer: an audible board for someone
+    ///     who deliberately chose a quiet one, on a counter-surveillance device. Never do that; when
+    ///     the board is audible and the user wanted quiet, keep trying to MUTE. Erring quiet is the
+    ///     only safe direction here.
+    ///  3. The correction was persisted, so one transient link fault could rewrite a stored
+    ///     preference. The correction is now in-memory for the session; the stored preference is
+    ///     re-asserted from scratch on the next launch.
+    private func reconcileBuzzer(_ s: DeviceStatus) {
+        guard !s.isMeshDetect else { buzzerReassertAttempts = 0; return }   // no buzzer to reconcile
+
+        let wantBuzzer = (alertMode == .buzzer)
+        guard wantBuzzer != s.buzzer else { buzzerReassertAttempts = 0; return }
+
+        if buzzerReassertAttempts < Self.maxBuzzerReasserts {
+            buzzerReassertAttempts += 1
+            setBuzzerEnabled(wantBuzzer)     // most likely a dropped write; say it again
+            return
+        }
+        // Re-asserting did not take. Only correct the UI where the mapping is LOSSLESS.
+        if wantBuzzer {
+            // We claim sound, the board is muted: the originally reported bug. Tell the truth for
+            // this session, WITHOUT persisting, so a transient fault can't rewrite the preference.
+            alertMode = .silent
+        }
+        // Otherwise the board is audible while the user chose .vibrate or .silent. Leave the mode
+        // alone (both are honest about what the PHONE does) and stop writing; an audible board at
+        // this point is a link or firmware fault, not a preference to overwrite.
+    }
 
     /// Pick how alerts reach you. Only `.buzzer` keeps the board's buzzer live;
     /// the others mute it.
@@ -2093,10 +2193,23 @@ final class BLEManager: NSObject, ObservableObject {
         if !d.isHistory { scheduleLiveCheckpoint() }
         // Live first sightings buzz; replayed history never does.
         if !d.isHistory, alertMode == .vibrate, firstTime, !focusActive { alertHaptic(for: d.type) }
+        // Phone notification, per category, opt-in. Deliberately INDEPENDENT of alertMode: that
+        // governs the board's buzzer, and choosing a silent board is not the same as choosing a
+        // silent phone. Ignored devices never reach here (dropped above), so one cannot notify.
+        //
+        // NOT gated on `firstTime`, deliberately. `firstTime` is `store[d.id] == nil`, and the store
+        // is PERSISTED across launches, so a device seen in any previous session was never first
+        // again and could never notify. The notifier owns the dedup via its per-device cooldown,
+        // which is what the settings copy actually promises.
+        if !d.isHistory, DetectionNotifier.anyEnabled {
+            notifier.silenceForeground = (alertMode != .buzzer) && focusActive
+            notifier.notifyIfNeeded(d)
+        }
         // Drive mode: push the live count to the Dynamic Island / Lock Screen. History never
         // updates. A brand-new device escalates (immediate), but only for the categories that
-        // change what the activity shows (the five counter buckets plus a starred device -
-        // Desert-mode .nearbyDevice and opt-in .networkCamera rows don't fill any bucket) and
+        // change what the activity shows (the six counter buckets plus a starred device -
+        // Desert-mode .nearbyDevice fills no bucket; network cameras have had one since
+        // 2026-07-31, when the columns became toggle-driven) and
         // at most one escalation per escalateMinGap: everything else rides the controller's
         // coalescer, so the counts still land within its window.
         if !d.isHistory {
@@ -2409,10 +2522,22 @@ final class BLEManager: NSObject, ObservableObject {
 
     private func ingestStatus(_ data: Data) {
         if let s = try? JSONDecoder().decode(DeviceStatus.self, from: data) {
+            let previousEnabled = lastPushedEnabled
             status = s
             otaSawFreshStatus = true      // a frame off THIS link; the post-reboot check keys on it
             bufferingOn = s.bufferingOn   // keep the toggle in step with the board
             ledOn = s.ledEnabled          // same, for the lights-out toggle
+            reconcileBuzzer(s)            // and the buzzer, which used to be the one that drifted
+            // The drive-mode columns follow the board's detector toggles, and the Live Activity is
+            // otherwise only pushed from publishDetections(). Without this, flipping a detector did
+            // nothing visible until the NEXT detection arrived, which in a quiet area is minutes,
+            // and is worst exactly when you turn a detector ON to watch for something. Push only on
+            // an actual change so a 1 Hz status frame is not a 1 Hz activity update.
+            let nowEnabled = enabledWidgetCategories()
+            if driveModeOn, nowEnabled != previousEnabled {
+                lastPushedEnabled = nowEnabled
+                liveActivity.update(liveState())
+            }
         }
         // "wiping": true rides the status frame while the board is still sweeping a deferred buffer
         // erase (absent = idle). It isn't part of DeviceStatus, so read it straight off the frame
@@ -2456,7 +2581,7 @@ final class BLEManager: NSObject, ObservableObject {
         // dimmed - the demo forces motorolaSupported precisely to introduce that control, and a
         // dimmed sub-toggle under an off parent defeats the tour. Matches the Android seed.
         status = decodeJSON(DeviceStatus.self, [
-            "fw": "beacon board 2.0.0", "up": 4920, "total": 6, "ble": true, "wifi": true,
+            "fw": "beacon board 2.0.2", "up": 4920, "total": 6, "ble": true, "wifi": true,
             "axon": true, "tracker": true, "glasses": true, "buzzer": true, "vol": 70, "gps": true, "bat": 82,
         ])
         // The sample board is a current one. Without this the tour would read it as pre-split
@@ -2490,12 +2615,17 @@ final class BLEManager: NSObject, ObservableObject {
             // Ray-Ban / Oakley Meta glasses share Meta's BLE company ID with Quest headsets,
             // so this one lands at moderate confidence and says so in the detail.
             ["t": 9, "s": 0, "meth": 3, "c": 60, "mac": "1A:2B:3C:4D:5E:6F", "rssi": -71,
-             "det": "Meta Platforms Technologies \u{00B7} possible recording glasses. Shared ID: could be a Meta Quest headset.",
+            // VERBATIM from glasses_signatures.h. These seeds must carry the firmware's real
+            // strings, not a prettified paraphrase: `maker` parses them, so a paraphrase would
+            // demo the OLD behaviour (a row reading "Recording glasses") while real hardware
+            // shows the new one. This one resolves to "Meta".
+             "det": "Meta: possible recording glasses or Quest",
              "cid": 1422, "lat": 37.7795, "lon": -122.4193, "n": 2, "new": true, "rnd": true],
             // Branded IP-camera OUI seen on the host WiFi (matched by source MAC), so the NETCAM
-            // tile and NETWORK CAM map chip both show up on the tour.
+            // tile and NETWORK CAM map chip both show up on the tour. The MAC is a real Hikvision
+            // block, so this row demonstrates the maker-led title end to end.
             ["t": 10, "s": 0, "meth": 1, "c": 80, "mac": "44:19:B6:22:0A:5C", "rssi": -70,
-             "det": "Hikvision \u{00B7} IP camera on the local network", "lat": 37.7788, "lon": -122.4183, "n": 2, "new": true],
+             "det": "Hikvision on wifi", "lat": 37.7788, "lon": -122.4183, "n": 2, "new": true],
         ]
         // The demo replaces the WHOLE store, so clear every per-id side map - the same ten-map
         // list as evictKey/resetDetectionState. Leaving capturedLoc/bestRssi/crumb trails alive
@@ -2808,6 +2938,8 @@ extension BLEManager: CBPeripheralDelegate {
         writeWidgetSummary(force: true)   // home widget goes to "connected"
         sendIgnoreList()   // re-send the whitelist so the board has it this session
         sendWatchList()    // then the watchlist, same MAC format, right after the ignore push
+        buzzerReassertAttempts = 0               // fresh link: the first status frame is pre-write, don't count it
+        lastPushedEnabled = nil                  // force the next status frame to re-push the columns
         setBuzzerEnabled(alertMode == .buzzer)   // a fresh board boots up buzzing; match the phone's mode
         lastGpsSent = .distantPast; sendPhoneLocation()   // push our location to the freshly-connected board
         // Background: keep the "latest"/OTA gate current. Hop to the main actor explicitly

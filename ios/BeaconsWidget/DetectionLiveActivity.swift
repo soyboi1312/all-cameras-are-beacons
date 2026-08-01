@@ -12,6 +12,9 @@ private enum WidgetTheme {
     static let amber   = Color(red: 0xF2 / 255, green: 0xB5 / 255, blue: 0x3C / 255)
     static let bodyCam = Color(red: 0xCD / 255, green: 0xC1 / 255, blue: 0xC3 / 255)
     static let tracker = Color(red: 0x49 / 255, green: 0xC5 / 255, blue: 0xB1 / 255)
+    /// Network-camera column. Distinct from `tracker`, which it briefly shared, so two adjacent
+    /// columns are not the same colour at a glance.
+    static let teal    = Color(red: 0x6E / 255, green: 0xA8 / 255, blue: 0xE0 / 255)
     static let glasses = Color(red: 0xB0 / 255, green: 0x7C / 255, blue: 0xFF / 255)
 
     /// Display face for digits: Space Grotesk Bold.
@@ -20,10 +23,13 @@ private enum WidgetTheme {
     static func mono(_ size: CGFloat) -> Font { .custom("JetBrainsMono-Medium", size: size) }
 }
 
-// Widget-local presentation tokens for the five detection buckets. The symbol map
+// Widget-local presentation tokens for the six detection buckets. The symbol map
 // mirrors the app's DeviceType, kept self-contained here.
-private enum DetCat: CaseIterable {
-    case alpr, drone, bodyCam, tracker, glasses
+private enum DetCat: String, CaseIterable {
+    // rawValue MUST equal the matching WidgetCategory rawValue: DetectionState.enabled
+    // carries those strings and this is what matches them back to a column.
+    case alpr = "ALPR", drone = "DRONE", bodyCam = "BODY", tracker = "TRACKER"
+    case glasses = "GLASSES", camera = "CAMERA"
 
     var symbol: String {
         switch self {
@@ -32,6 +38,7 @@ private enum DetCat: CaseIterable {
         case .bodyCam: return "person.fill.viewfinder"
         case .tracker: return "dot.radiowaves.left.and.right"
         case .glasses: return "eyeglasses"
+        case .camera:  return "video.fill"
         }
     }
     var tint: Color {
@@ -41,6 +48,7 @@ private enum DetCat: CaseIterable {
         case .bodyCam: return WidgetTheme.bodyCam
         case .tracker: return WidgetTheme.tracker
         case .glasses: return WidgetTheme.glasses
+        case .camera:  return WidgetTheme.teal   // its own tint: reusing the tracker colour made two adjacent columns indistinguishable
         }
     }
     var label: String {
@@ -50,6 +58,7 @@ private enum DetCat: CaseIterable {
         case .bodyCam: return "BODY"
         case .tracker: return "TRACK"
         case .glasses: return "GLASS"
+        case .camera:  return "CAM"
         }
     }
     func count(_ s: DetectionActivityAttributes.DetectionState) -> Int {
@@ -59,8 +68,25 @@ private enum DetCat: CaseIterable {
         case .bodyCam: return s.bodyCams
         case .tracker: return s.trackers
         case .glasses: return s.glasses
+        case .camera:  return s.cameras
         }
     }
+}
+
+/// The columns to draw: exactly the detectors the board reports ON, in canonical order.
+///
+/// A zero under an enabled detector means "watching, nothing found" and is worth showing. A zero
+/// under a disabled one implies coverage that is not running, which is why this is driven off the
+/// board's toggles rather than off the counts. Falls back to the historical five when the enabled
+/// set is empty (older app build, or status not yet received), so the widget is never blank.
+private func visibleCats(_ s: DetectionActivityAttributes.DetectionState) -> [DetCat] {
+    // nil = no status yet -> fall back to the historical five rather than render nothing.
+    // [] = every detector genuinely OFF -> draw NOTHING. Those two cases used to collapse into the
+    // same empty array, which made this branch unreachable and left five phantom columns claiming
+    // coverage that is not running. Keep `enabled` optional for exactly this reason.
+    guard let on = s.enabled else { return [.alpr, .drone, .bodyCam, .tracker, .glasses] }
+    let set = Set(on)
+    return DetCat.allCases.filter { set.contains($0.rawValue) }
 }
 
 /// Dynamic Island slots go to whichever buckets are actually firing: leading and
@@ -70,7 +96,7 @@ private enum DetCat: CaseIterable {
 private func rankedCats(_ s: DetectionActivityAttributes.DetectionState) -> [DetCat] {
     // Imperative on purpose: the chained tuple map/sort was too much for the type-checker.
     var live: [(idx: Int, cat: DetCat, n: Int)] = []
-    for (idx, cat) in DetCat.allCases.enumerated() {
+    for (idx, cat) in visibleCats(s).enumerated() {
         let n = cat.count(s)
         if n > 0 { live.append((idx: idx, cat: cat, n: n)) }
     }
@@ -78,7 +104,7 @@ private func rankedCats(_ s: DetectionActivityAttributes.DetectionState) -> [Det
         if a.n != b.n { return a.n > b.n }
         return a.idx < b.idx
     }
-    if live.isEmpty { return Array(DetCat.allCases.prefix(3)) }
+    if live.isEmpty { return Array(visibleCats(s).prefix(3)) }   // all-zero: first three ENABLED, not first three defined
     return live.map { $0.cat }
 }
 
@@ -132,7 +158,13 @@ struct DetectionLiveActivity: Widget {
                         if ranked.count > 2 { StatBadge(cat: ranked[2], state: s) }
                         Spacer(minLength: 4)
                         Group {
-                            if s.total > 0 {
+                            if s.enabled?.isEmpty == true {
+                                Text("all detectors off").foregroundStyle(.secondary)
+                            } else if s.total > 0 && s.lastKind.isEmpty {
+                                // Nonzero total with no LIVE lastKind (post-relaunch, offline replay): say how
+                                // many, never "no detections" over real hits.
+                                Text("\(s.total) seen").foregroundStyle(.secondary)
+                            } else if s.total > 0 {
                                 Text("last \(s.lastKind) ").foregroundStyle(.secondary)
                                 + Text(s.lastSeen, style: .relative).foregroundStyle(.secondary)
                                 + Text(" ago").foregroundStyle(.secondary)
@@ -202,7 +234,13 @@ private struct SmallCell: View {
 
     private var stateLabel: String {
         guard state.connected else { return "reconnecting" }
+        // All detectors off is not "no detections", it is "not looking". Saying the former over an
+        // explicitly empty enabled-set is the same lie the phantom columns were.
+        if state.enabled?.isEmpty == true { return "all detectors off" }
         guard state.total > 0 else { return "no detections" }
+        // Nonzero total but no LIVE lastKind (post-relaunch, or an offline replay whose rows count
+        // but never set the live pointer): say how many, never "no detections" over real hits.
+        guard !state.lastKind.isEmpty else { return "\(state.total) seen" }
         return "last · \(state.lastKind.lowercased())"
     }
 }
@@ -246,13 +284,23 @@ private struct LockScreenView: View {
                 .padding(.vertical, 6)
             } else {
                 HStack(spacing: 8) {
-                    ForEach(DetCat.allCases, id: \.self) { StatTile(cat: $0, state: state) }
+                    // An explicit empty set means EVERY detector is off. Rendering nothing there
+                    // reads as a broken widget; say it, matching Android's breakdownOf().
+                    let cats = visibleCats(state)
+                    if cats.isEmpty {
+                        Text("all detectors off")
+                            .font(WidgetTheme.mono(10)).foregroundStyle(.white.opacity(0.5))
+                    } else {
+                        ForEach(cats, id: \.self) { StatTile(cat: $0, state: state) }
+                    }
                 }
                 HStack(spacing: 4) {
                     Text(deviceName).font(WidgetTheme.mono(9.5)).foregroundStyle(.white.opacity(0.33)).lineLimit(1)
                     Spacer(minLength: 6)
                     Group {
-                        if state.total > 0 {
+                        if state.total > 0 && state.lastKind.isEmpty {
+                            Text("\(state.total) seen")
+                        } else if state.total > 0 {
                             Text("last \(state.lastKind) ")
                             + Text(state.lastSeen, style: .relative)
                             + Text(" ago")

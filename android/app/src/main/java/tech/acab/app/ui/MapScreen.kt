@@ -80,6 +80,7 @@ import tech.acab.app.model.DeviceType
 import tech.acab.app.model.validCoord
 import tech.acab.app.net.AlprStore
 import tech.acab.app.ui.theme.Acab
+import tech.acab.app.model.displayName
 
 /** AND-PERF-1: hard cap on detection overlays drawn in one viewport rebuild, so a huge log
  *  can't rebuild thousands of markers on every ~3 Hz emission. */
@@ -238,9 +239,6 @@ fun MapScreen(
     var zoomedOutTooFar by remember { mutableStateOf(false) }
     var emptyDismissed by remember { mutableStateOf(false) }   // R12: matches iOS dismissible empty banner
 
-    // osmdroid setup (user agent + bounded tile cache) must land before the first tile fetch.
-    remember { configureOsmdroid(context) }
-
     // One pass per publish, not per recomposition: mapCoord takes storeLock per row, so the
     // up-to-FEED_CAP filter must not re-run for every chip tap or legend toggle. Counts are a
     // single grouped pass instead of one O(n) scan per category chip.
@@ -262,6 +260,12 @@ fun MapScreen(
         AndroidView(
             modifier = Modifier.fillMaxSize(),
             factory = { ctx ->
+                // osmdroid setup (user agent + bounded tile cache) MUST land before the first tile
+                // fetch, and the factory is the last point before MapView is constructed. It used
+                // to sit in a remember{} in composition, which lint flags as a side effect in
+                // remember (it is: remember is for caching, not for running things). Idempotent
+                // via compareAndSet, so calling it per factory is free.
+                configureOsmdroid(ctx)
                 MapView(ctx).apply {
                     setTileSource(TileSourceFactory.MAPNIK)
                     // F17/R4: MAPNIK tiles are light; the one shared dark-tile filter (defined in
@@ -777,8 +781,13 @@ fun MapScreen(
                         CatGlyph(d.type, size = 30)
                         Spacer(Modifier.size(10.dp))
                         Column(Modifier.weight(1f)) {
-                            Text(d.type.category, color = Acab.text, fontSize = 13.sp,
-                                fontWeight = FontWeight.Medium)
+                            // displayName, not the raw category. This sheet rendered the bare
+                            // UPPERCASE category for every member, so it discarded real
+                            // advertised names even before makers existed, and iOS has always
+                            // reused the whole DetectionRow here. Without this the map sheet
+                            // would say "CAMERA" while the log two taps away says "Hikvision".
+                            Text(d.displayName, color = Acab.text, fontSize = 13.sp,
+                                fontWeight = FontWeight.Medium, maxLines = 1)
                             Text("NODE ${d.mac.replace(":", "").takeLast(4).uppercase()}",
                                 color = Acab.dim, fontSize = 10.sp, fontFamily = Acab.mono)
                         }

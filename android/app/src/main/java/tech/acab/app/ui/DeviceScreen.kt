@@ -46,12 +46,12 @@ import androidx.compose.material.icons.filled.Landscape
 import androidx.compose.material.icons.filled.Lightbulb
 import androidx.compose.material.icons.filled.Memory
 import androidx.compose.material.icons.filled.Notifications
+import androidx.compose.material.icons.filled.PhoneAndroid
 import androidx.compose.material.icons.filled.Radar
 import androidx.compose.material.icons.filled.Refresh
 import androidx.compose.material.icons.filled.SettingsInputAntenna
 import androidx.compose.material.icons.filled.Star
 import androidx.compose.material.icons.filled.WarningAmber
-import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
@@ -61,7 +61,6 @@ import androidx.compose.material3.SliderDefaults
 import androidx.compose.material3.Switch
 import androidx.compose.material3.SwitchDefaults
 import androidx.compose.material3.Text
-import androidx.compose.ui.draw.clip
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
@@ -76,32 +75,35 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.alpha
+import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalView
-import androidx.core.content.ContextCompat
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import androidx.core.content.ContextCompat
+import kotlin.math.roundToInt
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.launch
 import tech.acab.app.ble.AcabBleManager
 import tech.acab.app.ble.AlertMode
 import tech.acab.app.ble.CombinedUpdatePhase
 import tech.acab.app.ble.CombinedUpdateProgress
+import tech.acab.app.ble.DetectionNotifier
 import tech.acab.app.model.DeviceType
 import tech.acab.app.net.FirmwareBuild
 import tech.acab.app.net.FirmwareManifest
-import kotlin.math.roundToInt
 import tech.acab.app.ui.theme.Acab
 import tech.acab.app.ui.theme.tone
-import kotlinx.coroutines.delay
-import kotlinx.coroutines.launch
 
 /** Latest published beacon-board firmware; last-resort offline fallback for an unrecognized
  *  board label (known boards read their per-board version from the manifest). Bump on release. */
-private const val LATEST = "2.0.0"
+private const val LATEST = "2.0.2"
 
 /** Which config drawer section is open. Exactly one at a time (proposal 1g). */
-private enum class ConfigSection { NONE, FIRMWARE, RADIOS, DETECTORS, ALERTS, DRIVE, DESERT, LED }
+private enum class ConfigSection { NONE, FIRMWARE, RADIOS, DETECTORS, ALERTS, NOTIFY, DRIVE, DESERT, LED }
 
 /**
  * True only when [installed] is a strictly OLDER version than [latest], compared numerically
@@ -146,6 +148,17 @@ fun DeviceScreen(ble: AcabBleManager) {
     val notifLauncher = rememberLauncherForActivityResult(
         ActivityResultContracts.RequestPermission(),
     ) { granted -> notifGranted = granted || hasNotifPermission(context) }
+
+    /** Phone-notification toggles mirrored into state so the switches animate. The source of truth
+     *  is DetectionNotifier's prefs; keyed by DeviceType.raw. */
+    var notifyOn by remember { mutableStateOf(mapOf<Int, Boolean>()) }
+    /** Ask on the FIRST enable, with obvious context, rather than at launch. Reuses the same
+     *  POST_NOTIFICATIONS launcher Drive mode already owns: one permission, one request path. */
+    val askPostPermission: () -> Unit = {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU && !notifGranted) {
+            notifLauncher.launch(Manifest.permission.POST_NOTIFICATIONS)
+        }
+    }
 
     // Keep a local copy of each toggle so flipping one sticks until the next status
     // frame, instead of snapping back to the old value mid-write. Each toggle also
@@ -270,6 +283,10 @@ fun DeviceScreen(ble: AcabBleManager) {
         AlertMode.VIBRATE -> "VIBRATE · PHONE BUZZES"
         AlertMode.SILENT -> "SILENT"
     }
+    // "3 ON" / "OFF", so the collapsed row says whether anything will interrupt you.
+    val notifyKicker = DetectionNotifier.NOTIFIABLE.count {
+        notifyOn[it.raw] ?: DetectionNotifier.isEnabled(context, it)
+    }.let { if (it == 0) "OFF" else "$it ON" }
     val driveKicker = "COUNTER ${if (driveMode) "ON" else "OFF"} · LOCK SCREEN ${if (redactLock) "HIDDEN" else "SHOWN"}"
     val desertBufKicker = when {
         desertOn && bufferOn -> "BOTH ON"
@@ -585,6 +602,37 @@ fun DeviceScreen(ble: AcabBleManager) {
                         }
                         HorizontalDivider(color = Acab.line)
                     }
+                    // NOT gated on isMeshDetect, unlike Alerts: these are PHONE notifications, so
+                    // they work the same on a board with no buzzer, which is where they matter most.
+                    FoldRow(Icons.Filled.PhoneAndroid, "Notifications", notifyKicker,
+                        openSection == ConfigSection.NOTIFY, { toggleSection(ConfigSection.NOTIFY) }) {
+                        NotifyCard(
+                            isOn = { t -> notifyOn[t.raw] ?: DetectionNotifier.isEnabled(context, t) },
+                            muted = DetectionNotifier.mutedBySystem(context),
+                            detectorOff = { t ->
+                                // false when no status yet (do not cry wolf) and for WATCHED,
+                                // which has no detector switch: the watchlist is always live.
+                                status?.let { st ->
+                                    when (t) {
+                                        DeviceType.FLOCK_CAMERA, DeviceType.FLOCK_RAVEN -> !st.flock
+                                        DeviceType.DRONE -> !st.drone
+                                        DeviceType.BODY_CAM -> !st.bodyCam
+                                        DeviceType.TRACKER -> !st.tracker
+                                        DeviceType.GLASSES -> !st.glasses
+                                        DeviceType.NETWORK_CAMERA -> !st.ncam
+                                        else -> false
+                                    }
+                                } ?: false
+                            },
+                            onChange = { t, on ->
+                                notifyOn = notifyOn + (t.raw to on)
+                                DetectionNotifier.setEnabled(context, t, on)
+                                // Ask on the FIRST enable, with obvious context, rather than at launch.
+                                if (on) askPostPermission()
+                            },
+                        )
+                    }
+                    HorizontalDivider(color = Acab.line)
                     // Board LED sits with Alerts (both are local feedback), above the situational modes.
                     FoldRow(Icons.Filled.Lightbulb, "Board LED", ledKicker,
                         openSection == ConfigSection.LED, { toggleSection(ConfigSection.LED) }, ledContent)
@@ -1228,6 +1276,62 @@ private fun CardButton(label: String, tint: Color = Acab.accent, filled: Boolean
  * lives in DeviceScreen (with its pending-echo hold), so a status frame mid-drag can't snap
  * the thumb; dragging only repaints, one write on release.
  */
+/** Per-category phone notifications. A SEPARATE card from ALERTS on purpose: ALERTS picks how the
+ *  BOARD behaves, this picks what is worth interrupting you for on the PHONE. Folding them together
+ *  would imply a dependency that does not exist. Mirrors iOS notifyCard. */
+@Composable
+private fun NotifyCard(
+    isOn: (DeviceType) -> Boolean,
+    muted: Boolean,
+    detectorOff: (DeviceType) -> Boolean,
+    onChange: (DeviceType, Boolean) -> Unit,
+) {
+    Column(Modifier.fillMaxWidth().panel(), verticalArrangement = Arrangement.spacedBy(14.dp)) {
+        Kicker("PHONE NOTIFICATIONS")
+        if (muted) {
+            // A green toggle over a dead feature is the worst outcome here: the user believes they
+            // are covered. Say it plainly instead.
+            Text(
+                "Android is blocking these. Turn notifications on for beacons in Settings, or nothing here will arrive.",
+                color = Acab.warn, fontSize = 11.sp, fontFamily = Acab.mono, lineHeight = 16.sp,
+            )
+        }
+        Text(
+            "Pick what's worth a notification. Every category is off until you turn it on, and Android asks permission the first time you do.",
+            color = Acab.faint, fontSize = 11.sp, fontFamily = Acab.mono, lineHeight = 16.sp,
+        )
+        DetectionNotifier.NOTIFIABLE.forEach { t ->
+            val on = isOn(t)
+            ToggleRow(t.label, notifySubtitle(t), on, exp = t.isExperimental) { onChange(t, it) }
+            // A notification for a detector the BOARD is not running can never fire. Left unsaid,
+            // that is the worst kind of dead switch: it reads as coverage. Only shown once the
+            // toggle is on, so the card is not a wall of warnings.
+            if (on && detectorOff(t)) {
+                Text(
+                    "the ${t.label.lowercase()} detector is off, so this won't fire. turn it on under Detectors.",
+                    color = Acab.warn, fontSize = 10.sp, fontFamily = Acab.mono, lineHeight = 14.sp,
+                )
+            }
+        }
+        Text(
+            "The same device won't notify again for ten minutes, so one camera can't keep buzzing you. Ignored devices never notify at all.",
+            color = Acab.faint, fontSize = 11.sp, fontFamily = Acab.mono, lineHeight = 16.sp,
+        )
+    }
+}
+
+/** Mirrors iOS SettingsView.notifySubtitle word for word. */
+private fun notifySubtitle(t: DeviceType): String = when (t) {
+    DeviceType.FLOCK_CAMERA -> "plate readers"
+    DeviceType.BODY_CAM -> "worn cameras"
+    DeviceType.GLASSES -> "camera glasses"
+    DeviceType.NETWORK_CAMERA -> "cameras on nearby wifi"
+    DeviceType.DRONE -> "remote ID broadcasts"
+    DeviceType.TRACKER -> "separated AirTag \u00B7 Tile \u00B7 SmartTag"
+    DeviceType.WATCHED -> "devices you starred"
+    else -> ""
+}
+
 @Composable
 private fun BuzzerCard(
     mode: AlertMode,

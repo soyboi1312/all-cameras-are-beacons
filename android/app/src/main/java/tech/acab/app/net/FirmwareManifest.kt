@@ -183,19 +183,19 @@ class FirmwareManifest private constructor(context: Context) {
             updated = "",
             builds = mapOf(
                 "beacon board" to FirmwareBuild(
-                    version = "2.0.0", ota = false, appUrl = "", sha256 = "", size = 0L, sig = "",
+                    version = "2.0.2", ota = false, appUrl = "", sha256 = "", size = 0L, sig = "",
                     flasher = "https://soyboi.tech/flash.html", notes = "",
                 ),
                 "ACAB-ouispy" to FirmwareBuild(
-                    version = "2.0.0", ota = false, appUrl = "", sha256 = "", size = 0L, sig = "",
+                    version = "2.0.2", ota = false, appUrl = "", sha256 = "", size = 0L, sig = "",
                     flasher = "https://soyboi1312.github.io/all-cameras-are-beacons/", notes = "",
                 ),
                 "mesh-detect-ACAB" to FirmwareBuild(
-                    version = "2.0.0", ota = false, appUrl = "", sha256 = "", size = 0L, sig = "",
+                    version = "2.0.2", ota = false, appUrl = "", sha256 = "", size = 0L, sig = "",
                     flasher = "https://soyboi1312.github.io/all-cameras-are-beacons/", notes = "",
                 ),
                 "mesh-detect-ACAB-ch1" to FirmwareBuild(
-                    version = "2.0.0", ota = false, appUrl = "", sha256 = "", size = 0L, sig = "",
+                    version = "2.0.2", ota = false, appUrl = "", sha256 = "", size = 0L, sig = "",
                     flasher = "https://soyboi1312.github.io/all-cameras-are-beacons/", notes = "",
                 ),
             ),

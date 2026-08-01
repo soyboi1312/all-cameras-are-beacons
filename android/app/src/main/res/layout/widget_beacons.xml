@@ -231,8 +231,11 @@
         </LinearLayout>
     </LinearLayout>
 
-    <!-- Spacer pushes the last-seen line to the bottom edge. -->
-    <View
+    <!-- Spacer pushes the last-seen line to the bottom edge. FrameLayout, NOT View: RemoteViews
+         only inflates an allowlisted set of classes and a bare View is not in it, so the widget
+         threw at inflate time on some launchers. FrameLayout is allowlisted and an empty weighted
+         one is the same spacer. -->
+    <FrameLayout
         android:layout_width="match_parent"
         android:layout_height="0dp"
         android:layout_weight="1" />

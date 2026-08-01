@@ -79,6 +79,7 @@ import java.util.ArrayDeque
 import java.util.zip.CRC32
 import javax.crypto.KeyGenerator
 import javax.crypto.SecretKey
+import tech.acab.app.model.maker
 
 enum class ConnState { DISCONNECTED, SCANNING, CONNECTING, BONDING, READY, POWERED_OFF }
 
@@ -289,6 +290,9 @@ class AcabBleManager(private val context: Context) {
 
     // Hide detection counts on the lock-screen notification (user setting, default on). The
     // shade (unlocked) and the app still show the full breakdown. Loaded from prefs in init.
+    /** Per-category phone notifications (see DetectionNotifier). Independent of alertMode. */
+    val notifier = DetectionNotifier(context)
+
     private val _redactLockScreen = MutableStateFlow(true)
     val redactLockScreen: StateFlow<Boolean> = _redactLockScreen.asStateFlow()
 
@@ -1367,6 +1371,7 @@ class AcabBleManager(private val context: Context) {
         startStatusPolling()
         sendIgnoreList()   // re-push the whitelist for this session
         sendWatchList()    // then the watchlist (ordered right after the ignore push, like iOS)
+        buzzerReassertAttempts = 0                       // fresh link: first status frame is pre-write
         setBuzzer(_alertMode.value == AlertMode.BUZZER)   // a fresh board boots with the buzzer on; sync it to the phone's mode
         // Board just connected: make sure the firmware manifest is current so the update nudge
         // and OTA gate reflect the latest published build. Non-blocking; no-ops if cache is fresh.
@@ -1956,6 +1961,7 @@ class AcabBleManager(private val context: Context) {
             AcabProfile.STATUS -> {
                 val s = DeviceStatus.fromJson(json)
                 _status.value = s
+                reconcileBuzzer(s)
                 // Reconcile the whitelist: if the board reports fewer ignore entries than we
                 // hold (a reboot dropped them, say), re-push so the two converge.
                 // Reconcile against what the board CAN hold, never against our raw size: the
@@ -2126,6 +2132,16 @@ class AcabBleManager(private val context: Context) {
         // The only thing that puts a live session on disk. See checkpointDetections.
         checkpointDetections()
         if (_alertMode.value == AlertMode.VIBRATE && firstTime && !focusSuppressed()) alertHaptic(d.type)   // buzz on the first sighting, unless DND/Focus is on
+        // Phone notification, per category, opt-in. INDEPENDENT of alertMode: that governs the
+        // board buzzer, and a silent board is not a silent phone. Ignored devices are dropped
+        // before this point so they can never notify.
+        //
+        // NOT gated on `firstTime`, deliberately: that is `store[d.id] == null` and the store is
+        // PERSISTED across launches, so a device seen in any earlier session was never first again
+        // and could never notify. The notifier owns the dedup via its per-device cooldown.
+        if (!d.hist && DetectionNotifier.anyEnabled(context)) {
+            notifier.notifyIfNeeded(d, _redactLockScreen.value)
+        }
     }
 
     /** A replayed history record. Use the board's recorded timestamp when it has one;
@@ -2601,6 +2617,48 @@ class AcabBleManager(private val context: Context) {
 
     /** Pick how sightings get announced. VIBRATE and SILENT both mute the board's
      *  buzzer, for when a chirp would give you away; VIBRATE buzzes this phone instead. */
+    /** Re-assert attempts since the app and board last agreed on the buzzer. Reset on every fresh
+     *  connection so a stale value cannot skip the grace period. */
+    private var buzzerReassertAttempts = 0
+
+    /** Reconcile the alert mode against what the board actually reports.
+     *
+     *  THE BUG (reported 2026-07-31): Desert mode on then off left the app showing sound ON while
+     *  the board stayed silent. The alert mode was optimistic local state, asserted once on connect
+     *  but never reconciled against the per-status `buzzer` the board already reports, so any lost
+     *  config write left the two diverged with nothing to heal it. setDesertMode is the only path
+     *  firing TWO config writes back to back, which is where a drop shows up.
+     *
+     *  THREE THINGS THE FIRST VERSION GOT WRONG, found in re-review:
+     *   1. Mesh-Detect has NO buzzer hardware (weak `alertsBuzzerEnabled()` stub returns false
+     *      forever, buzzer writes discarded), so want(true) != report(false) never converged and
+     *      this wrote SILENT into the SHARED prefs file, muting the user's real beacon board on its
+     *      next connect. Hence the isMeshDetect bail.
+     *   2. It collapsed three modes onto a Bool and could only write back BUZZER or SILENT, so a
+     *      VIBRATE user could be silently promoted to BUZZER: an audible board for someone who
+     *      chose a quiet one. When the board is audible and the user wanted quiet, keep trying to
+     *      MUTE. Erring quiet is the only safe direction on this product.
+     *   3. The correction was persisted, so one transient fault could rewrite a stored preference.
+     *      It is now in-memory for the session.
+     *  Mirrors iOS reconcileBuzzer() branch for branch. */
+    private fun reconcileBuzzer(s: DeviceStatus) {
+        if (s.isMeshDetect) { buzzerReassertAttempts = 0; return }   // no buzzer to reconcile
+
+        val wantBuzzer = _alertMode.value == AlertMode.BUZZER
+        if (wantBuzzer == s.buzzer) { buzzerReassertAttempts = 0; return }
+
+        if (buzzerReassertAttempts < MAX_BUZZER_REASSERTS) {
+            buzzerReassertAttempts++
+            setBuzzer(wantBuzzer)          // most likely a dropped write; say it again
+            return
+        }
+        // Only correct the mode where the mapping is LOSSLESS: we claim sound, board is muted.
+        // In-memory only, so a transient fault cannot rewrite the stored preference.
+        if (wantBuzzer) _alertMode.value = AlertMode.SILENT
+        // Otherwise the board is audible while the user chose VIBRATE or SILENT: leave the mode
+        // alone (both are honest about what the PHONE does) and stop writing.
+    }
+
     fun setAlertMode(mode: AlertMode) {
         _alertMode.value = mode
         prefs.edit().putString("alertMode", mode.name).apply()
@@ -2744,6 +2802,7 @@ class AcabBleManager(private val context: Context) {
 
     /** Drop every filed detection from memory and republish. Does NOT touch the on-disk log. */
     private fun resetInMemoryLog() {
+        notifier.reset()   // a new session may alert on the same devices again (iOS parity)
         // Called from main, unlike the rest of the store's mutations. See storeLock.
         synchronized(storeLock) {
             // The store and every per-device side map, off the one list, so a map added later
@@ -2791,7 +2850,11 @@ class AcabBleManager(private val context: Context) {
      *  or blank if we didn't have one. */
     fun detectionsCsv(): String {
         val rows = StringBuilder(
-            "detected_at,time_basis,time_precision_s,type,mac,rssi,source,matched_on,confidence,sightings,approx_lat,approx_lon,company_id,uas_id,drone_lat,drone_lon,altitude_m,speed_ms,heading_deg,height_agl_m,operator_lat,operator_lon,operator_alt_m,rid_status")
+            // `maker` is appended LAST so an existing parser keyed on column order still reads
+            // every field it knew about. Byte-identical to iOS's, which is why it moves in the
+            // same commit or not at all: the UI now names a manufacturer, and the evidence file
+            // has to be able to say the same thing.
+            "detected_at,time_basis,time_precision_s,type,mac,rssi,source,matched_on,confidence,sightings,approx_lat,approx_lon,company_id,uas_id,drone_lat,drone_lon,altitude_m,speed_ms,heading_deg,height_agl_m,operator_lat,operator_lon,operator_alt_m,rid_status,maker")
         fun iStr(v: Int?): String = v?.toString() ?: ""
         // Export the full store (newest first), not the bounded live feed, so nothing is lost.
         // Snapshot the values under storeLock so the export can't collide with the BLE callback
@@ -2864,7 +2927,8 @@ class AcabBleManager(private val context: Context) {
                     d.count.toString(), lat, lon, d.companyIdHex ?: "",
                     csvSafe(d.rid ?: ""), dLat, dLon,
                     iStr(d.altitude), iStr(d.speedH), iStr(d.heading), iStr(d.heightAGL),
-                    opLat, opLon, iStr(d.pilotAlt), csvSafe(d.ridStatusLabel ?: "")).joinToString(","))
+                    opLat, opLon, iStr(d.pilotAlt), csvSafe(d.ridStatusLabel ?: ""),
+                    csvSafe(d.maker ?: "")).joinToString(","))
         }
         return rows.toString()
     }
@@ -3125,7 +3189,7 @@ class AcabBleManager(private val context: Context) {
             // "moto" is present so the tour shows the Motorola sub-toggle. Omitting it would make
             // the demo board look like pre-split firmware and hide the control the tour exists to
             // introduce. "axon":true so the parent category is on and the sub-row is not dimmed.
-            """{"fw":"beacon board 2.0.0","up":4920,"total":6,"ble":true,"wifi":true,"axon":true,"moto":true,"tracker":true,"glasses":true,"buzzer":true,"vol":70,"gps":true,"bat":82}"""))
+            """{"fw":"beacon board 2.0.2","up":4920,"total":6,"ble":true,"wifi":true,"axon":true,"moto":true,"tracker":true,"glasses":true,"buzzer":true,"vol":70,"gps":true,"bat":82}"""))
         _state.value = ConnState.READY
         // placeDemoDetections clears + repopulates the same maps the async startup reload fills, so
         // wait for that reload before seeding, to avoid a concurrent mutation of the non-synchronized
@@ -3153,10 +3217,15 @@ class AcabBleManager(private val context: Context) {
             """{"t":4,"s":2,"meth":7,"c":99,"mac":"DA:7E:E0:44:21:09","rssi":-61,"id":"1581F4FED0A2B7","lat":37.7816,"lon":-122.4169,"plat":37.7821,"plon":-122.4151,"alt":84,"n":1,"new":true}""",
             """{"t":3,"s":0,"meth":3,"c":45,"mac":"A0:0F:11:BA:7C:33","rssi":-88,"n":1}""",
             """{"t":5,"s":0,"meth":3,"c":85,"mac":"4C:00:12:19:AA:BB","rssi":-72,"det":"Apple Find My (offline)","cid":76,"lat":37.7791,"lon":-122.4196,"n":3}""",
-            """{"t":9,"s":0,"meth":3,"c":60,"mac":"5A:2E:7C:41:08:D3","rssi":-69,"det":"Meta Platforms Technologies, possible recording glasses. May be a Meta Quest headset.","cid":1422,"lat":37.7804,"lon":-122.4181,"n":2,"new":true}""",
+            // VERBATIM from glasses_signatures.h. These seeds must carry the firmware's real
+            // strings, not a prettified paraphrase: `maker` parses them, so a paraphrase would
+            // demo the OLD behaviour (a row reading "Recording glasses") while real hardware
+            // shows the new one. This one resolves to "Meta".
+            """{"t":9,"s":0,"meth":3,"c":60,"mac":"5A:2E:7C:41:08:D3","rssi":-69,"det":"Meta: possible recording glasses or Quest","cid":1422,"lat":37.7804,"lon":-122.4181,"n":2,"new":true}""",
             // Branded IP-camera OUI seen on the host WiFi (matched by source MAC), so the NETCAM
-            // tile and NETWORK CAM map chip both show up on the tour.
-            """{"t":10,"s":0,"meth":1,"c":80,"mac":"44:19:B6:22:0A:5C","rssi":-70,"det":"Hikvision · IP camera on the local network","lat":37.7788,"lon":-122.4183,"n":2,"new":true}""",
+            // tile and NETWORK CAM map chip both show up on the tour. The MAC is a real Hikvision
+            // block, so this row demonstrates the maker-led title end to end.
+            """{"t":10,"s":0,"meth":1,"c":80,"mac":"44:19:B6:22:0A:5C","rssi":-70,"det":"Hikvision on wifi","lat":37.7788,"lon":-122.4183,"n":2,"new":true}""",
         )
         val now = System.currentTimeMillis()
         val wobble = listOf(-6, -3, -7, -1, -4, 2, -2, 1, -3, 0, -1, 1, -2, 0)
@@ -3623,6 +3692,9 @@ class AcabBleManager(private val context: Context) {
         // How often to READ the Status characteristic as a notify fallback while connected. A big
         // status frame skipped as a notify under a small MTU stays fresh via this read.
         private const val STATUS_POLL_MS = 5_000L
+        /** Buzzer re-assert attempts before the reconciler stops writing (see reconcileBuzzer).
+         *  Matches iOS BLEManager.maxBuzzerReasserts. */
+        private const val MAX_BUZZER_REASSERTS = 3
         // Max MACs per ignore/watch config write. 20 MACs (~17 chars each) plus the JSON envelope
         // and the "more" flag stays well under the 512 B ATT write cap; a >24-entry single write
         // would exceed it and be rejected. Apps split into these chunks; the board stages each

@@ -38,15 +38,19 @@ enum class DeviceType(val raw: Int) {
             UNKNOWN      -> "Unknown"
         }
 
-    /** True for the buckets the drive-mode notification speaks: the five counters plus a
-     *  starred device (a star pinging the drive surface is the point of starring). Desert-mode
-     *  NEARBY and opt-in NETWORK_CAMERA rows fill no bucket, so letting them set the "last ..."
-     *  line would name a category the surface never lists. Mirrors DeviceType.onDriveSurface on
-     *  iOS. The home widget is separate state and keeps all six categories. */
+    /** True for the buckets the drive-mode notification speaks: the six counters plus a
+     *  starred device (a star pinging the drive surface is the point of starring).
+     *
+     *  NETWORK_CAMERA joined 2026-07-31. It was excluded because the surface listed a fixed five
+     *  and letting it set the "last ..." line would have named a category with no row. Now that
+     *  the breakdown is driven by the board's toggles, network cameras get a row exactly when
+     *  the opt-in is on, so the reason no longer holds. Desert-mode NEARBY still fills no bucket
+     *  and would make "last ..." meaningless. Mirrors iOS DeviceType.onDriveSurface. */
     val onDriveSurface: Boolean
         get() = when (this) {
-            FLOCK_CAMERA, FLOCK_RAVEN, DRONE, BODY_CAM, TRACKER, GLASSES, WATCHED -> true
-            NEARBY_DEVICE, NETWORK_CAMERA, UNKNOWN -> false
+            FLOCK_CAMERA, FLOCK_RAVEN, DRONE, BODY_CAM, TRACKER, GLASSES, WATCHED,
+            NETWORK_CAMERA -> true
+            NEARBY_DEVICE, UNKNOWN -> false
         }
 
     /** Coarse category; ALPR camera + Raven share one, like the iOS app. */
@@ -106,6 +110,41 @@ enum class DeviceType(val raw: Int) {
      *  field-validated against a visually confirmed scene. Keep this in step with the EXP
      *  counter in DeviceScreen and with iOS DeviceType.isExperimental. */
     val isExperimental: Boolean get() = this == GLASSES
+
+    /** The noun the "experimental detector" banner names, so it can never again describe a
+     *  category other than the one on screen. It hardcoded "Body-cam signatures" and kept
+     *  saying so after body cam graduated and isExperimental moved to GLASSES, putting a
+     *  body-cam warning on every glasses detection (seen in the field 2026-07-31). Mirrors
+     *  iOS DeviceType.experimentalNoun. */
+    val experimentalNoun: String
+        get() = when (this) {
+            GLASSES -> "Recording-glasses"
+            BODY_CAM -> "Body-cam"
+            NETWORK_CAMERA -> "Network-camera"
+            FLOCK_CAMERA, FLOCK_RAVEN -> "ALPR"
+            DRONE -> "Drone"
+            TRACKER -> "Tracker"
+            NEARBY_DEVICE, WATCHED, UNKNOWN -> "These"
+        }
+
+    /** First line of the "Confirm it" checklist: what to physically look for to verify THIS
+     *  kind of device. Was one hardcoded ALPR string ("pole-mounted camera, solar panel,
+     *  small antenna"), which is the wrong instruction on every other category and was
+     *  showing on glasses detections in the field 2026-07-31. A checklist naming the wrong
+     *  object is worse than none: it invites the user to confirm a false negative.
+     *  Mirrors iOS DeviceType.confirmPrompt word for word. */
+    val confirmPrompt: String
+        get() = when (this) {
+            FLOCK_CAMERA, FLOCK_RAVEN ->
+                "Look around, pole-mounted camera, solar panel, small antenna?"
+            BODY_CAM -> "Look around, anyone with a camera worn on the chest or shoulder?"
+            GLASSES -> "Look around, anyone in glasses with a lens or LED in the frame?"
+            NETWORK_CAMERA -> "Look around, a doorbell camera, or one under an eave or on a wall?"
+            DRONE -> "Look up, anything hovering or circling?"
+            TRACKER -> "Check your bag, pockets, and car for a tag that isn't yours."
+            NEARBY_DEVICE, WATCHED, UNKNOWN ->
+                "Look around, anything nearby that could be transmitting?"
+        }
 
     companion object {
         /** The retired police-gear wire type. Firmware <= v1.7 filed the Motorola/LE proxy

@@ -25,15 +25,92 @@ struct DetectionActivityAttributes: ActivityAttributes {
         var bodyCams: Int
         var trackers: Int
         var glasses: Int
+        var cameras: Int       // network cameras; only ever nonzero when the opt-in is on
         var lastKind: String   // "ALPR" / "DRONE" / "BODY CAM" / "TRACKER" / "GLASSES" / ""
         var lastSeen: Date
         var connected: Bool    // false -> show "Reconnecting…" instead of a frozen count
         var redact: Bool       // hide counts on the Lock Screen banner (user setting, default on)
 
-        var total: Int { alpr + drones + bodyCams + trackers + glasses }
+        /// WidgetCategory rawValues for the detectors the BOARD currently has switched on, or nil
+        /// when no status has arrived yet.
+        ///
+        /// OPTIONAL ON PURPOSE. A plain array cannot tell "no status yet" from "every detector is
+        /// off", and those need opposite handling: unknown falls back to the historical five so the
+        /// surface is never blank, while all-off must draw NOTHING, because five phantom columns
+        /// advertising coverage that is not running is the exact bug this whole change set exists
+        /// to fix. Collapsing them also left the headline total summing six buckets while the
+        /// fallback drew five.
+        ///
+        /// WHY (2026-07-31): the buckets used to be a fixed five, which made a "0" ambiguous in
+        /// the worst way. A zero under an ENABLED detector is real information ("watching, found
+        /// nothing"). A zero under a DISABLED one is a lie by omission: it implies coverage the
+        /// board is not providing. The user hit exactly this, reading GLASS 0 / TRACK 0 / BODY 0
+        /// on a drive where those detectors were off.
+        ///
+        /// Driving the columns off the board's own toggles fixes both, and dissolves the network
+        /// camera special case: it was hardcoded out because it is opt-in and "would dilute the
+        /// drive-mode buckets", but an opt-in category that only appears once you opt in dilutes
+        /// nothing. nil means "unknown" (no status yet) and falls back to the historical five;
+        /// [] means every detector is genuinely off and renders no columns at all.
+        var enabled: [String]?
+
+        /// Decoded with defaults so an activity STARTED BY A PREVIOUS BUILD still decodes.
+        /// ActivityKit hands back the ContentState it persisted; `cameras` and `enabled` were
+        /// added 2026-07-31, and synthesised Codable would have thrown `keyNotFound` on that
+        /// older payload, which is exactly the path adoptExisting() takes on launch. The result
+        /// would have been a live drive-mode activity the app could no longer adopt or end.
+        init(alpr: Int, drones: Int, bodyCams: Int, trackers: Int, glasses: Int, cameras: Int,
+             lastKind: String, lastSeen: Date, connected: Bool, redact: Bool, enabled: [String]?) {
+            self.alpr = alpr; self.drones = drones; self.bodyCams = bodyCams
+            self.trackers = trackers; self.glasses = glasses; self.cameras = cameras
+            self.lastKind = lastKind; self.lastSeen = lastSeen
+            self.connected = connected; self.redact = redact; self.enabled = enabled
+        }
+
+        init(from decoder: Decoder) throws {
+            let c = try decoder.container(keyedBy: CodingKeys.self)
+            alpr     = try c.decodeIfPresent(Int.self, forKey: .alpr) ?? 0
+            drones   = try c.decodeIfPresent(Int.self, forKey: .drones) ?? 0
+            bodyCams = try c.decodeIfPresent(Int.self, forKey: .bodyCams) ?? 0
+            trackers = try c.decodeIfPresent(Int.self, forKey: .trackers) ?? 0
+            glasses  = try c.decodeIfPresent(Int.self, forKey: .glasses) ?? 0
+            cameras  = try c.decodeIfPresent(Int.self, forKey: .cameras) ?? 0
+            lastKind = try c.decodeIfPresent(String.self, forKey: .lastKind) ?? ""
+            lastSeen = try c.decodeIfPresent(Date.self, forKey: .lastSeen) ?? Date()
+            connected = try c.decodeIfPresent(Bool.self, forKey: .connected) ?? true
+            redact   = try c.decodeIfPresent(Bool.self, forKey: .redact) ?? true
+            enabled  = try c.decodeIfPresent([String].self, forKey: .enabled)   // absent -> nil = unknown
+        }
+
+        /// Sum of the buckets actually RENDERED, not of every bucket counted.
+        ///
+        /// The columns follow `enabled`, so an unfiltered sum let the headline exceed the sum of
+        /// the visible tiles: a drive with the tracker detector off but tracker rows still in the
+        /// store showed "7" above columns adding to 4. Falls back to summing everything when
+        /// `enabled` is unknown, which is exactly when the UI also falls back to all five.
+        var total: Int {
+            // nil = no status yet. Sum exactly the FALLBACK column set (the historical five), not all
+            // six: the tiles fall back to five, so summing six here made the headline exceed the sum
+            // of what is drawn, which is the bug this property was introduced to fix.
+            guard let enabled else { return alpr + drones + bodyCams + trackers + glasses }
+            var n = 0
+            for key in enabled {
+                switch key {
+                case "ALPR":    n += alpr
+                case "DRONE":   n += drones
+                case "BODY":    n += bodyCams
+                case "TRACKER": n += trackers
+                case "GLASSES": n += glasses
+                case "CAMERA":  n += cameras
+                default:        break
+                }
+            }
+            return n
+        }
 
         static let empty = DetectionState(alpr: 0, drones: 0, bodyCams: 0, trackers: 0, glasses: 0,
-                                          lastKind: "", lastSeen: .now, connected: true, redact: true)
+                                          cameras: 0, lastKind: "", lastSeen: .now,
+                                          connected: true, redact: true, enabled: nil)
     }
 }
 
@@ -45,9 +122,11 @@ struct DetectionActivityAttributes: ActivityAttributes {
 /// detection type itself; the app does that mapping (DeviceType.widgetCategoryKey) and writes one
 /// scalar per key, and the widget reads them back by the same key.
 ///
-/// Six categories, matching the Status and Log screens rather than the five the Live Activity
-/// tracks. The Live Activity deliberately omits network cameras because they are opt-in and would
-/// dilute its drive-mode buckets; the widget mirrors what the app's own screens show instead.
+/// Six categories, matching the Status and Log screens. As of 2026-07-31 the Live Activity
+/// tracks the same six: it used to omit network cameras on the grounds that they are opt-in and
+/// "would dilute the drive-mode buckets", but now that the Live Activity renders only the
+/// detectors the board actually has ON (DetectionState.enabled), an opt-in category simply does
+/// not appear until you opt in, so there is nothing left to dilute.
 public enum WidgetCategory: String, CaseIterable {
     case alpr    = "ALPR"
     case drone   = "DRONE"

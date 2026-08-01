@@ -85,6 +85,8 @@ import tech.acab.app.model.validCoord
 import tech.acab.app.model.vendor
 import tech.acab.app.ui.theme.Acab
 import tech.acab.app.ui.theme.tone
+import tech.acab.app.model.maker
+import tech.acab.app.model.isChipsetRegistrant
 
 /** Detection dossier: top bar, title block, match-quality verdict (with a confirm-it
  *  checklist for weak hits), live RSSI + band, a slim stat pair, and an identity panel
@@ -164,11 +166,12 @@ fun DetailScreen(
                     BadgePill("${d.type.category.lowercase()} · ${d.type.classLabel}", tone)
                     Text("NODE ${nodeName(d.mac)}", color = Acab.text,
                         fontSize = 26.sp, fontWeight = FontWeight.SemiBold)
-                    // Deliberately d.vendor, NOT the OUI lookup: the OUI resolves a Flock
+                    // NEITHER branch may consult the OUI lookup: the OUI resolves a Flock
                     // Falcon to its Liteon WiFi module and would head the ALPR dossier with
                     // "Liteon" instead of "Flock Safety". The OUI reading still shows in the
-                    // identity panel below, where it is labelled as such.
-                    Text(d.vendor, color = Acab.dim,
+                    // identity panel below, where it is labelled as such. maker is null for
+                    // Flock, so the ALPR case is unaffected by the new first branch.
+                    Text(d.maker ?: d.vendor, color = Acab.dim,
                         fontSize = 11.sp, fontFamily = Acab.mono)
                 }
             }
@@ -176,8 +179,8 @@ fun DetailScreen(
             // ---- how good the match is: verdict, meter, plain-language explainer ----
             MatchQualityPanel(d)
 
-            // ---- heads-up that body-cam signatures aren't field-verified ----
-            if (d.type.isExperimental) ExperimentalNote()
+            // ---- heads-up that THIS category's signatures aren't field-verified ----
+            if (d.type.isExperimental) ExperimentalNote(d.type)
 
             // ---- signal: big RSSI + band + sparkline, dimmed if stale ----
             Column(Modifier.fillMaxWidth().panel(), verticalArrangement = Arrangement.spacedBy(12.dp)) {
@@ -242,8 +245,22 @@ fun DetailScreen(
                 Kicker("IDENTITY")
                 Spacer(Modifier.size(4.dp))
                 val rows = buildList {
-                    d.type.brand?.let { add("Brand" to it) }
-                    add("Vendor" to (d.ouiVendor ?: d.vendor))
+                    // TWO ROWS, NOT ONE. The old single "Vendor" row rendered a union of a real
+                    // IEEE registrant and a per-type constant, so it printed "Vendor: IP camera"
+                    // and "Vendor: Unknown vendor": the category restated under a label that
+                    // claims an identification the detector never made. Renaming it "Category"
+                    // would have been worse, not better, since the same row also holds "Liteon"
+                    // on a genuine Falcon and "Motorola Solutions" on a body cam.
+                    //
+                    // So: Maker = who built it (payload-derived, absorbing the old Brand row),
+                    // OUI vendor = who owns the MAC block, annotated when that is only the radio
+                    // module. When neither resolves NOTHING RENDERS, which is the actual fix.
+                    // Row-for-row identical to iOS DetectionDetailView.identityPanel.
+                    val mk = d.maker ?: d.type.brand
+                    mk?.let { add("Maker" to it) }
+                    d.ouiVendor?.takeIf { it != mk }?.let {
+                        add("OUI vendor" to if (isChipsetRegistrant(it)) "$it · chipset" else it)
+                    }
                     d.companyIdText?.let { add("Company ID" to it) }
                     add("Identifier" to d.mac)
                     add(FIRST_SEEN_LABEL to firstSeenText)
@@ -265,7 +282,16 @@ fun DetailScreen(
                     })
                     d.name?.takeIf { it.isNotEmpty() }?.let { add("Name" to it) }
                     d.rid?.takeIf { it.isNotEmpty() }?.let { add("UAS ID" to it) }
-                    d.ridManufacturer?.let { add("Manufacturer" to it) }
+                    // No separate "Manufacturer" row: maker's step 2 IS ridManufacturer, so it
+                    // now renders as Maker above. Keeping both printed the same company twice,
+                    // rows apart, under two different labels.
+                    //
+                    // The Detail row stays VERBATIM and is load-bearing, not decoration. Every
+                    // hedge the firmware authors wrote lives only here now that maker parses the
+                    // same string: " on wifi" (a device on the network, not necessarily a camera
+                    // pointed at you), "(offline)" (a separated tag, NOT buffer replay), "or
+                    // Quest" (glasses_signatures.h says that caveat must be present), and "gear,
+                    // no Remote ID" (may be a controller, not an aircraft). Do not condense it.
                     d.detail?.takeIf { it.isNotEmpty() }?.let { add("Detail" to it) }
                     // Numeric lat/lon alongside the mini-map: the coordinates are the actionable
                     // datum in an evidence export, and the operator (pilot) fix is the whole point
@@ -400,11 +426,14 @@ private fun MatchQualityPanel(d: Detection) {
 private fun MethodChip(d: Detection) {
     val amber = d.isOuiMatch
     val label = when {
-        // A body-cam OUI is the maker's OWN registered block (Axon, Utility, Motorola
-        // Solutions), not a chipset shared with unrelated gear, so "chipset only" would
-        // understate what we know. What's uncertain is which of the vendor's products
-        // this is, which is why it keeps the amber weak-match treatment.
-        d.method == 1 && d.bodyCamSigDetail != null -> "OUI · VENDOR ONLY"
+        // Some OUI hits land on the maker's OWN registered block (Axon, Utility, Motorola
+        // Solutions, and every camera brand in netcam_signatures.h), not a chipset shared
+        // with unrelated gear, so "chipset only" would understate what we know. What's
+        // uncertain is which of the vendor's products this is, which is why it keeps the
+        // amber weak-match treatment. Keyed on `maker` rather than bodyCamSigDetail so
+        // network cameras stop sitting on the wrong side of this exact distinction, and so
+        // this stops being a THIRD hardcoded copy of the body-cam wire contract.
+        d.method == 1 && d.maker != null -> "OUI · VENDOR ONLY"
         d.method == 1 -> "OUI · CHIPSET ONLY"
         d.method == 2 -> "NAME MATCH"
         else -> d.methodLabel.lowercase()   // "manufacturer id", "service uuid", ... like iOS
@@ -472,7 +501,19 @@ private fun plainMatchLine(d: Detection): AnnotatedString = buildAnnotatedString
         return@buildAnnotatedString
     }
     when (d.method) {
-        1 -> {   // OUI: only the chipset vendor matched, the false-positive-prone case
+        1 -> {   // OUI: one of two very different things, and the copy has to say which
+            // When `maker` resolved, the block is the MAKER'S OWN registration (Hikvision's
+            // 44:19:B6, Axon's 00:25:DF), so the old "only the radio chipset matched" line was
+            // flatly false, and would have contradicted a row now titled "Hikvision" on the same
+            // screen. What stays open is which of that maker's products this is.
+            val mk = d.maker
+            if (mk != null) {
+                append("Matched ")
+                withStyle(SpanStyle(fontWeight = FontWeight.Bold)) { append(mk) }
+                append("'s own registered MAC block. That names the maker, not which of their products this is.")
+                return@buildAnnotatedString
+            }
+            // No maker: the block really does name a chipset vendor, the false-positive-prone case.
             val isFlock = d.type == DeviceType.FLOCK_CAMERA || d.type == DeviceType.FLOCK_RAVEN
             val part = if (isFlock) "a part Flock shares with routers and home cameras"
                        else "a part shared with routers and home cameras"
@@ -547,7 +588,7 @@ private fun ConfirmItPanel(d: Detection, firstSeen: Long?, watched: Boolean, onW
     var secondPass by remember(d.id) { mutableStateOf(false) }
     Column(Modifier.fillMaxWidth().panel(), verticalArrangement = Arrangement.spacedBy(12.dp)) {
         Kicker("CONFIRM IT", color = Acab.warn)   // amber header, iOS parity: this is a to-do, not chrome
-        CheckRow("Look around, pole-mounted camera, solar panel, small antenna?",
+        CheckRow(d.type.confirmPrompt,
             checked = looked) { looked = !looked }
         val span = seenSpan(firstSeen)
         CheckRow(
@@ -608,7 +649,7 @@ private fun WatchChip(watched: Boolean, onClick: () -> Unit) {
 
 /** Amber warning for experimental detectors: body-cam signatures are still guesswork. */
 @Composable
-private fun ExperimentalNote() {
+private fun ExperimentalNote(type: DeviceType) {
     Row(
         Modifier.fillMaxWidth().panel(),
         verticalAlignment = Alignment.CenterVertically,
@@ -616,7 +657,7 @@ private fun ExperimentalNote() {
     ) {
         Icon(Icons.Filled.Warning, contentDescription = null,
             tint = Acab.warn, modifier = Modifier.size(13.dp))
-        Text("Experimental detector. Body-cam signatures are not field-verified yet, so treat this as a maybe.",
+        Text("Experimental detector. ${type.experimentalNoun} signatures are not field-verified yet, so treat this as a maybe.",
             color = Acab.warn, fontSize = 11.sp, fontFamily = Acab.mono)
     }
 }
@@ -665,9 +706,6 @@ private fun LocationPanel(d: Detection, lat: Double, lon: Double, onOpenInMap: (
     val markers = rememberCategoryMarkers()
     val operatorMarker = rememberOperatorMarker()
 
-    // osmdroid setup (user agent + bounded tile cache) must land before the first tile fetch.
-    remember { configureOsmdroid(context) }
-
     Column(Modifier.fillMaxWidth().panel(), verticalArrangement = Arrangement.spacedBy(10.dp)) {
         Row(verticalAlignment = Alignment.CenterVertically) {
             Kicker("LOCATION")
@@ -712,6 +750,12 @@ private fun LocationPanel(d: Detection, lat: Double, lon: Double, onOpenInMap: (
             AndroidView(
                 modifier = Modifier.fillMaxSize(),
                 factory = { ctx ->
+                // osmdroid setup (user agent + bounded tile cache) MUST land before the first tile
+                // fetch, and the factory is the last point before MapView is constructed. It used
+                // to sit in a remember{} in composition, which lint flags as a side effect in
+                // remember (it is: remember is for caching, not for running things). Idempotent
+                // via compareAndSet, so calling it per factory is free.
+                configureOsmdroid(ctx)
                     // A TRUE static thumbnail, the analog of iOS's .allowsHitTesting(false) on this
                     // same panel: refuse every touch at dispatch so the gesture falls through to the
                     // scrolling sheet instead of being half-eaten by a map that won't pan anyway.

@@ -32,6 +32,17 @@ jobs:
           java-version: '17'
           cache: gradle
 
+      # FULL lint, as its own gate. assembleRelease only triggers lintVitalRelease, which runs the
+      # "fatal" subset and PROVABLY misses real defects: reintroducing the bare <View> in the
+      # RemoteViews widget layout (which throws at inflate on some launchers) still let
+      # lintVitalRelease report BUILD SUCCESSFUL, verified 2026-07-30. So the vital pass is not a
+      # substitute for this step. Errors fail the release; the ~90 warnings stay non-fatal.
+      - name: Lint (full, gates the release)
+        working-directory: android
+        run: |
+          chmod +x ./gradlew
+          ./gradlew :app:lintRelease --no-daemon
+
       - name: Decode keystore
         env:
           ACAB_KEYSTORE_BASE64: ${{ secrets.ACAB_KEYSTORE_BASE64 }}

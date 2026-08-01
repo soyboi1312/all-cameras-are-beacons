@@ -14,6 +14,9 @@ struct DeviceView: View {
     @State private var glassesOn = true
     @State private var droneOuiOn = false        // drone vendor-OUI fallback; sub-option of droneOn, off by default
     @State private var netcamOn = false          // network-camera detector; opt-in, off by default (like droneOui)
+    /// Phone-notification toggles, mirrored into @State so the switches animate; the source of
+    /// truth is DetectionNotifier's UserDefaults keys. Keyed by DeviceType.rawValue.
+    @State private var notifyOn: [Int: Bool] = [:]
     @State private var motorolaOn = true         // broad Motorola-OUI match; sub-option of bodyCamOn, on by default
     @State private var pendingFlock = false     // just flipped; hold the value until the board confirms
     @State private var pendingDrone = false
@@ -167,7 +170,7 @@ struct DeviceView: View {
     // Which config fold section is currently open. Exactly one at a time (nil = all closed).
     // The firmware row/banner shares this state under `.firmware`, so opening it also
     // collapses any open config section.
-    private enum ConfigSection: Hashable { case firmware, radios, detectors, alerts, drive, desert, led }
+    private enum ConfigSection: Hashable { case firmware, radios, detectors, alerts, notify, drive, desert, led }
     @State private var openSection: ConfigSection?
 
     // An update "exists" whenever the board is behind the manifest, or an OTA is mid-flight
@@ -222,13 +225,17 @@ struct DeviceView: View {
                 foldRow(.alerts, glyph: "bell", title: "Alerts", kicker: alertsKicker) { buzzerCard }
             }
             rowDivider
+            // NOT gated on isMeshDetect, unlike Alerts: these are PHONE notifications, so they work
+            // the same on a board with no buzzer. That is precisely the board where they matter most.
+            foldRow(.notify, glyph: "app.badge", title: "Notifications", kicker: notifyKicker) { notifyCard }
+            rowDivider
             // Board LED sits with Alerts (both are local feedback), above the situational modes.
             foldRow(.led, glyph: "lightbulb", title: "Board LED", kicker: ledKicker) { lightsOutCard }
             rowDivider
-            foldRow(.drive, glyph: "car", title: "drive mode", kicker: driveKicker) { driveModeCard }
+            foldRow(.drive, glyph: "car", title: "Drive mode", kicker: driveKicker) { driveModeCard }
             rowDivider
             foldRow(.desert, glyph: "mountain.2",
-                    title: "desert mode + buffer", kicker: desertKicker) {
+                    title: "Desert mode + buffer", kicker: desertKicker) {
                 VStack(spacing: 12) { desertModeCard; offlineBufferCard }
             }
         }
@@ -1062,6 +1069,86 @@ struct DeviceView: View {
         .panel()
     }
 
+    // MARK: phone notifications
+    //
+    // A SEPARATE card from ALERTS on purpose. ALERTS picks how the BOARD behaves (buzzer / vibrate
+    // / silent); this picks which categories are worth interrupting you for on the PHONE. Folding
+    // them together implied a dependency that does not exist: a silent board with notifications on
+    // is a perfectly normal setup, and arguably the main one for a device you keep in a bag.
+    private var notifyCard: some View {
+        VStack(alignment: .leading, spacing: 14) {
+            Kicker("PHONE NOTIFICATIONS")
+
+            if ble.notifier.mutedBySystem {
+                // A green toggle over a dead feature is the worst outcome here: the user believes
+                // they are covered. Say it plainly instead.
+                Text("iOS is blocking these. Turn notifications on for beacons in Settings, or nothing here will arrive.")
+                    .font(ACABTheme.mono(10.5)).foregroundStyle(ACABTheme.warn)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+
+            Text("Pick what's worth a notification. Every category is off until you turn it on, and iOS asks permission the first time you do.")
+                .font(ACABTheme.mono(10.5)).foregroundStyle(ACABTheme.faint)
+                .fixedSize(horizontal: false, vertical: true)
+
+            VStack(spacing: 12) {
+                ForEach(DetectionNotifier.notifiableTypes, id: \.self) { t in
+                    let on = notifyOn[t.rawValue] ?? DetectionNotifier.isEnabled(t)
+                    VStack(alignment: .leading, spacing: 4) {
+                        radioToggle(t.label, notifySubtitle(t), isOn: Binding(
+                            get: { on },
+                            set: { v in
+                                notifyOn[t.rawValue] = v
+                                ble.notifier.setEnabled(v, for: t)
+                            }), exp: t.isExperimental)
+                        // A notification for a detector the BOARD is not running can never fire.
+                        // Left unsaid, that is the worst kind of dead switch: it reads as coverage.
+                        // Only shown once the toggle is on, so the card is not a wall of warnings.
+                        if on, detectorIsOff(t) {
+                            Text("the \(t.label.lowercased()) detector is off, so this won't fire. turn it on under Detectors.")
+                                .font(ACABTheme.mono(10)).foregroundStyle(ACABTheme.warn)
+                                .fixedSize(horizontal: false, vertical: true)
+                        }
+                    }
+                }
+            }
+
+            Text("The same device won't notify again for ten minutes, so one camera can't keep buzzing you. Ignored devices never notify at all.")
+                .font(ACABTheme.mono(10.5)).foregroundStyle(ACABTheme.faint)
+                .fixedSize(horizontal: false, vertical: true)
+        }
+        .panel()
+    }
+
+    /// True when the board is NOT running the detector behind this notification category, so the
+    /// toggle cannot ever fire. Returns false when no status has arrived (do not cry wolf) and for
+    /// `.watched`, which has no detector switch: the watchlist is always live.
+    private func detectorIsOff(_ t: DeviceType) -> Bool {
+        guard let s = ble.status else { return false }
+        switch t {
+        case .flockCamera, .flockRaven: return !s.flock
+        case .drone:                    return !s.drone
+        case .axonBodyCam:              return !s.axon
+        case .tracker:                  return !s.tracker
+        case .recordingGlasses:         return !s.glasses
+        case .networkCamera:            return !s.ncam
+        case .watched, .nearbyDevice, .unknown: return false
+        }
+    }
+
+    private func notifySubtitle(_ t: DeviceType) -> String {
+        switch t {
+        case .flockCamera:              return "plate readers"
+        case .axonBodyCam:              return "worn cameras"
+        case .recordingGlasses:         return "camera glasses"
+        case .networkCamera:            return "cameras on nearby wifi"
+        case .drone:                    return "remote ID broadcasts"
+        case .tracker:                  return "separated AirTag \u{00B7} Tile \u{00B7} SmartTag"
+        case .watched:                  return "devices you starred"
+        default:                        return ""
+        }
+    }
+
     // Themed 3-way switch: one joined capsule of equal segments split by hairlines,
     // the active one filled with the accent. Rolled our own because a stock
     // .segmented Picker won't match the theme. Same anatomy as Android.
@@ -1094,6 +1181,14 @@ struct DeviceView: View {
                 .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
+    }
+
+    /// "3 ON" / "OFF", so the collapsed row says whether anything will interrupt you.
+    private var notifyKicker: String {
+        let n = DetectionNotifier.notifiableTypes.filter {
+            notifyOn[$0.rawValue] ?? DetectionNotifier.isEnabled($0)
+        }.count
+        return n == 0 ? "OFF" : "\(n) ON"
     }
 
     private var alertModeCaption: String {

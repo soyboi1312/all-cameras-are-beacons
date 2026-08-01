@@ -124,12 +124,16 @@ struct DetectionDetailView: View {
                 Text("NODE \(d.nodeName)")
                     .font(ACABTheme.display(26, weight: .semibold)).foregroundStyle(ACABTheme.text)
                 // Subtitle is the vendor, not the type label (F15), the badge pill
-                // above already names the category. Deliberately d.vendor, NOT
-                // displayVendor: displayVendor prefers the OUI lookup, which for a Flock
-                // Falcon resolves to its Liteon WiFi module and would head the ALPR
-                // dossier with "Liteon" instead of "Flock Safety". The OUI reading still
-                // shows in the identity panel below, where it is labelled as such.
-                Text(d.vendor).font(ACABTheme.mono(11)).foregroundStyle(ACABTheme.dim)
+                // above already names the category. NEITHER branch may consult the OUI
+                // lookup: for a Flock Falcon it resolves to the Liteon WiFi module and
+                // would head the ALPR dossier with "Liteon" instead of "Flock Safety".
+                // The OUI reading still shows in the identity panel below, labelled as such.
+                //
+                // `maker` first fixes a real mislabel: d.vendor answers the body-cam
+                // category with a fixed guess, so a Motorola-proxy or Utility hit headed
+                // this dossier with Axon's name outright. maker is nil for Flock, so the
+                // ALPR case above is unaffected.
+                Text(d.maker ?? d.vendor).font(ACABTheme.mono(11)).foregroundStyle(ACABTheme.dim)
             }
             Spacer(minLength: 0)
         }
@@ -152,7 +156,7 @@ struct DetectionDetailView: View {
         HStack(spacing: 8) {
             Image(systemName: "exclamationmark.triangle.fill")
                 .foregroundStyle(ACABTheme.warn).font(.system(size: 12))
-            Text("Experimental detector. Body-cam signatures are not field-verified yet, so treat this as a maybe.")
+            Text("Experimental detector. \(d.type.experimentalNoun) signatures are not field-verified yet, so treat this as a maybe.")
                 .font(ACABTheme.mono(11)).foregroundStyle(ACABTheme.warn)
         }
         .panel(strong: false, padding: 13)
@@ -222,11 +226,13 @@ struct DetectionDetailView: View {
 
     private var methodChipLabel: String {
         switch d.method {
-        // A body-cam OUI is the maker's OWN registered block (Axon, Utility, Motorola
-        // Solutions), not a chipset shared with unrelated gear, so "chipset only" would
-        // understate what we know. What's uncertain is which of the vendor's products
-        // this is, which is why it keeps the amber weak-match treatment.
-        case .oui where d.bodyCamSignature != nil: return "OUI \u{00B7} VENDOR ONLY"
+        // Some OUI hits land on the maker's OWN registered block (Axon, Utility, Motorola
+        // Solutions, and every camera brand in netcam_signatures.h), not a chipset shared
+        // with unrelated gear, so "chipset only" would understate what we know. What's
+        // uncertain is which of the vendor's products this is, which is why it keeps the
+        // amber weak-match treatment. Keyed on `maker` rather than bodyCamSignature so
+        // network cameras stop sitting on the wrong side of this exact distinction.
+        case .oui where d.maker != nil: return "OUI \u{00B7} VENDOR ONLY"
         case .oui:  return "OUI \u{00B7} CHIPSET ONLY"
         case .name: return "NAME MATCH"
         default:    return d.method.label.lowercased()   // "service UUID", "SSID", ...
@@ -265,8 +271,18 @@ struct DetectionDetailView: View {
         }
         switch d.method {
         case .oui:
-            // An OUI only names the chipset vendor, which Flock shares with plenty
-            // of consumer gear, so spell out how thin the evidence is.
+            // An OUI block is one of two very different things and the copy has to say which.
+            // When `maker` resolved, the block is the MAKER'S OWN registration (Hikvision's
+            // 44:19:B6, Axon's 00:25:DF), so the old "only the radio chipset matched" line was
+            // flatly false, and would have contradicted a row now titled "Hikvision" on the
+            // same screen. What stays open is which of that maker's products this is.
+            if let m = d.maker {
+                return Text("Matched ")
+                    + Text(m).font(ACABTheme.mono(11, weight: .semibold))
+                    + Text("'s own registered MAC block. That names the maker, not which of their products this is.")
+            }
+            // No maker: the block really does name a chipset vendor, which Flock shares with
+            // plenty of consumer gear, so spell out how thin the evidence is.
             let isFlock = d.type == .flockCamera || d.type == .flockRaven
             let part = isFlock ? "a part Flock shares with routers and home cameras"
                                : "a part shared with routers and home cameras"
@@ -321,7 +337,7 @@ struct DetectionDetailView: View {
         VStack(alignment: .leading, spacing: 0) {
             Kicker("CONFIRM IT", color: ACABTheme.warn).padding(.bottom, 6)
             checkRow(isOn: $lookedAround,
-                     text: "Look around, pole-mounted camera, solar panel, small antenna?")
+                     text: d.type.confirmPrompt)
             Rectangle().fill(ACABTheme.line).frame(height: 1)
             checkRow(isOn: $secondPass, text: secondPassText)
             Rectangle().fill(ACABTheme.line).frame(height: 1)
@@ -493,15 +509,36 @@ struct DetectionDetailView: View {
     private var identityPanel: some View {
         VStack(alignment: .leading, spacing: 0) {
             Kicker("IDENTITY").padding(.bottom, 4)
-            if let brand = d.type.brand { idRow("Brand", brand) }
-            idRow("Vendor", d.displayVendor)
+            // TWO ROWS, NOT ONE. The old single "Vendor" row rendered a union of a real IEEE
+            // registrant and a per-type constant, so it printed "Vendor: IP camera" and
+            // "Vendor: Nearby device": the category restated under a label that claims an
+            // identification the detector never made. Renaming it "Category" would have been
+            // worse, not better, since the same row also holds "Liteon" on a genuine Falcon.
+            //
+            // So: Maker = who built it (payload-derived, absorbing the old Brand row), OUI
+            // vendor = who owns the MAC block, annotated when that is only the radio module.
+            // When neither resolves NOTHING RENDERS, which is the actual fix.
+            let mk = d.maker ?? d.type.brand
+            if let m = mk { idRow("Maker", m) }
+            if let o = d.ouiVendor, o != mk {
+                idRow("OUI vendor", isChipsetRegistrant(o) ? "\(o) \u{00B7} chipset" : o)
+            }
             if let cid = d.companyIdText { idRow("Company ID", cid) }
             idRow("Identifier", d.mac)
             timeRow("First seen", ble.firstSeenDate(for: d.id))
             timeRow("Last seen", ble.lastSeenDate(for: d.id))
             if let n = d.name, !n.isEmpty { idRow("Name", n) }
             if let id = d.uasID, !id.isEmpty { idRow("UAS ID", id) }
-            if let mfr = d.ridManufacturer { idRow("Manufacturer", mfr) }
+            // No separate "Manufacturer" row: maker's step 2 IS ridManufacturer, so it now
+            // renders as Maker above. Keeping both printed the same company twice, three rows
+            // apart, under two different labels.
+            //
+            // The Detail row stays VERBATIM and is load-bearing, not decoration. Every hedge the
+            // firmware authors wrote lives only here now that maker parses the same string:
+            // " on wifi" (this is a device on the network, not necessarily a camera pointed at
+            // you), "(offline)" (a separated tag, NOT buffer replay), "or Quest"
+            // (glasses_signatures.h says that caveat must be present), and "gear, no Remote ID"
+            // (may be a controller, not an aircraft). Do not reformat or condense it.
             if let det = d.detail, !det.isEmpty { idRow("Detail", det) }
             // Numeric lat/lon alongside the mini-map above: the coordinates are the actionable
             // datum in an evidence export, and the operator (pilot) fix is the whole point of a

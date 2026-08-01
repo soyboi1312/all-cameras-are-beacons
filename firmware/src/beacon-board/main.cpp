@@ -42,6 +42,11 @@ static bool alertTypeEnabled(AcabDeviceType t) {
     switch (t) {
         case ACAB_TRACKER:      return trackerIsEnabled();
         case ACAB_AXON_BODYCAM: return axonIsEnabled();
+        // Network cameras are opt-in like the two above, so the BUZZER honours the same toggle.
+        // The detector self-gates upstream, so nothing should reach here with the opt-in off, but
+        // this layer should not depend on that: an alert path that beeps for a category the user
+        // switched off is the kind of thing that only shows up as "why is it beeping at my house".
+        case ACAB_NETCAM:       return netcamIsEnabled();
         default:                return true;
     }
 }
@@ -579,7 +584,18 @@ void setup() {
     Serial.begin(115200);
     delay(200);
     Serial.print(acabBanner());
+    // Banner follows the BUILD, like the BLE fw label below it does. This used to be hardcoded
+    // "ACAB OUI-Spy" from the original single-radio project, so a dual-radio beacon board booted
+    // announcing itself as a Colonel Panic OUI-Spy. Cosmetic, but it is the first thing anyone
+    // sees on a serial console and it contradicted the fw label the same setup() sets.
+    // NOTE this is the HUMAN-READABLE banner only. The fw LABEL below ("beacon board" /
+    // "ACAB-ouispy") is a WIRE CONTRACT: the apps and firmware-latest.json resolve a manifest
+    // entry from it, so it must not be "fixed" to match this string.
+#ifdef ACAB_DUAL_RADIO
+    Serial.println("=== All Cameras Are Beacons " ACAB_FW_VERSION " ===");
+#else
     Serial.println("=== ACAB OUI-Spy " ACAB_FW_VERSION " ===");
+#endif
 
     // Rollback gate: if a prior OTA image booted without confirming health, revert now
     // (may esp_restart()). Must run before heavy init so a bad image can't wedge here first.

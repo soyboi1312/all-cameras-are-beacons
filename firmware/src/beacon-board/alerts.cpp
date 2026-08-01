@@ -190,10 +190,20 @@ static void playPattern(AcabDeviceType type) {
         case ACAB_GLASSES:                // recording glasses: a short KITT voice-modulator
             warble(3400, 220, 6, 14);     // wobble - distinct from the caws/blips of the others
             break;
+        case ACAB_NETCAM:                 // network camera: two flat RISING blips.
+            // Distinct by rhythm and contour, per the note above: nothing else uses two FLAT
+            // tones (body cam is three equal, Flock is two DESCENDING sweeps), and the rise
+            // separates it from Flock's fall. It had no case at all until 2026-07-31 and fell to
+            // the anonymous default beep, which stopped being acceptable once the Ring/Wyze OUIs
+            // made this the category most likely to fire on a residential street.
+            beep(2600, 110); vTaskDelay(pdMS_TO_TICKS(70)); beep(3300, 110);
+            break;
         case ACAB_WATCHED:                // user-starred: the most attention-grabbing sound we
             playReveal();                 // have (the reveal sting) - the user explicitly asked
             break;                        // to be told about this exact device
         default:
+            // Unclassified / future type. Anything with a real category should get its own case
+            // above rather than land here, or the user cannot tell it apart from anything else.
             beep(2800, 120);
             break;
     }

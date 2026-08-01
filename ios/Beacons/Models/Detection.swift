@@ -107,22 +107,27 @@ struct Detection: Identifiable, Equatable {
     var customName: String? { DeviceNames.shared.label(for: mac) }
 
     /// Best label we have: the user's own name, else advertised name, else UAS serial, else the
-    /// device class.
+    /// manufacturer the device broadcast, else the device class.
+    ///
+    /// The `maker` rung is why a log full of network cameras no longer reads "Network camera"
+    /// twelve times beside a glyph that already said so. It sits BELOW the UAS serial (a drone's
+    /// serial is a unique handle, and beats a maker shared by every DJI in the sky) and ABOVE
+    /// type.label. It is nil for every category with no honest manufacturer, so those rows are
+    /// unchanged. See Detection.maker for what may and may not feed it.
     var displayName: String {
         if let c = customName { return c }
         if let name, !name.isEmpty { return name }
         if let uasID, !uasID.isEmpty { return uasID }
+        if let m = maker { return m }
         return type.label
     }
 
-    /// True when we have a real handle (user name, advertised name, or UAS-ID) to lead with,
-    /// rather than falling back to the device class. Drives the log row layout.
-    var hasName: Bool {
-        if customName != nil { return true }
-        if let name, !name.isEmpty { return true }
-        if let uasID, !uasID.isEmpty { return true }
-        return false
-    }
+    /// True when the row leads with something other than the bare device class, which is what
+    /// every caller was really asking. Derived FROM displayName rather than re-listing its steps:
+    /// the two drifted the moment `maker` was added, and a row that leads with "Hikvision" while
+    /// hasName reports false renders the category in NEITHER the title nor the subtitle. Keep
+    /// this defined in terms of displayName.
+    var hasName: Bool { displayName != type.label }
 
     /// Readable label for the drone's ODID operational status.
     var ridStatusLabel: String? {

@@ -131,19 +131,111 @@ extension Detection {
         return BodyCamSignature(rawValue: det)
     }
 
-    /// Vendor line for the detail screen, in descending order of how much we actually know:
-    /// the registered owner of the MAC's OUI, then the maker behind the signature that fired
-    /// (which survives BLE address randomization, where there is no OUI to look up), then a
-    /// per-type guess.
+    /// The company that MADE this exact device, read ONLY off the device's own payload.
     ///
-    /// The last step is why this exists. `Detection.vendor` answers the body-cam category
-    /// with "Axon (unverified)", so a Motorola or Utility hit, which the firmware files under
-    /// the same category, printed the wrong company outright. An unknown OUI here names the
-    /// category's makers rather than picking one, mirroring Android's fallback.
-    var displayVendor: String {
-        if let v = ouiVendor { return v }
-        if let sig = bodyCamSignature { return sig.vendor }
-        if type == .axonBodyCam { return "Axon / Utility / Motorola" }
-        return vendor
+    /// WHY THIS EXISTS: an unnamed detection used to lead its log row with the category label, so
+    /// twelve cameras in a row all read "Network camera" beside a glyph that already said network
+    /// camera. The manufacturer was on the wire the whole time and both apps threw it away:
+    /// netcam_detect.cpp writes "<vendor> on wifi" off a 43-OUI table, and not one of those
+    /// vendors is in OUIVendors.table, so `ouiVendor` is nil for 100% of network cameras.
+    ///
+    /// READ THIS BEFORE ADDING A STEP: the maker is a WEAKER claim than the category label it
+    /// replaces, not a stronger one. "Hikvision" could be an NVR or a doorbell; "Network camera"
+    /// asserts the product class. That is the whole justification for promoting it to the title,
+    /// and it only holds while every step below names a company the DEVICE ITSELF broadcast.
+    ///
+    /// NEVER consults `ouiVendor`. Not as a fallback, not as a last resort. 56 of the 74 entries
+    /// in OUIVendors.table are silicon or module vendors, and all four SHIPPING Falcon probe OUIs
+    /// (flock_signatures.h) are Liteon blocks, so an OUI-fed title prints the WiFi module on a
+    /// genuine plate reader. Desert mode and the watchlist pass arbitrary MACs, which is how the
+    /// 21 Espressif blocks become reachable, and our own board is an ESP32-S3 that other boards
+    /// detect. The dossier subtitle already made this exact call (see the "NEITHER branch may
+    /// consult the OUI lookup" comment in DetectionDetailView.headerBlock, which is why the old
+    /// OUI-first `displayVendor` was deleted rather than reused); this extends that decision
+    /// rather than reopening it.
+    ///
+    /// Also never `type.brand` (a 1:1 function of the category, so it would rebuild the same wall
+    /// of identical rows in different words) and never `bleCompanyName` (would title every passing
+    /// iPhone "Apple").
+    ///
+    /// nil for ALPR, Raven, Desert, watchlist, unknown, and every row replayed from the offline
+    /// buffer: StoredDet carries no detail field, so a replayed row has no vendor route at all and
+    /// correctly degrades to the category. Do not fill that gap with a guess.
+    var maker: String? {
+        // Trims, and refuses any name that identifies SILICON rather than a product. Nothing the
+        // firmware can currently emit hits the deny-list (the glasses colon rule already
+        // self-excludes Jieli and HeyCyan, neither of which contains a colon). It exists so a
+        // FUTURE firmware string cannot: glasses_signatures.h calls Jieli "the Espressif problem
+        // in miniature - the ID identifies the SILICON, not the product".
+        func clean(_ s: String?) -> String? {
+            guard let t = s?.trimmingCharacters(in: .whitespaces), !t.isEmpty,
+                  !Self.notAMaker.contains(t.lowercased()) else { return nil }
+            return t   // verbatim: "Anker/eufy" keeps its slash, see below
+        }
+
+        // 1. Body cam: the four-string wire contract both apps already match on exactly.
+        if let sig = bodyCamSignature { return clean(sig.vendor) }
+
+        // 2. Drone Remote ID. `ridManufacturer` passes an unrecognised CTA-2063 code straight
+        //    through as "Mfr 7A3C", which must never become a row title.
+        if let m = ridManufacturer, !m.hasPrefix("Mfr ") { return clean(m) }
+
+        guard let det = detail, !det.isEmpty else { return nil }
+
+        // 3. TYPE-GATED, AFFIX-ANCHORED parsing of the detail string. Deliberately not a generic
+        //    "first token" rule: that would turn "Axon OUI" into "Axon" (erasing that this is the
+        //    WEAK variant, not the conf-90 payload tag) and "Motorola Solutions OUI" into
+        //    "Motorola", which reads as Motorola MOBILITY, a different company. The suffix anchors
+        //    are safe against the body-cam contract precisely because the WiFi body-cam path omits
+        //    " on wifi" to stay byte-identical to its BLE strings.
+        switch type {
+        case .networkCamera:
+            guard det.hasSuffix(" on wifi") else { return nil }
+            return clean(String(det.dropLast(" on wifi".count)))
+        case .drone:
+            // METHOD GATE, and it is load-bearing. Drone is the ONE parsed type whose detail can
+            // contain REMOTE-DEVICE TEXT: on the Remote ID path the firmware writes "op %s" from
+            // the broadcaster's 20-byte ODID Operator ID (drone_detect.cpp), so a crafted
+            // Operator ID whose last 19 bytes are exactly this anchor would make the row title,
+            // the dossier Maker row and the CSV read "op". The vendor-OUI fallback that actually
+            // emits this string sets method = OUI, while the attacker-reachable "op ..." detail
+            // only ever arrives as Remote ID, so requiring OUI here closes it. The deny-list
+            // cannot: it screens silicon vendor names, not arbitrary broadcast text.
+            guard method == .oui, det.hasSuffix(" gear, no Remote ID") else { return nil }
+            return clean(String(det.dropLast(" gear, no Remote ID".count)))
+        case .recordingGlasses:
+            // The firmware encodes confidence as ":" and hedging as "?", so the colon rule admits
+            // "Ray-Ban Meta: ..." and "Meta: ..." while self-excluding "HeyCyan glasses UUID",
+            // "Jieli chipset? ..." and "TCL/RayNeo? ...". Do not relax this to a prefix match.
+            guard let c = det.firstIndex(of: ":") else { return nil }
+            return clean(String(det[det.startIndex..<c]))
+        case .tracker:
+            // Exact map, no parsing. "Apple Find My" rather than "Apple" on purpose: Chipolo and
+            // Pebblebee tags advertise the same offline Find My payload, so the NETWORK is what
+            // was proved, not the manufacturer. "(offline)" is dropped from the title only
+            // because it would read as the row's OFFLINE buffer-replay tag, which it is not.
+            switch det {
+            case "Apple Find My (offline)": return "Apple Find My"
+            case "Tile":                    return "Tile"
+            case "Samsung SmartTag":        return "Samsung SmartTag"
+            default:                        return nil
+            }
+        default:
+            return nil
+        }
     }
+
+    /// Names that identify the radio module rather than the product. Backstop only, see `maker`.
+    private static let notAMaker: Set<String> = [
+        "espressif", "liteon", "lite-on", "silicon labs", "silabs", "usi",
+        "murata", "jieli", "realtek", "asustek", "heycyan", "unknown",
+    ]
+}
+
+/// True when an OUI registrant is a chipset or module vendor rather than the product's maker.
+/// Used to annotate the dossier's OUI row, because a reader cannot be expected to know that
+/// Liteon is a WiFi module house. This makes the weakness legible instead of leaving it to the
+/// label, which is what OUIVendors.table says it exists for.
+func isChipsetRegistrant(_ vendor: String) -> Bool {
+    ["Espressif", "Liteon", "Silicon Labs", "USI", "Murata", "Realtek", "ASUSTek"].contains(vendor)
 }

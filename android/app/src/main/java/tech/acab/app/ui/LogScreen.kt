@@ -82,6 +82,8 @@ import tech.acab.app.model.sourceLabel
 import tech.acab.app.ui.theme.Acab
 import tech.acab.app.ui.theme.tone
 import java.io.File
+import tech.acab.app.model.hasName
+import androidx.compose.ui.text.style.TextOverflow
 
 /** Seed for the Log's lens: everything, only-new-since-the-watermark, or one category.
  *  Public so callers (MainScreen deep links) can seed LogScreen with an initial filter.
@@ -654,9 +656,28 @@ private fun DetectionRow(
         Spacer(Modifier.size(12.dp))
         Column(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(3.dp)) {
             Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-                // the advertised name when present, else the type + last-4 label
+                // the advertised name when present, else the broadcast maker, else the type label
+                //
+                // weight(fill = false) makes the TITLE the flexible child, so Compose measures
+                // the fixed-width siblings first. Without it a long title (a user rename has no
+                // length cap) eats the whole Row and every chip after it is measured at 0dp and
+                // clipped away: no NODE, no EXP, no OFFLINE, no time-basis tag, no new-dot. Those
+                // chips are exactly what stops a reader trusting a reconstructed timestamp or
+                // mistaking a buffer replay for a live sighting, so losing them is not cosmetic.
+                // This is how SwiftUI's HStack already behaves on the iOS row; Android needed to
+                // be told, and adding the NODE handle ahead of the chips made it reachable at
+                // ordinary title lengths rather than only absurd ones.
                 Text(d.displayName, color = Acab.text, fontSize = 15.sp,
-                    fontWeight = FontWeight.SemiBold, maxLines = 1)
+                    fontWeight = FontWeight.SemiBold, maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
+                    modifier = Modifier.weight(1f, fill = false))
+                // NODE handle, matching iOS DetectionRow. Android rendered NOTHING here, which is
+                // why three cameras in a row were LITERALLY identical on this platform and merely
+                // near-identical on iPhone: the last-4 of the MAC is the only per-device text on a
+                // row whose title falls back to a shared label. The comment above claimed a "type
+                // + last-4 label" that had never existed.
+                Text("NODE ${d.mac.replace(":", "").takeLast(4).uppercase()}",
+                    color = Acab.dim, fontSize = 11.sp, fontFamily = Acab.mono)
                 if (d.type.isExperimental) ExpTag()
                 if (d.offline) OfflineTag()
                 // A dense row has no space to explain itself, so it flags that this record's
@@ -671,8 +692,13 @@ private fun DetectionRow(
                 if (isNew) NewDot()
             }
             Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-                // how it was seen, like the iOS row: "BLE / OUI match"
-                Text("${d.sourceLabel} · ${d.methodLabel}",
+                // how it was seen, like the iOS row: "BLE · OUI match". When the title leads with
+                // something OTHER than the category (an advertised name, or now the broadcast
+                // maker), the category moves here so it is never absent from the row entirely.
+                // This branch is why the iOS row can afford a maker-led title; Android printed
+                // source·method unconditionally and would have lost the category outright.
+                Text(if (d.hasName) "${d.type.label} · ${d.methodLabel}"
+                     else "${d.sourceLabel} · ${d.methodLabel}",
                     color = Acab.faint, fontSize = 11.sp, fontFamily = Acab.mono)
                 // Confidence, so the list answers "definitely something, or just suspected?"
                 // without opening the dossier. Bands match the dossier's verdict copy exactly

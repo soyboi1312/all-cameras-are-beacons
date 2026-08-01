@@ -71,9 +71,20 @@ class AcabLinkService : Service() {
             // a burst of hits can't hammer NotificationManager (it drops excess updates anyway).
             // The minute tick keeps the "last ALPR 2m ago" line honest during a quiet stretch.
             val minuteTick = flow { while (true) { emit(Unit); delay(60_000L) } }
-            combine(ble.detections, ble.state, ble.redactLockScreen, ble.driveMode, minuteTick) { d, s, r, drv, _ ->
+            // ble.status is in the combine ON PURPOSE. The breakdown became toggle-derived
+            // (enabledDriveCats reads status), so without status as a render INPUT a detector
+            // toggle only reached the notification on the next detection or minute tick, up to
+            // ~60 s late, while iOS repaints immediately. It is read inside build() either way;
+            // being in the combine is what makes a change to it TRIGGER a render.
+            combine(ble.detections, ble.state, ble.redactLockScreen, ble.driveMode, minuteTick) {
+                    d, s, r, drv, _ ->
                 RenderInput(d, s, r, drv)
             }
+                // Chained rather than a sixth argument: Kotlin's typed combine() tops out at five
+                // flows and a sixth silently selects the vararg Array<*> overload, which does not
+                // compile against this lambda. status carries no data into RenderInput, it is here
+                // purely as a render TRIGGER.
+                .combine(ble.status) { input, _ -> input }
                 .sample(RENDER_SAMPLE_MS)
                 .collect { renderIfChanged(it) }
         }
@@ -106,12 +117,49 @@ class AcabLinkService : Service() {
      *  which folded in NEARBY / network-camera / WATCHED rows that breakdownOf never shows,
      *  so the title disagreed with its own expanded row and with iOS. */
     private fun driveTotal(counts: Map<String, Int>): Int =
-        DRIVE_CATS.sumOf { counts[it] ?: 0 }
+        enabledDriveCats().sumOf { counts[it] ?: 0 }
 
-    private fun breakdownOf(counts: Map<String, Int>): String =
-        DRIVE_CATS
-            .mapNotNull { c -> (counts[c] ?: 0).takeIf { it > 0 }?.let { "$c $it" } }
-            .joinToString("  ")
+    /** Category tally for the expanded shade. Lists every detector the BOARD has switched ON,
+     *  INCLUDING at zero, and nothing that is off.
+     *
+     *  It used to list only buckets with hits, which made a missing row ambiguous: "found none"
+     *  and "not looking" rendered identically. A zero under an enabled detector is real
+     *  information; a row for a disabled one implies coverage that is not running. Mirrors the
+     *  iOS Live Activity's visibleCats(). Falls back to the historical five when no status has
+     *  arrived, so the row is never empty. */
+    private fun breakdownOf(counts: Map<String, Int>): String {
+        val cats = enabledDriveCats()
+        // Every detector off: say so, rather than emitting an empty line that reads as a render
+        // glitch. build() only attaches the BigText style when this is non-blank, so returning ""
+        // would silently drop the row entirely.
+        if (cats.isEmpty()) return "all detectors off"
+        return cats.joinToString("  ") { c -> "$c ${counts[c] ?: 0}" }
+    }
+
+    /** DRIVE_CATS filtered to the detectors the board reports on. */
+    private fun enabledDriveCats(): List<String> {
+        // No status yet -> the historical five, so the row is never blank before the first frame.
+        // Named explicitly rather than DRIVE_CATS.dropLast(1), which silently depended on CAMERA
+        // being last and would have changed meaning the moment anyone reordered the list.
+        val st = ble.status.value ?: return PRE_STATUS_CATS
+        // Derived from DRIVE_CATS rather than rebuilt as a parallel list: a category added to
+        // DRIVE_CATS but forgotten here would silently never appear, and the two lists drifting
+        // is exactly the class of bug this file already carries scars from.
+        return DRIVE_CATS.filter { c ->
+            when (c) {
+                "ALPR" -> st.flock
+                "DRONE" -> st.drone
+                "BODY CAM" -> st.bodyCam
+                "TRACKER" -> st.tracker
+                "GLASSES" -> st.glasses
+                "CAMERA" -> st.ncam
+                else -> false   // in DRIVE_CATS with no toggle mapping: never claim coverage
+            }
+        }
+        // Deliberately NOT falling back when the result is empty: an empty list means every
+        // detector really is off, and listing five rows then would advertise coverage that is not
+        // running, which is the exact bug this change exists to fix. Mirrors iOS visibleCats().
+    }
 
     private fun textOf(connected: Boolean, total: Int): String = when {
         !connected -> "Reconnecting…"
@@ -132,7 +180,7 @@ class AcabLinkService : Service() {
         val counts = dets.groupingBy { it.type.category }.eachCount()
         val total = driveTotal(counts)
         val connected = state == ConnState.READY
-        // Only show buckets with hits, in the same order as the iOS Live Activity.
+        // Every ENABLED detector, zeros included, in DRIVE_CATS order (matches iOS visibleCats).
         val breakdown = breakdownOf(counts)
         // Same vocabulary as the iOS Live Activity (F27): title DRIVE MODE, body one of
         // "no detections" / "Reconnecting…" / "last <KIND> <relative>".
@@ -300,7 +348,15 @@ class AcabLinkService : Service() {
          *  mode's NEARBY rows, opt-in network cameras and WATCHED re-sightings are excluded
          *  deliberately, matching the iOS Live Activity (BLEManager.publishDetections).
          *  These are DeviceType.category identifiers, not display text. */
-        private val DRIVE_CATS = listOf("ALPR", "DRONE", "BODY CAM", "TRACKER", "GLASSES")
+        // Canonical order. NETWORK CAMERA joined 2026-07-31 when the breakdown became
+        // toggle-driven: it was excluded as an opt-in that would dilute the buckets, but a
+        // category that only appears once you enable it dilutes nothing.
+        private val DRIVE_CATS =
+            listOf("ALPR", "DRONE", "BODY CAM", "TRACKER", "GLASSES", "CAMERA")
+        /** Shown before any status frame arrives: the five categories that existed before the
+         *  network-camera column, named explicitly so reordering DRIVE_CATS cannot change it. */
+        private val PRE_STATUS_CATS =
+            listOf("ALPR", "DRONE", "BODY CAM", "TRACKER", "GLASSES")
         // Render cadence. The surface is glanceable (relative ages in seconds/minutes), so
         // 2 s is plenty; unchanged faces are skipped before the build + IPC anyway.
         private const val RENDER_SAMPLE_MS = 2_000L

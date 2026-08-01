@@ -214,3 +214,58 @@ bool axonClassifyBLE(const uint8_t mac[6], const uint8_t* adv, size_t advLen,
     }
     return true;
 }
+
+// ---- WiFi OUI path (see the header for why this exists) --------------------------------
+// Mirrors policeClassifyWiFi's shape: mgmt frames only, check transmitter then BSSID.
+// Matches the SAME tables the BLE path uses (the active signature's OUI list + Utility's),
+// so there is one place to edit an OUI, not two.
+// 0 = no match, 1 = Axon signature table, 2 = Utility Inc. The caller needs to know WHICH so the
+// detail string can name the right vendor.
+static int axonOuiHit(const uint8_t mac[6]) {
+    if (mac[0] & 0x02) return 0;   // locally-administered / random MAC carries no real OUI
+    if (gSig.useOui) {
+        for (uint8_t i = 0; i < gSig.ouiCount; i++)
+            if (mac[0] == gSig.oui[i][0] && mac[1] == gSig.oui[i][1] &&
+                mac[2] == gSig.oui[i][2]) return 1;
+    }
+    for (size_t i = 0; i < UTIL_BWC_OUI_COUNT; i++)
+        if (mac[0] == UTIL_BWC_OUI[i][0] && mac[1] == UTIL_BWC_OUI[i][1] &&
+            mac[2] == UTIL_BWC_OUI[i][2]) return 2;
+    return 0;
+}
+
+static bool axonEmitWiFi(AcabDetection* out, const uint8_t mac[6], int rssi, bool utility) {
+    acabInit(out, ACAB_AXON_BODYCAM, SRC_WIFI, mac, (int16_t)rssi);
+    out->method = M_OUI;
+    // 65, NOT the BLE tier's 75. The OUI read is just as reliable (these are public,
+    // non-randomized MACs), but the TYPE claim is weaker on WiFi and unproven: the OUI
+    // says "an Axon device", and Axon's WiFi estate includes docks, evidence terminals
+    // and station infrastructure alongside Fleet in-car video. Never yet observed in any
+    // capture in this repo. Same tier as an unvalidated netcam OUI, below the field-
+    // validated Axon BLE match (75) and far below the BWCDEVICE tag (90). Raise this only
+    // on a capture that confirms an Axon WiFi device was really in-car video.
+    out->confidence = 65;
+    // Name the vendor that actually matched. axonOuiHit checks the Axon signature table AND
+    // Utility Inc's OUIs, so labelling every hit "Axon" misattributed Utility hardware to a
+    // competitor, in a detail string the user reads to decide whether the match is credible.
+    //
+    // These strings are a WIRE CONTRACT: both apps resolve the body-cam vendor by EXACT match
+    // against a fixed set (iOS BodyCamSignature, Android its twin), so an unrecognised string
+    // silently degrades the detail screen. They must stay exactly the four the BLE paths already
+    // emit. No " on wifi" suffix for that reason, and because it would be redundant anyway: the
+    // radio is already carried in the detection's own `source` field and shown as the band.
+    if (utility) snprintf(out->detail, sizeof(out->detail), "%s", "Utility BodyWorn");
+    else         snprintf(out->detail, sizeof(out->detail), "%s", "Axon OUI");
+    return true;
+}
+
+bool axonClassifyWiFi(const uint8_t* frame, size_t len, int rssi, AcabDetection* out) {
+    if (!gEnabled && !desertIsEnabled()) return false;
+    if (!frame || len < 24) return false;
+    if (((frame[0] >> 2) & 0x3) != 0x0) return false;   // management frames only
+    const uint8_t* addr2 = &frame[10];   // transmitter
+    const uint8_t* addr3 = &frame[16];   // BSSID
+    if (int h = axonOuiHit(addr2)) return axonEmitWiFi(out, addr2, rssi, h == 2);
+    if (int h = axonOuiHit(addr3)) return axonEmitWiFi(out, addr3, rssi, h == 2);
+    return false;
+}

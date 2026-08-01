@@ -720,6 +720,12 @@ static void IRAM_ATTR wifiRxCallback(void* buf, wifi_promiscuous_pkt_type_t type
     AcabDetection d;
     if (droneClassifyWiFi(payload, len, rssi, &d)) { handleDetection(d); return; }
     if (flockClassifyWiFi(payload, len, rssi, &d)) { handleDetection(d); return; }
+    // Axon OUI on a mgmt frame (2026-07-31). Ordered BEFORE the Motorola proxy so that when a
+    // frame could satisfy both, the specific named vendor wins over the broad gear guess.
+    // In-car video (Axon Fleet) is a WiFi device, so before this an in-car system could only
+    // ever land as a generic Nearby Device. Registry-sourced, UNVALIDATED on WiFi - the
+    // rationale and the deliberately-lower confidence are documented in axon_detect.h.
+    if (axonClassifyWiFi(payload, len, rssi, &d)) { handleDetection(d); return; }
     if (policeClassifyWiFi(payload, len, rssi, &d)) { handleDetection(d); return; }
     // Network-camera OUI on a mgmt frame (BONUS, opt-in): a branded IP camera acting as its
     // own AP (beacon/probe-resp BSSID) or probing (probe-req) shows its vendor OUI here on the

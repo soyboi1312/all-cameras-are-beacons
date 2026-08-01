@@ -77,4 +77,17 @@ void axonRestoreEnabled(bool defaultEnabled);
 bool axonClassifyBLE(const uint8_t mac[6], const uint8_t* adv, size_t advLen,
                      int rssi, AcabDetection* out);
 
+// Classify a WiFi MANAGEMENT frame against the same OUI table.
+//
+// WHY THIS EXISTS (2026-07-31): the Axon OUI was matched on BLE ONLY, so any Axon device
+// that speaks WiFi instead of BLE fell through to a generic Nearby Device. That is exactly
+// the wrong gap: in-car video (Axon Fleet) is a WiFi device, and an in-car system is what a
+// user driving past a vehicle would most expect to see.
+//
+// Deliberately WEAKER than the BLE path and NOT field-validated - no capture in this repo
+// has ever matched this OUI over WiFi. Registry-sourced only, same honesty bar the netcam
+// table sets for its own unconfirmed blocks. Payload / name / service-tag matching cannot
+// apply here (a mgmt frame carries no BLE advert), so this is strictly an OUI match.
+bool axonClassifyWiFi(const uint8_t* frame, size_t len, int rssi, AcabDetection* out);
+
 #endif // ACAB_AXON_DETECT_H

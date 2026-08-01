@@ -18,9 +18,11 @@ struct DetectionRow: View {
 
             VStack(alignment: .leading, spacing: 3) {
                 HStack(spacing: 6) {
-                    // Lead with the advertised name / UAS-ID when we have one, else the
-                    // device class. displayName falls back to type.label on its own.
-                    Text(d.hasName ? d.displayName : d.type.label)
+                    // Lead with the advertised name / UAS-ID / broadcast manufacturer when we
+                    // have one, else the device class. displayName falls back to type.label on
+                    // its own, so the old hasName ternary was already a no-op and is now actively
+                    // wrong: it would strip a maker-led title back to "Network camera".
+                    Text(d.displayName)
                         .font(ACABTheme.display(15, weight: .semibold)).foregroundStyle(ACABTheme.text)
                         .lineLimit(1).minimumScaleFactor(0.8)
                     Text("NODE \(d.nodeName)")

@@ -155,14 +155,26 @@ object DeviceNames {
 /** A name the USER assigned to this exact MAC on the managed-devices screen (watched or ignored). */
 val Detection.customName: String? get() = DeviceNames.label(mac)
 
-/** Best label we have: the user's own name, else advertised name, else UAS serial, else device
- *  class. Feeds the log row, the ignore list, and CSV export. Mirrors iOS Detection.displayName
- *  exactly so the same record leads with the same label on both platforms. */
+/** Best label we have: the user's own name, else advertised name, else UAS serial, else the
+ *  manufacturer the device broadcast, else device class. Feeds the log row, the ignore list, and
+ *  CSV export. Mirrors iOS Detection.displayName exactly so the same record leads with the same
+ *  label on both platforms.
+ *
+ *  The `maker` rung is why a log full of network cameras no longer reads "Network camera" twelve
+ *  times beside a glyph that already said so. It sits BELOW the UAS serial (a drone's serial is a
+ *  unique handle and beats a maker shared by every DJI in the sky) and ABOVE type.label. */
 val Detection.displayName: String
     get() = customName
         ?: name?.takeIf { it.isNotEmpty() }
         ?: rid?.takeIf { it.isNotEmpty() }
+        ?: maker
         ?: type.label
+
+/** True when the row leads with something other than the bare device class. Derived FROM
+ *  displayName rather than re-listing its steps, so the two cannot drift: a row that leads with
+ *  "Hikvision" while hasName reports false would render the category in NEITHER the title nor the
+ *  subtitle. Mirrors iOS Detection.hasName. */
+val Detection.hasName: Boolean get() = displayName != type.label
 
 /** Which body-cam signature actually fired. Body cam is the one category that carries
  *  several makers' signatures at once, so the category alone cannot name a vendor: an Axon
@@ -195,4 +207,100 @@ val Detection.bodyCamSignature: BodyCamSignature?
     get() {
         if (type != DeviceType.BODY_CAM) return null
         return detail?.let { BodyCamSignature.from(it) }
+    }
+
+/** Names that identify the radio module rather than the product. Backstop only, see [maker]. */
+private val NOT_A_MAKER = setOf(
+    "espressif", "liteon", "lite-on", "silicon labs", "silabs", "usi",
+    "murata", "jieli", "realtek", "asustek", "heycyan", "unknown",
+)
+
+/** Trims, and refuses any name that identifies SILICON rather than a product. Nothing the
+ *  firmware can currently emit hits the deny-list (the glasses colon rule already self-excludes
+ *  Jieli and HeyCyan, neither of which contains a colon). It exists so a FUTURE firmware string
+ *  cannot: glasses_signatures.h calls Jieli "the Espressif problem in miniature - the ID
+ *  identifies the SILICON, not the product". */
+private fun cleanMaker(s: String?): String? {
+    val t = s?.trim().orEmpty()
+    return if (t.isEmpty() || t.lowercase() in NOT_A_MAKER) null else t   // "Anker/eufy" verbatim
+}
+
+/** True when an OUI registrant is a chipset or module vendor rather than the product's maker.
+ *  Annotates the dossier's OUI row, because a reader cannot be expected to know that Liteon is a
+ *  WiFi module house. Mirrors iOS isChipsetRegistrant. */
+fun isChipsetRegistrant(vendor: String): Boolean = vendor in setOf(
+    "Espressif", "Liteon", "Silicon Labs", "USI", "Murata", "Realtek", "ASUSTek",
+)
+
+/** The company that MADE this exact device, read ONLY off the device's own payload. Mirrors iOS
+ *  Detection.maker step for step, string for string, so the same record leads with the same label
+ *  on both platforms.
+ *
+ *  WHY THIS EXISTS: an unnamed detection used to lead its log row with the category label, so
+ *  twelve cameras in a row all read "Network camera" beside a glyph that already said network
+ *  camera. The manufacturer was on the wire the whole time and both apps threw it away:
+ *  netcam_detect.cpp writes "<vendor> on wifi" off a 43-OUI table, and not one of those vendors
+ *  is in OUI_VENDORS, so [ouiVendor] is null for 100% of network cameras.
+ *
+ *  READ THIS BEFORE ADDING A STEP: the maker is a WEAKER claim than the category label it
+ *  replaces, not a stronger one. "Hikvision" could be an NVR or a doorbell; "Network camera"
+ *  asserts the product class. That is the whole justification for promoting it to the title, and
+ *  it only holds while every step below names a company the DEVICE ITSELF broadcast.
+ *
+ *  NEVER reads [ouiVendor]. Not as a fallback, not as a last resort. 56 of the 74 entries in
+ *  OUI_VENDORS are silicon or module vendors, and all four SHIPPING Falcon probe OUIs are Liteon
+ *  blocks, so an OUI-fed title prints the WiFi module on a genuine plate reader. Desert mode and
+ *  the watchlist pass arbitrary MACs, which is how the 21 Espressif blocks become reachable, and
+ *  our own board is an ESP32-S3 that other boards detect. Also never [DeviceType.brand] (a 1:1
+ *  function of the category, so it would rebuild the same wall of identical rows in different
+ *  words) and never bleCompanyName (would title every passing iPhone "Apple").
+ *
+ *  null for ALPR, Raven, Desert, watchlist, unknown, and every row replayed from the offline
+ *  buffer: StoredDet carries no detail field, so a replayed row has no vendor route at all and
+ *  correctly degrades to the category. Do not fill that gap with a guess. */
+val Detection.maker: String?
+    get() {
+        // 1. Body cam: the four-string wire contract both apps already match on exactly.
+        bodyCamSignature?.let { return cleanMaker(it.vendor) }
+        // 2. Drone Remote ID. ridManufacturer passes an unrecognised CTA-2063 code straight
+        //    through as "Mfr 7A3C", which must never become a row title.
+        ridManufacturer?.takeIf { !it.startsWith("Mfr ") }?.let { return cleanMaker(it) }
+        val det = detail?.takeIf { it.isNotEmpty() } ?: return null
+        // 3. TYPE-GATED, AFFIX-ANCHORED parsing. Deliberately not a generic "first token" rule:
+        //    that would turn "Axon OUI" into "Axon" (erasing that this is the WEAK variant, not
+        //    the conf-90 payload tag) and "Motorola Solutions OUI" into "Motorola", which reads
+        //    as Motorola MOBILITY, a different company. The suffix anchors are safe against the
+        //    body-cam contract precisely because the WiFi body-cam path omits " on wifi" to stay
+        //    byte-identical to its BLE strings.
+        return when (type) {
+            DeviceType.NETWORK_CAMERA ->
+                cleanMaker(det.removeSuffix(" on wifi").takeIf { it != det })
+            // METHOD GATE, and it is load-bearing. Drone is the ONE parsed type whose detail can
+            // contain REMOTE-DEVICE TEXT: on the Remote ID path the firmware writes "op %s" from
+            // the broadcaster's 20-byte ODID Operator ID (drone_detect.cpp), so a crafted
+            // Operator ID whose last 19 bytes are exactly this anchor would make the row title,
+            // the dossier Maker row and the CSV read "op". The vendor-OUI fallback that actually
+            // emits this string sets method = OUI, while the attacker-reachable "op ..." detail
+            // only ever arrives as Remote ID, so requiring OUI here closes it. The deny-list
+            // cannot: it screens silicon vendor names, not arbitrary broadcast text.
+            DeviceType.DRONE ->
+                if (!isOuiMatch) null
+                else cleanMaker(det.removeSuffix(" gear, no Remote ID").takeIf { it != det })
+            // The firmware encodes confidence as ":" and hedging as "?", so the colon rule admits
+            // "Ray-Ban Meta: ..." and "Meta: ..." while self-excluding "HeyCyan glasses UUID",
+            // "Jieli chipset? ..." and "TCL/RayNeo? ...". Do not relax this to a prefix match.
+            DeviceType.GLASSES ->
+                cleanMaker(det.substringBefore(':', "").takeIf { it.isNotEmpty() })
+            // Exact map, no parsing. "Apple Find My" rather than "Apple" on purpose: Chipolo and
+            // Pebblebee tags advertise the same offline Find My payload, so the NETWORK is what
+            // was proved, not the manufacturer. "(offline)" is dropped from the title only
+            // because it would read as the row's OFFLINE buffer-replay tag, which it is not.
+            DeviceType.TRACKER -> when (det) {
+                "Apple Find My (offline)" -> "Apple Find My"
+                "Tile"                    -> "Tile"
+                "Samsung SmartTag"        -> "Samsung SmartTag"
+                else                      -> null
+            }
+            else -> null
+        }
     }
