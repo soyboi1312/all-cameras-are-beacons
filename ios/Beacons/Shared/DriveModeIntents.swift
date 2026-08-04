@@ -1,5 +1,27 @@
 import AppIntents
 import ActivityKit
+import Foundation
+
+/// The user's Drive-mode INTENT, persisted. This is NOT the same fact as "a Live Activity is
+/// running", and conflating the two is what made the setting reset on every app close:
+/// `BLEManager.driveModeOn` is derived state with no backing store, and BLEManager's own
+/// willTerminate handler calls `liveActivity.endBlocking()` on the way out. So the app destroys
+/// the only carrier of the setting itself, and the next launch finds nothing to adopt.
+///
+/// The split: the ACTIVITY is the surface and is still torn down at terminate (a counter left
+/// frozen on the Lock Screen after a force-quit was its own bug, and that fix stays). The INTENT
+/// lives here and survives, so the app can re-create the surface when it next comes forward.
+///
+/// App Group rather than UserDefaults.standard so the app and the widget extension read one
+/// value; same id as both entitlements and BLEManager.widgetSuite.
+enum DriveModeState {
+    private static let suite = "group.tech.beacons.app"
+    private static let key = "acab.driveModeWanted"
+    static var wanted: Bool {
+        get { UserDefaults(suiteName: suite)?.bool(forKey: key) ?? false }
+        set { UserDefaults(suiteName: suite)?.set(newValue, forKey: key) }
+    }
+}
 
 // Interactive intents for the Drive-mode Live Activity (the in-activity End button) and the
 // Control Center toggle. Deliberately dependency-free - they use only ActivityKit and the
@@ -12,6 +34,7 @@ struct EndDriveModeIntent: LiveActivityIntent {
     static var title: LocalizedStringResource = "End Drive Mode"
 
     func perform() async throws -> some IntentResult {
+        DriveModeState.wanted = false   // an explicit End must not come back at the next launch
         for activity in Activity<DetectionActivityAttributes>.activities {
             await activity.end(nil, dismissalPolicy: .immediate)
         }
@@ -30,6 +53,7 @@ struct ToggleDriveModeIntent: SetValueIntent {
 
     func perform() async throws -> some IntentResult {
         let running = Activity<DetectionActivityAttributes>.activities
+        DriveModeState.wanted = value   // Control Center is a real user choice; remember it too
         if value {
             if running.isEmpty {
                 let attrs = DetectionActivityAttributes(deviceName: "beacons", sessionStart: .now)

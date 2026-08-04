@@ -121,6 +121,36 @@ apps' weak-match threshold (50), so every hit renders as amber "weak match, veri
 rather than a calm partial match. Do not raise it above 50 and do not label it "ALPR
 camera": either is a false-certainty bug, not a tuning choice.
 
+### Considered and REJECTED: Sierra Wireless AirLink and Cradlepoint vehicle routers (2026-08-02)
+
+Proposed as rows in `police_signatures.h`, on the reasoning that both vendors dominate US cruiser
+connectivity and run WiFi APs from marked vehicles. The OUIs are real and the registrants narrow,
+IEEE-confirmed against a fresh `standards-oui.ieee.org` pull:
+`Sierra Wireless, ULC` = `50:13:9D 84:DB:2F 64:CE:6E CC:93:4A 00:A0:D5 28:A3:31`;
+`CradlePoint, Inc` = `00:30:44 00:E0:1C`. **Rejected anyway**, for three independent reasons:
+
+1. **The table cannot say who it matched.** `POLICE_OUI[][3]` has no per-row vendor field, and
+   `police_detect.cpp` hard-codes `"Motorola Solutions OUI"` into the detail string. Appending
+   these blocks would report a Sierra AirLink on a transit bus **as a Motorola body cam** , a lie
+   about the vendor on every hit. That is why this is not an "add the rows at low confidence"
+   situation: the confidence would be honest and the vendor name would not.
+2. **Our own field data says what a bare vendor-OUI row of this shape measures.** Of the 30
+   body-cam rows in our capture, all **27** Motorola WiFi OUI hits were confirmed NOT body cams.
+   These two vendors are broader still: their own marketing leads with transit, EMS, retail SD-WAN,
+   utilities and school buses. The installs most likely to have an AP on and beaconing loudly are a
+   bus running open passenger WiFi and a storefront failover router, i.e. the opposite of the
+   target, and no payload byte, capability bit or IE separates a patrol install from a bus install.
+3. **The crux is unresolved and may be fatal on its own.** Nothing published ties either vendor's
+   OUI to the BSSID the radio actually transmits. Cradlepoint's own documentation says only that
+   "BSSIDs are derived from the hardware MAC address of the broadcasting radio", which is a
+   mechanism, not a prefix. The MG90 hardware guide describes the WiFi radios as modules, so the
+   BSSID may carry the module maker's block instead , in which case the rows are dead on arrival
+   and the tempting "fix" is to add the module block, which is exactly the shared-silicon trap this
+   document and `netcam_signatures.h` both already forbid.
+
+Re-proposing these needs a captured BSSID from a marked vehicle, and a per-row vendor field in
+`POLICE_OUI` before any hit could be labelled honestly.
+
 **Coverage went from 1 block to 7 (2026-07-19).** The table shipped only `4C:CC:34`, which
 left six sibling blocks of the same vendor's gear invisible. This is now the COMPLETE set
 registered to the Motorola Solutions entities, cross-checked against the IEEE registry via
@@ -170,6 +200,66 @@ src: IEEE OUI registry -> https://maclookup.app/macaddress/4CCC34
 > a mesh board against a beacon/oui-spy board may see Motorola hits on one and not the
 > other until the sub-toggle is turned on. This is a boot default only, not a signature
 > difference. Wire details in [docs/ble-protocol.md](ble-protocol.md).
+
+### Considered and REJECTED: LiveView Technologies (LVT) mobile surveillance trailers (2026-08-03)
+
+The solar-and-camera trailers parked in retail lots. Proposed as a detection target because they
+are large, obvious, unmistakably surveillance, and sitting where people actually are.
+
+**Rejected on our own field measurement: they emit nothing this hardware can hear.**
+
+The raw capture was 50 minutes / 105,932 lines from `firmware/tools/capture-log.py`, on a
+`-DACAB_DIAG -DACAB_DIAG_WIFI` build with Desert mode on. That file is gitignored (`*.log`, 9 MB),
+so the evidence is committed distilled instead:
+[`docs/captures/lvt-2026-08-03-summary.txt`](captures/lvt-2026-08-03-summary.txt) , every typed
+marker, every classifier detection, and every raw sighting inside the three LVT approach windows.
+Two different LVT units were approached, one at 15 ft and both at 2 m. Nothing on either trailer produced a BLE advert or a
+WiFi frame at any range.
+
+**Why this is a measurement and not an absence of effort.** The same board, on the same drive, in
+the same lots, caught every other target within seconds of the marker being typed:
+
+| marker | detection | delta |
+|---|---|---|
+| `2 flock` 90.8s | ALPR camera, Falcon probe, -70 dBm | -1 s |
+| `flock` 1621.1s | ALPR camera, Falcon probe | -10 s |
+| `flock` 1701.7s | ALPR camera, Falcon probe | -6 s |
+| `bodycam` 2587.9s | Body camera, BLE `BWC DEVICE` conf 90, **and** WiFi Axon OUI | -14 s |
+| **`LVT#1 2m` 151.2s** | **nothing** | |
+| **`LVT#2 15ft` 299.9s** | **nothing** | |
+| **`LVT#2 2m` 341.5s** | **nothing** | |
+
+(Detections precede their markers because the operator typed the note after seeing the alert.)
+
+**The distance calibration, from the same capture, is what makes the negative solid.** RSSI on this
+hardware, measured against known distances that day:
+
+```
+the board's own beacon          ~0 m    -17 dBm
+operator's phone / car gear    ~1-2 m   -30 to -40 dBm
+POS terminals inside a store    50+ ft  -65 to -92 dBm   (distance eyeballed on site)
+loudest thing beside an LVT       2 m   -30 dBm ... and it was the operator's own gear
+```
+
+A transmitter at 2 m reads like the phone did. Nothing at either trailer came close. The four
+strongest devices next to the trailers were the same four that followed the operator between both
+stops and disappeared 300 s after he left , his own car and pocket.
+
+**One near-miss worth recording so nobody re-chases it.** Thirteen BLE devices with a shared OUI
+`CC:4D:74` / `38:3C:9C` and a structured name pattern `51idx0018xxxxxxx` appeared at both LVT stops
+and nowhere else in the capture. That is exactly the shape of a vendor signature, and it is not
+one: `CC:4D:74` is **Fujian Newland Payment Technology**, i.e. checkout card readers inside the
+store, ~50 ft away and reading -65 to -92 dBm accordingly. Structured pattern, mundane cause. Look
+the OUI up before believing a cluster.
+
+**Consistent with the vendor material**, which describes cellular uplink with satellite backup and
+never mentions WiFi, Bluetooth, or a local hotspot. This is the recording-is-not-transmitting case
+from the top of this file, now measured rather than inferred.
+
+**The one gap left.** We sweep 2.4 GHz channels 1-13 only (`WIFI_HOP_SEQ`). A 5 GHz-only service AP
+inside the enclosure would be invisible to us regardless. Settling that needs either a phone WiFi
+analyser alongside the board, or the FCC ID off the unit's plate, which names every radio in it.
+Neither changes the practical answer: **there is nothing here to add a row for.**
 
 ## Drone (Remote ID primary, vendor-OUI fallback)
 

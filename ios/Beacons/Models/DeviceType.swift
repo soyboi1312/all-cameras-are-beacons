@@ -23,6 +23,36 @@ enum DeviceType: Int, CaseIterable, Identifiable, Codable {
 
     var id: Int { rawValue }
 
+    /// Key into the SHARED faq-content.json `relatedHelp` map. That file is byte-identical on both
+    /// platforms, so its keys are the Android enum's SCREAMING_CASE names and iOS maps onto them
+    /// here rather than the JSON carrying two spellings of every category. A type with no entry
+    /// simply has no RELATED HELP panel, which is the intended state for several of them.
+    /// Key into `faq-content.json`'s `relatedHelp` map. Matches the Android enum's SCREAMING_CASE
+    /// names, because the JSON is shared and Android keys off `name` directly.
+    ///
+    /// TWO KINDS OF "NO PANEL" HERE, and they are not the same thing:
+    ///   - BODY_CAM and GLASSES return a REAL key that the JSON has no entry for. That is
+    ///     RESERVED, not dead: both categories already carry an experimental note on the dossier,
+    ///     and stacking a second hedge under it reads as doubt about the detection rather than a
+    ///     pointer to context. If those notes ever go away, add the entries and the panel appears
+    ///     with no code change. Do not "clean up" these keys.
+    ///   - nearbyDevice and unknown return "", which means NEVER. They are not categories a user
+    ///     can have a question about; nearbyDevice is Desert mode's firehose and unknown is a
+    ///     parse fallback.
+    var faqKey: String {
+        switch self {
+        case .flockCamera:       return "FLOCK_CAMERA"
+        case .flockRaven:        return "FLOCK_RAVEN"
+        case .axonBodyCam:       return "BODY_CAM"
+        case .drone:             return "DRONE"
+        case .tracker:           return "TRACKER"
+        case .watched:           return "WATCHED"
+        case .recordingGlasses:  return "GLASSES"
+        case .networkCamera:     return "NETWORK_CAMERA"
+        case .nearbyDevice, .unknown: return ""
+        }
+    }
+
     var label: String {
         switch self {
         case .flockCamera: return "ALPR Camera"

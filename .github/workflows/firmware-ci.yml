@@ -1,0 +1,94 @@
+name: Firmware CI
+
+# The firmware had NO CI at all while being the component that ships signed OTA images to
+# hardware in the field. The Android workflow already gates on full lint because lintVitalRelease
+# provably missed a real crash; this is the equivalent gate for the side where a regression is
+# both least visible and least recoverable.
+#
+# Deliberately NOT here: iOS. `xcodebuild` without signing is doable but needs macOS runners,
+# which is the one item in this file with a real recurring cost. Add it if the app side starts
+# breaking; today it never has.
+
+on:
+  push:
+    branches: [main]
+    paths: ['firmware/**', 'docs/**', 'README.md', '.github/workflows/firmware-ci.yml']
+  pull_request:
+    paths: ['firmware/**', 'docs/**', 'README.md', '.github/workflows/firmware-ci.yml']
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      # PlatformIO's package cache is the slow part, not the compile.
+      - name: Cache PlatformIO
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.platformio
+            firmware/.pio
+          key: pio-${{ runner.os }}-${{ hashFiles('firmware/platformio.ini') }}
+          restore-keys: pio-${{ runner.os }}-
+
+      - name: Install PlatformIO
+        run: pip install --upgrade platformio
+
+      # ALL envs, not just the product one. The rev-B and channel-1 variants are exactly the
+      # targets a local `pio run` forgets, because nobody builds them by hand day to day.
+      - name: Build every firmware env
+        working-directory: firmware
+        run: pio run
+
+      # Sub-second, no board needed. This is the layer that catches a classifier that still
+      # compiles but has quietly stopped matching, which is the failure this product cannot
+      # afford and which no amount of building would reveal.
+      - name: Host tests (classifiers)
+        run: firmware/tools/host-tests/run.sh
+
+      # A drift watcher that only runs when someone remembers to run it is not a watcher.
+      - name: Signature + vendored-copy drift
+        run: python3 firmware/tools/check-signature-drift.py
+
+  # The repo has a public/private split (firmware/nrf-ble-scan/, firmware/OTA.md and the whole
+  # hardware/ tree are gitignored), which is precisely the condition that produces links pointing
+  # at files no public reader can see. Two had already shipped that way.
+  links:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check relative links in tracked markdown resolve
+        run: |
+          # The `while read` below runs in a pipeline subshell, so a shell variable set inside it
+          # is invisible out here. A scratch FILE is the state that actually survives. mktemp
+          # rather than a fixed /tmp path: on a reused or self-hosted runner a leftover file from
+          # an earlier run would fail this job with no BROKEN lines printed, which is a confusing
+          # way to be told nothing is wrong.
+          broken=$(mktemp)
+          for f in $(git ls-files '*.md'); do
+            dir=$(dirname "$f")
+            # relative markdown links only: skip http(s), mailto and pure anchors
+            grep -oE '\]\([^)#][^)]*\)' "$f" 2>/dev/null \
+              | sed -E 's/^\]\(//; s/\)$//; s/#.*$//' \
+              | grep -vE '^(https?:|mailto:)' \
+              | while read -r link; do
+                  [ -z "$link" ] && continue
+                  target="$dir/$link"
+                  if [ ! -e "$target" ]; then
+                    echo "BROKEN  $f  ->  $link"
+                    echo broken >> "$broken"
+                  fi
+                done
+          done
+          if [ -s "$broken" ]; then
+            echo "::error::one or more markdown links point at a path that is not in the repo"
+            echo "(a gitignored target counts as broken: public readers get a 404)"
+            exit 1
+          fi
+          echo "all relative markdown links resolve"

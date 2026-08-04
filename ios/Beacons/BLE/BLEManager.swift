@@ -9,6 +9,10 @@ import WidgetKit
 import Security
 
 /// A board we spotted while scanning.
+///
+/// Keyed on `peripheral.identifier`, which is CoreBluetooth's PER-HOST UUID and not the board's
+/// BLE address. That does NOT make the row immune to the firmware's rotating Resolvable Private
+/// Address; see the staleness prune in didDiscover for the evidence and the window.
 struct DiscoveredDevice: Identifiable {
     let id: UUID
     let peripheral: CBPeripheral
@@ -120,7 +124,21 @@ final class BLEManager: NSObject, ObservableObject {
     @Published private(set) var demoMode = false   // canned sample data, no real board
     private var demoNeedsRelocate = false          // demo seeded before a GPS fix -> re-place around the user when one arrives
     @Published private(set) var alertMode: AlertMode = .buzzer
-    private var alertModeBeforeDesert: AlertMode?      // alert mode to restore when Desert mode turns off
+    /// Alert mode to restore when Desert mode turns off.
+    ///
+    /// PERSISTED. This used to be plain in-memory state, and Desert mode force-writes Silent to
+    /// BOTH UserDefaults and the board's NVS (buzz=false). So relaunching the app while Desert was
+    /// on lost the restore target, and turning Desert off afterwards left the board permanently
+    /// mute with no way back except hand-picking the mode again. A user in that state reports "my
+    /// starred device never beeps", which reads as a detection bug and is not one.
+    private var alertModeBeforeDesert: AlertMode? {
+        get { AlertMode(rawValue: UserDefaults.standard.string(forKey: alertModeBeforeDesertKey) ?? "") }
+        set {
+            if let v = newValue { UserDefaults.standard.set(v.rawValue, forKey: alertModeBeforeDesertKey) }
+            else { UserDefaults.standard.removeObject(forKey: alertModeBeforeDesertKey) }
+        }
+    }
+    private let alertModeBeforeDesertKey = "acab.alertModeBeforeDesert"
     @Published private(set) var driveModeOn = false   // Live Activity (Drive mode) running
     /// True while a pending auto-reconnect is armed after an UNEXPECTED drop (board unplugged /
     /// power-cycled). Distinct from a fresh scan-connect (which is also .connecting but has no
@@ -185,6 +203,20 @@ final class BLEManager: NSObject, ObservableObject {
     /// it found, exactly like Android keeps _found.
     private var scanTimeoutTimer: Timer?
     private let scanTimeoutInterval: TimeInterval = 45
+
+    /// How long a scanned board stays in the picker after its last advertisement, matching
+    /// Android's FOUND_STALE_MS. See the prune in didDiscover for why a picker keyed on a UUID
+    /// still needs one.
+    private let foundStaleInterval: TimeInterval = 6
+    /// Last advertisement time per discovered id, feeding that prune.
+    ///
+    /// Deliberately a SIDE MAP rather than a field on DiscoveredDevice, which is where Android
+    /// puts it (FoundBoard.seenAt). `discovered` is @Published, an advertising board arrives
+    /// 10-20 times a second, and stamping the row on every advert would republish the picker at
+    /// that rate - the exact re-render storm the meaningful-change filter in didDiscover exists to
+    /// stop. Android rebuilds its whole _found list per result anyway, so the field costs it
+    /// nothing there. The window and the behaviour are identical; only the storage differs.
+    private var lastAdvertAt: [UUID: Date] = [:]
 
     // MARK: OTA firmware update
     // The whole OTA state machine lives in BLEManager+OTA.swift; these are the pieces it
@@ -263,6 +295,16 @@ final class BLEManager: NSObject, ObservableObject {
     /// exactly like trackHistory. lastCrumbAt holds the last append time per id for the rate gate.
     private var crumbHistory: [String: [CLLocationCoordinate2D]] = [:]
     private var lastCrumbAt: [String: Date] = [:]
+    /// When this device's FIRST crumb was dropped, i.e. the START of its crumb window.
+    ///
+    /// Separate from firstSeenAt, and the difference is the whole point: firstSeenAt is when the
+    /// device was first HEARD and it is PERSISTED across launches, while crumbs begin later (the
+    /// first fresh fix after the sighting) and are session-only. Scoring a follow window from
+    /// firstSeenAt therefore narrated a duration the trail does not cover, and let the band time
+    /// floors be satisfied by time that contains no crumbs at all. Torn down in lockstep with
+    /// lastCrumbAt at EVERY site, because a stamp that outlives its crumbs is exactly the stale
+    /// input this exists to remove.
+    private var firstCrumbAt: [String: Date] = [:]
 
     /// What ingestHistory filed for a row, and how honest the time on it is. Keyed by detection
     /// id but carrying the STAMP it applies to, because the two can disagree: a device replayed
@@ -347,6 +389,22 @@ final class BLEManager: NSObject, ObservableObject {
     private let notifHaptic = UINotificationFeedbackGenerator()
     private let impactHaptic = UIImpactFeedbackGenerator(style: .medium)
 
+    /// Per-device haptic cooldown. THE COOLDOWN IS THE EDGE, NOT `firstTime`.
+    ///
+    /// This is the same defect DetectionNotifier already fixed for notifications, left behind on
+    /// the haptic line. `firstTime` is `store[d.id] == nil`, and the store is PERSISTED across
+    /// launches (init -> loadPersistedDetections), so a device seen in ANY earlier session was
+    /// never "first" again and could never buzz. On a commute past the same hardware that is every
+    /// device, which is why the vibrate setting read as doing nothing at all. See the DESIGN RULES
+    /// block in DetectionNotifier.swift, which spells out this exact trap.
+    ///
+    /// Deliberately NOT shared with the notifier's table: a silent board is not a silent phone, and
+    /// one shared cooldown would let a notification suppress a haptic or the reverse. Bounded the
+    /// same way the notifier's is, which matters in Desert mode where one drive sees thousands of
+    /// MACs.
+    private var lastHapticByMac: [String: Date] = [:]
+    private static let hapticCooldown: TimeInterval = 600   // 10 min, matches DetectionNotifier
+
     private let locationManager = CLLocationManager()
     /// The whole CLLocation, not just its coordinate, because the coordinate alone can't be tested
     /// for freshness even in principle. See freshCoord.
@@ -426,6 +484,13 @@ final class BLEManager: NSObject, ObservableObject {
         // previous launch (so a relaunch mid-drive resumes instead of orphaning it).
         liveActivity.onInactive = { [weak self] in
             self?.driveLinkGrace?.invalidate(); self?.driveLinkGrace = nil   // activity is gone; nothing to auto-end
+            // Reached ONLY on an OUTSIDE end: a swipe-away, the in-activity End button, the
+            // Control Center toggle, or the system's own ceiling. Our own teardowns cannot land
+            // here, because end()/endBlocking() nil `activity` before ending and handleInactive
+            // guards on `activity?.id == id`. That is exactly what makes it safe to clear the
+            // persisted intent here: a user dismissing the activity means OFF and must not
+            // resurrect, while the willTerminate teardown leaves the intent standing.
+            DriveModeState.wanted = false
             self?.driveModeOn = false
             self?.stopLocationIfIdle()   // Drive mode was the only thing holding location, disconnected
         }
@@ -488,6 +553,7 @@ final class BLEManager: NSObject, ObservableObject {
     func startScan() {
         guard central.state == .poweredOn else { return }
         discovered.removeAll()
+        lastAdvertAt.removeAll()   // freshness stamps belong to the list they describe
         connectionState = .scanning
         // Allow duplicates so we don't miss the scan-response manufacturer data
         // (the firmware version) - it usually shows up a callback or two after the first advert.
@@ -604,7 +670,8 @@ final class BLEManager: NSObject, ObservableObject {
         publishTimer?.invalidate(); publishTimer = nil   // drop any queued coalesced republish
         liveCheckpointTimer?.invalidate(); liveCheckpointTimer = nil   // and any queued disk write of the store we're dropping
         store.removeAll(); lastSeen.removeAll(); rssiHistory.removeAll()
-        trackHistory.removeAll(); crumbHistory.removeAll(); lastCrumbAt.removeAll()
+        trackHistory.removeAll(); crumbHistory.removeAll()
+        lastCrumbAt.removeAll(); firstCrumbAt.removeAll()   // both crumb stamps die with the crumbs
         firstSeenAt.removeAll(); capturedLoc.removeAll(); bestRssi.removeAll(); detections = []
         histBasis.removeAll(); histAnchoredBoots.removeAll()
         liveCounts = (0, 0, 0, 0, 0, 0)
@@ -631,6 +698,7 @@ final class BLEManager: NSObject, ObservableObject {
     /// begin one; the toggle lives in DeviceView, which is on-screen when tapped.
     func startDriveMode() {
         guard liveActivity.isAvailable else { return }
+        DriveModeState.wanted = true    // survives the willTerminate teardown below
         liveActivity.dropIfInactive()
         if liveActivity.adoptExisting() {   // reuse one already running (e.g. the Control Center toggle)
             driveModeOn = true
@@ -646,6 +714,7 @@ final class BLEManager: NSObject, ObservableObject {
 
     func endDriveMode() {
         driveLinkGrace?.invalidate(); driveLinkGrace = nil   // no pending auto-end to fire later
+        DriveModeState.wanted = false   // deliberate off: do not resume this at the next launch
         driveModeOn = false
         liveActivity.end()
         writeWidgetSummary(force: true)   // reflect "not connected / drive off" on the home widget
@@ -695,6 +764,15 @@ final class BLEManager: NSObject, ObservableObject {
             driveModeOn = true
             liveActivity.update(liveState())
             startLocationIfNeeded()
+        } else if DriveModeState.wanted, liveActivity.isAvailable {
+            // No activity running, but the user never turned Drive mode off - so this is the
+            // relaunch case: willTerminate ended the activity, and the intent outlived it.
+            // Re-create the surface. This is the only path that reads `wanted`; every way of
+            // turning Drive mode OFF (endDriveMode, the End button, the Control Center toggle,
+            // a swipe-away via onInactive) clears it first, so a deliberate off cannot land here.
+            // Foreground-safe by construction: reconcileDriveMode is only called from scenePhase
+            // .active, which is the state iOS requires to begin a Live Activity.
+            startDriveMode()
         } else {
             driveModeOn = false
             stopLocationIfIdle()
@@ -869,6 +947,30 @@ final class BLEManager: NSObject, ObservableObject {
     /// (empty for everything else).
     func crumbTrail(for id: String) -> [CLLocationCoordinate2D] { crumbHistory[id] ?? [] }
 
+    /// When this device's most recent crumb was dropped, i.e. the END of its crumb window.
+    /// Read-only, added for FollowEvidence and nothing else: the follow score needs the close of
+    /// the window, and lastSeen is the wrong stamp for it (a tag heard once more from a parked
+    /// phone advances lastSeen without adding a crumb, which would stretch the duration in the
+    /// sentence past the ground the crumbs actually cover). Mirrors Android's lastCrumbAt(id).
+    func lastCrumbAt(for id: String) -> Date? { lastCrumbAt[id] }
+
+    /// When this device's FIRST crumb was dropped, i.e. the START of its crumb window.
+    /// The follow scorer's other stamp, and deliberately NOT firstSeenDate(for:): that one is when
+    /// the device was first HEARD, it survives app restarts, and the crumbs do not, so scoring
+    /// between them measured a window the trail never covered. Mirrors Android's firstCrumbAt(id).
+    func firstCrumbAt(for id: String) -> Date? { firstCrumbAt[id] }
+
+    /// Whether location is authorized at all, which is the difference between "we looked and saw
+    /// nothing move" and "we were never watching". Only the follow panel asks, and only to pick
+    /// which empty state to print: an unexplained blank there reads as a clean bill of health.
+    /// Reading authorizationStatus does not prompt and does not start the radio.
+    var locationAuthorized: Bool {
+        switch locationManager.authorizationStatus {
+        case .authorizedWhenInUse, .authorizedAlways: return true
+        default: return false
+        }
+    }
+
     /// Phone's last known coordinate - used to center the no-GPS RSSI ring. Falls back to
     /// CoreLocation's cached fix, so browsing history while disconnected still has a center now
     /// that we don't keep location running when nothing needs it. Reading the cache costs no radio.
@@ -914,7 +1016,7 @@ final class BLEManager: NSObject, ObservableObject {
 
     // MARK: - Whitelist (ignored devices)
 
-    /// Drop EVERY per-id side map for one detection - the same ten maps the cap eviction in
+    /// Drop EVERY per-id side map for one detection - the same eleven maps the cap eviction in
     /// publishDetections clears. Any teardown that removes a row by id must go through this:
     /// clearing only store + lastSeen left firstSeenAt (and friends) populated, which kept
     /// inflating the widget's today count for an ignored device, resumed a stale breadcrumb
@@ -923,7 +1025,8 @@ final class BLEManager: NSObject, ObservableObject {
     private func evictKey(_ id: String) {
         store[id] = nil; lastSeen[id] = nil; rssiHistory[id] = nil
         trackHistory[id] = nil; firstSeenAt[id] = nil; capturedLoc[id] = nil
-        bestRssi[id] = nil; crumbHistory[id] = nil; lastCrumbAt[id] = nil
+        bestRssi[id] = nil; crumbHistory[id] = nil
+        lastCrumbAt[id] = nil; firstCrumbAt[id] = nil   // both crumb stamps die with the crumbs
         histBasis[id] = nil
     }
 
@@ -1043,7 +1146,11 @@ final class BLEManager: NSObject, ObservableObject {
     }
     /// Send the watch list to the board so it alerts on those MACs at the source. Same
     /// MAC string format as the ignore push, chunked the same way, debounced per key.
-    private func sendWatchList() { scheduleListPush("watch") }
+    /// USER-EDIT path only (see sendIgnoreList).
+    private func sendWatchList() {
+        setListClearPending("watch", watched.isEmpty)   // tracks the edit; re-starring retires it
+        scheduleListPush("watch")
+    }
 
     // MARK: - Seen watermark ("mark all seen")
 
@@ -1134,7 +1241,36 @@ final class BLEManager: NSObject, ObservableObject {
         } catch { }
     }
     /// Send the ignore list to the board so it suppresses those MACs at the source.
-    private func sendIgnoreList() { scheduleListPush("ignore") }
+    /// USER-EDIT path only; the connect-time re-statement goes through resyncListsOnConnect().
+    private func sendIgnoreList() {
+        setListClearPending("ignore", ignored.isEmpty)   // tracks the edit; re-adding retires it
+        scheduleListPush("ignore")
+    }
+
+    /// Whether the last user edit on `key` emptied the list and we have not yet delivered that
+    /// clear to a board. Persisted, because the edit can happen while disconnected and the board
+    /// must still learn about it on the next connect.
+    private func listClearPending(_ key: String) -> Bool {
+        UserDefaults.standard.bool(forKey: "acab.\(key).clearPending")
+    }
+    private func setListClearPending(_ key: String, _ pending: Bool) {
+        UserDefaults.standard.set(pending, forKey: "acab.\(key).clearPending")
+    }
+
+    /// Re-state both lists to a freshly connected board.
+    ///
+    /// Skips a list we have nothing to say about. Pushing an EMPTY list unconditionally is how a
+    /// fresh install (or any second phone that had never starred anything) silently wiped every
+    /// star on a board the instant it connected: the push committed an empty list and the board
+    /// rewrote its NVS. An empty list is only worth sending when the user actually emptied it,
+    /// which is what the persisted clear-pending flag records. The firmware refuses a bare empty
+    /// commit as well (it requires "clr"), so this is belt and braces, not the only guard.
+    private func resyncListsOnConnect() {
+        if !ignored.isEmpty || listClearPending("ignore") { sendIgnoreListResync() }
+        if !watched.isEmpty || listClearPending("watch") { sendWatchListResync() }
+    }
+    private func sendIgnoreListResync() { scheduleListPush("ignore") }
+    private func sendWatchListResync()  { scheduleListPush("watch") }
 
     // Star/ignore pushes are debounced per list key: every toggle resends the ENTIRE list
     // (13 chunked write-with-response writes at a full 256 entries), so rapid taps queued
@@ -1167,6 +1303,10 @@ final class BLEManager: NSObject, ObservableObject {
         lastListPush[key] = Date()
         let macs = (key == "watch") ? watched.map({ $0.mac }) : ignored.map({ $0.mac })
         sendMacList(key: key, macs: macs)
+        // The clear is only delivered once a board has actually taken the write. writeConfig
+        // silently no-ops when it has no peripheral or no characteristic, so clearing the flag off
+        // a dropped write would lose the user's intent for good.
+        if macs.isEmpty && canWriteConfig { setListClearPending(key, false) }
     }
 
     /// Push a MAC list to the board under `key` ("ignore" or "watch"), split into chunks of
@@ -1179,7 +1319,14 @@ final class BLEManager: NSObject, ObservableObject {
     /// arrive in order.
     private func sendMacList(key: String, macs: [String]) {
         let chunkSize = 20
-        guard macs.count > chunkSize else { writeConfig([key: macs]); return }
+        // "clr" marks an empty list as a DELIBERATE clear. Firmware refuses a bare empty commit
+        // and keeps whatever it had, so this flag is what makes "unstar the last device" work.
+        guard macs.count > chunkSize else {
+            var cfg: [String: Any] = [key: macs]
+            if macs.isEmpty { cfg["clr"] = true }
+            writeConfig(cfg)
+            return
+        }
         var i = 0
         while i < macs.count {
             let end = min(i + chunkSize, macs.count)
@@ -1484,7 +1631,13 @@ final class BLEManager: NSObject, ObservableObject {
             if alertMode != .silent {
                 alertModeBeforeDesert = alertMode
                 setAlertMode(.silent)
+            } else {
+                // Already Silent, so there is nothing to restore. CLEAR the token rather than
+                // leaving it: now that it is persisted it would otherwise be an arbitrarily old
+                // mode, and a later Desert-off would un-mute a user who deliberately chose Silent.
+                alertModeBeforeDesert = nil
             }
+            desertSeenOn = false   // wait for the board to confirm before arming the reconciler
         } else if let prior = alertModeBeforeDesert {
             // Desert forced Silent on; put the user's earlier alert mode back - but only if the
             // mode is still Silent. The card says "Switch sound back on anytime", and a mode the
@@ -1550,6 +1703,28 @@ final class BLEManager: NSObject, ObservableObject {
     ///  3. The correction was persisted, so one transient link fault could rewrite a stored
     ///     preference. The correction is now in-memory for the session; the stored preference is
     ///     re-asserted from scratch on the next launch.
+    /// Latched view of the board's Desert state, so a `desert:false` frame can be told apart from
+    /// "our enable write has not landed yet". Only flips true once the BOARD confirms Desert on.
+    private var desertSeenOn = false
+
+    /// Restore the pre-Desert alert mode when Desert ends WITHOUT going through setDesertMode(off).
+    ///
+    /// Desert is the one toggle with no NVS backing (desert_detect.cpp: a plain `static bool`), so
+    /// any board reboot comes back with it off. The Settings toggle just follows the status frame
+    /// (SettingsView: `desertOn = s.desertMode`), which means the restore branch in setDesertMode
+    /// never ran for the single most common way Desert ends. The board's Silent IS persisted
+    /// (buzz=false in its NVS), so the result was a board left permanently mute after a power
+    /// cycle, which reads as "my starred device stopped beeping" and is not a detection fault.
+    private func reconcileDesert(_ s: DeviceStatus) {
+        if s.desertMode { desertSeenOn = true; return }
+        guard desertSeenOn else { return }        // never saw it on: nothing to restore
+        desertSeenOn = false
+        // Same conditions as the manual path: only un-mute if we are still on the Silent that
+        // Desert forced, so a mode the user hand-picked while Desert ran survives.
+        if let prior = alertModeBeforeDesert, alertMode == .silent { setAlertMode(prior) }
+        alertModeBeforeDesert = nil
+    }
+
     private func reconcileBuzzer(_ s: DeviceStatus) {
         guard !s.isMeshDetect else { buzzerReassertAttempts = 0; return }   // no buzzer to reconcile
 
@@ -1577,8 +1752,29 @@ final class BLEManager: NSObject, ObservableObject {
     func setAlertMode(_ m: AlertMode) {
         alertMode = m
         UserDefaults.standard.set(m.rawValue, forKey: alertModeKey)
+        // A mode picked while Desert is running is an explicit choice and outranks whatever we
+        // captured on the way in, so drop the token. setDesertMode's own restore calls this too,
+        // which is harmless: it nils the token a line later anyway.
+        if m != .silent { alertModeBeforeDesert = nil }
         setBuzzerEnabled(m == .buzzer)
-        if m == .vibrate { notifHaptic.prepare(); requestFocusAuthIfNeeded() }
+        // Prime BOTH generators. impactHaptic is the one used for every type EXCEPT Flock and
+        // drone (see alertHaptic), i.e. the common case, and it was never being prepared - an
+        // unprepared generator still fires but with enough latency to feel like a miss on a
+        // single medium tap.
+        if m == .vibrate { notifHaptic.prepare(); impactHaptic.prepare(); requestFocusAuthIfNeeded() }
+    }
+
+    /// May this MAC buzz now? True when it has never buzzed or is past `hapticCooldown`, and it
+    /// RECORDS the buzz, so only call it once you know everything else has passed.
+    private func hapticDue(_ mac: String, now: Date = Date()) -> Bool {
+        if let last = lastHapticByMac[mac], now.timeIntervalSince(last) < Self.hapticCooldown {
+            return false
+        }
+        lastHapticByMac[mac] = now
+        if lastHapticByMac.count > 256 {
+            lastHapticByMac = lastHapticByMac.filter { now.timeIntervalSince($0.value) < Self.hapticCooldown }
+        }
+        return true
     }
 
     /// Buzz the phone on a fresh sighting - a sharper pattern for priority threats.
@@ -1623,6 +1819,17 @@ final class BLEManager: NSObject, ObservableObject {
         guard let peripheral, let configChar,
               let data = try? JSONSerialization.data(withJSONObject: dict) else { return }
         peripheral.writeValue(data, for: configChar, type: .withResponse)
+    }
+
+    /// EXACTLY what writeConfig needs to actually put bytes on the wire.
+    ///
+    /// `connectionState == .connected` is NOT the same thing and must not be used as a proxy for
+    /// it: demo mode publishes .connected with a nil peripheral, and the OTA reboot window keeps
+    /// .connected while the link is down and configChar is stale. Retiring a persisted "the user
+    /// cleared this list" flag off a write that was silently dropped loses the clear for good,
+    /// because resyncListsOnConnect then has nothing to say and never pushes again.
+    private var canWriteConfig: Bool {
+        peripheral?.state == .connected && configChar != nil
     }
 
     // MARK: - OTA bridges (internal, so BLEManager+OTA.swift can drive the link)
@@ -2183,6 +2390,14 @@ final class BLEManager: NSObject, ObservableObject {
                 c.append(coord); if c.count > 120 { c.removeFirst(c.count - 120) }
                 crumbHistory[d.id] = c
                 lastCrumbAt[d.id] = now
+                // Only when absent, so this stays the START of the window rather than tracking the
+                // latest crumb. Set here and nowhere else: the follow scorer's duration is only
+                // honest if its opening stamp is the moment a crumb actually landed.
+                // Known limit, stated rather than hidden: the 120 cap above can drop the crumb this
+                // stamp names (120 crumbs at 60 s minimum spacing is a run over two hours long), and
+                // the stamp is deliberately NOT advanced with it. Erring long here only ever makes
+                // the mean-gap test stricter and the run look older, both of which under-claim.
+                if firstCrumbAt[d.id] == nil { firstCrumbAt[d.id] = now }
             }
         }
         schedulePublish()   // coalesced: a Desert-mode firehose updates the feed a few Hz, not per-record
@@ -2191,8 +2406,10 @@ final class BLEManager: NSObject, ObservableObject {
         // Live rows get their own, slower checkpoint: the board does not buffer while we're
         // connected, so nothing else is holding this session.)
         if !d.isHistory { scheduleLiveCheckpoint() }
-        // Live first sightings buzz; replayed history never does.
-        if !d.isHistory, alertMode == .vibrate, firstTime, !focusActive { alertHaptic(for: d.type) }
+        // Live sightings buzz, past their per-device cooldown; replayed history never does.
+        // `hapticDue` RECORDS, so it stays LAST: the cheap gates short-circuit ahead of it, and a
+        // buzz suppressed by Focus must not start the cooldown that suppressed it.
+        if !d.isHistory, alertMode == .vibrate, !focusActive, hapticDue(d.mac) { alertHaptic(for: d.type) }
         // Phone notification, per category, opt-in. Deliberately INDEPENDENT of alertMode: that
         // governs the board's buzzer, and choosing a silent board is not the same as choosing a
         // silent phone. Ignored devices never reach here (dropped above), so one cannot notify.
@@ -2528,6 +2745,7 @@ final class BLEManager: NSObject, ObservableObject {
             bufferingOn = s.bufferingOn   // keep the toggle in step with the board
             ledOn = s.ledEnabled          // same, for the lights-out toggle
             reconcileBuzzer(s)            // and the buzzer, which used to be the one that drifted
+            reconcileDesert(s)            // Desert has no NVS: a board reboot ends it behind our back
             // The drive-mode columns follow the board's detector toggles, and the Live Activity is
             // otherwise only pushed from publishDetections(). Without this, flipping a detector did
             // nothing visible until the NEXT detection arrived, which in a quiet area is minutes,
@@ -2581,7 +2799,7 @@ final class BLEManager: NSObject, ObservableObject {
         // dimmed - the demo forces motorolaSupported precisely to introduce that control, and a
         // dimmed sub-toggle under an off parent defeats the tour. Matches the Android seed.
         status = decodeJSON(DeviceStatus.self, [
-            "fw": "beacon board 2.0.2", "up": 4920, "total": 6, "ble": true, "wifi": true,
+            "fw": "beacon board 2.0.3", "up": 4920, "total": 6, "ble": true, "wifi": true,
             "axon": true, "tracker": true, "glasses": true, "buzzer": true, "vol": 70, "gps": true, "bat": 82,
         ])
         // The sample board is a current one. Without this the tour would read it as pre-split
@@ -2627,11 +2845,12 @@ final class BLEManager: NSObject, ObservableObject {
             ["t": 10, "s": 0, "meth": 1, "c": 80, "mac": "44:19:B6:22:0A:5C", "rssi": -70,
              "det": "Hikvision on wifi", "lat": 37.7788, "lon": -122.4183, "n": 2, "new": true],
         ]
-        // The demo replaces the WHOLE store, so clear every per-id side map - the same ten-map
+        // The demo replaces the WHOLE store, so clear every per-id side map - the same eleven-map
         // list as evictKey/resetDetectionState. Leaving capturedLoc/bestRssi/crumb trails alive
         // under the sample store let a real session's pins and trails bleed into the tour.
         store.removeAll(); lastSeen.removeAll(); firstSeenAt.removeAll(); rssiHistory.removeAll()
-        trackHistory.removeAll(); crumbHistory.removeAll(); lastCrumbAt.removeAll()
+        trackHistory.removeAll(); crumbHistory.removeAll()
+        lastCrumbAt.removeAll(); firstCrumbAt.removeAll()   // both crumb stamps die with the crumbs
         capturedLoc.removeAll(); bestRssi.removeAll()
         histBasis.removeAll()   // the tour's stamps are all live-path; no buffered basis survives it
         for var dict in samples {
@@ -2772,11 +2991,15 @@ extension BLEManager: CBCentralManagerDelegate {
         #endif
         let dev = DiscoveredDevice(id: peripheral.identifier, peripheral: peripheral,
                                    name: name, rssi: RSSI.intValue, firmware: fw)
+        let now = Date()
+        lastAdvertAt[dev.id] = now
         if let i = discovered.firstIndex(where: { $0.id == dev.id }) {
             // Allow-duplicates exists to catch the LATE scan-response manufacturer data (the
             // firmware version), but republishing on every advert re-rendered ConnectView
             // 10-20x/s per advertising board. Only publish a meaningful change: the version
-            // landing, or the RSSI moving by a visible step.
+            // landing, or the RSSI moving by a visible step. (The freshness stamp above is NOT a
+            // meaningful change: it lives outside the published row precisely so it can be
+            // written every time without costing a render.)
             if (fw != nil && discovered[i].firmware == nil) || abs(discovered[i].rssi - dev.rssi) >= 3 {
                 discovered[i].rssi = dev.rssi
                 if let fw { discovered[i].firmware = fw }
@@ -2784,6 +3007,53 @@ extension BLEManager: CBCentralManagerDelegate {
         } else {
             discovered.append(dev)
         }
+        pruneStaleDiscovered(now)
+    }
+
+    /// Drop picker rows we have not heard an advertisement from in `foundStaleInterval`.
+    ///
+    /// WHY THIS EXISTS ON IOS AT ALL, since the list is keyed on peripheral.identifier and that is
+    /// a CoreBluetooth per-host UUID rather than the board's BLE address. The question is whether
+    /// CoreBluetooth collapses a peripheral whose advertised address rotates (the firmware
+    /// advertises a Resolvable Private Address, re-rolled every CONFIG_BT_NIMBLE_RPA_TIMEOUT =
+    /// 900 s) onto ONE identifier. It does not, and cannot, before the board is bonded:
+    ///
+    ///   - An RPA is only resolvable with the advertiser's Identity Resolving Key, and a central
+    ///     receives that key during bonding (Bluetooth Core Spec; the firmware distributes it
+    ///     explicitly via BLE_SM_PAIR_KEY_DIST_ID in acab_ble_service.cpp for exactly this reason).
+    ///     CoreBluetooth exposes no API to hand it an IRK, so before the first pair iOS has nothing
+    ///     to resolve WITH: each new address is a device it has never met.
+    ///   - Apple documents the identifier only as "The unique, persistent identifier associated
+    ///     with the peer" (CBPeer.h) and promises nothing about an unresolvable address change.
+    ///     Punch Through's Core Bluetooth guide is blunter: the UUID "isn't guaranteed to stay the
+    ///     same across scanning sessions and should not be 100% relied upon for peripheral
+    ///     re-identification", and their iOS 18 write-up states the mechanism directly: "If a
+    ///     device is unbonded and rotates its BLE address, it may become unconnectable. Without
+    ///     bonding, the BLE central cannot identify a device with a new address."
+    ///
+    /// So iOS is exposed in the same way Android is, and Android's prune is NOT redundant: for an
+    /// unbonded board a rotation mid-scan mints a second identifier and the old row would sit in
+    /// the picker as a phantom duplicate of the same physical unit. Once bonded, the OS resolves
+    /// the rotation with the IRK it holds and the identifier stays put, so the exposure is the
+    /// first-pair window (and any board the user has since forgotten). It is narrower here than on
+    /// Android only because a scan window is bounded at 45 s and startScan() empties the list, so
+    /// a 900 s rotation has to land inside that window; narrower is not absent.
+    ///
+    /// Advert-driven, like Android's: nothing prunes while no results arrive, so a scan that ends
+    /// with the boards it found still shows them. That is the resting screen behaviour both
+    /// platforms already document, not an accident of where the call sits.
+    private func pruneStaleDiscovered(_ now: Date) {
+        // An id with no stamp is treated as fresh, mirroring Android's `seenAt == 0L ||` guard:
+        // absent bookkeeping must never be a reason to delete a row the user can see.
+        let isStale = { (d: DiscoveredDevice) in
+            now.timeIntervalSince(self.lastAdvertAt[d.id] ?? now) >= self.foundStaleInterval
+        }
+        let goners = Set(discovered.filter(isStale).map(\.id))
+        guard !goners.isEmpty else { return }   // never republish for nothing
+        // Take the ids FIRST. Clearing the stamps before the removal would make isStale read the
+        // absent-is-fresh branch above and quietly delete nothing.
+        discovered.removeAll { goners.contains($0.id) }
+        for id in goners { lastAdvertAt[id] = nil }
     }
 
     /// Pull the firmware version out of our scan-response manufacturer data (company id 0xACAB).
@@ -2936,8 +3206,7 @@ extension BLEManager: CBPeripheralDelegate {
         startStatusPolling()   // periodic READ fallback for status frames too big for a small MTU notify
         driveModeLinkRestored()   // back from a dropout: cancel the auto-end, resume the live counter
         writeWidgetSummary(force: true)   // home widget goes to "connected"
-        sendIgnoreList()   // re-send the whitelist so the board has it this session
-        sendWatchList()    // then the watchlist, same MAC format, right after the ignore push
+        resyncListsOnConnect()   // re-state ignore then watch, skipping a list we never emptied
         buzzerReassertAttempts = 0               // fresh link: the first status frame is pre-write, don't count it
         lastPushedEnabled = nil                  // force the next status frame to re-push the columns
         setBuzzerEnabled(alertMode == .buzzer)   // a fresh board boots up buzzing; match the phone's mode

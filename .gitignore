@@ -36,3 +36,7 @@ ios/Beacons/Resources/Info.plist
 # OTA image-signing PRIVATE keys: keep offline, NEVER commit. Only the public key
 # (lib/acab_core/ota_pubkey.h) ships. Losing this key just means re-keying + a web-flash.
 firmware/tools/ota_signing/*.pem
+
+# Python bytecode (firmware tooling)
+__pycache__/
+*.pyc

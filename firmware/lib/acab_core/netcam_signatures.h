@@ -130,6 +130,40 @@ static const NetcamOui CAMERA_VENDOR_OUI[] = {
     { { 0xac, 0x12, 0x2f }, "Anker/eufy", 0 },
     { { 0xe8, 0xee, 0xcc }, "Anker/eufy", 0 },
     { { 0xf4, 0x9d, 0x8a }, "Anker/eufy", 0 },
+    // ---- added 2026-08-02, every block re-confirmed against a fresh standards-oui.ieee.org pull --
+    // Hangzhou Ezviz Software Co.,Ltd. - 14 blocks in the registry, all of them listed here.
+    // Ezviz is Hikvision's CONSUMER brand and holds its OWN registrations, so the Hikvision blocks
+    // above never catch an Ezviz camera: a real hole, not a duplicate. The registrant is a camera
+    // company, so the block is narrow in the way this file demands. src: IEEE MA-L.
+    { { 0x64, 0xf2, 0xfb }, "Ezviz", 0 },
+    { { 0x94, 0xec, 0x13 }, "Ezviz", 0 },
+    { { 0xec, 0x97, 0xe0 }, "Ezviz", 0 },
+    { { 0xf4, 0x70, 0x18 }, "Ezviz", 0 },
+    { { 0xfc, 0x24, 0x22 }, "Ezviz", 0 },
+    { { 0x78, 0xc1, 0xae }, "Ezviz", 0 },
+    { { 0x58, 0x8f, 0xcf }, "Ezviz", 0 },
+    { { 0x78, 0xa6, 0xa0 }, "Ezviz", 0 },
+    { { 0x54, 0xd6, 0x0d }, "Ezviz", 0 },
+    { { 0x20, 0xbb, 0xbc }, "Ezviz", 0 },
+    { { 0x64, 0x24, 0x4d }, "Ezviz", 0 },
+    { { 0x0c, 0xa6, 0x4c }, "Ezviz", 0 },
+    { { 0x34, 0xc6, 0xdd }, "Ezviz", 0 },
+    { { 0xac, 0x1c, 0x26 }, "Ezviz", 0 },
+    // Lorex Technology Inc. and Swann communications Pty Ltd - one block each, their entire
+    // registry presence. Both sell driveway/perimeter DVR kits, i.e. cameras pointed at a street,
+    // which is squarely what this table is for. One block per vendor also keeps the blast radius
+    // small if either turns out to be re-used on an NVR or a bridge. src: IEEE MA-L.
+    { { 0x00, 0x1f, 0x54 }, "Lorex", 0 },
+    { { 0xbc, 0x51, 0xfe }, "Swann", 0 },
+    // DELIBERATELY ABSENT, checked 2026-08-02 against that same pull. Do not "fix" these:
+    //   TP-Link (Tapo / Kasa) - proposed as the biggest remaining consumer hole, and by installed
+    //     base it is. But there is NO Tapo or Kasa registrant: the cameras ride TP-LINK
+    //     TECHNOLOGIES CO.,LTD., which holds 263 MA-L blocks spanning routers, switches, range
+    //     extenders, plugs and bulbs. Matching those would label a home router a camera in most
+    //     houses in the country. That is exactly the test Espressif fails in this file's header,
+    //     and TP-Link fails it 263 times over. Not addable at the OUI layer.
+    //   Foscam - ZERO registrations under any spelling (foscam / fos cam / Shenzhen variants).
+    //     Their gear runs other people's silicon, so there is nothing narrow to match.
 };
 static const size_t CAMERA_VENDOR_OUI_COUNT = sizeof(CAMERA_VENDOR_OUI) / sizeof(CAMERA_VENDOR_OUI[0]);
 

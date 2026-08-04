@@ -9,6 +9,7 @@ Exits 0 when nothing upstream is missing locally, 1 when there is drift to look
 at. It only reports; it never edits anything. Provenance is in CREDITS.md. When an
 upstream repo moves a file or renames a branch, update the URLs below.
 """
+import hashlib
 import json
 import os
 import re
@@ -124,9 +125,89 @@ def check_odid():
     return 1
 
 
+def check_odid_copies():
+    """The opendroneid decoder is vendored TWICE, on purpose.
+
+    lib/acab_core/opendroneid/ is what the product links; src/odid-sim/ carries its own copy so
+    the bench simulator stays self-contained and does not drag in the rest of acab_core (see the
+    odid-sim env in platformio.ini). That layout is fine, but it has one failure mode: check_odid
+    above says to re-vendor "opendroneid/" in the SINGULAR, and a re-vendor that updates one copy
+    and forgets the other leaves a bench simulator that silently disagrees with the receiver it
+    exists to test. A test tool that lies is worse than no test tool.
+
+    So assert byte-identity instead of trusting whoever does the next re-vendor to remember.
+    """
+    print("\n== opendroneid vendored copies (must stay identical) ==")
+    pairs = [
+        ("lib/acab_core/opendroneid/opendroneid.c", "src/odid-sim/opendroneid.c"),
+        ("lib/acab_core/opendroneid/opendroneid.h", "src/odid-sim/opendroneid.h"),
+    ]
+    drift = 0
+    for a, b in pairs:
+        pa = os.path.join(repo_root(), "firmware", a)
+        pb = os.path.join(repo_root(), "firmware", b)
+        if not os.path.exists(pa) or not os.path.exists(pb):
+            print(f"   WARN missing: {a if not os.path.exists(pa) else b}")
+            drift += 1
+            continue
+        ha = hashlib.sha256(open(pa, "rb").read()).hexdigest()
+        hb = hashlib.sha256(open(pb, "rb").read()).hexdigest()
+        if ha == hb:
+            print(f"   ok: {os.path.basename(pa):15} identical ({ha[:12]})")
+        else:
+            print(f"   !! {os.path.basename(pa)} DIFFERS between the two vendored copies")
+            print(f"      {a}  {ha[:12]}")
+            print(f"      {b}  {hb[:12]}")
+            print("      re-vendor BOTH, or the bench simulator no longer matches the receiver")
+            drift += 1
+    return drift
+
+
+def check_faq_copies():
+    """The bundled FAQ ships as ONE file copied into both app resource trees. Assert byte equality.
+
+    faq-content.json is 20 answers that must read identically on iOS and Android. Keeping it as a
+    Swift literal and a Kotlin literal would be two hand-maintained copies of the same prose, and
+    cross-platform copy drift is the most recurring defect class in this repo. So it is one file,
+    duplicated verbatim into two resource trees because neither build system will reach outside its
+    own tree, and this check is what makes the duplication safe: edit one, the build tells you.
+
+    Same guard, same reasoning as the vendored opendroneid copies above.
+    """
+    root = repo_root()
+    a = os.path.join(root, "ios/Beacons/Resources/faq-content.json")
+    b = os.path.join(root, "android/app/src/main/assets/faq-content.json")
+    print("\n== bundled FAQ content (both app copies must be identical) ==")
+    missing = [p for p in (a, b) if not os.path.exists(p)]
+    if missing:
+        for p in missing:
+            print(f"   !! MISSING: {os.path.relpath(p, root)}")
+        return len(missing)
+    ha = hashlib.sha256(open(a, "rb").read()).hexdigest()
+    hb = hashlib.sha256(open(b, "rb").read()).hexdigest()
+    if ha != hb:
+        print("   !! DRIFT: the two faq-content.json copies differ")
+        print(f"      ios     {ha[:12]}")
+        print(f"      android {hb[:12]}")
+        print("      fix: copy the intended one over the other, they are meant to be byte-identical")
+        return 1
+    # A parse check too: a syntactically broken JSON degrades to an EMPTY help screen at runtime
+    # on both platforms (both parsers swallow the error by design), so the build is the only place
+    # it can be caught.
+    try:
+        d = json.loads(open(a, encoding="utf-8").read())
+        nq = sum(len(sec.get("questions", [])) for sec in d.get("sections", []))
+        print(f"   ok: identical ({ha[:12]}), {len(d.get('sections', []))} sections, {nq} questions, "
+              f"{len(d.get('support', []))} support rows")
+    except Exception as e:
+        print(f"   !! faq-content.json does not parse: {e}")
+        return 1
+    return 0
+
+
 def main():
     print("ACAB signature drift check (reports only, changes nothing)\n")
-    drift = check_flock() + check_odid()
+    drift = check_flock() + check_odid() + check_odid_copies() + check_faq_copies()
     print()
     if drift:
         print(f"DRIFT: {drift} item(s) need a look. Review and re-port by hand.")

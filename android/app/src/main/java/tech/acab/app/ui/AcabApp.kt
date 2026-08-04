@@ -343,7 +343,25 @@ private fun BoardRow(board: FoundBoard, onConnect: () -> Unit) {
                             .padding(horizontal = 5.dp, vertical = 1.dp))
                 }
             }
-            Text(board.device.address, color = Acab.dim, fontSize = 10.sp, fontFamily = Acab.mono)
+            // Only show the advertised address when it is STABLE. With address privacy on, the
+            // board advertises a Resolvable Private Address that rotates roughly every 15 minutes,
+            // so this line showed a DIFFERENT value for the same board each time you opened the
+            // picker, and two boards could not be told apart across a rotation. Worse, someone who
+            // wrote it down would never match it again. Android does not reliably resolve a peer
+            // RPA to its identity inside scan results (it does that at connect), so the value here
+            // really is the rotating one even for a board you have already bonded.
+            //
+            // Detect it by the top two bits of the first octet: 01 = resolvable private. A board on
+            // older firmware, or built with ACAB_BLE_PRIVACY=0, still advertises a fixed public MAC
+            // that IS worth showing, so this hides the line rather than deleting it.
+            //
+            // iOS deliberately differs and needs no equivalent: CoreBluetooth never exposes a peer
+            // MAC at all, it substitutes a per-host UUID that stays stable for that phone, which is
+            // why ConnectView keeps showing its 8-character handle.
+            val addrHi = board.device.address.substringBefore(':').toIntOrNull(16) ?: 0
+            if ((addrHi shr 6) != 0b01) {
+                Text(board.device.address, color = Acab.dim, fontSize = 10.sp, fontFamily = Acab.mono)
+            }
         }
         SignalBars(rssiBars(board.rssi), tint = Acab.accent)
         Spacer(Modifier.width(8.dp))

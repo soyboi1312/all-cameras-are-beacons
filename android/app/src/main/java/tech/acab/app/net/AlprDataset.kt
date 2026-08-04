@@ -29,11 +29,21 @@ import kotlin.math.sqrt
  * queries Overpass, never sends its viewport anywhere, and the fetch only happens after the user
  * opts in. Same "nothing about where you are leaves the device" promise as the rest of the app.
  *
- * Wire format (alpr.bin, little-endian): "ALP2" | epochDay:u32 | count:u32 | nMakers:u8 |
- * nMakers*(len:u8, utf8) | count*(latE7:i32, lonE7:i32) | count*(makerIdx:u8). Maker table index 0 is
- * always "" (unknown); the coord block matches ALP1, so an old cached ALP1 file still loads (all
- * makers unknown). We hold coords as an interleaved IntArray [latE7, lonE7, ...] plus a parallel
- * makerIdx IntArray and the self-describing table. Cached to files/ for instant, offline redraw.
+ * Wire format, little-endian. THREE versions are accepted; the magic's last byte selects:
+ *   "ALP1"  epochDay:u32 | count:u32 | count*(latE7:i32, lonE7:i32)
+ *   "ALP2"  ...plus nMakers:u8 | nMakers*(len:u8, utf8) | count*(makerIdx:u8)
+ *   "ALP3"  ...plus count*(tier:u8)          1 = confirmed, 0 = unverified
+ * Each version is a strict prefix of the next, so the parser shares the coord and maker paths and
+ * only appends a read. Maker table index 0 is always "" (unknown). A pre-ALP3 file defaults every
+ * tier to CONFIRMED, never unverified , the tier is an accusation and an old cache carries no
+ * evidence for it (see parse()).
+ *
+ * WHICH ONE WE ACTUALLY RECEIVE depends on the manifest we poll, and this build polls the v3 one.
+ * `alpr-latest.json` still serves ALP2 to the installed base and always will; see MANIFEST_URL
+ * below for why that split exists and why it cannot be collapsed.
+ *
+ * We hold coords as an interleaved IntArray [latE7, lonE7, ...] plus parallel makerIdx and
+ * confirmed arrays, and the self-describing table. Cached to files/ for instant, offline redraw.
  */
 class AlprStore private constructor(context: Context) {
 
@@ -43,6 +53,23 @@ class AlprStore private constructor(context: Context) {
 
     private val _enabled = MutableStateFlow(prefs.getBoolean(KEY_ENABLED, false))
     val enabled: StateFlow<Boolean> = _enabled.asStateFlow()
+
+    /** Show the community-mapped nodes nobody could name a manufacturer for. DEFAULT OFF.
+     *
+     *  These are the pins that get the APP blamed. A node with no manufacturer recorded is
+     *  disproportionately a solar panel on a pole that someone marked in passing, and when a user
+     *  drives to one and finds nothing there they conclude the detector is broken, not that an OSM
+     *  contributor guessed. 8.1% of nodes across five metros, 22% in Chicago, so not a rounding
+     *  error. Still DOWNLOADED and still counted in the manifest: hiding them is a display
+     *  decision, deleting them would make the data-quality problem invisible rather than absent.
+     *  Mirrors iOS ALPRStore.showUnverified. */
+    private val _showUnverified = MutableStateFlow(prefs.getBoolean(KEY_SHOW_UNVERIFIED, false))
+    val showUnverified: StateFlow<Boolean> = _showUnverified.asStateFlow()
+
+    /** How many of [confirmed] are tier-0. A flow, not a scan: the settings caption reads it on
+     *  every recomposition and the array is six figures long. Assigned with [confirmed]. */
+    private val _unverifiedCount = MutableStateFlow(0)
+    val unverifiedCount: StateFlow<Int> = _unverifiedCount.asStateFlow()
 
     /** Interleaved latE7,lonE7 pairs. Empty until enabled + a dataset is present. */
     private val _nodes = MutableStateFlow(IntArray(0))
@@ -54,6 +81,11 @@ class AlprStore private constructor(context: Context) {
     @Volatile var makerIdx: IntArray = IntArray(0); private set
     /** Self-describing maker names; index 0 is always "" (unknown). */
     @Volatile var makerTable: Array<String> = arrayOf(""); private set
+    /** Per-node confidence, parallel to the node count: true when the mapper picked the
+     *  manufacturer from an editor preset (it carries a wikidata id), false when it was typed
+     *  freehand or left blank. The false set is small (7-14%) and is where misidentified pins
+     *  concentrate, so the map draws it amber + dashed and says so. Mirrors iOS nodeConfirmed. */
+    @Volatile var confirmed: BooleanArray = BooleanArray(0); private set
 
     /** True while ANY fetch is in flight, including the sub-second manifest freshness check.
      *  Drives the toggle's spinner, and suppresses the "couldn't load" hint so a first load
@@ -81,7 +113,14 @@ class AlprStore private constructor(context: Context) {
     private val _lastOutcome = MutableStateFlow<RefreshOutcome?>(null)
     val lastOutcome: StateFlow<RefreshOutcome?> = _lastOutcome.asStateFlow()
 
-    enum class RefreshOutcome { UPDATED, UP_TO_DATE, FAILED }
+    /**
+     * NOT_PUBLISHED is a 404 on the manifest, and it is deliberately NOT folded into FAILED. This
+     * build polls its own manifest URL (see MANIFEST_URL), so between an app release and the
+     * dataset being published there is a legitimate window where the file does not exist yet.
+     * Reporting that as "check your connection" sends the user to debug a working network.
+     * Mirrors iOS ALPRStore.RefreshOutcome.notPublished.
+     */
+    enum class RefreshOutcome { UPDATED, UP_TO_DATE, FAILED, NOT_PUBLISHED }
 
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     private val fetching = AtomicBoolean(false)
@@ -102,7 +141,17 @@ class AlprStore private constructor(context: Context) {
             _nodes.value = IntArray(0)
             makerIdx = IntArray(0)
             makerTable = arrayOf("")
+            confirmed = BooleanArray(0)
+            _unverifiedCount.value = 0
         }
+    }
+
+    /** Toggle the unverified tier on the map. No refetch: the nodes are already loaded, this only
+     *  changes what the overlay and [nearest] are willing to hand back. */
+    fun setShowUnverified(on: Boolean) {
+        if (on == _showUnverified.value) return
+        _showUnverified.value = on
+        prefs.edit().putBoolean(KEY_SHOW_UNVERIFIED, on).apply()
     }
 
     /** Freshen if the layer is on. Non-blocking, failure-tolerant. */
@@ -146,7 +195,13 @@ class AlprStore private constructor(context: Context) {
         _loading.value = true
         var outcome = RefreshOutcome.FAILED
         try {
-            val manifestRaw = httpGetText(MANIFEST_URL) ?: return
+            val manifestRaw = httpGetText(MANIFEST_URL)
+            if (manifestRaw == null) {
+                // 404 means the dataset has not been published for this build's manifest yet,
+                // which is a rollout state, not a fault. Anything else stays FAILED.
+                if (lastStatus == HttpURLConnection.HTTP_NOT_FOUND) outcome = RefreshOutcome.NOT_PUBLISHED
+                return
+            }
             val m = JSONObject(manifestRaw)
             if (m.optInt("schema", 0) != 1) return
             val data = m.optJSONObject("data") ?: return
@@ -176,6 +231,8 @@ class AlprStore private constructor(context: Context) {
                 prefs.edit().putString(KEY_VERSION, updated).apply()
                 makerIdx = parsed.makerIdx           // set BEFORE the nodes emit so a collector
                 makerTable = parsed.table            // waking on new nodes sees the matching makers
+                confirmed = parsed.confirmed         // same ordering rule: tiers land before nodes
+                _unverifiedCount.value = parsed.confirmed.count { !it }
                 _nodes.value = parsed.coords
                 _updated.value = updated
                 outcome = RefreshOutcome.UPDATED
@@ -206,6 +263,8 @@ class AlprStore private constructor(context: Context) {
         if (_enabled.value) {
             makerIdx = parsed.makerIdx
             makerTable = parsed.table
+            confirmed = parsed.confirmed
+            _unverifiedCount.value = parsed.confirmed.count { !it }
             _nodes.value = parsed.coords
         }
     }
@@ -213,26 +272,43 @@ class AlprStore private constructor(context: Context) {
     /** Nearest mapped camera to (lat, lon) for the detail screen's "matches a mapped camera" line.
      *  ~2km bounding-box prefilter keeps it cheap over the full set; equirectangular distance is
      *  accurate to well under 1% at these ranges. On-device only. null when the box is empty. */
-    fun nearest(lat: Double, lon: Double): Pair<Double, String>? {
+    fun nearest(lat: Double, lon: Double): Triple<Double, String, Boolean>? {
         val nd = _nodes.value; if (nd.isEmpty()) return null
-        val idx = makerIdx; val tbl = makerTable
+        val idx = makerIdx; val tbl = makerTable; val conf = confirmed
+        // Never corroborate a detection against a node the user cannot see on the map. Vouching for
+        // a hit using evidence we have decided is untrustworthy is worse than staying quiet.
+        val skipUnverified = !_showUnverified.value
         val box = 0.02; val cosLat = cos(lat * PI / 180)
-        var bestM = Double.MAX_VALUE; var bestMaker = ""
+        var bestM = Double.MAX_VALUE; var bestMaker = ""; var bestConfirmed = true
         var i = 0
         while (i + 1 < nd.size) {
             val la = nd[i] / 1e7; val lo = nd[i + 1] / 1e7
             val node = i / 2; i += 2
             if (abs(la - lat) > box || abs(lo - lon) > box) continue
+            if (skipUnverified && node < conf.size && !conf[node]) continue
             val dLat = (la - lat) * 111_320; val dLon = (lo - lon) * 111_320 * cosLat
             val m = sqrt(dLat * dLat + dLon * dLon)
-            if (m < bestM) { bestM = m; bestMaker = if (node < idx.size) tbl.getOrElse(idx[node]) { "" } else "" }
+            if (m < bestM) {
+                bestM = m
+                bestMaker = if (node < idx.size) tbl.getOrElse(idx[node]) { "" } else ""
+                bestConfirmed = if (node < conf.size) conf[node] else true
+            }
         }
-        return if (bestM < Double.MAX_VALUE) bestM to bestMaker else null
+        return if (bestM < Double.MAX_VALUE) Triple(bestM, bestMaker, bestConfirmed) else null
     }
 
     companion object {
-        private const val MANIFEST_URL = "https://soyboi.tech/data/alpr-latest.json"
+        /** The V3 manifest, deliberately a SEPARATE URL from the one shipped builds poll.
+         *  alpr-latest.json still serves ALP2 and always will: an already-installed app
+         *  exact-length-checks the binary and REJECTS an ALP3 file outright rather than ignoring
+         *  the tail, and its reject path returns before it stamps KEY_VERSION, so it would
+         *  re-download and re-fail forever with a map frozen at the last good dataset. Pointing new
+         *  builds at their own manifest means the rollout cannot break the installed base whatever
+         *  order the stores approve things in. Keep in lockstep with iOS ALPRStore.manifestURL and
+         *  the generator's dual-publish block (soyboi.tech/tools/build_alpr_dataset.py). */
+        private const val MANIFEST_URL = "https://soyboi.tech/data/alpr-v3-latest.json"
         private const val KEY_ENABLED = "enabled"
+        private const val KEY_SHOW_UNVERIFIED = "show_unverified"
         private const val KEY_VERSION = "version"
         private const val KEY_LAST_CHECKED = "last_checked"
 
@@ -243,19 +319,29 @@ class AlprStore private constructor(context: Context) {
             }
 
         /** Parsed dataset: interleaved latE7,lonE7 coords + a parallel maker index + the table. */
-        private class Parsed(val coords: IntArray, val makerIdx: IntArray, val table: Array<String>)
+        private class Parsed(val coords: IntArray, val makerIdx: IntArray, val table: Array<String>,
+                            val confirmed: BooleanArray)
 
-        /** Parse the "ALP2" binary (coords + per-node maker). Also accepts a legacy "ALP1" file
-         *  (coords only, all makers unknown), so a cache from an older build still loads.
-         *  Bounds-checked throughout; returns null on any malformation (bad length, a table that
-         *  runs past the buffer, etc.). A maker index past the table resolves to "" at read time. */
+        /** Parse the "ALP3" binary (coords + per-node maker + per-node confidence tier). Also
+         *  accepts a legacy "ALP2" (coords + makers) and "ALP1" (coords only), so a cache from an
+         *  older build still loads. Bounds-checked throughout; returns null on any malformation
+         *  (bad length, a table that runs past the buffer, etc.). A maker index past the table
+         *  resolves to "" at read time.
+         *
+         *  A pre-ALP3 file defaults every node to CONFIRMED, never unverified. The tier is an
+         *  accusation ("nobody picked this manufacturer from a preset, so it may be misidentified")
+         *  and a cache predating the field carries no evidence either way; defaulting the other way
+         *  would paint a whole stale map amber purely because the file is old.
+         *  Mirrors iOS ALPRStore.parse constant for constant. */
         private fun parse(bytes: ByteArray): Parsed? {
             if (bytes.size < 12) return null
             val a = 'A'.code.toByte(); val l = 'L'.code.toByte(); val pC = 'P'.code.toByte()
             if (bytes[0] != a || bytes[1] != l || bytes[2] != pC) return null
+            val v3 = bytes[3] == '3'.code.toByte()
             val v2 = bytes[3] == '2'.code.toByte()
             val v1 = bytes[3] == '1'.code.toByte()
-            if (!v2 && !v1) return null
+            val hasMakers = v2 || v3
+            if (!v1 && !hasMakers) return null
             val buf = ByteBuffer.wrap(bytes).order(ByteOrder.LITTLE_ENDIAN)
             buf.position(4)
             buf.int                                  // epochDay (unused here)
@@ -263,7 +349,7 @@ class AlprStore private constructor(context: Context) {
             if (count < 0 || count > 5_000_000) return null
 
             var table = arrayOf("")
-            if (v2) {
+            if (hasMakers) {
                 if (buf.remaining() < 1) return null
                 val nMakers = buf.get().toInt() and 0xFF
                 val list = ArrayList<String>(nMakers)
@@ -277,13 +363,16 @@ class AlprStore private constructor(context: Context) {
                 table = list.toTypedArray()
             }
             val coordStart = buf.position()
-            val idxBytes = if (v2) count else 0
-            if (bytes.size.toLong() != coordStart.toLong() + count.toLong() * 8 + idxBytes) return null
+            val idxBytes = if (hasMakers) count.toLong() else 0L
+            val tierBytes = if (v3) count.toLong() else 0L
+            if (bytes.size.toLong() != coordStart.toLong() + count.toLong() * 8 + idxBytes + tierBytes) return null
             val coords = IntArray(count * 2)
             for (i in 0 until count) { coords[i * 2] = buf.int; coords[i * 2 + 1] = buf.int }
             val makerIdx = IntArray(count)
-            if (v2) for (i in 0 until count) makerIdx[i] = buf.get().toInt() and 0xFF
-            return Parsed(coords, makerIdx, table)
+            if (hasMakers) for (i in 0 until count) makerIdx[i] = buf.get().toInt() and 0xFF
+            val confirmed = BooleanArray(count) { true }          // pre-v3: no evidence, so no accusation
+            if (v3) for (i in 0 until count) confirmed[i] = (buf.get().toInt() and 0xFF) == 1
+            return Parsed(coords, makerIdx, table, confirmed)
         }
 
         private fun sha256Hex(bytes: ByteArray): String {
@@ -294,6 +383,11 @@ class AlprStore private constructor(context: Context) {
         }
 
         private fun httpGetText(url: String): String? = httpGet(url) { it.readBytes().decodeToString() }
+
+        /** Last HTTP status seen by httpGet, so the manifest fetch can tell a 404 ("not published
+         *  yet") from a dead network. Only read immediately after a failed httpGetText on the
+         *  manifest; it is best-effort, not a general-purpose channel. */
+        @Volatile private var lastStatus: Int = 0
 
         /** Stream-read with a bounded loop (AND-SEC-2), aborting once the total exceeds the
          *  manifest-declared size (hard-capped at 8 MB), so a misconfigured/compromised server
@@ -323,9 +417,11 @@ class AlprStore private constructor(context: Context) {
                     connectTimeout = 8_000
                     readTimeout = 30_000
                 }
+                lastStatus = conn.responseCode
                 if (conn.responseCode != HttpURLConnection.HTTP_OK) return null
                 conn.inputStream.use(read)
             } catch (_: Exception) {
+                lastStatus = 0          // transport failure, not an HTTP status
                 null
             } finally {
                 conn?.disconnect()

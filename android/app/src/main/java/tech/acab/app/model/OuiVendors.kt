@@ -299,6 +299,9 @@ val Detection.maker: String?
                 "Apple Find My (offline)" -> "Apple Find My"
                 "Tile"                    -> "Tile"
                 "Samsung SmartTag"        -> "Samsung SmartTag"
+                // "(separated)" dropped for the same reason "(offline)" is above: it describes the
+                // tag's STATE, not its maker, and the row already conveys the state.
+                "Google Find Hub (separated)" -> "Google Find Hub"
                 else                      -> null
             }
             else -> null

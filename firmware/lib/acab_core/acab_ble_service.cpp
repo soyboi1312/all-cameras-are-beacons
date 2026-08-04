@@ -20,6 +20,29 @@
 #include <freertos/FreeRTOS.h>
 #include <freertos/semphr.h>
 #include <string.h>
+#include <Preferences.h>   // per-unit IRK persistence (see the privacy block in acabBleBegin)
+#include <esp_random.h>
+
+// ---- privacy build-configuration guard -------------------------------------------------------
+// PROVEN ON HARDWARE 2026-08-01, and the reason this guard exists rather than a comment.
+//
+// NimBLEDevice::setOwnAddrType(BLE_OWN_ADDR_RPA_*) looks like it enables address privacy. On
+// ESP32-S3 with the stock Arduino sdkconfig it does NOT: the ble_hs_pvcy_rpa_config() call inside
+// it sits behind #if MYNEWT_VAL(BLE_HOST_BASED_PRIVACY), which resolves to
+// CONFIG_BT_NIMBLE_HOST_BASED_PRIVACY, which is not defined. The call compiles away, the function
+// sets a member variable, and the board advertises its fixed factory address forever while every
+// line of source reads as though privacy is on.
+//
+// That is exactly what shipped in the first attempt at this: two consecutive boots printed the
+// identical address e8:3d:c1:... (an Espressif OUI, i.e. the factory public address). Nothing in
+// the build warned. A comment would not have caught it, because the code was already commented.
+//
+// So: asking for privacy without the stack support is now a BUILD FAILURE, not a silent no-op.
+#if ACAB_BLE_PRIVACY && !(defined(CONFIG_BT_NIMBLE_HOST_BASED_PRIVACY) && CONFIG_BT_NIMBLE_HOST_BASED_PRIVACY)
+#error "ACAB_BLE_PRIVACY=1 needs -DCONFIG_BT_NIMBLE_HOST_BASED_PRIVACY=1 in build_flags. \
+Without it NimBLE compiles the RPA call away and the board advertises a FIXED address while \
+appearing to be private. Add the flag to this env in platformio.ini, or set ACAB_BLE_PRIVACY=0."
+#endif
 
 // acab_core-internal loop pumps and hooks driven from acabBleDrainTick below (every build's
 // loop() already calls it each pass): the det_log deferred-wipe chunker + drain-resume cursor
@@ -148,6 +171,67 @@ static NimBLECharacteristic* gCfgChar = nullptr;
 static NimBLECharacteristic* gStatChar = nullptr;
 static NimBLECharacteristic* gOtaChar = nullptr;
 static volatile bool         gConnected = false;
+
+// NimBLE host-privacy re-arm. Private header (ble_hs_pvcy_priv.h), no NimBLE-Arduino wrapper.
+extern "C" int ble_hs_pvcy_rpa_config(uint8_t enable);
+#define ACAB_NIMBLE_ENABLE_RPA 1
+
+// RAW GAP TAP. Observer only, returns 0, the normal handlers still run.
+//
+// WHY THIS EXISTS: NimBLE-Arduino's C++ callbacks DROP the fields that carry the reason.
+// onAuthenticationComplete gets only the conn_desc and discards event->enc_change.status, and the
+// no-desc onDisconnect discards event->disconnect.reason. So from the board side "the bond
+// resolved", "the phone had no bond record", "the board had no bond record" and "the link timed
+// out" all look identical: a connect followed by a drop. That ambiguity is what turned this into
+// four rounds of hypothesis. setCustomGapHandler registers through ble_gap_event_listener_register,
+// which is the same dispatch the wrapper sits on, so it sees the RAW event with .status intact.
+//
+// It also catches REPEAT_PAIRING, which is the trap: NimBLE-Arduino's stock handler DELETES the
+// existing bond ("sacrifices security for convenience", NimBLEServer.cpp) and re-pairs. That path
+// reports encrypted=1 bonded=1, so it reads as a SUCCESS in every other log line here while
+// actually being a bond loss, and it lets any stranger evict the owner's bond.
+static int acabGapTap(ble_gap_event* ev, void*) {
+    switch (ev->type) {
+    case BLE_GAP_EVENT_ENC_CHANGE:
+        Serial.printf("[ACAB] enc_change status=%d (0=ok, 5=ENOENT no bond record, 7=ENOTCONN link gone)\n",
+                      ev->enc_change.status);
+        break;
+    case BLE_GAP_EVENT_DISCONNECT:
+        Serial.printf("[ACAB] disconnect reason=%d (0x%02x)\n",
+                      ev->disconnect.reason, ev->disconnect.reason & 0xff);
+        break;
+    case BLE_GAP_EVENT_REPEAT_PAIRING:
+        // OBSERVE ONLY, WE CANNOT STOP IT. NimBLE-Arduino's stock handler deletes the existing
+        // bond and re-pairs ("sacrifices security for convenience", NimBLEServer.cpp), which is
+        // both a silent bond-loss route and a downgrade: any peer that triggers repeat pairing
+        // evicts the owner's bond. It cannot be overridden from here, because
+        // ble_gap_event_listener_call iterates listeners and returns 0 unconditionally, so this
+        // handler's return value is discarded and only NimBLEServer's reply is honoured. Changing
+        // it means patching the pinned library, which a clean checkout would silently undo. So the
+        // best available move is to make it VISIBLE: without this line a bond deletion looks
+        // identical to a successful re-pair in every other log the board emits.
+        Serial.println("[ACAB] REPEAT_PAIRING: the stack is about to DELETE the existing bond");
+        break;
+    default: break;
+    }
+    return 0;
+}
+
+// Re-arm advertising after the stack preempts it. LOAD-BEARING, and the failure it prevents is
+// worse than the leak address privacy was added to fix.
+//
+// ble_hs_pvcy_rpa_config arms an RPA rotation timer (CONFIG_BT_NIMBLE_RPA_TIMEOUT, 900 s by
+// default). Each rotation calls ble_gap_preempt(), which STOPS advertising, and ble_gap_preempt_done
+// then delivers ADV_COMPLETE with reason BLE_HS_EPREEMPTED and restarts NOTHING. With no completion
+// callback that event is dropped on the floor and the board goes silent 15 minutes after boot and
+// stays silent until it is power-cycled - which is exactly the product's normal case, a board left
+// running in a car with the phone connecting later.
+//
+// Restarting from inside the callback is legal: preempt_done clears the preempted flag inside the
+// lock BEFORE dispatching, so start() here does not return BLE_HS_EPREEMPTED.
+static void advCompleteCb(NimBLEAdvertising* a) {
+    if (!gConnected && a) a->start(0, advCompleteCb);
+}
 static uint32_t              gHistSent  = 0;     // records sent so far in the current replay drain
 static bool                  gHistBeginSent = false;  // whether this drain's {"hist":"begin","n":N} lead-in went out
 // Replay back-pressure. notify() is void in NimBLE 1.4.x (can't report a drop), so we pace the
@@ -246,13 +330,42 @@ static uint8_t  gIgnoreStage[256][6];
 static int      gIgnoreStageN = 0;
 static uint8_t  gWatchStage[256][6];
 static int      gWatchStageN  = 0;
+// Has this PEER committed a NON-EMPTY list for that key on THIS connection? See the empty-commit
+// rule below. Reset with the stage counters on every connect/disconnect, which is what makes it
+// per-peer: a second phone starts the connection having proved nothing.
+static bool     gIgnoreHadContent = false;
+static bool     gWatchHadContent  = false;
 
 // ---- server connection lifecycle ----
 class ServerCb : public NimBLEServerCallbacks {
-    void onConnect(NimBLEServer*) override {
+    void onConnect(NimBLEServer*, ble_gap_conn_desc* d) override {
+        // desc overload: peer_id_addr is the RESOLVED identity when the bond resolved, and still
+        // the rotating RPA when it did not. That one field separates the two cases at connect
+        // time, before security has had a chance to fail.
+        if (d) Serial.printf("[ACAB] peer_id type=%d %02x:%02x:%02x:%02x:%02x:%02x\n",
+                             d->peer_id_addr.type, d->peer_id_addr.val[5], d->peer_id_addr.val[4],
+                             d->peer_id_addr.val[3], d->peer_id_addr.val[2],
+                             d->peer_id_addr.val[1], d->peer_id_addr.val[0]);
         gConnected = true;
         gPeerMtu = 23;   // reset to the BLE default; the MTU exchange bumps it right after connect
         gIgnoreStageN = 0; gWatchStageN = 0;   // fresh connection: drop any half-staged chunk sequence
+        gIgnoreHadContent = false; gWatchHadContent = false;   // and this peer has proved nothing yet
+        // Connection lifecycle on the wire. Added because the board previously said nothing when a
+        // phone attached or left, which made "did the bond survive the update" impossible to answer
+        // from the board side: a working reconnect and a silent failure looked identical here.
+        Serial.println("[ACAB] BLE peer connected");
+    }
+    // Pairing outcome, which is the ONLY way to tell "the bond resolved" from "the link came up and
+    // then security failed". Added 2026-08-02 after a bonded phone connected, chirped, and dropped:
+    // from the board side those two look identical without this.
+    void onAuthenticationComplete(ble_gap_conn_desc* desc) override {
+        Serial.printf("[ACAB] pairing: encrypted=%d authenticated=%d bonded=%d peer_id_type=%d "
+                      "peer_id=%02x:%02x:%02x:%02x:%02x:%02x\n",
+                      desc->sec_state.encrypted, desc->sec_state.authenticated,
+                      desc->sec_state.bonded, desc->peer_id_addr.type,
+                      desc->peer_id_addr.val[5], desc->peer_id_addr.val[4],
+                      desc->peer_id_addr.val[3], desc->peer_id_addr.val[2],
+                      desc->peer_id_addr.val[1], desc->peer_id_addr.val[0]);
     }
     // Track the negotiated MTU so every notify path can size to what the peer accepts (see
     // notifyCap). Fires after connect once the client exchanges MTU.
@@ -263,6 +376,7 @@ class ServerCb : public NimBLEServerCallbacks {
     void onDisconnect(NimBLEServer*) override {
         gConnected = false;
         gIgnoreStageN = 0; gWatchStageN = 0;   // drop any half-staged chunk sequence on link drop
+        gIgnoreHadContent = false; gWatchHadContent = false;
         // A link drop mid-update must not leave OTA stuck BUSY with the radios paused:
         // abort the session and un-quiesce so the next connect can start fresh.
         if (otaInProgress()) { otaAbort(); otaQuiesce(false); }
@@ -272,7 +386,8 @@ class ServerCb : public NimBLEServerCallbacks {
         // outside any begin/end envelope). Force the next drain to wait for a {sync}.
         detLogStopDrain(); gHistBeginSent = false;
         acabScannerReArmCapture();                 // app left: re-arm offline capture
-        NimBLEDevice::getAdvertising()->start();   // become discoverable again
+        Serial.println("[ACAB] BLE peer disconnected");
+        NimBLEDevice::getAdvertising()->start(0, advCompleteCb);   // become discoverable again
     }
 };
 
@@ -465,19 +580,50 @@ class CfgCb : public NimBLECharacteristicCallbacks {
         if (doc["beep"].is<bool>() && doc["beep"].as<bool>()) {
             alertsBeepTest();             // volume preview at the level just set above
         }
+        // THE EMPTY-COMMIT RULE. An empty list only commits when EITHER the write says so
+        // explicitly with {"clr":true}, OR this peer has already committed a NON-EMPTY list for
+        // the same key on this connection.
+        //
+        // WHY AT ALL. Both apps re-push their whole list on every connect, and an empty commit used
+        // to zero the count and rewrite NVS. So a reinstalled app, or any SECOND phone that had
+        // never starred anything, silently wiped every star on the board the moment it connected.
+        // The watchlist is user-authored data (a starred MAC is a deliberate act, and its label
+        // lives only in the app), so losing it is destruction, not something the user can redo from
+        // memory.
+        //
+        // WHY THE SECOND CLAUSE, rather than requiring "clr" outright. Boards update over the air,
+        // so the board is routinely NEWER than the app talking to it: an app already in someone's
+        // hands does not know about "clr" and would permanently lose the ability to clear a list.
+        // That trades a wipe bug for a never-clears bug. But a peer that has already committed a
+        // non-empty list this connection has, by definition, already replaced whatever the board
+        // held, so letting it then empty that list grants no destructive power it did not just
+        // exercise. The wipe case is exactly the one this excludes: an app with nothing to say
+        // whose FIRST word on the connection is "empty". Version negotiation would be the obvious
+        // alternative and is worse - it needs a version the old app never sends.
+        //
+        // The flag is per-write like "more", and a chunked write carries at most one of
+        // ignore/watch, so one flag serves both without ambiguity.
+        const bool listClr = doc["clr"].is<bool>() && doc["clr"].as<bool>();
         // Ignore list. Supports chunking: {"ignore":[...],"more":true} stages more MACs without
         // committing; a chunk with "more" absent/false appends then commits the whole staged list.
         // A single small write with no "more" stages then commits immediately (unchanged behavior).
         if (doc["ignore"].is<JsonArray>()) {
+            // An explicit clear means "the list is empty", so a stale staged chunk sequence for
+            // THIS key must not survive into the commit below. Per-key on purpose: zeroing both
+            // would truncate an in-flight chunk sequence on the other list.
+            if (listClr) gIgnoreStageN = 0;
             for (JsonVariant v : doc["ignore"].as<JsonArray>()) {
                 if (gIgnoreStageN >= 256) break;
                 if (parseMac6(v.as<const char*>(), gIgnoreStage[gIgnoreStageN])) gIgnoreStageN++;
             }
             if (doc["more"].is<bool>() && doc["more"].as<bool>()) {
                 Serial.printf("[ACAB] ignore list: staged %d device(s), awaiting more\n", gIgnoreStageN);
+            } else if (gIgnoreStageN == 0 && !listClr && !gIgnoreHadContent) {
+                Serial.println("[ACAB] ignore list: empty first commit, no clr - keeping the stored list");
             } else {
                 acabScannerSetIgnoreList(gIgnoreStage, gIgnoreStageN);
                 Serial.printf("[ACAB] ignore list: %d device(s)\n", gIgnoreStageN);
+                if (gIgnoreStageN > 0) gIgnoreHadContent = true;
                 gIgnoreStageN = 0;
             }
         }
@@ -485,15 +631,19 @@ class CfgCb : public NimBLECharacteristicCallbacks {
         // "more" protocol. The app pushes it right after the ignore push on connect; a starred MAC
         // alerts every time it is seen even with no signature match.
         if (doc["watch"].is<JsonArray>()) {
+            if (listClr) gWatchStageN = 0;   // see the ignore block
             for (JsonVariant v : doc["watch"].as<JsonArray>()) {
                 if (gWatchStageN >= 256) break;
                 if (parseMac6(v.as<const char*>(), gWatchStage[gWatchStageN])) gWatchStageN++;
             }
             if (doc["more"].is<bool>() && doc["more"].as<bool>()) {
                 Serial.printf("[ACAB] watch list: staged %d device(s), awaiting more\n", gWatchStageN);
+            } else if (gWatchStageN == 0 && !listClr && !gWatchHadContent) {
+                Serial.println("[ACAB] watch list: empty first commit, no clr - keeping the stored list");
             } else {
                 acabScannerSetWatchList(gWatchStage, gWatchStageN);
                 Serial.printf("[ACAB] watch list: %d device(s)\n", gWatchStageN);
+                if (gWatchStageN > 0) gWatchHadContent = true;
                 gWatchStageN = 0;
             }
         }
@@ -539,6 +689,35 @@ void acabBleBegin(const char* deviceName, const char* fwLabel) {
     if (!gNotifyMux) gNotifyMux = xSemaphoreCreateMutex();   // serializes every setValue+notify pair
 
     NimBLEDevice::init(deviceName ? deviceName : "ACAB");
+    NimBLEDevice::setCustomGapHandler(acabGapTap);   // raw reason codes, see acabGapTap
+
+// PER-UNIT IRK: DESIGNED, IMPLEMENTED, AND REVERTED. Read this before trying it again.
+//
+// NimBLE installs a HARDCODED DEFAULT IRK (ble_hs_pvcy_default_irk, a public constant sitting in
+// this repo's own libdeps) unless told otherwise, so every board ships the same identity key. That
+// is a real weakness and it is UNFIXED: a listener holding that published constant can resolve any
+// unit's rotating address, and two boards bonded to one phone can resolve to each other.
+//
+// The obvious fix, 16 random bytes in NVS installed with ble_hs_pvcy_set_our_irk, was built and
+// then removed because it BREAKS PAIRING ON EVERY BOOT. Traced through the pinned NimBLE 1.4.3:
+//   ble_hs_pvcy_irk[16] is file-static BSS, so it reads as zero on every boot and the "is this a
+//   new IRK" memcmp in ble_hs_pvcy_set_our_irk ALWAYS differs. That runs
+//   ble_hs_resolv_list_clear_all(), which zeroes the resolving list (discarding the bonded peers
+//   ble_hs_misc_restore_irks just restored during sync) and calls ble_rpa_peer_dev_rec_clear_all(),
+//   which calls ble_store_persist_peer_records() - so the peer records are deleted FROM NVS.
+//   A bonded phone then connects from an RPA nothing can resolve, the LTK lookup misses, encryption
+//   fails, and every characteristic here is READ_ENC/WRITE_ENC, so the app gets nothing. Re-pairing
+//   works only until the next power cycle, forever.
+//
+// Doing it properly means rebuilding peer_dev_rec from the bond store and re-running
+// ble_hs_misc_restore_irks after the install, both private host APIs, and it must be proven on a
+// BONDED board across a power cycle before it ships. Restoring the resolving list alone is not
+// enough: the connect path reads peer_dev_rec, and ble_hs_resolv_list_add only updates records that
+// already exist, it never creates them.
+//
+// Until then the shared default IRK stands, and the privacy claim must be stated honestly: the
+// address rotates, which defeats casual correlation, but it is NOT unlinkable to anyone who knows
+// the NimBLE constant.
     NimBLEDevice::setMTU(512);   // roomy ATT payload: the status + rich drone JSON outgrew 247 (see NOTIFY_MAX)
     // Encrypted, bonded link for the whole service, so a stranger can't silence the
     // scanner (config write) or watch what you're detecting (detection/status stream).
@@ -549,6 +728,62 @@ void acabBleBegin(const char* deviceName, const char* fwLabel) {
     // RF environment (not in public) - a no-I/O device can't do better without OOB pairing.
     NimBLEDevice::setSecurityAuth(true, false, true);            // bonding, no MITM, LE Secure Connections
     NimBLEDevice::setSecurityIOCap(BLE_HS_IO_NO_INPUT_OUTPUT);
+    // DISTRIBUTE THE IRK EXPLICITLY (BLE_SM_PAIR_KEY_DIST_ID), do not inherit a default.
+    //
+    // This is what makes address privacy WORK rather than break pairing. Under ACAB_BLE_PRIVACY
+    // below, the board advertises a Resolvable Private Address that rotates. A bonded phone can
+    // only follow that rotation if it holds our Identity Resolving Key, and it only holds the IRK
+    // if we handed it over during bonding. Rely on whatever NimBLE's default key distribution
+    // happens to be and the outcome is version-dependent: on a build that omits ID, every rotation
+    // looks like a brand-new stranger and the paired phone stops reconnecting.
+    //
+    // Stated as its own call so it is impossible to change the privacy setting without seeing this.
+    NimBLEDevice::setSecurityInitKey(BLE_SM_PAIR_KEY_DIST_ENC | BLE_SM_PAIR_KEY_DIST_ID);
+    NimBLEDevice::setSecurityRespKey(BLE_SM_PAIR_KEY_DIST_ENC | BLE_SM_PAIR_KEY_DIST_ID);
+
+#if ACAB_BLE_PRIVACY
+    // ADDRESS PRIVACY. Advertise a Resolvable Private Address that rotates, instead of a fixed
+    // one that persists across reboots.
+    //
+    // WHY A COUNTER-SURVEILLANCE DEVICE OF ALL THINGS NEEDS THIS: the detection path is genuinely
+    // passive and always was, but the phone link had to exist, and it was broadcasting a stable
+    // address forever. That makes a unit a persistent, trackable identity - the same beacon at a
+    // protest on Tuesday and a courthouse on Friday is provably the same device to anyone with a
+    // cheap dongle. It is precisely the harm this product's own tracker detection exists to warn
+    // people about, pointed back at its owner. Our own drive tests recorded boards detecting each
+    // other, which is that enumeration working by accident.
+    //
+    // A bonded phone follows the rotation using the IRK distributed above; strangers cannot.
+    //
+    // *** BENCH BEFORE PUBLISHING. NOT A DESK CHANGE. ***
+    // Existing bonds were made BEFORE the explicit IRK distribution above, so a phone paired to an
+    // older build may not hold our IRK and may need to forget-and-re-pair ONCE after this update.
+    // That is recoverable, not a brick, but it must be a known cost rather than a surprise.
+    // Required sequence on real hardware before this reaches anyone:
+    //   1. flash one board, confirm an ALREADY-BONDED phone still reconnects (or note that it does
+    //      not, and that re-pairing is therefore required for existing users)
+    //   2. confirm a FRESH pair works end to end on both iOS and Android
+    //   3. confirm the board still appears in the app's picker across an address rotation
+    // BLE_OWN_ADDR_RANDOM (0x01), NOT BLE_OWN_ADDR_RPA_PUBLIC_DEFAULT (0x02). This distinction is
+    // the whole feature and it is invisible from the board.
+    //
+    // 0x02 asks the CONTROLLER to generate an RPA from its resolving list. Under HOST-based
+    // privacy NimBLE keeps that list in a host-side array and never sends HCI LE Add Device To
+    // Resolving List, so the controller's list is empty, and per Core Spec Vol 4 Pt E 7.8.5 an
+    // empty list under 0x02 means the controller falls back to THE PUBLIC ADDRESS. The board then
+    // advertises its fixed factory MAC exactly as before, while ble_hs_pvcy_rpa_config has
+    // genuinely installed a rotating RPA as the controller's RANDOM address, which nothing reads.
+    //
+    // 0x01 advertises that random address, which IS the RPA the host installed and keeps
+    // re-rolling. NimBLE-Arduino routes both cases through the same ble_hs_pvcy_rpa_config, so
+    // nothing else changes. ble_hs_pvcy.h states this outright: "2. Set own_addr_type to
+    // BLE_OWN_ADDR_RANDOM."
+    //
+    // The first attempt used 0x02 and the serial diagnostic below printed a rotating address, so
+    // it read as working. It was not: the diagnostic proves an RPA was GENERATED, never that it
+    // was ADVERTISED. Do not treat that line as on-air proof.
+    NimBLEDevice::setOwnAddrType(BLE_OWN_ADDR_RANDOM);
+#endif
 #ifdef ESP_PWR_LVL_P9
     NimBLEDevice::setPower(ESP_PWR_LVL_P9);
 #endif
@@ -583,21 +818,67 @@ void acabBleBegin(const char* deviceName, const char* fwLabel) {
     adv->addServiceUUID(ACAB_BLE_SVC_UUID);
     adv->setScanResponse(true);
 
-    // Stick the firmware version in the scan response (name + manufacturer data),
-    // so the app can show it in the device list before connecting.
     NimBLEAdvertisementData scanResp;
     scanResp.setName(deviceName ? deviceName : "ACAB");
+
+#if ACAB_ADVERTISE_VERSION
+    // LEGACY, DEFAULT OFF. The exact firmware version used to ride the scan response so the app
+    // could show it in the picker before connecting. That published the unit's CAPABILITY to
+    // every passive listener - which signature set it carries, therefore what it can and cannot
+    // see - to save its owner one tap. The version is already in the Status characteristic, which
+    // is post-connect and post-bond, so nothing is lost but the pre-connect convenience.
     std::string verData;
     verData.push_back((char)0xAB);          // company id 0xACAB (LE) - our own marker
     verData.push_back((char)0xAC);
     verData += ACAB_FW_VERSION;             // e.g. "0.2.3"
     scanResp.setManufacturerData(verData);
-    adv->setScanResponseData(scanResp);
+#endif
 
-    adv->start();
+    adv->setScanResponseData(scanResp);
+    adv->start(0, advCompleteCb);
 
     acabBleUpdateStatus();
     Serial.printf("[ACAB] BLE service up, advertising as '%s'\n", deviceName);
+    // Report the advertised address and whether privacy is on. This is the ONLY way to verify the
+    // RPA change from a laptop: macOS and iOS never hand a peer's MAC to an application, they
+    // substitute a per-host UUID, so a scan from a development machine cannot tell a rotating
+    // address from a fixed one. The board has to say it itself. Two boots printing two different
+    // addresses is the evidence that privacy is actually engaged rather than silently ignored.
+    // getAddress() is hardcoded to BLE_ADDR_PUBLIC in NimBLE-Arduino, so it reports the IDENTITY
+    // address and CANNOT tell you whether an RPA is being advertised. The load-bearing fact is
+    // whether the host privacy code was compiled in at all: ble_hs_pvcy_rpa_config() sits behind
+    // #if MYNEWT_VAL(BLE_HOST_BASED_PRIVACY), which on ESP32-S3 resolves to
+    // CONFIG_BT_NIMBLE_HOST_BASED_PRIVACY. Without it, setOwnAddrType() silently does nothing but
+    // set a member variable, and a build that LOOKS correct advertises a fixed address forever.
+    // Tested on hardware 2026-08-01: two boots printed the identical factory address.
+    // Guarded with defined() because the symbol is genuinely absent, not zero, in a stock build,
+    // so a bare MYNEWT_VAL() here is a compile error rather than a false reading.
+#if defined(CONFIG_BT_NIMBLE_HOST_BASED_PRIVACY) && CONFIG_BT_NIMBLE_HOST_BASED_PRIVACY
+    const char* kPrivCompiled = "YES";
+#else
+    const char* kPrivCompiled = "NO - RPA IS A NO-OP IN THIS BUILD";
+#endif
+    // Ask the host for BOTH identity kinds. getAddress() only ever reports the PUBLIC one, so on
+    // its own it cannot distinguish a private build from a fixed one. When host privacy is live
+    // NimBLE configures a random address as well, and its presence plus its top two bits are the
+    // closest thing available WITHOUT A SNIFFER, and it is not on-air proof: 01 = resolvable private (the
+    // rotating kind privacy is supposed to produce), 11 = static random, 00 = non-resolvable.
+    ble_addr_t rnd; bool haveRnd = (ble_hs_id_copy_addr(BLE_ADDR_RANDOM, rnd.val, NULL) == 0);
+    char rndStr[24] = "none";
+    const char* rndKind = "-";
+    if (haveRnd) {
+        snprintf(rndStr, sizeof(rndStr), "%02x:%02x:%02x:%02x:%02x:%02x",
+                 rnd.val[5], rnd.val[4], rnd.val[3], rnd.val[2], rnd.val[1], rnd.val[0]);
+        switch (rnd.val[5] >> 6) {
+            case 0b01: rndKind = "RESOLVABLE-PRIVATE (rotates)"; break;
+            case 0b11: rndKind = "static-random";                break;
+            case 0b00: rndKind = "non-resolvable-private";       break;
+            default:   rndKind = "?";                            break;
+        }
+    }
+    Serial.printf("[ACAB] BLE public=%s | random=%s (%s) | privacy requested=%s compiled=%s\n",
+                  NimBLEDevice::getAddress().toString().c_str(), rndStr, rndKind,
+                  ACAB_BLE_PRIVACY ? "yes" : "no", kPrivCompiled);
 }
 
 // Build a detection record into `buf` (returns length). For replay set hist=true and
@@ -657,6 +938,38 @@ void acabBleDrainTick() {
     // ignore-mirror stream must complete after a disconnect too.
     detLogEraseTick();
     acabScannerMirrorTick();
+
+    // ADVERTISING SUPERVISOR, belt and braces to advCompleteCb above. A board that has silently
+    // stopped advertising is indistinguishable from a dead board to the user, and this class of
+    // stop is not unique to RPA rotation: any future preemption, a controller reset, or a start()
+    // that fails transiently would strand it the same way. Cheap enough to run unconditionally
+    // (one bool read on a tick loop() already calls), and it covers the window where a preemption
+    // lands while the callback pointer is momentarily unset. Rate-limited so a genuinely failing
+    // start() cannot spin, and it logs, because a board recovering itself in silence teaches
+    // nobody anything.
+    if (!gConnected) {
+        NimBLEAdvertising* adv = NimBLEDevice::getAdvertising();
+        static uint32_t lastKick = 0;
+        const uint32_t now = millis();
+        if (adv && !adv->isAdvertising() && (uint32_t)(now - lastKick) >= 2000) {
+            lastKick = now;
+#if ACAB_BLE_PRIVACY
+            // A HOST RESET (HCI timeout, controller fault) zeroes the random address, and the
+            // re-sync only guarantees a PUBLIC one. Under BLE_OWN_ADDR_RANDOM every start() then
+            // fails with BLE_HS_ENOADDR, and nothing re-establishes the RPA except the 900 s
+            // rotation callout, so without this the board is invisible for up to 15 minutes while
+            // this supervisor logs a restart every 2 s that cannot succeed. Reinstall privacy
+            // first, and only then try to advertise.
+            ble_addr_t rnd;
+            if (ble_hs_id_copy_addr(BLE_ADDR_RANDOM, rnd.val, NULL) != 0) {
+                Serial.println("[ACAB] random address gone (host reset?), reinstalling privacy");
+                ble_hs_pvcy_rpa_config(ACAB_NIMBLE_ENABLE_RPA);
+            }
+#endif
+            Serial.println("[ACAB] advertising had stopped, restarting (see advCompleteCb)");
+            adv->start(0, advCompleteCb);
+        }
+    }
 
     if (!gDetChar || !gConnected || !detLogDraining()) return;
     // Wait for the MTU exchange before draining. At the 23-byte default gPeerMtu, notifyCap() is

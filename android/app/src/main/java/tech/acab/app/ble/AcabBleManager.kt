@@ -89,8 +89,53 @@ enum class ConnState { DISCONNECTED, SCANNING, CONNECTING, BONDING, READY, POWER
  *  SILENT  = board muted, no phone feedback either. */
 enum class AlertMode { BUZZER, VIBRATE, SILENT }
 
-/** A board found while scanning. */
-data class FoundBoard(val device: BluetoothDevice, val name: String, val rssi: Int, val firmware: String? = null)
+/** How long a scanned board stays in the picker after its last advert. See FoundBoard.seenAt.
+ *
+ *  A board advertises many times a second, so a few seconds of silence means gone, not quiet. */
+private const val FOUND_STALE_MS = 6_000L
+
+/** Bench tooling, OFF in every shipped build. Flip true to log each scanned board's advertised
+ *  address and its type. Exists because Android is the ONLY platform that exposes a peer's real
+ *  MAC (iOS and macOS substitute a per-host UUID), which makes it the only way to confirm the
+ *  firmware's BLE address privacy is actually rotating rather than silently compiled out. */
+private const val SCAN_ADDR_DEBUG = false
+
+/** One board seen while scanning. [seenAt] exists because the board now advertises a ROTATING
+ *  Resolvable Private Address (ACAB_BLE_PRIVACY): the list is keyed on device.address, so when an
+ *  address rotates mid-scan the old entry would otherwise linger as a phantom second board.
+ *
+ *  THIS IS NOT AN ANDROID-ONLY PROBLEM, and the prune below must not be deleted as Android-specific
+ *  complexity. It was reviewed as one, on the reading that iOS keys its discovered list on
+ *  CBPeripheral.identifier, which is a per-host UUID rather than a MAC, and therefore already
+ *  collapses a rotating peripheral to one row. The evidence says otherwise:
+ *
+ *   1. Per-host is a property of the VALUE, not a promise about rotation. CoreBluetooth can only
+ *      keep issuing one UUID for one peer while it can tie successive advertisements to a stable
+ *      identity, and for an LE peer that means resolving the RPA against an IRK it holds.
+ *   2. The board hands its IRK over at BONDING and nowhere else: acab_ble_service.cpp sets
+ *      BLE_SM_PAIR_KEY_DIST_ID explicitly on both key-distribution masks precisely so a bonded
+ *      phone can follow the rotation, and states in the same comment that a stranger cannot.
+ *   3. The picker IS the unbonded case. It exists to choose a board that has not been paired yet
+ *      (first run, or after the user forgets the device), so at the moment this list is being built
+ *      neither platform holds the key. An unresolvable rotated address is a new peer to
+ *      CoreBluetooth exactly as it is a new BluetoothDevice here, and it gets a fresh identifier.
+ *
+ *  So both platforms need this and the correct action was to KEEP it. iOS reached the same verdict
+ *  independently and now carries the matching prune (BLEManager.pruneStaleDiscovered, same 6 s
+ *  window, same absent-is-fresh guard, same advert-driven timing); it stores the stamp in a side map
+ *  instead of on the row only because its list is @Published and stamping the row per advert would
+ *  republish the picker 10 to 20 times a second, which this file avoids for free by rebuilding
+ *  _found per scan result. Recorded here rather than left implicit because "iOS uses a UUID, so iOS
+ *  is fine" is a reasonable-sounding argument that will be made again.
+ *
+ *  Exposure is the same size on both, and it is small: the rotation period is
+ *  CONFIG_BT_NIMBLE_RPA_TIMEOUT (900 s, see the advCompleteCb comment in acab_ble_service.cpp) and
+ *  both platforms cap one picker scan at 45 s and clear the list when a scan starts. A phantom
+ *  needs a rotation to land inside a single 45 s window. Small is not zero, and the failure is
+ *  user-visible in the worst possible place: two rows for one board on the screen where a user
+ *  who owns exactly one board decides which one to trust. */
+data class FoundBoard(val device: BluetoothDevice, val name: String, val rssi: Int,
+                      val firmware: String? = null, val seenAt: Long = 0L)
 
 /** The most recent LIVE sighting (category + wall-clock last-seen), for the Drive-mode
  *  notification's "last <KIND> <ago>" line. One immutable object per update so a reader
@@ -528,6 +573,14 @@ class AcabBleManager(private val context: Context) {
     // me across all these places"). Same shape as trackHistory, drawn as a DASHED trail. Throttled
     // by lastCrumbAt (time) AND distance so a stakeout doesn't pile crumbs on one spot.
     private val crumbHistory = HashMap<String, MutableList<Pair<Double, Double>>>()
+    // The two ENDS of the crumb window, which is what the follow-evidence scorer measures its
+    // duration across. firstCrumbAt is NOT firstSeenAt: firstSeenAt is when the device was first
+    // HEARD and it survives an app restart in the persisted store, while crumbs start later (a
+    // crumb needs a fresh fix, 60 s and 25 m) and die with the session. Scoring first-HEARD to
+    // last-crumb narrated a duration the trail did not cover and let the band time floors be
+    // satisfied by minutes with no crumbs in them at all. Written together, torn down together
+    // (both are in perDeviceMaps below), read together by FollowEvidence.evaluate.
+    private val firstCrumbAt = HashMap<String, Long>()
     private val lastCrumbAt = HashMap<String, Long>()
     // Time quality for rows whose FIRST sighting came off the offline buffer. A row absent here
     // was first heard live, so its stamp is this phone's own clock reading (TimeBasis.Exact) and
@@ -541,7 +594,7 @@ class AcabBleManager(private val context: Context) {
     // Declared after the maps it names so they're all initialized by the time it builds.
     private val perDeviceMaps: List<MutableMap<String, *>> = listOf(
         store, firstSeenAt, lastSeenAt, histTime, rssiHistory,
-        capturedLoc, bestRssi, trackHistory, crumbHistory, lastCrumbAt,
+        capturedLoc, bestRssi, trackHistory, crumbHistory, firstCrumbAt, lastCrumbAt,
     )
     // Per-boot bounds over the buffered records the board WAS able to date, in unix seconds.
     // Boot counters are monotonic (the firmware persists and increments gBoot every power-up), so
@@ -724,9 +777,38 @@ class AcabBleManager(private val context: Context) {
             // value if this frame doesn't carry it.
             val fw = result.scanRecord?.getManufacturerSpecificData(0xACAB)
                 ?.toString(Charsets.UTF_8)?.takeIf { it.isNotBlank() }
+            val now = android.os.SystemClock.elapsedRealtime()
+            // DEBUG-ONLY address log. Android is the ONLY platform that hands an app a peer's real
+            // MAC: iOS and macOS substitute a per-host UUID, so neither can tell a rotating address
+            // from a fixed one. That made the firmware's BLE privacy change effectively unverifiable
+            // until this line existed. Top two bits of the first octet say which kind it is:
+            // These bits classify the address ONLY IF it is random. Android hands us the advertised
+            // address with no type attached, so a fixed public factory MAC is indistinguishable by
+            // bits alone and lands in whichever bucket its first octet happens to select: an
+            // Espressif e8:3d:c1 reads as 11, exactly like a static-random address. The real proof
+            // that privacy is live is the address CHANGING across boots and across the rotation,
+            // not the bucket this prints. 01 = resolvable private, 11 = static random or public,
+            // 00 = non-resolvable or public.
+            if (SCAN_ADDR_DEBUG) {
+                val b0 = dev.address.substringBefore(':').toIntOrNull(16) ?: 0
+                val kind = when (b0 shr 6) {
+                    0b01 -> "RESOLVABLE-PRIVATE (rotates)"
+                    0b11 -> "static-random"
+                    0b00 -> "non-resolvable-private"
+                    else -> "PUBLIC (not private)"
+                }
+                android.util.Log.d("ACAB-scan", "board $name addr=${dev.address} type=$kind rssi=${result.rssi}")
+            }
             val prev = _found.value.firstOrNull { it.device.address == dev.address }
-            val board = FoundBoard(dev, name, result.rssi, fw ?: prev?.firmware)
-            _found.value = (_found.value.filterNot { it.device.address == dev.address } + board)
+            val board = FoundBoard(dev, name, result.rssi, fw ?: prev?.firmware, now)
+            // Drop entries not heard from recently. Keying on address is still right (it is what
+            // distinguishes two real boards from each other), but with address privacy on, an
+            // address the board has rotated away from would sit in the picker forever as a
+            // duplicate of the same physical unit. A board advertises many times a second, so a
+            // few seconds of silence means gone, not quiet.
+            _found.value = (_found.value
+                .filterNot { it.device.address == dev.address }
+                .filter { it.seenAt == 0L || now - it.seenAt < FOUND_STALE_MS } + board)
                 .sortedByDescending { it.rssi }
         }
 
@@ -1369,8 +1451,7 @@ class AcabBleManager(private val context: Context) {
         readStatus()
         // Keep Status fresh even when a large frame is skipped as a notify: poll it every ~5 s.
         startStatusPolling()
-        sendIgnoreList()   // re-push the whitelist for this session
-        sendWatchList()    // then the watchlist (ordered right after the ignore push, like iOS)
+        resyncListsOnConnect()   // re-state ignore then watch, skipping a list we never emptied
         buzzerReassertAttempts = 0                       // fresh link: first status frame is pre-write
         setBuzzer(_alertMode.value == AlertMode.BUZZER)   // a fresh board boots with the buzzer on; sync it to the phone's mode
         // Board just connected: make sure the firmware manifest is current so the update nudge
@@ -1962,6 +2043,7 @@ class AcabBleManager(private val context: Context) {
                 val s = DeviceStatus.fromJson(json)
                 _status.value = s
                 reconcileBuzzer(s)
+                reconcileDesert(s)   // Desert has no NVS: a board reboot ends it behind our back
                 // Reconcile the whitelist: if the board reports fewer ignore entries than we
                 // hold (a reboot dropped them, say), re-push so the two converge.
                 // Reconcile against what the board CAN hold, never against our raw size: the
@@ -2122,6 +2204,11 @@ class AcabBleManager(private val context: Context) {
                     }
                     if (last == null || (now - (lastCrumbAt[d.id] ?: 0L) >= 60_000L && moved)) {
                         crumbs.add(self)
+                        // Only when absent: this is the START of the crumb window and must never
+                        // advance. putIfAbsent semantics spelled out rather than assumed, because
+                        // a stray unconditional write here would silently collapse every scored
+                        // duration to zero and refuse every tag on the clock-sanity test.
+                        if (!firstCrumbAt.containsKey(d.id)) firstCrumbAt[d.id] = now
                         lastCrumbAt[d.id] = now
                         if (crumbs.size > 120) crumbs.subList(0, crumbs.size - 120).clear()
                     }
@@ -2131,7 +2218,9 @@ class AcabBleManager(private val context: Context) {
         }
         // The only thing that puts a live session on disk. See checkpointDetections.
         checkpointDetections()
-        if (_alertMode.value == AlertMode.VIBRATE && firstTime && !focusSuppressed()) alertHaptic(d.type)   // buzz on the first sighting, unless DND/Focus is on
+        // hapticDue RECORDS, so it stays LAST: the cheap gates short-circuit ahead of it, and a
+        // buzz suppressed by DND must not start the cooldown that suppressed it.
+        if (_alertMode.value == AlertMode.VIBRATE && !focusSuppressed() && hapticDue(d.mac)) alertHaptic(d.type)   // buzz past the per-device cooldown, unless DND/Focus is on
         // Phone notification, per category, opt-in. INDEPENDENT of alertMode: that governs the
         // board buzzer, and a silent board is not a silent phone. Ignored devices are dropped
         // before this point so they can never notify.
@@ -2566,7 +2655,22 @@ class AcabBleManager(private val context: Context) {
     // The alert mode that was active before Desert mode muted the board, so disabling Desert
     // can restore it instead of leaving the board permanently silent. Null when Desert isn't
     // holding a prior mode (never enabled, or already SILENT when enabled).
-    private var alertModeBeforeDesert: AlertMode? = null
+    /** Alert mode to restore when Desert mode turns off.
+     *
+     *  PERSISTED. This used to be plain in-memory state, and Desert mode force-writes Silent to
+     *  BOTH prefs and the board's NVS (buzz=false). So relaunching the app while Desert was on
+     *  lost the restore target, and turning Desert off afterwards left the board permanently mute
+     *  with no way back except hand-picking the mode again. A user in that state reports "my
+     *  starred device never beeps", which reads as a detection bug and is not one. Mirrors iOS. */
+    private var alertModeBeforeDesert: AlertMode?
+        get() = prefs.getString("alert_mode_before_desert", null)
+            ?.let { v -> AlertMode.entries.firstOrNull { it.name == v } }
+        set(value) {
+            prefs.edit().apply {
+                if (value == null) remove("alert_mode_before_desert")
+                else putString("alert_mode_before_desert", value.name)
+            }.apply()
+        }
 
     /** Desert mode: the board reports EVERY device in range (not just signatures).
      *  Enabling it drops alerts to SILENT; with everything reporting in, the buzzer and
@@ -2579,7 +2683,13 @@ class AcabBleManager(private val context: Context) {
             if (_alertMode.value != AlertMode.SILENT) {
                 alertModeBeforeDesert = _alertMode.value
                 setAlertMode(AlertMode.SILENT)
+            } else {
+                // Already Silent, so there is nothing to restore. CLEAR the token rather than
+                // leaving it: now that it is persisted it would otherwise be an arbitrarily old
+                // mode, and a later Desert-off would un-mute a user who deliberately chose Silent.
+                alertModeBeforeDesert = null
             }
+            desertSeenOn = false   // wait for the board to confirm before arming the reconciler
         } else {
             // Restore the pre-Desert mode, but only if the user hasn't already picked one by
             // hand while Desert ran (in which case we're no longer SILENT and leave it alone).
@@ -2662,7 +2772,63 @@ class AcabBleManager(private val context: Context) {
     fun setAlertMode(mode: AlertMode) {
         _alertMode.value = mode
         prefs.edit().putString("alertMode", mode.name).apply()
+        // A mode picked while Desert is running is an explicit choice and outranks whatever we
+        // captured on the way in, so drop the token. Mirrors iOS.
+        if (mode != AlertMode.SILENT) alertModeBeforeDesert = null
         setBuzzer(mode == AlertMode.BUZZER)
+    }
+
+    /** Latched view of the board's Desert state, so a `desert:false` frame can be told apart from
+     *  "our enable write has not landed yet". Only flips true once the BOARD confirms Desert on. */
+    private var desertSeenOn = false
+
+    /** Restore the pre-Desert alert mode when Desert ends WITHOUT going through setDesert(false).
+     *
+     *  Desert is the one toggle with no NVS backing (desert_detect.cpp: a plain `static bool`), so
+     *  any board reboot comes back with it off. The Device screen's toggle just follows the status
+     *  frame (DeviceScreen.kt: `desertOn = s.desertMode`), which means the restore branch in
+     *  setDesert never ran for the single most common way Desert ends. The board's Silent IS
+     *  persisted (buzz=false in its NVS), so the result was a board left permanently mute after a
+     *  power cycle, which reads as "my starred device stopped beeping" and is not a detection
+     *  fault. Mirrors iOS reconcileDesert(). */
+    private fun reconcileDesert(s: DeviceStatus) {
+        if (s.desertMode) { desertSeenOn = true; return }
+        if (!desertSeenOn) return              // never saw it on: nothing to restore
+        desertSeenOn = false
+        // Same conditions as the manual path: only un-mute if we are still on the Silent that
+        // Desert forced, so a mode the user hand-picked while Desert ran survives.
+        alertModeBeforeDesert?.let { prior ->
+            if (_alertMode.value == AlertMode.SILENT) setAlertMode(prior)
+        }
+        alertModeBeforeDesert = null
+    }
+
+    /**
+     * Per-device haptic cooldown. THE COOLDOWN IS THE EDGE, NOT `firstTime`.
+     *
+     * Same defect DetectionNotifier already fixed for notifications, left behind on the haptic
+     * line: `firstTime` is `store[d.id] == null`, and the store is PERSISTED across launches
+     * (loadPersistedDetections), so a device seen in ANY earlier session was never first again and
+     * could never buzz. On a commute past the same hardware that is every device. The comment two
+     * lines under the haptic call already spelled this out for the notifier; it never reached the
+     * haptic itself. Parity with iOS BLEManager.lastHapticByMac.
+     */
+    private val lastHapticByMac = HashMap<String, Long>()
+    private val hapticCooldownMs = 600_000L   // 10 min, matches DetectionNotifier
+
+    /**
+     * May this MAC buzz now? True when never seen or past the cooldown, and it RECORDS the buzz,
+     * so only call it once everything else has passed. Bounded like the notifier's map, which
+     * matters in Desert mode where one drive sees thousands of MACs.
+     */
+    private fun hapticDue(mac: String, now: Long = System.currentTimeMillis()): Boolean {
+        val last = lastHapticByMac[mac]
+        if (last != null && now - last < hapticCooldownMs) return false
+        lastHapticByMac[mac] = now
+        if (lastHapticByMac.size > 256) {
+            lastHapticByMac.entries.removeAll { now - it.value >= hapticCooldownMs }
+        }
+        return true
     }
 
     /** Buzz the phone on a fresh sighting - a double pulse for the priority threats. */
@@ -2712,6 +2878,20 @@ class AcabBleManager(private val context: Context) {
 
     /** A tracker's breadcrumb trail of the PHONE's path while it stayed with us (empty otherwise). */
     fun crumbs(id: String): List<Pair<Double, Double>> = synchronized(storeLock) { crumbHistory[id]?.toList() } ?: emptyList()
+
+    /** When the FIRST crumb for [id] was dropped, or null if it has none. The START of the crumb
+     *  window, and deliberately not [firstSeen]: first-seen is when the device was first HEARD, it
+     *  is restored from the persisted store on launch, and the crumbs are not. Scoring from it
+     *  narrated a duration the trail did not cover. READ ONLY; takes storeLock like its siblings,
+     *  because the BLE thread writes the map under it. */
+    fun firstCrumbAt(id: String): Long? = synchronized(storeLock) { firstCrumbAt[id] }
+
+    /** When the most recent crumb for [id] was dropped, or null if it has none. READ ONLY, and with
+     *  [firstCrumbAt] and [crumbs] the whole of what the follow-evidence scorer needs from this
+     *  class. It is the END of the crumb window: [lastSeen] would keep advancing on adverts heard
+     *  while the phone sat still, which would stretch the run without a single new crumb behind it.
+     *  Takes storeLock like its siblings, because the BLE thread writes the map under it. */
+    fun lastCrumbAt(id: String): Long? = synchronized(storeLock) { lastCrumbAt[id] }
 
     /** The phone's last known coordinate (centers a no-GPS RSSI ring). */
     fun selfCoord(): Pair<Double, Double>? = lastLat?.let { la -> lastLon?.let { lo -> la to lo } }
@@ -3074,8 +3254,34 @@ class AcabBleManager(private val context: Context) {
     }
 
     /** Push the watchlist to the board so it alerts on those MACs at the source. Same MAC
-     *  string format and cap as the ignore list; the board keys reconciliation on "wat". */
-    private fun sendWatchList() = sendMacList("watch", _watched.value.map { it.mac })
+     *  string format and cap as the ignore list; the board keys reconciliation on "wat".
+     *
+     *  USER-EDIT path. An edit that leaves the list EMPTY is a real clear, so it is remembered
+     *  until a board has taken it; the connect-time re-statement goes through resyncListsOnConnect. */
+    private fun sendWatchList() {
+        setListClearPending("watch", _watched.value.isEmpty())   // tracks the edit; re-starring retires it
+        sendMacList("watch", _watched.value.map { it.mac })
+    }
+
+    /** Whether the last user edit on [key] emptied the list and we have not yet delivered that
+     *  clear to a board. Persisted, because the edit can happen while disconnected. Mirrors iOS. */
+    private fun listClearPending(key: String) = prefs.getBoolean("${key}_clear_pending", false)
+    private fun setListClearPending(key: String, pending: Boolean) {
+        prefs.edit().putBoolean("${key}_clear_pending", pending).apply()
+    }
+
+    /** Re-state both lists to a freshly connected board.
+     *
+     *  Skips a list we have nothing to say about. Pushing an EMPTY list unconditionally is how a
+     *  fresh install (or any second phone that had never starred anything) silently wiped every
+     *  star on a board the instant it connected: the push committed an empty list and the board
+     *  rewrote its NVS. An empty list is only worth sending when the user actually emptied it,
+     *  which is what the persisted clear-pending flag records. The firmware refuses a bare empty
+     *  commit as well (it requires "clr"), so this is belt and braces, not the only guard. */
+    private fun resyncListsOnConnect() {
+        if (_ignored.value.isNotEmpty() || listClearPending("ignore")) sendMacList("ignore", _ignored.value.map { it.mac })
+        if (_watched.value.isNotEmpty() || listClearPending("watch")) sendMacList("watch", _watched.value.map { it.mac })
+    }
 
     // ---- "mark all seen" baseline watermark ----
 
@@ -3144,8 +3350,12 @@ class AcabBleManager(private val context: Context) {
         prefs.edit().putString("ignored", arr.toString()).apply()
     }
 
-    /** Push the ignore list to the board so it drops those MACs at the source. */
-    private fun sendIgnoreList() = sendMacList("ignore", _ignored.value.map { it.mac })
+    /** Push the ignore list to the board so it drops those MACs at the source. USER-EDIT path
+     *  (see sendWatchList). */
+    private fun sendIgnoreList() {
+        setListClearPending("ignore", _ignored.value.isEmpty())   // tracks the edit; re-adding retires it
+        sendMacList("ignore", _ignored.value.map { it.mac })
+    }
 
     /** Push a MAC list ("ignore" or "watch") to the board, split into <=MAC_CHUNK-per-write
      *  chunks so a long list stays well under the 512 B ATT write cap. A single write of a full
@@ -3156,14 +3366,26 @@ class AcabBleManager(private val context: Context) {
      *  Protocol (backward compatible): every chunk but the last carries "more":true and the board
      *  STAGES it (appends without committing); the final chunk omits "more" and the board commits
      *  the whole staged list to the scanner. A list of <=MAC_CHUNK is a single write with no
-     *  "more", byte-for-byte what we sent before. An empty list is still one committing write
-     *  ({"ignore":[]}), so clearing the last entry clears the board too. Each writeConfig enqueues
-     *  on the serialized GATT queue, so the chunks land in order. */
+     *  "more", byte-for-byte what we sent before. An empty list is one committing write carrying
+     *  "clr":true, which is what marks it a DELIBERATE clear: firmware refuses a bare empty commit
+     *  and keeps whatever it had, so without the flag "unstar the last device" would not stick.
+     *  Each writeConfig enqueues on the serialized GATT queue, so the chunks land in order. */
     private fun sendMacList(key: String, macs: List<String>) {
-        if (gatt == null) return
+        // Not merely a live client: the CONFIG characteristic must be DISCOVERED. `gatt` is
+        // non-null throughout CONNECTING and BONDING, and for the entire indefinite autoConnect
+        // pending-client window, and in all of those charOf() returns null and writeConfig
+        // silently DISCARDS the write. Retiring the persisted clear flag off a write no board ever
+        // took loses the user's unstar for good: resyncListsOnConnect then sees an empty list with
+        // no pending clear and pushes nothing, and the status reconciler only fires when the board
+        // is BEHIND us, never ahead. Matches iOS canWriteConfig.
+        val g = gatt ?: return
+        if (charOf(g, AcabProfile.CONFIG) == null) return
         if (macs.size <= MAC_CHUNK) {
             val arr = JSONArray(); macs.forEach { arr.put(it) }
-            writeConfig(JSONObject().put(key, arr))   // single write, no "more" (commits) - unchanged
+            val obj = JSONObject().put(key, arr)
+            if (macs.isEmpty()) obj.put("clr", true)
+            writeConfig(obj)   // single write, no "more" (commits)
+            if (macs.isEmpty()) setListClearPending(key, false)
             return
         }
         val chunks = macs.chunked(MAC_CHUNK)
@@ -3189,7 +3411,7 @@ class AcabBleManager(private val context: Context) {
             // "moto" is present so the tour shows the Motorola sub-toggle. Omitting it would make
             // the demo board look like pre-split firmware and hide the control the tour exists to
             // introduce. "axon":true so the parent category is on and the sub-row is not dimmed.
-            """{"fw":"beacon board 2.0.2","up":4920,"total":6,"ble":true,"wifi":true,"axon":true,"moto":true,"tracker":true,"glasses":true,"buzzer":true,"vol":70,"gps":true,"bat":82}"""))
+            """{"fw":"beacon board 2.0.3","up":4920,"total":6,"ble":true,"wifi":true,"axon":true,"moto":true,"tracker":true,"glasses":true,"buzzer":true,"vol":70,"gps":true,"bat":82}"""))
         _state.value = ConnState.READY
         // placeDemoDetections clears + repopulates the same maps the async startup reload fills, so
         // wait for that reload before seeding, to avoid a concurrent mutation of the non-synchronized

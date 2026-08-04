@@ -24,7 +24,7 @@ it is a **passive listener** on two bands, WiFi and bluetooth. surveillance gear
 - network cameras on the WiFi you're on (opt-in, off by default; branded IP-camera OUIs like Hikvision, Dahua, Amcrest, Axis, Reolink on the host network. it matches known camera brands, not every camera, and is never a hidden-camera claim)
 
 **the device**
-- dual radio: a dedicated bluetooth scanner runs flat-out while a second radio handles WiFi and the app link, so neither starves the other. single-radio boards time-slice one antenna between scanning and the phone link; the beacon's bluetooth scan never pauses
+- dual radio: a dedicated bluetooth scanner runs flat-out while a second radio handles WiFi and the app link, so neither starves the other. single-radio boards time-slice one antenna between scanning and the phone link, which costs them about half their bluetooth listening time; the beacon's bluetooth scan is continuous, a measured 100% duty against ~51%, and a street drive found 2.5x more unique bluetooth devices over the same route. the numbers are in [how much does it actually hear?](#how-much-does-it-actually-hear) below
 - location tagged via your phone's GPS
 - an on-board buzzer alerts you, so it works with your phone put away
 - optional offline logging: opt in once and it keeps what it heard while you were gone, encrypted, waiting when you reconnect
@@ -54,6 +54,43 @@ Flock and Raven detection is built from publicly documented signatures, the IEEE
 ## How reliable is it?
 
 It depends on *how* a device matched, and the app tells you. ACAB flags things by the radio signatures they broadcast: a Bluetooth name, a service ID, or the MAC vendor prefix (OUI). Name and Bluetooth matches are specific to Flock and very reliable. An OUI match is weaker: it only identifies the chipset vendor, and Flock is built on commodity WiFi and cellular modules (Liteon, Espressif, USI, and friends) that also ship in consumer cameras, routers, and IoT gear. So an OUI-only hit can occasionally be a home device on the same part; we have seen a home security camera flagged this way. The app shows the real registered hardware vendor and marks OUI-only matches as possible false positives, so treat those as leads to confirm rather than certainties.
+
+## How much does it actually hear?
+
+The limits above are about *what* matches. These are about *how hard it looked*, which is the part
+a quiet screen depends on and which is easy to leave unsaid. All of it is measurable, so here it is.
+
+**2.4 GHz only. There is no 5 GHz radio.** The ESP32-S3 does not have one, so the entire 5 GHz band
+is invisible to this device, and a growing share of IP cameras and drone control links are 5 GHz
+first. This is a hardware limit, not a setting, and it is the single largest gap in coverage.
+
+**WiFi listens to one channel at a time, and not evenly. This is identical on every board.** The
+ESP32-S3 owns WiFi on the dual-radio beacon too, so the second radio buys the 802.11 side nothing:
+it is dedicated to Bluetooth. The scan walks a 24-slot sequence that returns to channel 6 between
+every other step, because 6 is where most consumer gear sits:
+
+| channel | share of listening time |
+|---|---|
+| 6 | 50% |
+| each of 1-5, 7-13 | 4.2% |
+
+So a camera beaconing on channel 11 as you drive past has a real chance of being missed. That is a
+deliberate trade, not a bug: spreading evenly would lower the odds on the busiest channel to raise
+them on twelve quiet ones. Battery-saver eco mode adds 3, 7 or 15 seconds of radio-off after each
+full sweep, which lowers all of these further in exchange for runtime.
+
+**Bluetooth duty cycle depends on which board you have,** and this is the clearest reason the
+dual-radio board exists:
+
+- **Single-radio builds** (oui-spy, mesh-detect) share one antenna between BLE and WiFi, so BLE
+  listens about **51%** of the time. Half of every second, it is not hearing Bluetooth at all.
+- **The dual-radio beacon board** gives BLE its own nRF52840, so it scans **continuously** and
+  never pauses for a WiFi channel hop. A measured street drive found 2.5x more unique BLE devices
+  than a single radio over the same route.
+
+None of this makes a detection less trustworthy. It makes *silence* less trustworthy, which is the
+direction that matters: a quiet screen means nothing announced itself on a band and channel we
+happened to be listening to at that moment.
 
 ## Flashing
 
@@ -150,8 +187,8 @@ Still on the list:
   radios, power, and over-the-air updates for BOTH processors are proven on hardware, the
   ESP32-S3 over its own OTA and the companion nRF over Bluetooth DFU from inside the app.
   What is still open is ground truth, not code: the glasses signatures have one capture
-  behind them and the WiFi body-cam path has none. The bring-up checklist is in
-  [firmware/nrf-ble-scan/BRINGUP.md](firmware/nrf-ble-scan/BRINGUP.md).
+  behind them and the WiFi body-cam path has none. The board bring-up checklist ships with
+  the hardware rather than living here, since the nRF firmware tree is not public.
 
 ## Thanks to
 

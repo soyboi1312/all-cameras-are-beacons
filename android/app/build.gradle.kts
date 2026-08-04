@@ -24,8 +24,8 @@ android {
         applicationId = "tech.acab.app"
         minSdk = 26
         targetSdk = 35
-        versionCode = 19
-        versionName = "2.0.2"
+        versionCode = 20
+        versionName = "2.0.3"
     }
 
     signingConfigs {
@@ -104,4 +104,10 @@ dependencies {
     implementation("org.osmdroid:osmdroid-android:6.1.20")
 
     debugImplementation("androidx.compose.ui:ui-tooling")
+
+    // Local JVM unit tests. The only suite here is the follow-evidence parity fixture set, which is
+    // the ACTUAL guarantee that the Android and iOS scorers band the same journey the same way: the
+    // scorer is deliberately pure Kotlin with no Android types, so it runs on a plain JVM against
+    // the same vectors the Swift side asserts. Run with `./gradlew :app:testDebugUnitTest`.
+    testImplementation("junit:junit:4.13.2")
 }

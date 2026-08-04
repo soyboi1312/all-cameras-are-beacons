@@ -10,6 +10,7 @@ import androidx.compose.runtime.remember
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.geometry.Size
 import androidx.compose.ui.graphics.Canvas
+import androidx.compose.ui.graphics.PathEffect
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.ColorFilter
 import androidx.compose.ui.graphics.ImageBitmap
@@ -50,11 +51,14 @@ fun rememberCategoryMarkers(): Map<DeviceType, BitmapDrawable> = mapOf(
 /** A quiet hollow ring for a known/mapped ALPR camera (the opt-in reference layer). Un-animated
  *  and low-contrast on purpose, so a mapped location never reads as a live detection. */
 @Composable
-fun rememberAlprMarker(): BitmapDrawable {
+fun rememberAlprMarker(confirmed: Boolean = true): BitmapDrawable {
     val context = LocalContext.current
     val density = LocalDensity.current
-    val tone = Acab.flockTone
-    return remember(density) {
+    // Confirmed rings stay the established red; unverified ones go amber AND DASHED. Colour alone
+    // is not a distinction for a red/green-deficient viewer, and telling the two tiers apart is the
+    // entire point of the second one. Mirrors iOS ALPRDot.
+    val tone = if (confirmed) Acab.flockTone else Acab.warn
+    return remember(density, confirmed) {
         with(density) {
             // Bolder 2026-07-29 (rings washed out on the map); keep in lockstep with iOS ALPRDot.
             val r = 7.0.dp.toPx()
@@ -64,8 +68,12 @@ fun rememberAlprMarker(): BitmapDrawable {
             val center = Offset(full / 2f, full / 2f)
             val image = ImageBitmap(side, side)
             CanvasDrawScope().draw(density, LayoutDirection.Ltr, Canvas(image), Size(full, full)) {
-                drawCircle(tone, radius = r, center = center, alpha = 0.20f)
-                drawCircle(tone, radius = r, center = center, alpha = 0.95f, style = Stroke(width = stroke))
+                drawCircle(tone, radius = r, center = center, alpha = if (confirmed) 0.20f else 0.10f)
+                drawCircle(tone, radius = r, center = center, alpha = 0.95f,
+                           style = if (confirmed) Stroke(width = stroke)
+                                   else Stroke(width = stroke,
+                                               pathEffect = PathEffect.dashPathEffect(
+                                                   floatArrayOf(2.6.dp.toPx(), 2.2.dp.toPx()), 0f)))
             }
             BitmapDrawable(context.resources, image.asAndroidBitmap())
         }

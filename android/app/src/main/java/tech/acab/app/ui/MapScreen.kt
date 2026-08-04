@@ -77,6 +77,7 @@ import org.osmdroid.views.overlay.mylocation.MyLocationNewOverlay
 import tech.acab.app.ble.AcabBleManager
 import tech.acab.app.model.Detection
 import tech.acab.app.model.DeviceType
+import tech.acab.app.model.FollowEvidence
 import tech.acab.app.model.validCoord
 import tech.acab.app.net.AlprStore
 import tech.acab.app.ui.theme.Acab
@@ -230,8 +231,12 @@ fun MapScreen(
     val alprEnabled by alpr.enabled.collectAsState()
     val alprNodes by alpr.nodes.collectAsState()
     val alprLoading by alpr.loading.collectAsState()
+    val alprOutcome by alpr.lastOutcome.collectAsState()
     val alprDownloading by alpr.downloading.collectAsState()
+    val alprShowUnverified by alpr.showUnverified.collectAsState()
+    val alprUnverifiedCount by alpr.unverifiedCount.collectAsState()
     val alprMarker = rememberAlprMarker()
+    val alprMarkerUnverified = rememberAlprMarker(confirmed = false)
     val alprHolder = remember { AlprOverlayHolder() }
     // "Too far out for ALPR pins", hoisted so the hint can react to zoom (osmdroid won't
     // recompose). A Boolean written only when it flips, so a pan/zoom gesture's stream of
@@ -505,7 +510,9 @@ fun MapScreen(
                 // ~3 Hz path; its own debounced listener re-culls on pan/zoom)
                 // makerIdx/makerTable are read here (not collected) - they are set in the same
                 // parse as alprNodes, so an alprNodes change recomposes this and passes the match.
-                alprHolder.update(map, alprNodes, alpr.makerIdx, alpr.makerTable, alprEnabled, alprMarker)
+                alprHolder.update(map, alprNodes, alpr.makerIdx, alpr.makerTable,
+                                  alpr.confirmed, alprMarkerUnverified, alprEnabled,
+                                  alprShowUnverified, alprMarker)
             },
             onRelease = { map ->
                 myLocation.value?.disableMyLocation()
@@ -569,6 +576,9 @@ fun MapScreen(
         // so "off" is never confused with "broken".
         val alprHint = when {
             !alprEnabled || alprLoading -> null
+            // A 404 is a rollout state, not a connectivity problem , see RefreshOutcome.
+            alprNodes.isEmpty() && alprOutcome == AlprStore.RefreshOutcome.NOT_PUBLISHED ->
+                "camera data not published yet · try again later"
             alprNodes.isEmpty() -> "couldn't load camera data · check your connection"
             zoomedOutTooFar -> "zoom in to see mapped cameras"
             else -> null
@@ -679,14 +689,21 @@ fun MapScreen(
             // settings dropdown card, above the gear, matching the legend card styling
             if (mapSettingsOpen) {
                 Column(
+                    // Capped, not just floored: the breadcrumb caption below is a full sentence and
+                    // an uncapped min-width card would stretch it edge to edge across a tablet.
                     Modifier
-                        .widthIn(min = 196.dp)
+                        .widthIn(min = 196.dp, max = 264.dp)
                         .background(Acab.bg2.copy(alpha = 0.95f), RoundedCornerShape(Acab.radiusSm))
                         .border(1.dp, Acab.line, RoundedCornerShape(Acab.radiusSm))
                         .padding(horizontal = 12.dp, vertical = 8.dp),
                     verticalArrangement = Arrangement.spacedBy(2.dp),
                 ) {
-                    MapSettingRow("breadcrumb trail", showBreadcrumbs) {
+                    // The trail is the other tracker-only surface a user will assume is universal
+                    // (it draws nothing for a body cam, and that silence reads as "nothing to
+                    // draw"), so it carries the SAME scope sentence as the detail-screen follow
+                    // panel that scores the same crumbs. One sentence, one place it is authored.
+                    MapSettingRow("breadcrumb trail", showBreadcrumbs,
+                        note = FollowEvidence.SCOPE_TEXT) {
                         showBreadcrumbs = it
                         mapPrefs.edit().putBoolean("show_breadcrumbs", it).apply()
                     }
@@ -698,7 +715,8 @@ fun MapScreen(
                     // in sync), repeated here so the layer controls live with the map settings.
                     MapSettingRow("known ALPR", alprEnabled) { alpr.setEnabled(it) }
                     if (alprEnabled) {
-                        AlprDatasetRows(alpr, alprNodes, alprLoading)
+                        AlprDatasetRows(alpr, alprNodes, alprLoading, alprShowUnverified,
+                                        alprUnverifiedCount)
                     }
                 }
             }
@@ -734,6 +752,14 @@ fun MapScreen(
                     LegendRow(Acab.netcamTone, "Network camera")
                     if (alprEnabled) {
                         LegendRow(Acab.flockTone.copy(alpha = 0.95f), "Known ALPR", hollow = true)
+                        // Parity with iOS: the unverified tier is rendered on the map
+                        // (rememberAlprMarker(confirmed = false)) but had no legend row here at
+                        // all, so an amber dashed ring was unexplained on Android only. Gated on
+                        // the opt-in for the same reason it is gated on the layer: a legend naming
+                        // a colour nothing on screen is using reads as a rendering bug.
+                        if (alprShowUnverified) {
+                            LegendRow(Acab.warn.copy(alpha = 0.95f), "ALPR (unverified)", hollow = true)
+                        }
                         Text("cameras: OpenStreetMap ODbL · DeFlock", color = Acab.faint,
                             fontSize = 8.5.sp, fontFamily = Acab.mono)
                     }
@@ -817,34 +843,46 @@ private fun Marker.labelMarker(
     }
 }
 
-/** One row of the map-settings menu: a label + a Switch, whole row tappable. */
+/** One row of the map-settings menu: a label + a Switch, whole row tappable, with an optional
+ *  caption under it for a toggle whose SCOPE isn't obvious from its two-word label. */
 @Composable
-private fun MapSettingRow(label: String, checked: Boolean, onChange: (Boolean) -> Unit) {
-    Row(
-        Modifier.fillMaxWidth().clickable { onChange(!checked) }.padding(vertical = 2.dp),
-        verticalAlignment = Alignment.CenterVertically,
-    ) {
-        Text(label, color = Acab.dim, fontSize = 11.sp, fontFamily = Acab.mono,
-            modifier = Modifier.weight(1f))
-        Spacer(Modifier.size(12.dp))
-        Switch(
-            checked = checked,
-            onCheckedChange = onChange,
-            colors = SwitchDefaults.colors(
-                checkedThumbColor = Acab.onAccent,
-                checkedTrackColor = Acab.accent,
-                checkedBorderColor = Acab.accent,
-                uncheckedThumbColor = Acab.dim,
-                uncheckedTrackColor = Acab.bg3,
-                uncheckedBorderColor = Acab.line,
-            ),
-        )
+private fun MapSettingRow(label: String, checked: Boolean, note: String? = null, onChange: (Boolean) -> Unit) {
+    Column(Modifier.fillMaxWidth()) {
+        Row(
+            Modifier.fillMaxWidth().clickable { onChange(!checked) }.padding(vertical = 2.dp),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            Text(label, color = Acab.dim, fontSize = 11.sp, fontFamily = Acab.mono,
+                modifier = Modifier.weight(1f))
+            Spacer(Modifier.size(12.dp))
+            Switch(
+                checked = checked,
+                onCheckedChange = onChange,
+                colors = SwitchDefaults.colors(
+                    checkedThumbColor = Acab.onAccent,
+                    checkedTrackColor = Acab.accent,
+                    checkedBorderColor = Acab.accent,
+                    uncheckedThumbColor = Acab.dim,
+                    uncheckedTrackColor = Acab.bg3,
+                    uncheckedBorderColor = Acab.line,
+                ),
+            )
+        }
+        note?.let {
+            Text(it, color = Acab.faint, fontSize = 9.sp, fontFamily = Acab.mono, lineHeight = 12.sp,
+                modifier = Modifier.padding(end = 8.dp, bottom = 4.dp))
+        }
     }
 }
 
 /** "127,003 cameras", grouped like the manifest count reads on the site. */
 private fun cameraCount(n: Int): String =
     String.format(java.util.Locale.US, "%,d camera%s", n, if (n == 1) "" else "s")
+
+/** Same grouping, counting PINS instead. The unconfirmed tier is deliberately not called cameras:
+ *  that some of them are not cameras is the entire reason the toggle exists. */
+private fun pinCount(n: Int): String =
+    String.format(java.util.Locale.US, "%,d pin%s", n, if (n == 1) "" else "s")
 
 /** Manifest `updated` ("2026-07-27") -> "Jul 27" for the settings caption; the raw string if it
  *  ever arrives in another shape, null when we have no dataset stamp at all. */
@@ -870,14 +908,17 @@ private fun checkedAgo(epochMs: Long): String =
  *  download -> sha256 verify) and flashes the outcome inline. Double-taps are guarded twice:
  *  the row disables while a fetch is in flight, and the store's own fetch gate drops extras. */
 @Composable
-private fun AlprDatasetRows(alpr: AlprStore, nodes: IntArray, loading: Boolean) {
+private fun AlprDatasetRows(alpr: AlprStore, nodes: IntArray, loading: Boolean,
+                            showUnverified: Boolean, unverifiedCount: Int) {
     val updated by alpr.updated.collectAsState()
     val lastChecked by alpr.lastChecked.collectAsState()
     var awaiting by remember { mutableStateOf(false) }            // a tap-initiated check is out
     var outcome by remember { mutableStateOf<Pair<String, Boolean>?>(null) }   // msg to isSuccess
 
     val caption = buildString {
-        val n = nodes.size / 2
+        // Count what the map DRAWS. Captioning the full dataset while hiding a chunk of it makes
+        // the toggle below look broken (the number never moves) and overstates the coverage.
+        val n = (nodes.size / 2).let { if (showUnverified) it else it - unverifiedCount }
         if (n > 0) {
             append(cameraCount(n))
             datasetDateLabel(updated)?.let { append(" · dataset ").append(it) }
@@ -908,6 +949,23 @@ private fun AlprDatasetRows(alpr: AlprStore, nodes: IntArray, loading: Boolean) 
         caption, color = Acab.faint, fontSize = 9.sp, fontFamily = Acab.mono,
         modifier = Modifier.widthIn(max = 240.dp).padding(top = 2.dp),
     )
+    // Opt-in for the tier nobody could name a manufacturer for. Off by default because those pins
+    // are where "your app is wrong" reports come from: the user drives to one, finds an empty pole,
+    // and blames the detector rather than the stranger who mapped it. Kept as a row instead of
+    // dropped from the dataset so mappers who want to see and fix them still can. Mirrors iOS.
+    if (unverifiedCount > 0) {
+        MapSettingRow(
+            "unconfirmed pins", showUnverified,
+            // Says what the tier MEANS rather than naming it: "unverified" invites the reading
+            // that we checked and it failed. Nobody checked.
+            note = if (showUnverified)
+                "showing ${pinCount(unverifiedCount)} with no manufacturer recorded, drawn hollow. " +
+                    "some are not cameras."
+            else
+                "${pinCount(unverifiedCount)} name no manufacturer and are hidden. " +
+                    "some of those are not cameras.",
+        ) { alpr.setShowUnverified(it) }
+    }
     val done = outcome
     Row(
         Modifier

@@ -163,6 +163,11 @@ static void saveIgnoreList() {
 }
 
 static void loadIgnoreList() {
+    // Hold the published count at 0 for the whole load. This runs on the setup task while the GATT
+    // server may already be advertising, and every reader (isIgnored, publishIgnoreMirror's merge)
+    // walks the array unlocked against the count. A count published before the bytes are in place
+    // and sorted lets a reader binary-search garbage.
+    gIgnoreCount = 0;
     Preferences p;
     p.begin("acab-ignore", true);
     int n = p.getInt("n", 0);
@@ -184,6 +189,7 @@ static void saveWatchList() {
 }
 
 static void loadWatchList() {
+    gWatchCount = 0;   // see loadIgnoreList
     Preferences p;
     p.begin("acab-watch", true);
     int n = p.getInt("n", 0);
@@ -885,6 +891,53 @@ void acabScannerMirrorTick() {
     }
 }
 
+// Publish the co-processor's ignore mirror as (ignore MINUS watch).
+//
+// WHY THE SUBTRACTION. handleDetection() lets a starred MAC through even when it is also on the
+// ignore list ("watchlist beats the ignore drop"). On the SHIPPING dual-radio board that rule was
+// unreachable for BLE: cfg.enableBLE is false there (the S3 does WiFi only), every advert arrives
+// over UART from the nRF, and the nRF drops ignore-listed MACs before forwarding
+// (nrf-ble-scan/src/main.cpp scan_callback). The advert never reached the ESP32, so the rule the
+// comment describes could never run. Both apps enforce star/ignore exclusivity, which is why this
+// never showed up in testing, but the lists persist per-board and are re-pushed per-phone: phone A
+// ignoring a MAC and phone B starring it lands both entries on the same board.
+//
+// Filtering here rather than teaching the nRF about the watchlist keeps the co-processor protocol
+// unchanged (no second mirrored list, no nRF reflash) and keeps ONE definition of the rule.
+//
+// THE SINGLE PUBLISHER. Every write of gMirrorList goes through here, from all THREE callers: both
+// list setters (GATT config-write task) and acabScannerResyncCoProc (loop task, on every nRF boot).
+// An earlier version of this let the resync path re-seed the mirror from the raw gIgnore list,
+// which silently undid the subtraction on every co-processor reset - including the RESET the S3
+// pulses in its own setup(), so the filtered mirror was gone before the board finished booting.
+//
+// LOCKING. The whole merge runs under gIgnoreMux -> gWatchMux -> gMirrorMux, in that order. That
+// is a superset of the only nesting the file already had (gIgnoreMux -> gMirrorMux), so the order
+// stays globally consistent and there is no deadlock. Building OUTSIDE the muxes and merely
+// clearing gMirrorActive first is NOT sufficient: clearing the flag holds off acabScannerMirrorTick
+// but not the resync path, which is a second writer of the same buffer on a different task. Every
+// caller releases its own list mux before calling, so this cannot self-deadlock. The walk is a
+// sorted merge (<=512 six-byte compares, bounded), the same order of magnitude as the 1536-byte
+// memcpy the previous code already did with interrupts disabled.
+static void publishIgnoreMirror() {
+    if (!gCmdSink) return;
+    portENTER_CRITICAL(&gIgnoreMux);
+    portENTER_CRITICAL(&gWatchMux);
+    portENTER_CRITICAL(&gMirrorMux);
+    int n = 0, wi = 0;
+    for (int i = 0; i < gIgnoreCount && n < ACAB_IGNORE_MAX; i++) {
+        while (wi < gWatchCount && memcmp(gWatch[wi], gIgnore[i], 6) < 0) wi++;
+        if (wi < gWatchCount && memcmp(gWatch[wi], gIgnore[i], 6) == 0) continue;   // starred: keep forwarding
+        memcpy(gMirrorList[n++], gIgnore[i], 6);
+    }
+    gMirrorCount  = n;
+    gMirrorPos    = -1;      // restart: fresh 'IC', then the new snapshot
+    gMirrorActive = true;
+    portEXIT_CRITICAL(&gMirrorMux);
+    portEXIT_CRITICAL(&gWatchMux);
+    portEXIT_CRITICAL(&gIgnoreMux);
+}
+
 void acabScannerSetIgnoreList(const uint8_t macs[][6], int count) {
     if (count < 0) count = 0;
     if (count > ACAB_IGNORE_MAX) count = ACAB_IGNORE_MAX;
@@ -903,14 +956,7 @@ void acabScannerSetIgnoreList(const uint8_t macs[][6], int count) {
     // ignored MACs (the ESP32 still filters them regardless - this only trims UART).
     // DEFERRED to acabScannerMirrorTick (see above): pacing the burst here, on the NimBLE
     // host task, stalled all GATT traffic for the whole stream.
-    if (gCmdSink) {
-        portENTER_CRITICAL(&gMirrorMux);
-        if (count > 0) memcpy(gMirrorList, gMacSortScratch, (size_t)count * 6);
-        gMirrorCount  = count;
-        gMirrorPos    = -1;      // restart: fresh 'IC', then the new snapshot
-        gMirrorActive = true;
-        portEXIT_CRITICAL(&gMirrorMux);
-    }
+    publishIgnoreMirror();
 }
 
 void acabScannerSetWatchList(const uint8_t macs[][6], int count) {
@@ -925,9 +971,11 @@ void acabScannerSetWatchList(const uint8_t macs[][6], int count) {
     gWatchCount = count;
     portEXIT_CRITICAL(&gWatchMux);
     saveWatchList();   // persist outside the critical section - NVS writes are slow
-    // No co-processor mirror: the watch check runs on the ESP32 over the same classifier
-    // chain the dual-radio UART path feeds, so a forwarded advert is matched regardless.
-    // (The co-proc only needs the ignore list, to trim what it forwards.)
+    // The watchlist itself is never mirrored: the watch check runs on the ESP32 over the same
+    // classifier chain the dual-radio UART path feeds, so a FORWARDED advert is matched regardless.
+    // But the ignore mirror is (ignore MINUS watch), so starring a MAC has to rebuild it - else the
+    // nRF keeps dropping the advert and it is never forwarded at all. See publishIgnoreMirror().
+    publishIgnoreMirror();
 }
 
 uint32_t acabScannerTotalDetections() { return gTotal; }
@@ -984,18 +1032,12 @@ void     acabScannerSendCoProcCmd(const char* cmd) { cmdSinkLine(cmd); }
 void acabScannerResyncCoProc() {
     if (!gCmdSink) return;
     cmdSinkLine(gBleEnabled ? "S1" : "S0");   // same line acabScannerSetBLE emits
-    // Re-seed the mirror snapshot from the live ignore list (NOT from gMirrorList, which is empty
-    // until the app pushes a list) and restart the deferred stream: gMirrorPos = -1 makes
-    // acabScannerMirrorTick send a fresh 'IC' and then the paced 'IA' burst from the loop task.
-    portENTER_CRITICAL(&gIgnoreMux);
-    int n = gIgnoreCount;
-    portENTER_CRITICAL(&gMirrorMux);
-    if (n > 0) memcpy(gMirrorList, gIgnore, (size_t)n * 6);
-    gMirrorCount  = n;
-    gMirrorPos    = -1;
-    gMirrorActive = true;
-    portEXIT_CRITICAL(&gMirrorMux);
-    portEXIT_CRITICAL(&gIgnoreMux);
+    // Re-seed the mirror snapshot from the live lists and restart the deferred stream: gMirrorPos
+    // = -1 makes acabScannerMirrorTick send a fresh 'IC' and then the paced 'IA' burst from the
+    // loop task. Goes through publishIgnoreMirror so the nRF gets (ignore MINUS watch) here too.
+    // This used to memcpy the RAW gIgnore list, which re-armed the co-processor to drop starred
+    // MACs on every single nRF boot - the filtered mirror never survived to steady state.
+    publishIgnoreMirror();
 }
 
 uint32_t acabScannerIgnoreCount() { return (uint32_t)gIgnoreCount; }

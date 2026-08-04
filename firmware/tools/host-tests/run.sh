@@ -18,7 +18,14 @@ for t in test_*.cpp; do
     src="${t#test_}"; src="${CORE}/${src%.cpp}_detect.cpp"
     [ -f "$src" ] || { echo "!! no source for $t (looked for $src)"; fail=1; continue; }
     echo ">> $t"
-    g++ -std=c++17 -Wall -I"$CORE" -Istubs -o "/tmp/$(basename "$t" .cpp)" "$t" "$src"
+    # A COMPILE failure must be recorded and skipped, not fatal. Under `set -e` a bare g++ here
+    # aborted the whole script on the first broken file, so the remaining tests never ran and the
+    # log just stopped. That was survivable while this was one file run by hand; it is not now
+    # that there are eight and CI invokes this script, where a truncated log reads as "the suite
+    # is smaller than I thought" rather than "it died early". A failing test RUN already used
+    # `|| fail=1` and continued, so this only makes the two paths behave the same way.
+    g++ -std=c++17 -Wall -I"$CORE" -Istubs -o "/tmp/$(basename "$t" .cpp)" "$t" "$src" \
+        || { echo "!! COMPILE FAILED: $t"; fail=1; continue; }
     "/tmp/$(basename "$t" .cpp)" || fail=1
 done
 exit $fail

@@ -24,6 +24,25 @@ enum class DeviceType(val raw: Int) {
     // or a host-disclosed camera, so we only say the brand is on the network. t=10 on the wire.
     NETWORK_CAMERA(10);
 
+    /**
+     * Key into `faq-content.json`'s `relatedHelp` map. These enum names ARE the keys, which is why
+     * the shared JSON uses SCREAMING_CASE; iOS maps its own camelCase DeviceType onto them.
+     *
+     * TWO KINDS OF "NO PANEL" HERE, and they are not the same thing:
+     *  - BODY_CAM and GLASSES are real keys the JSON has no entry for. RESERVED, not dead: both
+     *    already carry an experimental note on the dossier, and stacking a second hedge under it
+     *    reads as doubt about the detection rather than a pointer to context. If those notes ever
+     *    go away, add the entries and the panel appears with no code change.
+     *  - NEARBY_DEVICE and UNKNOWN return "", which means NEVER. Neither is a category a user can
+     *    have a question about: NEARBY_DEVICE is Desert mode's firehose, UNKNOWN is a parse
+     *    fallback. Mirrors iOS DeviceType.faqKey.
+     */
+    val faqKey: String
+        get() = when (this) {
+            NEARBY_DEVICE, UNKNOWN -> ""
+            else -> name
+        }
+
     val label: String
         get() = when (this) {
             FLOCK_CAMERA -> "ALPR Camera"
@@ -471,6 +490,12 @@ data class DeviceStatus(
     // While true the bufCount above is stale (mid-wipe), so the UI shows a "clearing" state
     // rather than a leftover count.
     val wiping: Boolean,
+    /** Carrier-board revision, "A" or "B" ("rev"). Dual board only; ABSENT on older firmware and
+     *  on every single-radio build. Nullable ON PURPOSE: docs/ble-protocol.md is explicit that a
+     *  missing value means "not told", never "rev-A", so it must never default. Mirrors iOS
+     *  DeviceStatus.boardRev, which Android was missing entirely, along with the OTA revision
+     *  gate that reads it. */
+    val boardRev: String?,
 ) {
     /** Just the version, e.g. "0.2.3" from "ACAB-ouispy 0.2.3". */
     val version: String get() = firmware.substringAfterLast(' ', firmware)
@@ -526,6 +551,9 @@ data class DeviceStatus(
             charging = o.optBoolean("chg", false),
             // a deferred buffer erase still sweeping; absent = idle
             wiping = o.optBoolean("wiping", false),
+            // carrier revision; null when the key is absent. optString would hand back "" for a
+            // missing key, which is not the same thing as "not told", so screen it explicitly.
+            boardRev = o.optString("rev", "").ifEmpty { null },
         )
     }
 }

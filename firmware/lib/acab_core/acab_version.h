@@ -26,6 +26,25 @@
 // therefore un-shippable over the air: the apps compare unclamped, would keep offering the
 // update, and the board would refuse it forever. Bump the MINOR when the patch field runs out.
 //
+// 2.0.3: the BLE link round, plus two detection additions.
+//        DETECTION: Google Find Hub / FMDN separated trackers (Eddystone service data
+//        0xFEAA, frame type 0x41 ONLY - the near-owner 0x40 form is deliberately not
+//        matched, see tracker_detect.cpp). This closes the second-largest tracker
+//        network in the US and makes the follow-me scorer mean something for the
+//        Android ecosystem, which it previously did nothing for. Netcam OUIs 43 -> 59:
+//        Ezviz (14 blocks, Hikvision's consumer brand with its OWN registrations, so the
+//        Hikvision rows never caught it), Lorex, Swann. TP-Link/Tapo and Foscam were
+//        evaluated and REJECTED with the reasoning recorded in netcam_signatures.h.
+//        BLE LINK: CCCD slots raised to 32 so the 8 bond slots are real - the store
+//        saturated after 2 fully-subscribed bonds, and a CCCD overflow calls
+//        ble_gap_unpair_oldest_except(), i.e. IT DELETES A BOND, with nothing on the wire to
+//        say so. Bond slots 3 -> 8. The firmware version no longer goes out in the scan
+//        response. Advertising re-arms after GAP preemption, so a board cannot end up silently
+//        un-advertising and indistinguishable from a dead one. New GAP/pairing serial
+//        diagnostics (enc_change status, disconnect reason, peer identity), which are what
+//        named every fault in this round instead of guessing. Address privacy (rotating RPA) is
+//        implemented and OFF: proven on air and on Android, and iOS cannot connect through it.
+//        Read ACAB_BLE_PRIVACY in acab_ble_service.h before touching that flag.
 // 2.0.2: everything in 2.0.1 plus its review round. Network cameras got their own buzzer
 //        pattern and now honour their own opt-in; the glasses classifier scores all three
 //        match surfaces instead of returning on the first; the WiFi Axon detail strings match
@@ -37,7 +56,7 @@
 // 2.0.0: the Colonel Panic builds pick up the full v2 detection set the beacon board ships
 // with (offline buffer, watchlist/custom category, ignore list, refreshed OUIs, glasses).
 #ifndef ACAB_FW_VERSION
-#define ACAB_FW_VERSION "2.0.2"
+#define ACAB_FW_VERSION "2.0.3"
 #endif
 
 #endif // ACAB_VERSION_H

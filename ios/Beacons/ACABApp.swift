@@ -26,10 +26,19 @@ struct ACABApp: App {
                     // Launch with `-demo` in the scheme to load canned detections.
                     if ProcessInfo.processInfo.arguments.contains("-demo") { ble.seedDemoData() }
                     #endif
+                    // Cold launch: reconcile here too, not only from the scenePhase change below.
+                    // This is the launch that has to RESUME Drive mode after a force-quit, and
+                    // onChange fires only on a transition, so leaning on it alone would make the
+                    // resume depend on SwiftUI delivering .inactive before .active. Harmless
+                    // twice over: startDriveMode adopts an already-running activity rather than
+                    // opening a second one, and if this call is too early for iOS to permit a
+                    // start, the .active pass below retries.
+                    ble.reconcileDriveMode()
                 }
                 .onChange(of: scenePhase) { _, phase in
                     // Back to the foreground: re-sync Drive mode with the system (the Control
-                    // Center toggle or the Live Activity End button may have changed it).
+                    // Center toggle or the Live Activity End button may have changed it), and
+                    // resume it if the user never turned it off (see DriveModeState).
                     if phase == .active { ble.reconcileDriveMode() }
                 }
         }

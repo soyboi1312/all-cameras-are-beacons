@@ -28,8 +28,11 @@ class AlprOverlayHolder {
     private var nodes: IntArray = IntArray(0)   // interleaved latE7, lonE7
     private var makerIdx: IntArray = IntArray(0)   // per-node maker index (parallel to nodes/2)
     private var makerTable: Array<String> = arrayOf("")
+    private var confirmed: BooleanArray = BooleanArray(0)   // per-node tier, parallel to nodes/2
     private var enabled = false
+    private var showUnverified = false   // draw the no-manufacturer tier at all (default off)
     private var icon: BitmapDrawable? = null
+    private var iconUnverified: BitmapDrawable? = null   // amber dashed ring for the unverified tier
 
     companion object {
         const val MIN_ZOOM = 11.0     // don't draw cameras zoomed further out than ~city level
@@ -55,14 +58,18 @@ class AlprOverlayHolder {
      *  identity checks are sound; viewport changes are covered by the debounced pan/zoom
      *  listener attach() installs, which re-culls without coming through here. */
     fun update(map: MapView, nodes: IntArray, makerIdx: IntArray, makerTable: Array<String>,
-               enabled: Boolean, icon: BitmapDrawable) {
+               confirmed: BooleanArray, icUnverified: BitmapDrawable,
+               enabled: Boolean, showUnverified: Boolean, icon: BitmapDrawable) {
         if (nodes === this.nodes && makerIdx === this.makerIdx && enabled == this.enabled &&
-            icon === this.icon) return
+            showUnverified == this.showUnverified && icon === this.icon) return
         this.nodes = nodes
         this.makerIdx = makerIdx
         this.makerTable = makerTable
+        this.confirmed = confirmed
         this.enabled = enabled
+        this.showUnverified = showUnverified
         this.icon = icon
+        this.iconUnverified = icUnverified
         rebuild(map)
     }
 
@@ -78,6 +85,7 @@ class AlprOverlayHolder {
         if (folder.items == null) return
         folder.items.clear()
         val ic = icon
+        val icUnver = iconUnverified ?: ic
         if (!enabled || ic == null || nodes.isEmpty() || map.zoomLevelDouble < MIN_ZOOM) {
             map.invalidate(); return
         }
@@ -95,14 +103,34 @@ class AlprOverlayHolder {
                 if (drawn >= CAP) { folder.items.clear(); break }   // too many in view: draw none, wait for zoom-in
                 val node = i / 2 - 1                    // i was already advanced by 2 above
                 val maker = if (node < makerIdx.size) makerTable.getOrElse(makerIdx[node]) { "" } else ""
+                val ok = if (node < confirmed.size) confirmed[node] else true
+                // Hidden by default: a pin with no manufacturer recorded is the one users drive to,
+                // find nothing at, and blame the app for. Skipped BEFORE the drawn++ so hiding them
+                // buys headroom under CAP rather than silently costing it.
+                if (!ok && !showUnverified) continue
                 folder.add(Marker(map).apply {
                     position = GeoPoint(lat, lon)
                     setAnchor(Marker.ANCHOR_CENTER, Marker.ANCHOR_CENTER)
-                    this.icon = ic
-                    // tapping a reference camera names the maker (when OSM has it) + credits the
-                    // source; the maker is what the user asked to see in this callout.
-                    title = if (maker.isEmpty()) "Known ALPR camera" else "$maker ALPR camera"
-                    snippet = "mapped by DeFlock · OpenStreetMap ODbL"
+                    this.icon = if (ok) ic else icUnver
+                    // Tapping a reference camera names the maker (when OSM has it) + credits the
+                    // source. The snippet also has to say what a pin IS: a mapped location, not a
+                    // live detection. Most fixed ALPRs backhaul over cellular and are silent to
+                    // this hardware whether or not one is standing there, and a user who reads a
+                    // pin as a detection concludes the device is broken.
+                    // The two BODY lines below are word-identical to iOS. The TITLES are not, and
+                    // deliberately: this is an osmdroid info-window title, iOS is a floating
+                    // capsule, so they carry the same fact in the form each affordance wants.
+                    // TIER FIRST, then maker. Testing maker first titled a hand-typed node
+                    // "Flock Safety ALPR camera" while the snippet underneath said no
+                    // manufacturer was recorded. Mirrors iOS MapTabView.
+                    title = when {
+                        !ok && maker.isEmpty() -> "Unverified ALPR camera"
+                        !ok -> "$maker? ALPR camera, unverified"
+                        maker.isNotEmpty() -> "$maker ALPR camera"
+                        else -> "Known ALPR camera"
+                    }
+                    snippet = if (ok) "a mapped location, not a live detection · DeFlock / OSM ODbL"
+                              else "no manufacturer recorded, so it may be misidentified or gone · DeFlock / OSM ODbL"
                     setOnMarkerClickListener { m, _ -> m.showInfoWindow(); true }
                 })
                 drawn++
@@ -126,7 +154,9 @@ class AlprOverlayHolder {
         nodes = IntArray(0)
         makerIdx = IntArray(0)
         makerTable = arrayOf("")
+        confirmed = BooleanArray(0)
         enabled = false
+        showUnverified = false
         icon = null
     }
 }

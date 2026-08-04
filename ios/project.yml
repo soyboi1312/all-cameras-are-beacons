@@ -23,7 +23,7 @@ packages:
 
 settings:
   base:
-    MARKETING_VERSION: "2.0.2"
+    MARKETING_VERSION: "2.0.3"
     # BUMP THIS (then `xcodegen generate`) BEFORE EVERY ARCHIVE, and leave "Automatically manage
     # version and build number" UNCHECKED in Xcode's Distribute flow. If Xcode manages it, it bumps
     # the build at UPLOAD time and never writes it back here - so every archive on disk reads the same
@@ -119,6 +119,23 @@ targets:
         ENABLE_PREVIEWS: YES
         ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
 
+  # Logic tests for the pure model code. Today that is the follow-evidence parity fixtures, which
+  # are the mechanism holding this app and the Android app to ONE set of thresholds: both sides
+  # ship separate implementations of the same document, and a band boundary that lands differently
+  # on each phone is invisible without them. Hosted by the app target rather than compiling the
+  # model sources a second time, so the tests always exercise the code that actually ships.
+  BeaconsTests:
+    type: bundle.unit-test
+    platform: iOS
+    sources:
+      - BeaconsTests
+    dependencies:
+      - target: Beacons
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: tech.beacons.app.tests
+        GENERATE_INFOPLIST_FILE: YES
+
   # Widget extension: hosts the Live Activity (Dynamic Island + Lock Screen counter).
   BeaconsWidget:
     type: app-extension
@@ -170,6 +187,8 @@ schemes:
       config: Debug
     test:
       config: Debug
+      targets:
+        - BeaconsTests
     profile:
       config: Release
     analyze:

@@ -3,8 +3,10 @@ package tech.acab.app.ui
 import android.content.ClipData
 import android.content.ClipboardManager
 import android.content.Context
+import android.content.pm.PackageManager
 import android.graphics.ColorMatrix
 import android.graphics.ColorMatrixColorFilter
+import androidx.core.content.ContextCompat
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
@@ -13,6 +15,7 @@ import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
+import androidx.activity.compose.BackHandler
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxHeight
 import androidx.compose.foundation.layout.fillMaxSize
@@ -20,6 +23,7 @@ import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
@@ -73,7 +77,9 @@ import org.osmdroid.views.MapView
 import org.osmdroid.views.overlay.Marker
 import tech.acab.app.ble.AcabBleManager
 import tech.acab.app.model.Detection
+import tech.acab.app.model.FaqContent
 import tech.acab.app.model.DeviceType
+import tech.acab.app.model.FollowEvidence
 import tech.acab.app.net.AlprStore
 import tech.acab.app.model.TimeBasis
 import tech.acab.app.model.isOuiMatch
@@ -98,6 +104,8 @@ fun DetailScreen(
     onBack: () -> Unit,
     onOpenInMap: (Double, Double) -> Unit,
 ) {
+    // Which FAQ answer a RELATED HELP row asked for; non-null opens the Help sheet on it.
+    var helpDeepLink by remember { mutableStateOf<String?>(null) }
     // The pushed-in dossier is a frozen snapshot, so shadow it with the live record
     // from the feed; "seen N×" and friends keep updating while the screen is open.
     // The id is hoisted once so the ~3 Hz scan below compares against a local rather than
@@ -178,6 +186,9 @@ fun DetailScreen(
 
             // ---- how good the match is: verdict, meter, plain-language explainer ----
             MatchQualityPanel(d)
+
+            // ---- the FAQ answers that speak to THIS category ----
+            RelatedHelpPanel(d) { helpDeepLink = it }
 
             // ---- heads-up that THIS category's signatures aren't field-verified ----
             if (d.type.isExperimental) ExperimentalNote(d.type)
@@ -320,6 +331,11 @@ fun DetailScreen(
             // ---- location: static map thumbnail centered on the sighting ----
             ble.mapCoord(d)?.let { (lat, lon) -> LocationPanel(d, lat, lon, onOpenInMap) }
 
+            // ---- has this tag been near you across more than one place? trackers only ----
+            // Deliberately BELOW the location panel and ABOVE the actions: it is the last thing
+            // read before deciding to star or ignore, and it is a reading of the map above it.
+            if (d.type == DeviceType.TRACKER) FollowEvidencePanel(d.id, d.type, ble, timeBasis)
+
             // ---- actions ----
             CopyMacButton(d.mac)
             WatchButton(watched = isWatched, onToggle = toggleWatch)
@@ -372,6 +388,53 @@ fun DetailScreen(
             Spacer(Modifier.size(36.dp))   // dummy right item so the kicker stays centered
         }
     }
+
+    // A RELATED HELP row opens the bundled FAQ ON that answer. Rendered as a full-bleed overlay
+    // rather than a nav push because the dossier is itself already a pushed screen here, and
+    // stacking a second push makes the back button ambiguous. BackHandler in the overlay takes
+    // precedence, so back closes Help and leaves the dossier where it was.
+    helpDeepLink?.let { id ->
+        HelpOverlay(questionId = id, onClose = { helpDeepLink = null })
+    }
+}
+
+/** Full-bleed Help, opened on a specific answer from a dossier's RELATED HELP row. */
+@Composable
+private fun HelpOverlay(questionId: String, onClose: () -> Unit) {
+    BackHandler(enabled = true, onBack = onClose)
+    Column(
+        Modifier
+            .fillMaxSize()
+            .background(Acab.bg)
+            .clickable(enabled = false) {}      // swallow taps so the dossier behind is inert
+            .verticalScroll(rememberScrollState()),
+        horizontalAlignment = Alignment.CenterHorizontally,
+    ) {
+        Row(
+            Modifier.widthIn(max = 640.dp).fillMaxWidth().padding(14.dp),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            Box(
+                Modifier
+                    .size(36.dp)
+                    .clip(RoundedCornerShape(Acab.radius))
+                    .background(Acab.bg2)
+                    .clickable { onClose() },
+                contentAlignment = Alignment.Center,
+            ) {
+                Icon(Icons.AutoMirrored.Filled.ArrowBack, contentDescription = "Back",
+                    tint = Acab.text, modifier = Modifier.size(18.dp))
+            }
+            Spacer(Modifier.weight(1f))
+            Kicker("HELP")
+            Spacer(Modifier.weight(1f))
+            Spacer(Modifier.size(36.dp))
+        }
+        Box(Modifier.widthIn(max = 640.dp).fillMaxWidth()) {
+            HelpScreen(scrollToId = questionId)
+        }
+        Spacer(Modifier.height(24.dp))
+    }
 }
 
 /** Category badge pill in the type tone, like the iOS detail header. */
@@ -386,6 +449,44 @@ private fun BadgePill(label: String, tone: Color) {
     ) {
         Text(label, color = tone, fontSize = 9.5.sp, letterSpacing = 1.sp,
             fontWeight = FontWeight.Bold, fontFamily = Acab.mono)
+    }
+}
+
+/**
+ * RELATED HELP: the one or two FAQ answers that speak to THIS category, deep-linked.
+ *
+ * Sits directly under match quality because that is where the doubt lands. Someone looking at a 45%
+ * hit, or an ALPR pin with nothing detected next to it, is already asking a question, and until now
+ * the answer only existed on the website. A reporter using the device hit exactly that and
+ * concluded the hardware was broken.
+ *
+ * Renders nothing for categories with no mapped questions , deliberate for glasses and body cam,
+ * which already carry the experimental note directly below. Stacking a second hedge under it reads
+ * as doubt about the detection rather than a pointer to context. Mirrors iOS relatedHelpPanel.
+ */
+@Composable
+private fun RelatedHelpPanel(d: Detection, onOpen: (String) -> Unit) {
+    val context = LocalContext.current
+    val qs = remember(d.type) { FaqContent.get(context).related(d.type) }
+    if (qs.isEmpty()) return
+    Column(Modifier.fillMaxWidth().panel(), verticalArrangement = Arrangement.spacedBy(2.dp)) {
+        Kicker("RELATED HELP")
+        qs.forEachIndexed { i, q ->
+            Row(
+                Modifier.fillMaxWidth().clickable { onOpen(q.id) }.padding(vertical = 9.dp),
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                Text(
+                    q.q, color = Acab.text, fontSize = 13.5.sp, lineHeight = 18.sp,
+                    fontFamily = Acab.display, modifier = Modifier.weight(1f),
+                )
+                Spacer(Modifier.width(10.dp))
+                Text("\u203A", color = Acab.faint, fontSize = 13.sp, fontFamily = Acab.mono)
+            }
+            if (i < qs.size - 1) {
+                Box(Modifier.fillMaxWidth().height(1.dp).background(Acab.line))
+            }
+        }
     }
 }
 
@@ -724,13 +825,21 @@ private fun LocationPanel(d: Detection, lat: Double, lon: Double, onOpenInMap: (
         // We NEVER show a "no mapped camera" line: OSM lags installs and cruiser ALPR is meant to
         // move, so absence is not evidence of a false positive (the confidence % chip is that tell).
         if (d.type == DeviceType.FLOCK_CAMERA || d.type == DeviceType.FLOCK_RAVEN) {
-            AlprStore.getInstance(context).nearest(lat, lon)?.let { (meters, maker) ->
+            AlprStore.getInstance(context).nearest(lat, lon)?.let { (meters, maker, ok) ->
                 if (meters <= 150) {
                     val m = meters.roundToInt()
+                    // This line is the app VOUCHING for a detection using the mapped maker as
+                    // corroboration, so it must not spend the maker's credibility on a maker
+                    // nobody verified. An unverified node still corroborates the LOCATION but not
+                    // the NAME, so it drops the maker rather than repeating a guess back as
+                    // evidence. Mirrors iOS DetectionDetailView.
                     Text(
-                        if (maker.isEmpty()) "\u2713 matches a mapped camera · $m m"
-                        else "\u2713 matches a mapped $maker camera · $m m",
-                        color = Acab.flockTone, fontSize = 11.sp,
+                        when {
+                            !ok -> "\u2713 near a community-mapped camera · $m m"
+                            maker.isEmpty() -> "\u2713 matches a mapped camera · $m m"
+                            else -> "\u2713 matches a mapped $maker camera · $m m"
+                        },
+                        color = if (ok) Acab.flockTone else Acab.warn, fontSize = 11.sp,
                         fontWeight = FontWeight.Medium, fontFamily = Acab.mono,
                     )
                 }
@@ -849,6 +958,126 @@ private fun LocationPanel(d: Detection, lat: Double, lon: Double, onOpenInMap: (
                     fontWeight = FontWeight.Bold, fontFamily = Acab.mono)
             }
         }
+    }
+}
+
+/**
+ * "Seen with you": what the phone's own breadcrumb trail says about this tracker, and nothing else.
+ *
+ * TRACKERS ONLY, and the caller already gated on it. The manager collects crumbs for no other type,
+ * so a body cam has nothing to score; showing it an empty panel would claim a check that never ran.
+ *
+ * NEVER AN ALARM. No tone colour, no icon, no amber. A band is a header plus two dim paragraphs, and
+ * the second one names the innocent explanation. The NONE, NOT_MEASURED and no-crumb states get no
+ * Kicker at all, so a header can never assert something the body then walks back.
+ *
+ * FIVE STATES, FIVE SENTENCES, and none of them may be borrowed from another: a band, "scored and
+ * found nothing" (NONE), "refused to score" (NOT_MEASURED), "location is off", and "no position was
+ * recorded this session". Every one of those sentences is authored in FollowEvidence, never here.
+ *
+ * COST. The span pass is O(n^2) over up to 120 crumbs (7140 haversines). That is cheap, but it must
+ * never ride the ~3 Hz publish this screen live-shadows, or a Desert-mode flood would pay for it on
+ * every frame. So: score once when the screen appears, then at most once per 5 s, off a snapshot
+ * copy of the crumb list taken outside storeLock (crumbs() already hands back a .toList()).
+ */
+@Composable
+private fun FollowEvidencePanel(
+    id: String,
+    // Passed through rather than hardcoded to TRACKER at the evaluate() call below. The caller
+    // already gated on type, so this looks redundant, and that is the point: the scorer carries its
+    // own type guard so that widening crumb collection past trackers cannot start scoring body cams
+    // by accident. Handing it a constant would quietly disarm the guard on this platform only, and
+    // iOS would keep an assertion Android had lost.
+    type: DeviceType,
+    ble: AcabBleManager,
+    timeBasis: TimeBasis,
+) {
+    val context = LocalContext.current
+    val demo by ble.demoMode.collectAsState()
+    // The 5 s recompute clock. A plain counter rather than a re-read of the feed: the feed changes
+    // ~3 Hz and almost none of those changes can move a band, which needs a fresh crumb, and a
+    // crumb needs 60 s and 25 m.
+    var tick by remember(id) { mutableStateOf(0) }
+    LaunchedEffect(id) {
+        while (true) {
+            delay(5_000)
+            tick++
+        }
+    }
+    // Asked on every recompute rather than remembered: the user can grant location from the system
+    // sheet while this screen sits open, and the panel would otherwise keep saying we aren't using it.
+    //
+    // FINE *or* COARSE, matching the manager's own hasLocationPermission() gate and iOS's
+    // authorizedWhenInUse/Always test. Testing FINE alone would tell a user who chose Android 12's
+    // "Approximate location" that the app is not using location at all, which is false: coarse fixes
+    // do reach freshSelfCoord and do produce crumbs. Getting this wrong is not a cosmetic slip in a
+    // panel whose entire job is to say honestly what the app did and did not look at.
+    val locationGranted = ContextCompat.checkSelfPermission(
+        context, android.Manifest.permission.ACCESS_FINE_LOCATION,
+    ) == PackageManager.PERMISSION_GRANTED || ContextCompat.checkSelfPermission(
+        context, android.Manifest.permission.ACCESS_COARSE_LOCATION,
+    ) == PackageManager.PERMISSION_GRANTED
+
+    val crumbs = remember(id, tick) { ble.crumbs(id) }
+    val ev = remember(id, tick, timeBasis, type) {
+        FollowEvidence.evaluate(
+            type = type,
+            crumbs = crumbs,
+            // The FIRST CRUMB, not first-seen. first-seen is when the device was first HEARD, and
+            // it comes back off the persisted store on launch while the crumbs do not. Handing the
+            // scorer first-seen made it narrate a window the trail never covered, and let the
+            // bands' time floors be satisfied by minutes containing no crumbs at all. The scorer's
+            // parameter was RENAMED along with the fix precisely so this call site could not keep
+            // passing the wrong instant and still compile.
+            firstCrumbAtMs = ble.firstCrumbAt(id),
+            lastCrumbAtMs = ble.lastCrumbAt(id),
+            timeBasis = timeBasis,
+        )
+    }
+
+    // No crumbs at all has three different causes and they are not interchangeable. Demo seeds the
+    // store directly and never runs the live filing path, so a demo tracker has zero crumbs for a
+    // reason that is neither a permission problem nor a fix problem: it says the ordinary "not
+    // enough ground" line and stays at band NONE forever. Fabricating follow evidence inside a tour
+    // would teach the user to trust a fabricated judgement.
+    val hasTrail = crumbs.isNotEmpty() || demo
+    val body = when {
+        // A trail exists (or this is the tour), so the model owns the sentence, and it now has FOUR
+        // of them. NOT_MEASURED is the one this has to keep distinct: a refusal (a derived time
+        // basis off the board's offline buffer, a clock jump, a window longer than an address
+        // lives) is not a finding, and reporting it through the NONE branch is how the panel came
+        // to tell a user "not across enough ground to read anything into yet" about a tag it had
+        // never compared against anything. Under-claiming cuts both ways here: a false reassurance
+        // is as much a false statement as a false alarm, and it is the one nobody audits.
+        hasTrail -> ev.detailText
+        !locationGranted -> FollowEvidence.NO_LOCATION_TEXT
+        else -> FollowEvidence.NO_FIX_TEXT
+    }
+    // EVERY state, no exceptions. This used to be suppressed on the two no-crumb states, on the
+    // reasoning that a session-and-trackers caveat under them would qualify a measurement that was
+    // never taken. That had it backwards. The no-crumb states are precisely where the user needs to
+    // be told the memory is session-scoped: after an app restart the store row is restored from
+    // disk and the crumbs are not, so the panel says there is nothing to compare, and this is the
+    // one line that explains why a tag they watched ride along with them yesterday shows nothing
+    // today. Suppressing it left the false-looking sentence standing with no context at all.
+    val scope = FollowEvidence.SCOPE_TEXT
+
+    // Always the card, never the Kicker unless a band fired. Same shape as iOS: the panel chrome is
+    // constant so the screen does not visibly restructure itself when a band appears, but the header
+    // is conditional so it can never assert a finding that the body immediately walks back. Reading
+    // the label straight off the band covers the empty-crumb and refused states for free: fewer than
+    // three crumbs can only score NONE, and NONE and NOT_MEASURED both have no label.
+    val label = ev.band.label
+    Column(Modifier.fillMaxWidth().panel(), verticalArrangement = Arrangement.spacedBy(9.dp)) {
+        if (label != null) {
+            Kicker(FollowEvidence.KICKER)
+            // Plain body text, NOT a Kicker: the band label is content, and passing it through a
+            // casing transform is exactly how two platforms end up rendering it differently.
+            Text(label, color = Acab.text, fontSize = 15.sp, fontWeight = FontWeight.Medium,
+                fontFamily = Acab.display)
+        }
+        Text(body, color = Acab.dim, fontSize = 11.sp, fontFamily = Acab.mono, lineHeight = 16.sp)
+        Text(scope, color = Acab.faint, fontSize = 9.5.sp, fontFamily = Acab.mono, lineHeight = 13.sp)
     }
 }
 

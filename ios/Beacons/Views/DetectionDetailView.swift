@@ -15,6 +15,22 @@ extension EnvironmentValues {
     }
 }
 
+/// What the SEEN WITH YOU panel is currently saying, cached between evaluations.
+///
+/// Four states, not two, because "we have no opinion" has several different honest explanations and
+/// picking the wrong one is a lie: location off means we were never watching, no recorded position
+/// means we were watching and never filed one worth using (or the session that held them ended),
+/// and not-measured means the scorer REFUSED the row on its time record. All three are distinct
+/// from a real score of none, which is the only one of them that is a finding.
+private enum FollowPanelState: Equatable {
+    case scored(FollowEvidence.Score)
+    /// A refusal, kept as its own case rather than folded back into `.scored` so the panel cannot
+    /// quietly reacquire the none sentence for a row nothing was computed for.
+    case notMeasured
+    case noLocation
+    case noFix
+}
+
 /// Full detection detail, pushed from the dashboard and logbook, shown as a sheet
 /// from the map. Custom top bar, a live RSSI signal panel, stat grid, identity, and
 /// location.
@@ -34,6 +50,17 @@ struct DetectionDetailView: View {
     @State private var confirmRandomWatch = false   // R7: confirm dialog before starring a randomized MAC
     @State private var showRssiInfo = false          // tap the info dot next to SIGNAL to explain the RSSI graph
 
+    // Follow evidence (trackers only). Cached in @State and refreshed on a slow tick rather than
+    // derived inside `body`, because this dossier re-renders at the coalesced publish cadence (a
+    // few Hz, much more under a Desert-mode flood) and the span pass is O(n^2) over up to 120
+    // crumbs. Recomputing it per render would hang a 7140-haversine sweep off every incoming
+    // detection for as long as the screen is open, which is exactly the thing the spec forbids.
+    @State private var followState: FollowPanelState = .scored(.unscored)
+    /// 5 s cadence, held in @State so the SAME publisher survives a re-render. As a plain `let` it
+    /// would be rebuilt on every body evaluation, and onReceive would cancel and resubscribe each
+    /// time, so under a fast feed the timer would never live long enough to fire once.
+    @State private var followTick = Timer.publish(every: 5, on: .main, in: .common).autoconnect()
+
     /// Always re-read the live row: the captured `detection` is a value type with let fields,
     /// so it can never update, and this screen sits next to id-keyed lookups that do (the
     /// LIVE/STALE kicker, the sparkline). A frozen copy means the dBm readout never moves
@@ -50,6 +77,7 @@ struct DetectionDetailView: View {
                 VStack(alignment: .leading, spacing: 16) {
                     titleBlock
                     matchQualityPanel
+                    relatedHelpPanel
                     if d.type.isExperimental { experimentalNote }
                     signalPanel
                     statGrid
@@ -61,6 +89,12 @@ struct DetectionDetailView: View {
                     // get the LOCATION panel + OPEN IN MAP too, not just drones. Broadcast-GPS
                     // rows keep their richer readout in the identity panel above.
                     if let coord = d.coordinate ?? ble.capturedLocation(for: d.id) { locationPanel(coord) }
+                    // Tracker rows only, and only here. Nothing about this judgement is allowed to
+                    // reach a notification, a haptic, the buzzer, the log row, the dashboard
+                    // counters, the Live Activity, the map, or the CSV export. The export in
+                    // particular: it is a record of raw sightings that gets handed over as
+                    // evidence, and a derived opinion in a column reads as fact.
+                    followPanel
                     copyButton
                     watchButton
                     ignoreButton
@@ -76,6 +110,14 @@ struct DetectionDetailView: View {
         }
         .navigationBarHidden(true)
         .toolbar(embedded ? .visible : .hidden, for: .tabBar)
+        // Evaluate on appear, then at most once per 5 s while the screen is up, and never from
+        // the ingest or publish paths. Crumbs need 60 s and 25 m to move at all, so a 5 s refresh
+        // is already far faster than the underlying data can change.
+        .onAppear { refreshFollow() }
+        // The iPad two-pane keeps ONE detail view mounted and swaps the row into it, so without
+        // this the panel would keep showing the previously selected tag's score.
+        .onChange(of: d.id) { refreshFollow() }
+        .onReceive(followTick) { _ in refreshFollow() }
         // A star refused at the firmware's 256-entry cap sets this on the manager; surface it here
         // instead of the WATCH tap silently doing nothing.
         .alert("Watchlist full", isPresented: $ble.watchlistFull) {
@@ -167,6 +209,50 @@ struct DetectionDetailView: View {
     /// Low certainty is loud amber, high certainty is calm white. Crimson is for
     /// categories only, never for confidence.
     private var isWeakMatch: Bool { d.confidence < 50 }
+
+    /// RELATED HELP: the one or two FAQ answers that speak to THIS category, deep-linked.
+    ///
+    /// It sits directly under match quality because that is where the doubt lands. Someone looking
+    /// at a 45% Motorola hit, or an ALPR pin with nothing detected, is already asking a question,
+    /// and the answer was previously only on the website. A reporter using the device hit exactly
+    /// that and concluded the hardware was broken.
+    ///
+    /// Renders nothing for categories with no mapped questions. That is deliberate for glasses and
+    /// body cam: those already carry the experimental note directly below, and stacking a second
+    /// hedge under it reads as doubt about the detection rather than a pointer to context.
+    @ViewBuilder
+    private var relatedHelpPanel: some View {
+        let qs = FAQContent.shared.related(for: d.type)
+        if !qs.isEmpty {
+            VStack(alignment: .leading, spacing: 12) {
+                Kicker("RELATED HELP")
+                VStack(alignment: .leading, spacing: 0) {
+                    ForEach(Array(qs.enumerated()), id: \.element.id) { idx, q in
+                        NavigationLink { HelpView(scrollToId: q.id) } label: {
+                            HStack(spacing: 10) {
+                                Text(q.q)
+                                    .font(ACABTheme.display(13.5, weight: .medium))
+                                    .foregroundStyle(ACABTheme.text)
+                                    .lineSpacing(2)
+                                    .fixedSize(horizontal: false, vertical: true)
+                                    .frame(maxWidth: .infinity, alignment: .leading)
+                                Image(systemName: "chevron.right")
+                                    .font(.system(size: 12, weight: .semibold))
+                                    .foregroundStyle(ACABTheme.faint)
+                            }
+                            .padding(.vertical, 9)
+                            .contentShape(Rectangle())
+                        }
+                        .buttonStyle(.plain)
+                        if idx < qs.count - 1 {
+                            Rectangle().fill(ACABTheme.line).frame(height: 1)
+                        }
+                    }
+                }
+            }
+            .panel()
+        }
+    }
 
     private var matchQualityPanel: some View {
         VStack(alignment: .leading, spacing: 10) {
@@ -658,16 +744,30 @@ struct DetectionDetailView: View {
                let hit = ALPRStore.shared.nearest(to: coord), hit.meters <= 150 {
                 HStack(spacing: 7) {
                     Image(systemName: "checkmark.seal.fill")
-                        .font(.system(size: 11)).foregroundStyle(ACABTheme.flockTone)
-                    Text(hit.maker.isEmpty
-                         ? "matches a mapped camera · \(Int(hit.meters.rounded())) m"
-                         : "matches a mapped \(hit.maker) camera · \(Int(hit.meters.rounded())) m")
-                        .font(ACABTheme.mono(11, weight: .medium)).foregroundStyle(ACABTheme.flockTone)
+                        .font(.system(size: 11)).foregroundStyle(hit.confirmed ? ACABTheme.flockTone : ACABTheme.warn)
+                    // This line is the app VOUCHING for a detection using the mapped maker as
+                    // corroboration, so it must not spend the maker's credibility on a maker
+                    // nobody verified. An unverified node still corroborates the LOCATION (someone
+                    // mapped a camera here) but not the NAME, so it drops the maker from the
+                    // sentence rather than repeating a guess back at the user as evidence.
+                    Text(hit.confirmed
+                         ? (hit.maker.isEmpty
+                            ? "matches a mapped camera · \(Int(hit.meters.rounded())) m"
+                            : "matches a mapped \(hit.maker) camera · \(Int(hit.meters.rounded())) m")
+                         : "near a community-mapped camera · \(Int(hit.meters.rounded())) m")
+                        .font(ACABTheme.mono(11, weight: .medium))
+                        .foregroundStyle(hit.confirmed ? ACABTheme.flockTone : ACABTheme.warn)
                     Spacer(minLength: 0)
                 }
-                .accessibilityLabel(hit.maker.isEmpty
-                     ? "matches a mapped camera about \(Int(hit.meters.rounded())) meters away"
-                     : "matches a mapped \(hit.maker) camera about \(Int(hit.meters.rounded())) meters away")
+                // Must mirror the VISIBLE claim exactly. This branched on maker alone, so
+                // VoiceOver spoke "matches a mapped Motorola camera" for a node the sighted user
+                // is deliberately told is only "near a community-mapped camera" - the screen
+                // reader was making the stronger claim the visible copy refuses to make.
+                .accessibilityLabel(!hit.confirmed
+                     ? "near a community-mapped camera, about \(Int(hit.meters.rounded())) meters away, manufacturer unverified"
+                     : (hit.maker.isEmpty
+                        ? "matches a mapped camera about \(Int(hit.meters.rounded())) meters away"
+                        : "matches a mapped \(hit.maker) camera about \(Int(hit.meters.rounded())) meters away"))
             }
             // The whole thumbnail is one tap target: close the dossier and hand the full
             // Map tab a one-shot close-in focus on this coordinate (see MapFocus). The
@@ -731,6 +831,98 @@ struct DetectionDetailView: View {
         // Sheets and pushes close here. The embedded two-pane has no dismissal and
         // needs none: switching to the Map tab is itself the close.
         dismiss()
+    }
+
+    // MARK: Seen with you
+    //
+    // The one place in the app that answers "has this thing been with me", and it answers with
+    // evidence rather than a verdict. It is silent by design: no notification, no haptic, no
+    // buzzer, no list badge, no map change. The panel's own sentences name the innocent
+    // explanations in the same breath as the numbers, because no threshold can separate a stalker
+    // from a fellow commuter carrying a Tile, and a product that over-claims here spends the trust
+    // every other alert depends on.
+
+    /// Re-score from the manager's current state. Takes a VALUE COPY of the crumb list first, so
+    /// the O(n^2) diameter sweep never runs while anything else could be mutating the store.
+    private func refreshFollow() {
+        // Only trackers accumulate crumbs, so only trackers can be scored. Everything else gets no
+        // panel at all rather than an empty one, which would imply it had been checked. The state
+        // still goes to .notMeasured rather than a none score, matching what the scorer itself
+        // returns for a non-tracker: if the panel's own type gate above is ever widened, it must
+        // widen onto "we did not look" and not onto "we looked and found nothing".
+        guard d.type == .tracker else { followState = .notMeasured; return }
+        let crumbs = ble.crumbTrail(for: d.id)
+        // No crumbs at all needs an explanation, not a blank. Demo mode is the exception: it seeds
+        // the store directly and never runs the live path, so a demo tracker legitimately has zero
+        // crumbs and must sit at band none. Printing "there was no usable position" over sample
+        // data would teach the user to read a tour as a measurement.
+        if crumbs.isEmpty, !ble.demoMode {
+            followState = ble.locationAuthorized ? .noFix : .noLocation
+            return
+        }
+        // firstCrumbAt, NOT firstSeenDate: the row survives a restart and the crumbs do not, so
+        // the first-HEARD stamp would open a window the trail never covered.
+        let s = FollowEvidence.score(crumbs: crumbs,
+                                     firstCrumbAt: ble.firstCrumbAt(for: d.id),
+                                     lastCrumbAt: ble.lastCrumbAt(for: d.id),
+                                     basis: ble.timeBasis(for: d.id),
+                                     type: d.type)
+        // Split the refusal out here, once, so every reader below is either a real finding or an
+        // explicit "we did not look". Collapsing them is what let the panel report a comparison it
+        // had declined to run.
+        followState = (s.band == .notMeasured) ? .notMeasured : .scored(s)
+    }
+
+    @ViewBuilder private var followPanel: some View {
+        if d.type == .tracker {
+            VStack(alignment: .leading, spacing: 9) {
+                switch followState {
+                case .scored(let s):
+                    // The kicker appears ONLY when a band fires. Over the none state it would be a
+                    // header asserting something the body immediately walks back.
+                    if let label = FollowEvidence.label(s.band) {
+                        Kicker(FollowEvidence.kicker)
+                        // Plain body text, never routed through Kicker: an all-caps transform is
+                        // one more thing that can silently drift away from Android.
+                        Text(label)
+                            .font(ACABTheme.display(15, weight: .medium))
+                            .foregroundStyle(ACABTheme.text)
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
+                    Text(FollowEvidence.body(s))
+                        .font(ACABTheme.mono(11)).foregroundStyle(ACABTheme.dim)
+                        .fixedSize(horizontal: false, vertical: true)
+                case .notMeasured:
+                    Text(FollowEvidence.notMeasuredLine)
+                        .font(ACABTheme.mono(11)).foregroundStyle(ACABTheme.dim)
+                        .fixedSize(horizontal: false, vertical: true)
+                case .noLocation:
+                    Text(FollowEvidence.noLocationLine)
+                        .font(ACABTheme.mono(11)).foregroundStyle(ACABTheme.dim)
+                        .fixedSize(horizontal: false, vertical: true)
+                case .noFix:
+                    Text(FollowEvidence.noFixLine)
+                        .font(ACABTheme.mono(11)).foregroundStyle(ACABTheme.dim)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+                // EVERY state, not just the ones where a band fired. The states that say nothing
+                // are precisely where the user has to be told the memory is session-scoped: after
+                // a restart the crumbs are gone and the row is not, and without this line the
+                // panel's silence reads as a result.
+                scopeLine
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .panel()
+        }
+    }
+
+    /// Crumbs are session-only and never persisted, and they exist for trackers alone. Both facts
+    /// ride on every state of this panel, so it can never imply a longer memory or a wider scope
+    /// than the app actually has.
+    private var scopeLine: some View {
+        Text(FollowEvidence.scopeLine)
+            .font(ACABTheme.mono(9.5)).foregroundStyle(ACABTheme.faint)
+            .fixedSize(horizontal: false, vertical: true)
     }
 
     private var miniPin: some View {

@@ -75,6 +75,7 @@ struct DeviceView: View {
                                         statsGrid
                                         configPanel
                                         managedDevicesRow
+                                        helpSupportRow
                                     }
                                     .frame(maxWidth: .infinity, alignment: .top)
                                     VStack(alignment: .leading, spacing: 14) {
@@ -163,6 +164,7 @@ struct DeviceView: View {
         statsGrid                            // UPTIME + DETECTIONS (2-up)
         configPanel                          // scan radios / detectors / alerts / drive / desert+buffer / LED
         managedDevicesRow                    // -> watched + ignored sub-screen
+        helpSupportRow                       // -> bundled FAQ + support routes
         disconnectButton
         aboutFooter                          // -> about sub-screen
     }
@@ -292,6 +294,28 @@ struct DeviceView: View {
                 VStack(alignment: .leading, spacing: 2) {
                     Text("Managed devices").font(ACABTheme.display(15, weight: .medium)).foregroundStyle(ACABTheme.text)
                     Kicker(managedKicker)
+                }
+                Spacer(minLength: 8)
+                Image(systemName: "chevron.right")
+                    .font(.system(size: 13, weight: .semibold)).foregroundStyle(ACABTheme.faint)
+            }
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .panel()
+    }
+
+    /// Entry point for the bundled FAQ. Sits below Managed devices and above Disconnect on
+    /// purpose: it is a reference surface, not a control, so it should not sit among the toggles
+    /// that change what the board does.
+    private var helpSupportRow: some View {
+        NavigationLink { HelpView() } label: {
+            HStack(spacing: 12) {
+                Image(systemName: "questionmark.circle")
+                    .font(.system(size: 16, weight: .medium)).foregroundStyle(ACABTheme.dim).frame(width: 22)
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("Help + support").font(ACABTheme.display(15, weight: .medium)).foregroundStyle(ACABTheme.text)
+                    Kicker("FAQ · TROUBLESHOOTING · CONTACT")
                 }
                 Spacer(minLength: 8)
                 Image(systemName: "chevron.right")
@@ -629,8 +653,17 @@ struct DeviceView: View {
     // MARK: one-click combined update UI
 
     /// Either the board firmware or the co-processor is behind and self-updatable.
+    ///
+    /// `revisionMatchesManifest` is checked HERE because this is the live path. It was previously
+    /// only inside `otaEligible`, which is defined and referenced nowhere: the rev-B safety gate
+    /// was dead code on iOS while every update actually offered came through this property. So the
+    /// belt-and-braces revision check that Android performs did not exist here at all, which is
+    /// the reverse of what the comments on both sides claimed.
+    ///
+    /// It matters because a wrong-revision image parks the unit after every boot and is
+    /// USB-recovery only, so a false refusal is by far the cheaper error.
     private var combinedStale: Bool {
-        guard let e = fwEntry else { return false }
+        guard let e = fwEntry, revisionMatchesManifest else { return false }
         return ble.combinedUpdateStale(entry: e, latest: latestVersion)
     }
     /// The combined flow is at a terminal point we keep on screen (done / failed / partial).

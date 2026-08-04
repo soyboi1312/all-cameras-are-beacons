@@ -55,6 +55,52 @@
 #include "detection.h"
 #include "acab_version.h"  // the one place ACAB_FW_VERSION lives
 
+// ---- RF privacy defaults -------------------------------------------------------------------
+// The detector used to be the most conspicuous beacon in the room: a fixed service UUID, a literal
+// name, a custom company ID, an exact firmware version, and a stable MAC, broadcast continuously.
+// The detection path was always passive; the leak was in the phone link nobody audited.
+//
+// ACAB_BLE_PRIVACY      1 = advertise a rotating Resolvable Private Address.
+//                       OFF, AND IT STAYS OFF: IT BREAKS iOS. Bench-proven 2026-08-02, controlled
+//                       A/B on one board. Read the rest of this block before touching the flag.
+// ACAB_ADVERTISE_VERSION 1 = put the exact firmware version in the scan response. OFF by default:
+//                       it told every passive listener which signature set a unit carries, i.e.
+//                       what it can and cannot see, to save its owner one tap. The version still
+//                       reaches the app over the Status characteristic, post-connect and post-bond.
+//                       This one is off for a PRIVACY reason. Nothing about it is broken and it has
+//                       nothing to do with the iOS failure described below.
+//
+// The rotation itself works. Two independent proofs stand:
+//   1. ON AIR. The companion nRF52840, a separate receiver on the same PCB, captured AdvA = the
+//      rotating RPA at rssi -17 while the S3 reported that exact value. The public address never
+//      appeared. A board cannot observe its own AdvA and iOS/macOS substitute a per-host UUID, so
+//      the co-processor was the only way to see the truth.
+//   2. ANDROID IS FINE. Paired, rebooted the board (new RPA), and it reconnected unprompted in 4 s
+//      with enc_change status=0, encrypted=1 bonded=1.
+//
+// BUT iOS CANNOT CONNECT. Same board, same firmware, only this flag changed:
+//   ACAB_BLE_PRIVACY=1 -> the board appears in the picker, tapping it opens a link (the board even
+//                         sounds its connect chirp), and then NOTHING. onConnect never fires, so
+//                         the GATT server never sees the peer. Never recovers.
+//   ACAB_BLE_PRIVACY=0 -> connected in 7 s, encrypted=1 bonded=1 at t=18 s.
+// So the link reaches the controller and dies before the host hands it up. Not yet root-caused.
+//
+// A detector that cannot pair with an iPhone is not shippable, and that outweighs the leak this
+// setting closes. Everything the feature needs is still here and still correct: the address type
+// (BLE_OWN_ADDR_RANDOM, not RPA_PUBLIC_DEFAULT, see the .cpp), the explicit ENC|ID key
+// distribution, the build guard, the advertising re-arm after rotation preempts GAP, and the
+// serial diagnostics that made all of the above visible.
+//
+// Anyone resuming this: reproduce the A/B above FIRST, then instrument the iOS side. The board
+// tells you almost nothing because the failure is above the controller and below the host
+// callback. A sniffer on the CONNECT_IND / connection-request exchange is the next real step.
+#ifndef ACAB_BLE_PRIVACY
+#define ACAB_BLE_PRIVACY 0
+#endif
+#ifndef ACAB_ADVERTISE_VERSION
+#define ACAB_ADVERTISE_VERSION 0
+#endif
+
 #define ACAB_BLE_SVC_UUID    "acab0100-6f75-6973-7079-000000000000"
 #define ACAB_BLE_DET_UUID    "acab0101-6f75-6973-7079-000000000000"
 #define ACAB_BLE_CFG_UUID    "acab0102-6f75-6973-7079-000000000000"

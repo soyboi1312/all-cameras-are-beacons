@@ -218,6 +218,9 @@ extension Detection {
             case "Apple Find My (offline)": return "Apple Find My"
             case "Tile":                    return "Tile"
             case "Samsung SmartTag":        return "Samsung SmartTag"
+            // "(separated)" is dropped for the same reason "(offline)" is above: it describes the
+            // tag's STATE, not its maker, and the row already conveys the state.
+            case "Google Find Hub (separated)": return "Google Find Hub"
             default:                        return nil
             }
         default:

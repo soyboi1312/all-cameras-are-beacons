@@ -33,6 +33,7 @@ struct MapTabView: View {
     @State private var cluster: Cluster?         // tapped multi-member bubble (drives the picker sheet)
     @State private var showALPRInfo = false      // tapped a known-ALPR dot: show the shared credit callout (one overlay, never a per-dot popover)
     @State private var tappedALPRMaker = ""      // the maker of the last-tapped dot ("" = unknown), shown in that callout
+    @State private var tappedALPRConfirmed = true  // tier of the last-tapped dot; drives the callout's wording + tone
     @State private var span: MKCoordinateSpan = .init(latitudeDelta: 0.02, longitudeDelta: 0.02)
     @State private var region = MKCoordinateRegion(center: .init(latitude: 0, longitude: 0),
                                                    span: .init(latitudeDelta: 0.02, longitudeDelta: 0.02))
@@ -63,7 +64,9 @@ struct MapTabView: View {
             if !alprVisible.isEmpty { alprVisible = [] }   // only WRITE when it actually changes
             return
         }
-        let next = alpr.nodes(in: region, cap: 500).map { ALPRPoint(coord: $0.coord, maker: $0.maker) }
+        let next = alpr.nodes(in: region, cap: 500).map {
+            ALPRPoint(coord: $0.coord, maker: $0.maker, confirmed: $0.confirmed)
+        }
         // ALPRPoint is Equatable: an unchanged viewport costs zero @State writes / zero invalidations.
         if next != alprVisible { alprVisible = next }
     }
@@ -75,7 +78,15 @@ struct MapTabView: View {
     /// band where nothing drew yet ([0.30, 0.35)).
     private var alprHint: String? {
         guard alpr.enabled, !alpr.loading else { return nil }
-        if alpr.nodes.isEmpty { return "couldn't load camera data \u{00B7} check your connection" }
+        if alpr.nodes.isEmpty {
+            // A 404 is not a connectivity problem and must not be reported as one: this build
+            // polls its own manifest, so there is a legitimate window before the dataset is
+            // published where the file simply is not there yet.
+            if alpr.lastOutcome == .notPublished {
+                return "camera data not published yet \u{00B7} try again later"
+            }
+            return "couldn't load camera data \u{00B7} check your connection"
+        }
         if alprVisible.isEmpty && span.latitudeDelta >= 0.30 { return "zoom in to see mapped cameras" }
         return nil
     }
@@ -264,12 +275,33 @@ struct MapTabView: View {
                 if showALPRInfo {
                     Button { withAnimation(.easeOut(duration: 0.15)) { showALPRInfo = false } } label: {
                         HStack(spacing: 6) {
-                            Circle().strokeBorder(ACABTheme.flockTone.opacity(0.95), lineWidth: 2)
+                            Circle().strokeBorder((tappedALPRConfirmed ? ACABTheme.flockTone : ACABTheme.warn).opacity(0.95),
+                                                  style: StrokeStyle(lineWidth: 2,
+                                                                     dash: tappedALPRConfirmed ? [] : [2, 1.8]))
                                 .frame(width: 9, height: 9)
-                            Text(tappedALPRMaker.isEmpty
-                                 ? "known ALPR · sourced from DeFlock"
-                                 : "\(tappedALPRMaker) · known ALPR, via DeFlock")
-                                .font(ACABTheme.mono(10.5)).foregroundStyle(ACABTheme.dim)
+                            // The line the journalist needed: a pin is a MAPPED LOCATION, not a
+                            // live detection, and most fixed ALPRs backhaul over cellular so they
+                            // are silent to this hardware whether or not one is standing there.
+                            // The unverified tier says so more softly still: nobody recorded a
+                            // manufacturer for it, which is the shape a misidentified pole takes.
+                            VStack(alignment: .leading, spacing: 2) {
+                                // TIER FIRST, then maker. Testing maker first printed "known
+                                // ALPR" for a hand-typed name, contradicting the second line
+                                // directly beneath it. The maker is still shown when we have one:
+                                // an unverified node's NAME is the doubtful part, not its presence.
+                                Text(!tappedALPRConfirmed
+                                     ? (tappedALPRMaker.isEmpty
+                                        ? "unverified ALPR · community mapped"
+                                        : "\(tappedALPRMaker)? · unverified, community mapped")
+                                     : (tappedALPRMaker.isEmpty
+                                        ? "known ALPR · sourced from DeFlock"
+                                        : "\(tappedALPRMaker) · known ALPR, via DeFlock"))
+                                    .font(ACABTheme.mono(10.5)).foregroundStyle(ACABTheme.dim)
+                                Text(tappedALPRConfirmed
+                                     ? "a mapped location, not a live detection"
+                                     : "no manufacturer recorded, so it may be misidentified or gone")
+                                    .font(ACABTheme.mono(9)).foregroundStyle(ACABTheme.faint)
+                            }
                         }
                         .padding(.horizontal, 12).padding(.vertical, 7)
                         .background(.ultraThinMaterial, in: Capsule())
@@ -332,8 +364,9 @@ struct MapTabView: View {
                 Annotation("", coordinate: p.coord) {
                     Button {
                         tappedALPRMaker = p.maker
+                        tappedALPRConfirmed = p.confirmed
                         withAnimation(.easeOut(duration: 0.15)) { showALPRInfo = true }
-                    } label: { ALPRDot() }
+                    } label: { ALPRDot(confirmed: p.confirmed) }
                         .buttonStyle(.plain)
                 }
             }
@@ -408,6 +441,7 @@ struct MapTabView: View {
         // refresh on the other two inputs: the layer toggling on/off, and the dataset finishing
         // its (opt-in) load. nodes.count is a cheap Equatable proxy for "the dataset changed".
         .onChange(of: alpr.enabled) { _, _ in refreshALPRVisible() }
+        .onChange(of: alpr.showUnverified) { _, _ in refreshALPRVisible() }
         .onChange(of: alpr.nodes.count) { _, _ in refreshALPRVisible() }
         .onAppear { refreshALPRVisible() }
         .ignoresSafeArea()
@@ -547,6 +581,13 @@ struct MapTabView: View {
             Toggle(isOn: $showBreadcrumbs) {
                 Text("breadcrumb trail").font(ACABTheme.mono(11)).foregroundStyle(ACABTheme.dim)
             }
+            // Same sentence the SEEN WITH YOU panel ends on, deliberately word for word. This
+            // toggle is the other tracker-only surface a user will assume covers everything, and a
+            // trail that quietly skips body cams while claiming nothing is the kind of silence
+            // that gets read as "nothing was there".
+            Text(FollowEvidence.scopeLine)
+                .font(ACABTheme.mono(8.5)).foregroundStyle(ACABTheme.faint)
+                .fixedSize(horizontal: false, vertical: true)
             Toggle(isOn: $showLabels) {
                 Text("icon labels").font(ACABTheme.mono(11)).foregroundStyle(ACABTheme.dim)
             }
@@ -558,6 +599,20 @@ struct MapTabView: View {
                     Text(alprStatusLine)
                         .font(ACABTheme.mono(8.5)).foregroundStyle(ACABTheme.faint)
                         .fixedSize(horizontal: false, vertical: true)
+                    // Opt-in for the tier nobody could name a manufacturer for. Off by default
+                    // because those pins are where "your app is wrong" reports come from: the user
+                    // drives to one, finds an empty pole, and blames the detector rather than the
+                    // stranger who mapped it. Kept as a row instead of dropped from the dataset so
+                    // the mappers who want to see and fix them still can.
+                    if alpr.unverifiedCount > 0 {
+                        Toggle(isOn: Binding(get: { alpr.showUnverified },
+                                             set: { alpr.setShowUnverified($0) })) {
+                            Text("unconfirmed pins").font(ACABTheme.mono(10)).foregroundStyle(ACABTheme.faint)
+                        }
+                        Text(alprUnverifiedLine)
+                            .font(ACABTheme.mono(8.5)).foregroundStyle(ACABTheme.faint)
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
                     alprCheckRow
                 }
             }
@@ -576,10 +631,22 @@ struct MapTabView: View {
     private var alprStatusLine: String {
         let checked = alpr.lastChecked.map { "checked \(checkedAgo($0))" } ?? "never checked"
         guard !alpr.nodes.isEmpty else { return "no dataset yet \u{00B7} \(checked)" }
-        var parts = ["\(alpr.nodes.count.formatted()) camera\(alpr.nodes.count == 1 ? "" : "s")"]
+        // Count what the map DRAWS. Captioning the full dataset while hiding a chunk of it makes
+        // the toggle below look broken (number never moves) and overstates the coverage.
+        let shown = alpr.showUnverified ? alpr.nodes.count : alpr.nodes.count - alpr.unverifiedCount
+        var parts = ["\(shown.formatted()) camera\(shown == 1 ? "" : "s")"]
         if let u = alpr.updated { parts.append("dataset \(datasetDate(u))") }
         parts.append(checked)
         return parts.joined(separator: " \u{00B7} ")
+    }
+
+    /// Caption under the unconfirmed-pins toggle. Says what the tier MEANS rather than naming it,
+    /// because "unverified" invites the reading that we checked and it failed. Nobody checked.
+    private var alprUnverifiedLine: String {
+        let n = alpr.unverifiedCount.formatted()
+        return alpr.showUnverified
+            ? "showing \(n) pin\(alpr.unverifiedCount == 1 ? "" : "s") with no manufacturer recorded, drawn hollow. some are not cameras."
+            : "\(n) pin\(alpr.unverifiedCount == 1 ? "" : "s") name no manufacturer and are hidden. some of those are not cameras."
     }
 
     /// Manual dataset refresh, mirroring the firmware "check for updates" row in Settings at
@@ -762,9 +829,24 @@ struct MapTabView: View {
                         .frame(width: 9, height: 9)
                     Text("Known ALPR").font(ACABTheme.mono(11)).foregroundStyle(ACABTheme.dim)
                 }
-                .padding(.top, 6)
-                .overlay(alignment: .top) {
-                    Rectangle().fill(ACABTheme.line).frame(height: 1)
+                // Unverified tier. Hollow + DASHED, matching ALPRDot: the swatch has to be the
+                // shape you actually see on the map, and it cannot be a filled amber dot because
+                // ACABTheme.warn IS droneTone (both 0xF2B53C) - a filled one is pixel-identical to
+                // the Drone row above.
+                //
+                // Gated on showUnverified for the same reason it is gated on alpr.enabled: a legend
+                // that names a colour nothing on screen is using reads as a rendering bug.
+                if alpr.showUnverified {
+                    HStack(spacing: 7) {
+                        Circle().strokeBorder(ACABTheme.warn.opacity(0.95),
+                                              style: StrokeStyle(lineWidth: 2, dash: [2, 1.8]))
+                            .frame(width: 9, height: 9)
+                        Text("ALPR (unverified)").font(ACABTheme.mono(11)).foregroundStyle(ACABTheme.dim)
+                    }
+                    .padding(.top, 6)
+                    .overlay(alignment: .top) {
+                        Rectangle().fill(ACABTheme.line).frame(height: 1)
+                    }
                 }
                 Text("cameras: OpenStreetMap ODbL · DeFlock")
                     .font(ACABTheme.mono(8.5)).foregroundStyle(ACABTheme.faint)
@@ -901,10 +983,14 @@ private struct OperatorPin: View {
 private struct ALPRPoint: Identifiable, Equatable {
     let coord: CLLocationCoordinate2D
     let maker: String
+    /// False when the mapper typed the manufacturer freehand or left it blank. Drives the dot
+    /// colour and the callout wording; see ALPRStore.nodeConfirmed for what earns a true.
+    let confirmed: Bool
     let id: String
-    init(coord: CLLocationCoordinate2D, maker: String) {
+    init(coord: CLLocationCoordinate2D, maker: String, confirmed: Bool) {
         self.coord = coord
         self.maker = maker
+        self.confirmed = confirmed
         self.id = "\(coord.latitude),\(coord.longitude)"
     }
     // id is coord-derived, so a viewport that hasn't moved still costs zero @State churn; two dots
@@ -921,12 +1007,21 @@ private struct ALPRPoint: Identifiable, Equatable {
 /// wraps this in a Button that flips a single shared @State (showALPRInfo), and one bottom overlay
 /// renders the DeFlock credit callout. (The provenance is also credited permanently in the legend.)
 private struct ALPRDot: View {
+    /// Confirmed rings stay the established red. Unverified ones go amber and DASHED: colour alone
+    /// is not a distinction for a red/green-deficient viewer, and this is a map where the whole
+    /// point of the second tier is that you can tell it apart. Same shape and weight otherwise, so
+    /// neither tier reads as a live detection.
+    var confirmed: Bool = true
+    private var tone: Color { confirmed ? ACABTheme.flockTone : ACABTheme.warn }
     var body: some View {
         Circle()
-            .fill(ACABTheme.flockTone.opacity(0.20))
+            .fill(tone.opacity(confirmed ? 0.20 : 0.10))
             .frame(width: 14, height: 14)
-            .overlay(Circle().strokeBorder(ACABTheme.flockTone.opacity(0.95), lineWidth: 2.2))
-            .accessibilityLabel("Known ALPR camera")
+            .overlay(Circle().strokeBorder(tone.opacity(0.95),
+                                           style: StrokeStyle(lineWidth: 2.2,
+                                                              dash: confirmed ? [] : [2.6, 2.2])))
+            .accessibilityLabel(confirmed ? "Known ALPR camera"
+                                          : "Known ALPR camera, community mapped and unverified")
         // Bolder 2026-07-29 (user: rings washed out on the map). Still a HOLLOW STATIC ring -
         // the "never reads as a live detection" rule holds because detections are filled +
         // animated, not because this was faint. Keep in lockstep with Android rememberAlprMarker

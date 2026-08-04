@@ -27,6 +27,37 @@ See *Firmware update (OTA)* below.
 > detection record and the fuller status frame fit in a single notification (the
 > board negotiates 512; iOS auto-negotiates, Android calls `requestMtu(512)`).
 
+## Peripheral address, bonding and privacy
+
+**The board advertises from its fixed factory address.** Address privacy (a rotating
+Resolvable Private Address) is implemented in the firmware and is **off by default**;
+`ACAB_BLE_PRIVACY` in `acab_ble_service.h` carries the full bench note. The short version,
+from a controlled A/B on one board on 2026-08-02:
+
+- the rotation itself works, confirmed on air by the companion nRF52840 capturing `AdvA`;
+- **Android is fine**, re-pairing and reconnecting across a board reboot in about 4 s;
+- **iOS cannot connect**. The board appears in the picker and the link opens at the
+  controller, but `onConnect` never fires, so the GATT server never sees the peer.
+
+A detector that cannot pair with an iPhone is not shippable, so the feature is off. Do not
+re-enable it without reproducing that A/B first.
+
+**For app authors this changes nothing about how you should identify a board.** Match on the
+service UUID, never on the address:
+
+- iOS never sees a peripheral MAC at all. CoreBluetooth substitutes a per-host `UUID`, so the
+  same board shows a different identifier on a different phone. That is expected, and it is
+  why the iOS picker labels a board `beacon 6971c790` where Android labels the same board
+  `beacon 4b:ae:b1:20:5b:6f`.
+- Android does see the address. Treat it as a display detail, not an identity: if privacy is
+  ever enabled, an *unbonded* board's rotation mints a second entry in the picker, while a
+  *bonded* board's rotation resolves through the IRK and stays stable.
+
+**Bond budget.** The board keeps up to 8 bonds. Because the apps subscribe to all three
+NOTIFY characteristics on connect, each fully-subscribed bond costs 3 CCCD records, and the
+CCCD store is sized to match. Both limits are set in `firmware/platformio.ini`; the comment
+there explains why they are not independent of each other.
+
 ## Detections (notify)
 
 One compact-JSON object per sighting. Emitted on first detection and again each
@@ -105,7 +136,8 @@ Write a JSON object with any subset of keys:
 | `epoch` | unix seconds (the phone's wall clock). The board has no RTC, so this is the only wall clock it ever sees: it stores an *anchor* for the current boot and reconstructs capture times from it later. Persisted, so it dates records from earlier boots too. See *How replay times are derived* below |
 | `sync` | start a replay drain: stream stored records with `seq` greater than this value (`0` = everything) |
 | `clearlog` | `true` performs a real flash-sector erase of the buffer. The erase is chunked (one block per loop pass, so scanning and the GATT link stay live) and runs in the background; Status reports `wiping:true` until it finishes |
-| `watch` | the user watchlist: an array of MAC strings (same format as `ignore`, up to 256). A watched device alerts as `t:8` every time it's seen, even with no built-in signature. Persists across boots; the app pushes its list on connect. A MAC on both `watch` and `ignore` still alerts, but the apps keep the two lists exclusive |
+| `watch` | the user watchlist: an array of MAC strings (same format as `ignore`, up to 256). A watched device alerts as `t:8` every time it's seen, even with no built-in signature. Persists across boots; the app pushes its list on connect, but **only when it has something to say** (see `clr`). A MAC on both `watch` and `ignore` still alerts: on the dual-radio board the co-processor's ignore mirror is published as *ignore minus watch*, so a starred MAC is never dropped before it reaches the S3. The apps keep the two lists exclusive anyway |
+| `clr` | `true` marks an accompanying **empty** `ignore`/`watch` array as a deliberate clear. **A bare `{"watch":[]}` or `{"ignore":[]}` is REFUSED** and the stored list is kept, unless this peer already committed a non-empty list for that key on this connection. Without this, any app with an empty list wiped the board the moment it connected (a reinstall, or a second phone that had never starred anything), and a starred MAC plus its label exists nowhere else. The second clause is what keeps older apps working: boards update over the air, so the board is routinely newer than the app, and an app that has already replaced the list is not granted any new destructive power by then emptying it. Per-write like `more`; a chunked write carries at most one list, so one flag serves both |
 | `ota` | firmware-update control object (`begin` / `end` / `abort` / `confirm`). See *Firmware update (OTA)* below |
 | `nrfdfu` | `true` triggers a **co-processor (nRF) BLE DFU** (dual board only). The S3 reboots the nRF into its Adafruit bootloader and opens a fault-mute window (Status `nrfup`); the app then drives the signed `.zip` over native Nordic DFU. Part of the combined one-click update (S3 first, then nRF). See *Firmware update (OTA)* below |
 
@@ -427,8 +459,15 @@ reconnecting to the new S3, the app writes `{"nrfdfu":true}` to trigger the co-p
 DFU. The S3 reboots the nRF into its bootloader and opens a fault-mute window (Status
 `nrfup:true`) so the app shows "updating co-processor" instead of the `co:false` fault
 banner. That window clears event-driven the moment the nRF reports its new version (fast
-success), or after a 5-minute ceiling. See `firmware/OTA.md` for the full ordering
-rationale.
+success), or after a 5-minute ceiling.
+
+The ordering is not arbitrary. The S3 hosts the GATT link AND is the only thing that can
+drive the nRF into DFU, so it has to be updated and confirmed healthy first. Do it the
+other way and a failed nRF update leaves a co-processor sitting in its bootloader with an
+S3 that may then fail its own update, and nothing left that can reach either. The
+five-minute ceiling exists because the nRF's version report is the only success signal
+there is, and a silent co-processor is indistinguishable from a slow one until something
+times out.
 
 ## Notes for the app
 

@@ -50,6 +50,7 @@ import androidx.compose.material.icons.filled.PhoneAndroid
 import androidx.compose.material.icons.filled.Radar
 import androidx.compose.material.icons.filled.Refresh
 import androidx.compose.material.icons.filled.SettingsInputAntenna
+import androidx.compose.material.icons.filled.Info
 import androidx.compose.material.icons.filled.Star
 import androidx.compose.material.icons.filled.WarningAmber
 import androidx.compose.material3.CircularProgressIndicator
@@ -100,7 +101,7 @@ import tech.acab.app.ui.theme.tone
 
 /** Latest published beacon-board firmware; last-resort offline fallback for an unrecognized
  *  board label (known boards read their per-board version from the manifest). Bump on release. */
-private const val LATEST = "2.0.2"
+private const val LATEST = "2.0.3"
 
 /** Which config drawer section is open. Exactly one at a time (proposal 1g). */
 private enum class ConfigSection { NONE, FIRMWARE, RADIOS, DETECTORS, ALERTS, NOTIFY, DRIVE, DESERT, LED }
@@ -232,6 +233,7 @@ fun DeviceScreen(ble: AcabBleManager) {
     // --- proposal 1g state: one config section open at a time; firmware + sub-screens ---
     var openSection by remember { mutableStateOf(ConfigSection.NONE) }
     var managedOpen by remember { mutableStateOf(false) }
+    var helpOpen by remember { mutableStateOf(false) }
     var aboutOpen by remember { mutableStateOf(false) }
     fun toggleSection(s: ConfigSection) { openSection = if (openSection == s) ConfigSection.NONE else s }
 
@@ -240,9 +242,31 @@ fun DeviceScreen(ble: AcabBleManager) {
     val fwEntry = manifest.build(status?.firmwareLabel)
     val fwLatest = fwEntry?.version ?: LATEST
     val fwInstalled = status?.version
-    val fwOutdated = fwInstalled != null && isOlderThan(fwInstalled, fwLatest)
+    // BELT-AND-BRACES OTA REVISION GATE. Android had none at all: it parsed no `rev` and applied
+    // no revision check. iOS had the LOGIC but not the protection: its revisionMatchesManifest was
+    // referenced only from `otaEligible`, which nothing ever read, so the gate was dead code there
+    // while every update actually offered went through combinedStale, which did not check it.
+    // Both platforms now apply it on their live paths. An earlier version of this comment claimed
+    // iOS was already protected; it was not, and that claim is what hid the hole.
+    //
+    // The PRIMARY defence is shared and unchanged: rev-B firmware reports a distinct fw label
+    // ("beacon board rev-B", set in platformio.ini) and the manifest is KEYED by that label, so a
+    // rev-B board cannot resolve the rev-A entry at all. This second check catches the case where
+    // someone re-unifies the labels or hand-edits the manifest: if the board TELLS us its
+    // revision, the entry we are about to flash from has to agree.
+    //
+    // A wrong-image flash parks the unit after every boot and is USB-recovery only, so a false
+    // refusal is by far the cheaper error. "Not told" never blocks: docs/ble-protocol.md is
+    // explicit that an absent `rev` means absent, never rev-A.
+    val boardRev = status?.boardRev
+    val revisionMatchesManifest =
+        if (boardRev != "A" && boardRev != "B") true
+        else (status?.firmwareLabel?.lowercase()?.contains("rev-b") == true) == (boardRev == "B")
+    val fwOutdated = fwInstalled != null && isOlderThan(fwInstalled, fwLatest) &&
+        revisionMatchesManifest
     // Either radio behind (S3 OR nRF); a terminal we keep on screen (done / failed / partial).
-    val combinedStale = fwEntry?.let { ble.combinedUpdateStale(it) } ?: false
+    val combinedStale = (fwEntry?.let { ble.combinedUpdateStale(it) } ?: false) &&
+        revisionMatchesManifest
     val combinedTerminal = combined.phase == CombinedUpdatePhase.DONE ||
         combined.phase == CombinedUpdatePhase.FAILED || combined.phase == CombinedUpdatePhase.PARTIAL
     // The crimson banner promotes only when the S3 firmware is behind, or the flow is live/just
@@ -650,6 +674,12 @@ fun DeviceScreen(ble: AcabBleManager) {
             }
 
             // 4. Watched + ignored collapse behind one nav row (keeps the "N ON BOARD" trust cue).
+            // Reference surface, not a control, so it sits below the toggles that change what the
+            // board does and above Disconnect. Mirrors the iOS placement.
+            val helpRow: @Composable () -> Unit = {
+                NavRow(Icons.Filled.Info, Acab.dim, "Help + support",
+                    "FAQ · TROUBLESHOOTING · CONTACT") { helpOpen = true }
+            }
             val managedRow: @Composable () -> Unit = {
                 NavRow(Icons.Filled.Star, Acab.watchTone, "Managed devices", managedKicker) { managedOpen = true }
             }
@@ -685,6 +715,7 @@ fun DeviceScreen(ble: AcabBleManager) {
                 "stats" to statsSlot,
                 "config" to configPanel,
                 "managed" to managedRow,
+                "help" to helpRow,
                 "disconnect" to disconnectSlot,
                 "aboutfooter" to aboutFooter,
             )
@@ -708,7 +739,14 @@ fun DeviceScreen(ble: AcabBleManager) {
                     StatusRefreshButton { ble.refreshStatus() }
                 }
 
-                DeviceHero(name = name, firmware = status?.firmwareLabel, battery = status?.battery,
+                // Carrier revision rides on the firmware label, matching iOS boardRevSuffix, so
+                // support can tell which board is in the case without asking the owner to open it.
+                // Silent when the board does not report one: an unlabelled board reads as "we were
+                // not told", never as rev-A.
+                val fwWithRev = status?.firmwareLabel?.let {
+                    if (boardRev == "A" || boardRev == "B") "$it · rev-$boardRev" else it
+                }
+                DeviceHero(name = name, firmware = fwWithRev, battery = status?.battery,
                     charging = status?.charging == true, connected = !demo && status != null, demo = demo)
 
                 // nRF radio fault: dual-radio boards report "co" (co-processor alive). When it's
@@ -761,6 +799,11 @@ fun DeviceScreen(ble: AcabBleManager) {
 
         // State-driven full-bleed sub-screens (this tab has no NavHost of its own). Each hosts
         // today's cards verbatim and closes on the back arrow or the system back gesture.
+        if (helpOpen) {
+            SubScreen(title = "Help + support", onBack = { helpOpen = false }) {
+                HelpScreen()
+            }
+        }
         if (managedOpen) {
             SubScreen(title = "Managed devices", onBack = { managedOpen = false }) {
                 if (watched.isNotEmpty()) {
