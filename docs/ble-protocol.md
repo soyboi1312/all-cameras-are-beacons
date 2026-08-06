@@ -85,7 +85,10 @@ below.
 | `id` | RID serial / operator id | optional (drones) |
 | `det` | detail (raven fw, ssid, drone op-id…) | optional. On `t:3` it names the source, which is how the app tells the four body-cam signals apart: `"BWC DEVICE"` (Axon service-data payload, conf 90, MAC-independent), `"Axon OUI"` (conf 75), `"Utility BodyWorn"` (name 85 / OUI 70), `"Motorola Solutions OUI"` (broad proxy, conf 45) |
 | `cid` | BLE manufacturer company ID (Bluetooth SIG assigned #, integer) | optional; BLE only, present when the advert carried manufacturer-specific data. The field the glasses/tracker detectors key on; the app surfaces it in the detail screen + CSV so a miss is diagnosable |
-| `lat`,`lon` | subject location | drones: broadcast position; others: detector GPS |
+| `lat`,`lon` | subject location | **OVERLOADED, read carefully:** drones = the aircraft's own
+broadcast position; everything else = the DETECTOR's GPS. Consumers must branch on the type.
+Exporting it as a device position on a non-drone row, or as an observer position on a drone
+row, are both wrong and both have shipped as bugs. |
 | `gage` | age (s) of the GPS fix used for `lat`,`lon` | optional; set when stamped from a stale phone fix (offline / Desert) |
 | `plat`,`plon` | drone operator location | optional |
 | `alt` | altitude (m MSL) | optional (drones) |
@@ -123,7 +126,8 @@ Write a JSON object with any subset of keys:
 | `motorola` | enable/disable the broad **Motorola Solutions OUI** proxy, a sub-toggle underneath the body-cam category (default **on** on the beacon board and oui-spy, **off** on mesh-detect, where a broad OUI match would flood the rate-limited LoRa uplink). NVS-persisted, so the choice survives a reboot. Lets a user quiet the noisy corporate-OUI match (conf 45, reports as a body cam with detail "Motorola Solutions OUI") while keeping the field-validated Axon `BWCDEVICE` tag (conf 90) and Utility BodyWorn running |
 | `tracker` | enable/disable the BLE item-tracker (Find My, offline form) detector (default off). The detection is delivered to the app on the **first** sighting; only the buzzer is held, for the first **60 s** a tracker is in range (`TRACKER_ALERT_DEBOUNCE_MS`), so a tag you walk past stays quiet. See *Tracker alerts and the buzzer debounce* below |
 | `glasses` | enable/disable the smart/recording-glasses detector (Ray-Ban/Oakley Meta, Snap Spectacles, Vuzix; on by default). Keys off the BLE manufacturer-data company ID. See [docs/glasses.md](glasses.md) |
-| `netcam` | enable/disable the **network-camera** detector (default **off**, opt-in). Matches branded IP-camera OUIs (Hikvision/Dahua/Amcrest/Axis/Reolink) on the host Wi-Fi and emits `t:10` at confidence 65, detail "<Vendor> on wifi". Turning it on widens Wi-Fi capture to 802.11 **data** frames so a streaming camera's cleartext source MAC can be OUI-matched; off (default) keeps capture management-frame-only for zero added CPU / 2.4GHz load. Honest scope: it matches known camera BRANDS on the network (could be an NVR/doorbell/disclosed camera) and cannot find every camera - never a "hidden camera" claim |
+| `netcam` | enable/disable the **network-camera** detector (default **off**, opt-in). Matches branded IP-camera OUIs (Hikvision/Dahua/Amcrest/Axis/Reolink/Ring/Wyze/eufy/Ezviz/Lorex/Swann/Arlo) on the host Wi-Fi and emits `t:10` at confidence 65 (or 75 for a field-validated block), detail "<Vendor> on wifi". Since 2.0.4 it ALSO matches a base-station SSID prefix ("ARLO_VMB_"/"NTGR_VMB_") on beacon/probe-response frames, emitting `t:10` with method `M_SSID` at confidence **88**, detail "Arlo base station" and the matched SSID in `name` - a self-attested match outranks any OUI inference. Probe REQUESTS are deliberately excluded: they name the network sought, not the transmitter. Turning it on widens Wi-Fi capture to 802.11 **data** frames so a streaming camera's cleartext source MAC can be OUI-matched; off (default) keeps capture management-frame-only for zero added CPU / 2.4GHz load. Honest scope: it matches known camera BRANDS on the network (could be an NVR/doorbell/disclosed camera) and cannot find every camera - never a "hidden camera" claim |
+| `diag` | write `{"diag":true}` to request a ONE-SHOT expanded diagnostic. The reply arrives on the **Status** characteristic (Config is write-only, so there is no command-response channel) carrying `diag:true`, `sdrop`, `sdDeliv`, `sdBuf`, `sdRepl`, `sqHigh`, `up`. Not a setting - nothing is persisted, and it is safe to send at any time |
 | `desert` | **Desert mode**: report EVERY device in range, not just known signatures (default off). See *Desert mode* below |
 | `buzzer` | master audio on/off (`false` disables sound entirely) |
 | `volume` | buzzer loudness, integer `0` to `100` (`0` is silent) |
@@ -198,6 +202,7 @@ window and was sold as a follow-me test it was never able to make.
 
 | Key | Meaning |
 |---|---|
+| `proto` | BLE JSON contract version, integer. Bumped ONLY on a BREAKING change to this contract; additive keys never move it, because both apps ignore keys they do not know. **ABSENT MEANS 0**, which means fully compatible: every firmware before 2026-08-06 omits it. An app whose supported version is LOWER than the board's must say "this board needs a newer app" rather than keep parsing fields whose meaning may have changed |
 | `fw` | firmware build + version |
 | `up` | uptime (seconds) |
 | `total` | detections emitted this session |

@@ -47,7 +47,7 @@ it is a **passive listener** on two bands, WiFi and bluetooth. surveillance gear
 | **Axon body cameras** | Bluetooth | field-validated June 2026; on by default |
 | **BLE item trackers** (AirTag / Find My, Tile, Samsung SmartTag) | Bluetooth | off by default, flip it on from the app; the buzzer holds quiet for a tracker's first minute in range, so one you walk past never sounds, while the sighting still reaches the app straight away |
 | **Smart / recording glasses** (Ray-Ban / Oakley Meta, Snap Spectacles, Vuzix) | Bluetooth | on by default; capture-pending, reports as "possible glasses" since the Meta signature can also be a VR headset |
-| **Network cameras** (branded IP cameras: Hikvision, Dahua, Amcrest, Axis, Reolink) | WiFi | opt-in, off by default; the board never joins a network, it listens promiscuously and matches camera-brand OUIs in frames already on the air, at ~65 confidence; known brands only, cannot find every camera, never a hidden-camera claim. now 43 vendor blocks including Ring, Wyze and Anker/eufy, where a hit may be another product from the same maker |
+| **Network cameras** (branded IP cameras: Hikvision, Dahua, Amcrest, Axis, Reolink) | WiFi | opt-in, off by default; the board never joins a network, it listens promiscuously and matches camera-brand OUIs in frames already on the air, at 65-88 confidence (an OUI match is 65, or 75 field-validated; an Arlo base station naming itself in its SSID is 88); known brands only, cannot find every camera, never a hidden-camera claim. now 62 vendor blocks including Ring, Wyze and Anker/eufy, where a hit may be another product from the same maker |
 
 Flock and Raven detection is built from publicly documented signatures, the IEEE OUI registry, Bluetooth SIG assigned numbers, and independent Flock research, all mapped out in [docs/signatures.md](docs/signatures.md). Drone detection reads the public FAA / ASTM Remote ID broadcast via the open-source [OpenDroneID](https://github.com/opendroneid/opendroneid-core-c) decoder, with a secondary hardware-signature fallback for DJI, Parrot, Skydio, Autel, and Yuneec when a craft isn't broadcasting Remote ID. BLE tracker detection is opt-in; Axon body-cam detection is field-validated (notes in [docs/axon.md](docs/axon.md)). Smart/recording-glasses detection keys off Bluetooth SIG company IDs and is capture-pending (notes in [docs/glasses.md](docs/glasses.md)).
 
@@ -151,6 +151,15 @@ A few things worth knowing about how the apps read a detection:
 
 Either app needs an OUI-Spy or Mesh-Detect board to actually detect anything, but you can poke around the interface without one.
 
+**English only, deliberately.** Every string in both apps is authored in Swift and Kotlin source
+rather than in resource files, and there is no localization layer. That is a choice, not an
+oversight. The parity between the two apps is enforced by comparing strings as code (the bundled
+FAQ is byte-guarded across platforms, and the follow-evidence copy is fixture-compared), and moving
+copy into `.lproj` / `strings.xml` would give that up. The detection targets are also mostly US
+infrastructure. If a second language ever becomes a goal, the route is the one the FAQ already
+takes: a single shared, drift-guarded content file both platforms parse, which keeps byte-parity
+and gains a translation unit at the same time.
+
 ## How the project is organized
 
 ```
@@ -179,16 +188,35 @@ docs/                         # protocol, mesh wiring, Axon notes
 
 The firmware works, the mesh side has been tested on real hardware, and there are native apps for both iPhone and Android. Detection works by recognizing known signatures, so part of the ongoing work is keeping those signatures matching real-world gear as it changes.
 
-Firmware updates are handled two ways: the one-click browser flasher, and over-the-air updates over Bluetooth built into both apps (the app checks a hosted version manifest, so new firmware ships without waiting on an app-store release). The over-the-air path is validated end-to-end on hardware, including signature verification and automatic rollback if an update ever fails to boot.
+Firmware updates are handled two ways: the one-click browser flasher, and over-the-air updates over Bluetooth built into both apps (the app checks a hosted version manifest, so new firmware ships without waiting on an app-store release). The over-the-air path is validated end-to-end on hardware, including signature verification and automatic rollback if an update ever fails to boot. Both radios update from one button: the board firmware first, then the companion nRF, in a single flow. That combined flow has been run to completion on an iPhone and on an Android phone against the same board, each ending with the board back on the new version and detection resumed.
 
 Still on the list:
 - Getting the iPhone app onto the App Store and the Android app onto the Play Store
 - Field-proving the newer detectors. The dual-radio board is done and shipping: both
-  radios, power, and over-the-air updates for BOTH processors are proven on hardware, the
-  ESP32-S3 over its own OTA and the companion nRF over Bluetooth DFU from inside the app.
+  radios, power, and over-the-air updates for BOTH processors are proven on hardware from
+  both apps, the ESP32-S3 over its own OTA and the companion nRF over Bluetooth DFU.
   What is still open is ground truth, not code: the glasses signatures have one capture
   behind them and the WiFi body-cam path has none. The board bring-up checklist ships with
   the hardware rather than living here, since the nRF firmware tree is not public.
+
+
+## Licensing
+
+The **applications and firmware** in this repository are licensed under
+[Apache-2.0](LICENSE).
+
+The **Beacon hardware design, PCB layout, enclosure, manufacturing files, product name, and
+trademarks are NOT included in that license** unless explicitly stated otherwise. Apache-2.0 here
+covers the code, not the physical product or the name it ships under.
+
+Apache-2.0 also carries obligations that travel with the code: keep the applicable
+[LICENSE](LICENSE) and [NOTICE](NOTICE) material with any firmware-bearing product and with any app
+distribution you build from this source. That is a condition of the licence, not a courtesy.
+
+Worth stating plainly, because the licence is sometimes read as covering more than it does: nothing
+here is a defence against a compatible clone board. Apache-2.0 is a permissive code licence and is
+not the instrument for that. Preventing clones is a trademark, patent, hardware-design and
+distribution-strategy question, and it is answered outside this repository or not at all.
 
 ## Thanks to
 

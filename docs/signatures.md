@@ -261,6 +261,92 @@ inside the enclosure would be invisible to us regardless. Settling that needs ei
 analyser alongside the board, or the FCC ID off the unit's plate, which names every radio in it.
 Neither changes the practical answer: **there is nothing here to add a row for.**
 
+### Considered and REJECTED: consumer cellular GPS vehicle trackers (2026-08-05, registry pass)
+
+The under-the-wheel-well class: LandAirSea, Tracki, Spytec, Optimus, Vyncs, Bouncie, and the
+OBD-plug trackers. Proposed as the most important gap in the product, and that framing is right:
+these are the devices in actual stalking prosecutions, and they are what someone searching their
+own car is looking for. The BLE-tracker detector covers all four network ecosystems (Apple, Google
+FMDN, Tile, Samsung) and none of them.
+
+**Not rejected as a target. Rejected as an OUI signature, on the registry.** Pulled the
+88k-vendor master OUI list (see the Public registries section) and looked up all six brands:
+
+| brand | IEEE registration |
+|---|---|
+| LandAirSea | none |
+| Spytec | none |
+| Optimus | none |
+| Vyncs | none |
+| Bouncie | none |
+| Tracki | none (the three name-matches are Katch Asset Tracking, Broadband Antenna Tracking Systems and Advanced Realtime Tracking GmbH, all unrelated companies) |
+
+Not one of them holds a block. So any BLE these devices do emit for their setup app carries the
+**module vendor's** OUI (a Nordic, TI or SIMCom part), which is the shared-prefix trap that already
+killed OUI matching for Flock's Liteon modules and for Quercus/ELSAG/Selex on `70:B3:D5`. A 3-byte
+match there is a false-positive bomb, not a signature.
+
+**What that leaves, and what a field session should therefore look for.** If these are ever to be
+detected it has to be an advertised **local name** or a **service UUID** captured off a real
+device, not a MAC prefix. That is a weaker and more FP-prone class of signature than this project
+normally accepts (see the Flock name-pattern rules and the `FS-100` consumer-gadget collision), so
+the bar for admitting one should be high. The honest experiment is still worth running, roughly
+$100 of hardware and a bench day next to the nRF sniffer, but it should be scoped as **"harvest a
+name or a UUID, or write the not-detectable finding"**, and nobody should expect an OUI out of it.
+
+Until that capture happens, the honest public line is that cellular GPS trackers are **not
+detectable** by this hardware, for the same reason as the cellular-backhaul ALPRs above: their
+uplink is LTE, and LTE is not a band this device listens to.
+
+## Network cameras
+
+### ADMITTED 2026-08-05: Arlo, and the base-station SSID rule
+
+The first netcam vendor admitted on **our own field capture** rather than on a registry pull.
+
+- **3 blocks, `A4:11:62` / `FC:9C:98` / `48:62:64`, registrant "Arlo Technology".** Narrower than
+  Wyze: nothing with a radio in their catalogue but cameras, doorbells and the hubs that serve
+  them. Arlo had been named in `netcam_signatures.h`'s "why not" line with no reason given while
+  Nest and Blink each got one, i.e. swept in by association. That was wrong and is corrected.
+- **The evidence.** The 2026-07-24 A/B drive logged **12 distinct Arlo devices** across the route,
+  all three blocks firing, and three of them broadcast an `ARLO_VMB_<digits>` SSID naming
+  themselves. Until now every one of those fell through to a bare "Nearby device", confidence 0.
+- **`ARLO_VMB_` SSID prefix, confidence 88, same tier as the Flock SSID.** An SSID is a vendor
+  self-attestation, so it beats an OUI on both halves: it names the vendor *and* says what the box
+  is. It also reaches what the OUI cannot. The hub is mains-powered and beacons constantly while
+  the battery cameras sleep, which is why 11 of the 12 drive hits were single sightings; and
+  pre-2018 Arlo broadcasts the same SSID form while its MAC sits in NETGEAR's 76 unusable blocks.
+  `NTGR_VMB_` is listed for that legacy case but has never been captured by us, so it is a
+  potential miss, never a false positive.
+- **The label is "Arlo base station", not "camera".** A hub serves cameras and has no other
+  purpose, but the SSID does not prove a lens is pointed at anyone.
+- **Stated misses**, so nobody reads this as complete: 5GHz-only installs (Ultra on a VMB5000 hub,
+  dual-band Pro 5S/6), the LTE-only Arlo Go 1st gen, and all pre-spinoff hardware by OUI. The
+  discontinued Arlo Security Light talks BLE to a bridge, so this match stays **WiFi-only** or a
+  porch light gets labelled a camera.
+
+### Registry-checked, NOT yet admitted: SimpliSafe and Vivint outdoor cameras (2026-08-05)
+
+Both proposed as netcam rows on the Lorex/Swann pattern. Registry pull, for the record, so the next
+person starts from data rather than from the proposal:
+
+- **SimpliSafe: 1 block, `F8:51:28`, registrant "SimpliSafe".** Passes the narrow-registrant test
+  as cleanly as Lorex did. A camera-centric company with a single block is exactly the shape the
+  netcam table admits.
+- **Vivint: 4 blocks, and they are NOT all one product line.** `84:EB:3E` (Vivint Smart Home) and
+  `84:EB:3F` (Vivint Inc) are plausibly the smart-home/camera side. `A0:FE:61` and `5C:2B:F5` are
+  **Vivint Wireless Inc**, which was the fixed-wireless ISP business, i.e. home internet CPE rather
+  than cameras. Admitting those two would flag a router as a camera, which is the TP-Link rejection
+  in miniature.
+
+Neither is added. Registered OUI is not detectability, and this table's rule is field validation
+before confidence: nothing goes in on a registry lookup alone. For comparison, the rejected TP-Link
+registrant holds **263** blocks, every one tagged Router.
+
+If either is pursued, SimpliSafe is the clean one and needs a single capture of a real unit
+broadcasting. For Vivint, take `84:EB:3E`/`84:EB:3F` only, and only after a capture proves which
+line actually transmits.
+
 ## Drone (Remote ID primary, vendor-OUI fallback)
 
 Vendor in **opendroneid-core-c (Apache-2.0)** and call its decoder. It is ASTM F3411
@@ -349,6 +435,18 @@ signals and stay off the table.
 | Apple AirTag / Find My | mfg company ID + type | `0x004C` + payload type `0x12` | Bluetooth SIG + arXiv 2501.17452 |
 | Samsung SmartTag | service UUID | `0xFD5A` | arXiv 2501.17452 + Bluetooth SIG |
 | Tile | service UUID | `0xFEED` | Bluetooth SIG |
+| Google Find Hub / FMDN (separated) | service data UUID + frame type | `0xFEAA` + frame type `0x41` **only** | Google Find Hub Network Accessory Spec, tables 15/16 |
+
+**Find Hub covers the whole Android ecosystem, not one brand.** The `0xFEAA` + `0x41` match is
+network-wide, so Moto Tag, Chipolo Point and the compatible Pebblebee tags are already detected
+with no per-manufacturer signature. Do not add brand rows for them. The same holds on the Apple
+side: third-party Find My accessories ride the existing Find My offline frame above.
+
+**Frame type `0x40` is deliberately NOT matched.** `0x41` is the *separated* state, a tag away
+from its owner, which is the only state that means anything for following. `0x40` is the
+near-owner state and would fire on every pair of earbuds sitting beside their owner. Same rule,
+and the same reason, as the Apple `0x12` payload type above. The implementation and the
+accepted-miss note are in `firmware/lib/acab_core/tracker_detect.cpp`.
 
 ## Smart / recording glasses
 
@@ -442,3 +540,33 @@ before promoting past "possible recording glasses." Full write-up in
 above). Still open: verify Flock's BLE company ID `0x09C8` (registrant + exclusivity)
 against the current Bluetooth SIG assigned-numbers list; until then it ships at conf 45,
 in the apps' weak-match band.*
+
+---
+
+## Copy truthfulness: the two facts every privacy statement must accommodate
+
+Written down 2026-08-06 after an audit found three separate places claiming location "is never
+transmitted" or is "used only on your device". Both statements were false, and one of them was the
+iOS permission dialog, i.e. shown by the operating system itself.
+
+Anything written about privacy, in the apps, on the site, in store listings, or in a permission
+string, has to be true against these two facts:
+
+1. **The phone pushes its GPS fix to the board over BLE.** `sendPhoneLocation()` runs on connect
+   (iOS `BLEManager.swift`, Android `AcabBleManager.kt`). It is a LOCAL, encrypted link to the
+   user's own hardware and nothing leaves for a server, but it is still a transmission, so
+   "never transmitted" and "used only on your device" are both wrong. The honest framing is that
+   it goes to *your board and nowhere else*, and is never uploaded.
+2. **Opening the map fetches tiles from a third party.** Apple Maps on iOS, OpenStreetMap on
+   Android. That provider sees an ordinary map request and the user's IP address. It never sees
+   detections. This also means the tile fetch belongs in Google's Data Safety form, which treats
+   an off-device transmission as collection regardless of what it carries.
+
+What is NOT affected, and should not be softened: the first-run tour's "it never transmits, jams,
+or spoofs" describes the BOARD's RF posture, which is accurate. The board is a passive receiver
+whose only transmission is the BLE link to the phone.
+
+Canonical wording lives in `web/privacy.html`. The FAQ answer (`faq-content.json`, byte-identical
+on both platforms and enforced by `check-signature-drift.py`) and the iOS
+`NSLocationWhenInUseUsageDescription` in `ios/project.yml` are the two other places that must
+agree with it.
