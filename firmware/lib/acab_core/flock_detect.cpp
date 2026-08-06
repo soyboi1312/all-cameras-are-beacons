@@ -370,12 +370,23 @@ bool flockClassifyWiFi(const uint8_t* frame, size_t len, int rssi,
     // --- Primary: the "Flock-<partial MAC>" AP name is the strong WiFi signature
     //     (src: ryanohoro / GainSec). Match it directly with no OUI gate, since a
     //     camera's WiFi MAC belongs to the module maker, not Flock's own OUI. ---
+    // SELF-ATTESTATION ONLY (beacon 0x8 / probe-response 0x5). Corrected 2026-08-05; this is the
+    // same defect netcam_detect.cpp fixed in the same round. On a probe REQUEST the SSID IE is the
+    // network being SEARCHED FOR and addr2 is the searching station, so the frame attests nothing
+    // about the transmitter - which is the whole justification for the 88 tier. Admitting 0x4
+    // reported any station with a "Flock-" network saved, on a rotating random MAC, as a Flock
+    // CAMERA at 88: a row the app's exact-MAC ignore can never silence. M_SSID also bypasses
+    // acabApplyDurability's randomized-address down-cap (which only touches M_OUI), so nothing
+    // downstream caught it. The probe-borne form is already graded lower at M_PROBE 72/78 below.
+    const bool selfAttested = (subtype == 0x5 || subtype == 0x8);
     size_t pfxLen = strlen(FLOCK_SSID_PREFIX);
-    if (sawSSID && !emptySSID && strncmp(ssid, FLOCK_SSID_PREFIX, pfxLen) == 0) {
+    if (selfAttested && sawSSID && !emptySSID && strncmp(ssid, FLOCK_SSID_PREFIX, pfxLen) == 0) {
         acabInit(out, ACAB_FLOCK_CAMERA, SRC_WIFI, addr2, (int16_t)rssi);
         out->method = M_SSID;
         out->confidence = 88;
-        strncpy(out->name, ssid, sizeof(out->name) - 1);
+        // Attacker-controlled text: clamp on ingest like every other name path, instead of
+        // strncpy'ing raw control/high bytes straight into the record.
+        acabSanitizeAscii(out->name, (const uint8_t*)ssid, strlen(ssid), sizeof(out->name));
         return true;
     }
 
@@ -389,6 +400,22 @@ bool flockClassifyWiFi(const uint8_t* frame, size_t len, int rssi,
         out->method = M_SSID;
         out->confidence = 85;
         strncpy(out->name, ssid, sizeof(out->name) - 1);
+        return true;
+    }
+
+    // The probe-request form of the same two names, REGRADED rather than dropped (2026-08-05).
+    // A station asking for "Flock-..." or "*-FALCON" is still a real signal - a Falcon riding as a
+    // WiFi client is the documented case, and it is what the 88 branch above used to swallow. But
+    // the frame identifies the SEEKER, not the network's owner, so it belongs at the probe tier
+    // beside the Falcon-OUI rule below, with a detail that says which it is. Sits after the two
+    // self-attestation branches so a beacon/probe-response can never land here.
+    if (subtype == 0x4 && sawSSID && !emptySSID &&
+        (strncmp(ssid, FLOCK_SSID_PREFIX, pfxLen) == 0 || ciEndsWith(ssid, FLOCK_SSID_FALCON_SUFFIX))) {
+        acabInit(out, ACAB_FLOCK_CAMERA, SRC_WIFI, addr2, (int16_t)rssi);
+        out->method = M_PROBE;
+        out->confidence = 72;
+        acabSanitizeAscii(out->name, (const uint8_t*)ssid, strlen(ssid), sizeof(out->name));
+        snprintf(out->detail, sizeof(out->detail), "probing for a Flock network");
         return true;
     }
 

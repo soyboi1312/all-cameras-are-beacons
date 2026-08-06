@@ -97,6 +97,17 @@ final class BLEManager: NSObject, ObservableObject {
     static let shared = BLEManager()
 
     @Published private(set) var connectionState: BLEConnectionState = .unknown
+
+    /// Recovery hint shown when a connect attempt ends before the link is usable. The overwhelmingly
+    /// likely cause on a board that is present and advertising is the PAIRING WINDOW: a phone that
+    /// has never bonded may only pair in the two minutes after power-on, and outside that the board
+    /// refuses at connect (see ACAB_PAIR_WINDOW_MS in the firmware). The board cannot tell us why it
+    /// refused, because it hangs up before any of our characteristics exist to be read, so the app
+    /// offers the one recovery that covers this and most other stuck states. Cleared on a good link.
+    @Published private(set) var connectHint: String?
+
+    /// The one sentence a user needs. Kept identical to Android's PAIR_WINDOW_HINT.
+    static let pairWindowHint = "Turn the beacon off and on, then connect within two minutes."
     @Published private(set) var discovered: [DiscoveredDevice] = []
     @Published private(set) var detections: [Detection] = []
     @Published private(set) var status: DeviceStatus?
@@ -271,6 +282,11 @@ final class BLEManager: NSObject, ObservableObject {
     @Published var combinedElapsed: TimeInterval = 0
     /// A soft, non-failure note shown on a done/partial finish (e.g. couldn't re-check the nRF).
     @Published var combinedNotice: String?
+    /// Did the BOARD leg actually flash during the run that just finished? `combinedCtx` is torn
+    /// down at the terminal, so the card cannot ask it after the fact - and the PARTIAL copy has to
+    /// say what really happened. A co-processor-only run that fails never touched the board, and
+    /// telling the user "Board updated" there is simply false.
+    @Published var combinedS3Updated: Bool = false
     /// Live context for the running combined flow; nil when idle. Class so the timer mutates it.
     var combinedCtx: CombinedUpdateContext?
     /// Drives the elapsed clock and polls the two sub-engines while the combined flow runs.
@@ -583,6 +599,7 @@ final class BLEManager: NSObject, ObservableObject {
     }
 
     func connect(_ device: DiscoveredDevice) {
+        connectHint = nil   // fresh attempt: drop any stale recovery hint from the last one
         central.stopScan()
         scanTimeoutTimer?.invalidate(); scanTimeoutTimer = nil   // the window closes with the scan
         sessionWasReady = false   // a fresh session hasn't reached ready until its CCCD subscribe lands
@@ -1478,7 +1495,9 @@ final class BLEManager: NSObject, ObservableObject {
     /// Everything one CSV row reads, resolved on the MAIN thread: the timing/location
     /// dictionaries (and the isApproxTime verdict they feed) are main-confined, so the
     /// background CSV build must never touch them. Mirrors the StoredRow snapshot pattern.
-    private struct CSVRowInput {
+    /// Internal (not private) so the export tests can build fixtures directly against the pure
+    /// builders below, which is what makes the iOS/Android byte-parity assertions possible.
+    struct CSVRowInput {
         let d: Detection
         let firstSeen: Date?
         let loc: CLLocationCoordinate2D?
@@ -1488,7 +1507,7 @@ final class BLEManager: NSObject, ObservableObject {
     /// CSV of the current log: when, what, and where for each detection. "Where" is
     /// your phone's position at first sighting (the board has no GPS), or blank if we
     /// had no location then. Pure function of the snapshot, safe to run off-main.
-    private static func buildCSV(_ snapshot: [CSVRowInput]) -> String {
+    static func buildCSV(_ snapshot: [CSVRowInput]) -> String {
         let fmt = ISO8601DateFormatter()
         // Milliseconds always printed (exactly 3 fractional digits, .000 when zero): the default
         // options never emit fractional seconds while Android's live rows carry real millis, so
@@ -1531,7 +1550,11 @@ final class BLEManager: NSObject, ObservableObject {
             case .unknown:
                 when = ""
             }
-            let coord = r.loc ?? d.coordinate
+            // approx_lat/lon is the PHONE's position. The d.coordinate fallback is drone-gated
+            // for the same reason the drone columns below are: on a drone row that field is the
+            // AIRCRAFT's Remote ID broadcast, so ungated it exported the aircraft as the observer
+            // and made approx_lat identical to drone_lat. Matches Android mapCoordForExport.
+            let coord = r.loc ?? (d.type == .drone ? nil : d.coordinate)
             let lat = coord.map { String(format: "%.6f", $0.latitude) } ?? ""
             let lon = coord.map { String(format: "%.6f", $0.longitude) } ?? ""
             // Drone Remote ID telemetry, all blank for a non-drone row. approx_lat/lon above is
@@ -1539,7 +1562,18 @@ final class BLEManager: NSObject, ObservableObject {
             // position and, crucially, the OPERATOR (pilot) position, the single most valuable
             // field in a drone capture. It must survive into the evidence export, not just the
             // detail view. Coords go through coordinate/pilotCoordinate so a 0,0 reads blank.
-            let dc = d.coordinate, pc = d.pilotCoordinate
+            //
+            // THE TYPE GATE IS LOAD-BEARING (added 2026-08-05, fixing a real export defect).
+            // `lat`/`lon` on the wire is OVERLOADED: ble-protocol.md line 88 defines it as
+            // "drones: broadcast position; others: detector GPS". Without this gate every
+            // non-drone row copied the PHONE's own position into drone_lat/drone_lon. Measured on
+            // a real 2747-row export: 2746 of 2746 non-drone rows carried a bogus drone position,
+            // 555 of them byte-identical to that row's own approx_lat/lon. Anything reading the
+            // drone columns (a GPX/KML export, a map layer) would plot thousands of phantom
+            // aircraft. This comment already claimed "blank for a non-drone row"; now it is true.
+            // Kept byte-identical to Android's detectionsCsv.
+            let isDrone = d.type == .drone
+            let dc = isDrone ? d.coordinate : nil, pc = isDrone ? d.pilotCoordinate : nil
             rows.append([csvSafe(when), r.basis.csvToken, r.basis.csvPrecisionSec,
                          csvSafe(d.type.label), d.mac, "\(d.rssi)",
                          d.source.label, d.method.label, "\(d.confidence)",
@@ -1553,28 +1587,167 @@ final class BLEManager: NSObject, ObservableObject {
         return rows.joined(separator: "\n")
     }
 
+    /// XML text escape. Ampersand FIRST or it double-escapes the entities added after it.
+    private static func xmlSafe(_ s: String) -> String {
+        s.replacingOccurrences(of: "&", with: "&amp;")
+         .replacingOccurrences(of: "<", with: "&lt;")
+         .replacingOccurrences(of: ">", with: "&gt;")
+         .replacingOccurrences(of: "\"", with: "&quot;")
+    }
+
+    /// GPX 1.1 for import into a mapping app (Gaia GPS, Caltopo, OsmAnd).
+    ///
+    /// THE ONE THING A READER MUST NOT MISUNDERSTAND: for everything except a drone, the pin is
+    /// where the PHONE was standing, NOT where the device is. A passive radio cannot tell you
+    /// where a transmitter is - only that it was audible from here, which at BLE range could be
+    /// most of a block in any direction. GPX has no way to express that uncertainty, so every
+    /// such waypoint is NAMED "Heard:" and its description says so in words. Do not "clean that
+    /// up": the whole file is misread the moment it looks like a map of camera positions.
+    ///
+    /// A drone is the exception and gets up to three waypoints, because Remote ID broadcasts real
+    /// positions: where it was heard from, where the AIRCRAFT said it was, and where the OPERATOR
+    /// said they were. Those last two are the only true device positions this product can export.
+    ///
+    /// TEST COVERAGE, stated honestly: BeaconsTests/ExportTests.swift covers THIS side (13 cases:
+    /// the drone gate, waypoint counts, escaping, the bracketed-row time omission). Android's
+    /// detectionsGpx is NOT yet under test - it is an instance method on the manager and needs the
+    /// same pure-function extraction this side already has. The JSON fixtures in ExportTests are
+    /// deliberately written to be reusable verbatim when that happens, so this is a gap, not a
+    /// divergence. Do not claim parity is enforced until AcabBleManagerExportTest.kt exists.
+    static func buildGPX(_ snapshot: [CSVRowInput]) -> String {
+        let fmt = ISO8601DateFormatter()
+        fmt.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        var out = """
+        <?xml version="1.0" encoding="UTF-8"?>
+        <gpx version="1.1" creator="beacons" xmlns="http://www.topografix.com/GPX/1/1">
+        """
+        func f6(_ v: Double) -> String { String(format: "%.6f", v) }
+
+        // One waypoint. `time` is omitted rather than faked when the row has no single instant:
+        // a bracketed row's honest answer is a RANGE, and GPX <time> can only hold a point, so
+        // writing either end of the bracket would state a precision the data does not have. The
+        // basis always rides in <desc> instead.
+        func wpt(lat: Double, lon: Double, name: String, desc: String, time: String?) {
+            out += "\n  <wpt lat=\"\(f6(lat))\" lon=\"\(f6(lon))\">"
+            if let t = time, !t.isEmpty { out += "\n    <time>\(xmlSafe(t))</time>" }
+            out += "\n    <name>\(xmlSafe(name))</name>"
+            out += "\n    <desc>\(xmlSafe(desc))</desc>"
+            out += "\n  </wpt>"
+        }
+
+        for r in snapshot {
+            let d = r.d
+            // A single instant, or nil when the row is bracketed/unknown (see wpt above).
+            var stamp: String? = nil
+            var basisNote = ""
+            switch r.basis {
+            case .exact:
+                stamp = r.firstSeen.map { fmt.string(from: $0) }
+                basisNote = "exact"
+            case .reconstructed(let precision):
+                // Same source as buildCSV: the instant lives on the ROW; the basis only carries
+                // how wide that instant could be.
+                stamp = r.firstSeen.map { fmt.string(from: $0) }
+                basisNote = "reconstructed, +/-\(precision)s"
+            case .bracketed(let after, let before):
+                basisNote = "bracketed \(after.map { fmt.string(from: $0) } ?? "..")/"
+                          + "\(before.map { fmt.string(from: $0) } ?? "..")"
+            case .unknown:
+                basisNote = "time unknown"
+            }
+            let label = d.maker.map { "\(d.type.label) (\($0))" } ?? d.type.label
+            var facts = ["\(d.mac)", "\(d.rssi) dBm", "conf \(d.confidence)",
+                         "matched on \(d.method.label)", "\(d.count)x", "time: \(basisNote)"]
+            if let det = d.detail, !det.isEmpty { facts.append(det) }
+
+            // Where we heard it FROM. The `d.coordinate` fallback is DRONE-GATED because for a
+            // drone that field is the aircraft's Remote ID position, not the phone - the same wire
+            // overload that produced the CSV bug. Without the gate a drone's own position would be
+            // labelled "Position is where the PHONE was", the exact inversion of the honesty rule
+            // this writer exists to enforce. Its real position gets its own waypoint below.
+            // Matches Android detectionsGpx.
+            if let c = r.loc ?? (d.type == .drone ? nil : d.coordinate) {
+                wpt(lat: c.latitude, lon: c.longitude,
+                    name: "Heard: \(label)",
+                    desc: "Position is where the PHONE was, not the device. "
+                        + "Audible from here only. " + facts.joined(separator: " | "),
+                    time: stamp)
+            }
+            // Real broadcast positions. Drone-only, matching the CSV's type gate.
+            if d.type == .drone {
+                if let dc = d.coordinate {
+                    wpt(lat: dc.latitude, lon: dc.longitude,
+                        name: "Drone (broadcast position): \(label)",
+                        desc: "Aircraft position from its own Remote ID broadcast. "
+                            + facts.joined(separator: " | "),
+                        time: stamp)
+                }
+                if let pc = d.pilotCoordinate {
+                    wpt(lat: pc.latitude, lon: pc.longitude,
+                        name: "Drone OPERATOR: \(label)",
+                        desc: "Operator position from the aircraft's Remote ID broadcast. "
+                            + facts.joined(separator: " | "),
+                        time: stamp)
+                }
+            }
+        }
+        out += "\n</gpx>"
+        return out
+    }
+
     /// Build the log CSV and write it to a temp file for the share sheet, then hand the
     /// URL (nil on failure) to `completion` on the main thread. Snapshot on main,
     /// format + write off-main: string-formatting up to 5000 rows synchronously in the
     /// button action froze the UI for hundreds of ms right at the export tap, the same
     /// stall persistDetections() already had fixed for the checkpoint path.
-    func writeDetectionsCSV(completion: @escaping (URL?) -> Void) {
-        let snapshot = detections.map { d in
-            CSVRowInput(d: d, firstSeen: firstSeenAt[d.id], loc: capturedLoc[d.id],
-                        basis: timeBasis(for: d.id))
-        }
+    /// Export formats. CSV is the evidence file; GPX is for a mapping app (see buildGPX for the
+    /// "the pin is the phone, not the device" caveat that rides in every waypoint name).
+    enum ExportFormat {
+        case csv, gpx
+        var ext: String { self == .csv ? "csv" : "gpx" }
+    }
+
+    /// `category` is a DeviceType.category key (ALPR / DRONE / BODY CAM / TRACKER), or nil for
+    /// everything. Callers pass the filter the user is already looking at in the log, so export
+    /// means "give me what is on screen" rather than silently handing over the whole history.
+    /// The chosen category also lands in the FILENAME, so a partial export can never be mistaken
+    /// for a complete one after it leaves the app.
+    func writeDetections(_ format: ExportFormat, category: String? = nil,
+                         completion: @escaping (URL?) -> Void) {
+        let snapshot = detections
+            .filter { category == nil || $0.type.category == category }
+            .map { d in
+                CSVRowInput(d: d, firstSeen: firstSeenAt[d.id], loc: capturedLoc[d.id],
+                            basis: timeBasis(for: d.id))
+            }
         // Not persistQueue: that serial queue can be mid-checkpoint during a big replay, and
         // a user-initiated export shouldn't wait its turn behind a multi-MB store encode.
         DispatchQueue.global(qos: .userInitiated).async {
-            let csv = BLEManager.buildCSV(snapshot)
-            let url = FileManager.default.temporaryDirectory.appendingPathComponent("acab-detections.csv")
-            // write as Data with completeFileProtection: the GPS+MAC CSV must stay unreadable while
+            let body = format == .csv ? BLEManager.buildCSV(snapshot) : BLEManager.buildGPX(snapshot)
+            // A GPX with no waypoints is a valid 125-byte document that maps nothing, and handing
+            // that to a share sheet looks like the export silently failed. It happens whenever the
+            // selected rows have no GPS fix: a detection heard with location off, or before the
+            // first fix, still exports fine as CSV (blank approx columns) but has nothing to plot.
+            // Report it as a failure so the UI can say WHY, rather than shipping an empty map.
+            if format == .gpx && !body.contains("<wpt ") {
+                DispatchQueue.main.async { completion(nil) }
+                return
+            }
+            let slug = category.map { "-" + $0.lowercased().replacingOccurrences(of: " ", with: "-") } ?? ""
+            let url = FileManager.default.temporaryDirectory
+                .appendingPathComponent("acab-detections\(slug).\(format.ext)")
+            // write as Data with completeFileProtection: the GPS+MAC file must stay unreadable while
             // the phone is locked. String.write(to:atomically:encoding:) applies NO data protection,
             // so it was readable on a seized locked phone. The strict class is fine here (unlike the
             // checkpoint's UnlessOpen): exporting only happens with the phone unlocked in hand.
-            let ok = (try? Data(csv.utf8).write(to: url, options: [.atomic, .completeFileProtection])) != nil
+            let ok = (try? Data(body.utf8).write(to: url, options: [.atomic, .completeFileProtection])) != nil
             DispatchQueue.main.async { completion(ok ? url : nil) }
         }
+    }
+
+    /// Back-compat shim for existing callers. Same behaviour as before: whole log, CSV.
+    func writeDetectionsCSV(completion: @escaping (URL?) -> Void) {
+        writeDetections(.csv, category: nil, completion: completion)
     }
 
     private static func csvSafe(_ s: String) -> String {
@@ -2067,6 +2240,16 @@ final class BLEManager: NSObject, ObservableObject {
             do {
                 let data = try JSONEncoder().encode(rows)
                 try data.write(to: url, options: [.atomic, .completeFileProtectionUnlessOpen])
+                // Keep the log out of iCloud/iTunes backups, same as writeProtectedList() does for
+                // the ignore/watch lists. File protection guards a SEIZED phone; it does nothing
+                // about a backup copy sitting in someone else's cloud, and this file is MACs +
+                // phone GPS + timestamps. Re-applied after EVERY write on purpose: .atomic swaps in
+                // a brand-new file, so the flag can't survive a checkpoint - which also means an
+                // already-written log picks the exclusion up on its next checkpoint, no migration.
+                var u = url
+                var v = URLResourceValues()
+                v.isExcludedFromBackup = true
+                try? u.setResourceValues(v)
                 ok = true
             } catch {
                 ok = false
@@ -2478,7 +2661,15 @@ final class BLEManager: NSObject, ObservableObject {
         // history record for the same id.
         if firstTime {
             firstSeenAt[d.id] = stamp
-            capturedLoc[d.id] = d.coordinate
+            // NOT for a drone. capturedLoc means "where the PHONE was", and it feeds approx_lat/lon
+            // in the CSV and the "Heard:" waypoint in the GPX. For a drone, d.coordinate is the
+            // AIRCRAFT's own Remote ID broadcast (ble-protocol.md line 88: "drones: broadcast
+            // position; others: detector GPS"), so storing it here labelled the aircraft as the
+            // observer. The firmware makes the same distinction at the source - acab_scanner.cpp
+            // gates its detector-GPS stamp on `d.type != ACAB_DRONE`. A replayed drone therefore
+            // has NO known observer position, which is the truth; its own position still exports
+            // via drone_lat/lon and its own GPX waypoint.
+            capturedLoc[d.id] = (d.type == .drone) ? nil : d.coordinate
             store[d.id] = d
             lastSeen[d.id] = stamp
             noteHistoryBasis(d, stamp: stamp, basis: basis)
@@ -3102,6 +3293,7 @@ extension BLEManager: CBCentralManagerDelegate {
         }
         connectTimeoutTimer?.invalidate(); connectTimeoutTimer = nil
         connectionState = .idle
+        connectHint = BLEManager.pairWindowHint
         self.peripheral = nil
     }
 
@@ -3190,14 +3382,34 @@ extension BLEManager: CBPeripheralDelegate {
     func peripheral(_ peripheral: CBPeripheral, didDiscoverCharacteristicsFor service: CBService,
                     error: Error?) {
         otaChar = nil
+        var sawDetections = false, sawConfig = false
         for ch in service.characteristics ?? [] {
             switch ch.uuid {
-            case ACABProfile.detections: peripheral.setNotifyValue(true, for: ch)
+            case ACABProfile.detections: sawDetections = true; peripheral.setNotifyValue(true, for: ch)
             case ACABProfile.status:     peripheral.setNotifyValue(true, for: ch); peripheral.readValue(for: ch)
-            case ACABProfile.config:     configChar = ch
+            case ACABProfile.config:     configChar = ch; sawConfig = true
             case ACABProfile.ota:        otaChar = ch; peripheral.setNotifyValue(true, for: ch)
             default: break
             }
+        }
+        // REQUIRED CHARACTERISTICS. Detections is the entire product and Config is how every
+        // setting, list and OTA trigger is sent; without either, "connected" is a lie. This used to
+        // mark the link connected regardless, so a board advertising our service UUID with a
+        // truncated or wrong profile produced a healthy-looking session that could never report
+        // anything. Mirrors the Android policy in AcabBleManager.onSubscribeFailed, where a dead
+        // Detections subscription is fatal and Status merely degrades to polling.
+        //
+        // OTA is deliberately NOT required: released 1.7 boards do not carry acab0104, and refusing
+        // them would strand working hardware.
+        guard sawDetections, sawConfig else {
+            let missing = [sawDetections ? nil : "detections", sawConfig ? nil : "config"]
+                .compactMap { $0 }.joined(separator: " + ")
+            connectHint = "This board is missing its \(missing) channel, so it cannot report to the app. "
+                        + "Turn it off and on, then try again."
+            userDisconnect = true            // deliberate teardown: do not auto-reconnect into it
+            central.cancelPeripheralConnection(peripheral)
+            connectionState = .idle
+            return
         }
         // Only boards built with in-app OTA carry acab0104; released 1.7 boards don't.
         otaCapable = (otaChar != nil)
@@ -3248,6 +3460,7 @@ extension BLEManager: CBPeripheralDelegate {
         // (.connected in didDiscoverCharacteristicsFor is too early: it lands before this
         // async CCCD write resolves, so a declined pairing would still count as ready there.)
         sessionWasReady = true
+        connectHint = nil   // link is usable; the hint no longer applies
         sendBufferHandshake()
     }
 

@@ -15,8 +15,21 @@ cd "$(dirname "$0")"
 CORE="../../lib/acab_core"
 fail=0
 for t in test_*.cpp; do
-    src="${t#test_}"; src="${CORE}/${src%.cpp}_detect.cpp"
-    [ -f "$src" ] || { echo "!! no source for $t (looked for $src)"; fail=1; continue; }
+    stem="${t#test_}"; stem="${stem%.cpp}"
+    src="${CORE}/${stem}_detect.cpp"
+    if [ ! -f "$src" ]; then
+        # HEADER-ONLY SUITE. Not every testable unit is a classifier with a matching
+        # <name>_detect.cpp: sink_claim.h is a pure decision extracted from acab_scanner.cpp
+        # precisely so it can be tested without Arduino or FreeRTOS. Compile the test alone when
+        # the unit under test is a header. Anything else is still a hard error - a typo'd suite
+        # name silently compiling nothing is exactly the "the suite is smaller than I thought"
+        # failure this script's header warns about.
+        if [ -f "${CORE}/${stem}.h" ]; then
+            src=""
+        else
+            echo "!! no source for $t (looked for $src and ${CORE}/${stem}.h)"; fail=1; continue
+        fi
+    fi
     echo ">> $t"
     # A COMPILE failure must be recorded and skipped, not fatal. Under `set -e` a bare g++ here
     # aborted the whole script on the first broken file, so the remaining tests never ran and the
@@ -24,7 +37,7 @@ for t in test_*.cpp; do
     # that there are eight and CI invokes this script, where a truncated log reads as "the suite
     # is smaller than I thought" rather than "it died early". A failing test RUN already used
     # `|| fail=1` and continued, so this only makes the two paths behave the same way.
-    g++ -std=c++17 -Wall -I"$CORE" -Istubs -o "/tmp/$(basename "$t" .cpp)" "$t" "$src" \
+    g++ -std=c++17 -Wall -I"$CORE" -Istubs -o "/tmp/$(basename "$t" .cpp)" "$t" ${src:+"$src"} \
         || { echo "!! COMPILE FAILED: $t"; fail=1; continue; }
     "/tmp/$(basename "$t" .cpp)" || fail=1
 done

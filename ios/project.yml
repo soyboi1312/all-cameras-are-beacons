@@ -23,18 +23,23 @@ packages:
 
 settings:
   base:
-    MARKETING_VERSION: "2.0.3"
-    # BUMP THIS (then `xcodegen generate`) BEFORE EVERY ARCHIVE, and leave "Automatically manage
-    # version and build number" UNCHECKED in Xcode's Distribute flow. If Xcode manages it, it bumps
-    # the build at UPLOAD time and never writes it back here - so every archive on disk reads the same
-    # stale number while TestFlight climbs, and a crash report can then only be matched to its dSYM by
-    # UUID. Builds 7-14 were lost that way. App Store Connect rejects duplicates, so this must EXCEED
-    # the highest already uploaded (14 as of 2026-07-16).
+    MARKETING_VERSION: "2.0.4"
+    # The build number RESTARTS AT 0 for each new MARKETING_VERSION, and only climbs when a SECOND
+    # build of the SAME version has to go up. App Store Connect requires the build to be unique
+    # within a version string, NOT across the app, so 0 is always free on a version that has never
+    # uploaded. Proven in the archive history: 2.0.0 climbed to build 34, then 2.0.2 (0) and
+    # 2.0.3 (0) both uploaded clean. So the rule is: bump MARKETING_VERSION, set this back to 0.
+    #
+    # Leave "Automatically manage version and build number" UNCHECKED in Xcode's Distribute flow. If
+    # Xcode manages it, it bumps the build at UPLOAD time and never writes it back here, so every
+    # archive on disk reads the same stale number while TestFlight climbs, and a crash report can
+    # then only be matched to its dSYM by UUID. Builds 7-14 were lost that way.
+    #
     # DO NOT edit the build number in Xcode's General tab: the project is generated, so the edit is
-    # clobbered on the next regen AND it only touches the app target, leaving BeaconsWidget behind ->
-    # "extension version must match parent app". Both targets read $(CURRENT_PROJECT_VERSION), so
-    # editing it HERE keeps app + widget in lockstep automatically.
-    CURRENT_PROJECT_VERSION: "17"
+    # clobbered by the next `xcodegen generate` AND it only touches the app target, leaving
+    # BeaconsWidget behind -> "extension version must match parent app". Both targets read
+    # $(CURRENT_PROJECT_VERSION), so setting it HERE and regenerating keeps them in lockstep.
+    CURRENT_PROJECT_VERSION: "0"
     SWIFT_VERSION: "5.0"
     CODE_SIGN_STYLE: Automatic
     DEVELOPMENT_TEAM: "49B9T69XPF"        # baked in so `xcodegen generate` keeps signing
@@ -81,7 +86,7 @@ targets:
         # TestFlight/App Store Connect stops asking for export compliance each build.
         ITSAppUsesNonExemptEncryption: false
         NSBluetoothAlwaysUsageDescription: "This app connects to your beacon board over Bluetooth to receive detections."
-        NSLocationWhenInUseUsageDescription: "Used only on your device to map detections, including in the background during a Drive session so hits stay pinned while your screen is off. Never sent anywhere."
+        NSLocationWhenInUseUsageDescription: "Used to map detections, including in the background during a Drive session so hits stay pinned while your screen is off, and to geotag them on your board over your encrypted local Bluetooth link. Never uploaded."
         NSFocusStatusUsageDescription: "This app checks whether a Focus or Do Not Disturb is active so it can stay silent and skip the vibrate alert while you have one on."
         UIBackgroundModes:
           - bluetooth-central

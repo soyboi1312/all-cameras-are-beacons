@@ -102,10 +102,51 @@ class NrfDfuCoordinator(
         // its shallow HCI RX queue. Adafruit's guidance: OTA needs PRN <= 8; the library default is
         // 12. 6 gives headroom - each PRN is a flow-control stop that lets it drain to flash.
         private const val PRN = 6
+
+        /**
+         * RELEASE GATE for the co-processor DFU on Android. FALSE ships the app S3-only: the nRF
+         * leg is never offered and never runs, by any route.
+         *
+         * WHY IT IS OFF. The failure mode this guards is not a failed update, it is a DEAD RADIO:
+         * when the bootloader accepts Start DFU and the size array and the transfer then dies, it
+         * has already erased the application, so the nRF re-parks in its bootloader on every boot
+         * with BLE detection offline. A power cycle does NOT recover it - it took a USB UF2
+         * reflash (observed 2026-08-06). Nothing in the app can fix that, because the co-processor
+         * offer is gated on reading a version FROM the co-processor. An update path that can
+         * silently kill the product's main function is worse than no update path.
+         *
+         * WHAT FLIPPING IT TO TRUE REQUIRES (all of it, on hardware, not reasoning):
+         *   1. a run from a power-cycled nRF in its normal application,
+         *   2. a log with NO MTU negotiation on the DFU link,
+         *   3. Start DFU accepted (no status 2),
+         *   4. TWO complete passes: co-processor-only, and combined S3+nRF,
+         *   5. the board back on the new nrfv with detections resumed after each.
+         *
+         * STATUS: ALL FIVE PASSED on 2026-08-06 (Pixel 2, rev-A) once disableMtuRequest() was
+         * added - see the A/B recorded at that call.
+         *   pass 1, co-processor only: nRF v1 -> v2, 123120 bytes in 96.1 s, Validate status 1,
+         *     board reported "[nrf] co-processor app version 2", scanning + forwarding resumed.
+         *   pass 2, combined S3+nRF: board 2.0.3 -> 2.0.4, rebooted, reconnected, confirmed, then
+         *     nRF v1 -> v2 in the same flow (93.0 s), ending DONE / "You're on the latest
+         *     firmware" - not PARTIAL - with detections resumed.
+         * Neither log contained an MTU negotiation and neither Start DFU was refused.
+         *
+         * If this ever regresses, set it back to false FIRST and diagnose second: the failure
+         * costs a radio, not an update.
+         *
+         * The two functions below are the ONLY ways into the DFU - the combined coordinator reaches
+         * it through these same two, and nothing outside this file touches DfuServiceInitiator - so
+         * guarding both is a complete gate over every entry point (combined, co-processor-only,
+         * notification/deep link, and any automatic coordinator invocation).
+         */
+        const val NRF_DFU_ENABLED = true
     }
 
-    /** True when a co-processor update is available for this build vs the running version. */
+    /** True when a co-processor update is available for this build vs the running version.
+     *  Gated: with [NRF_DFU_ENABLED] false this is always false, so the update is never OFFERED -
+     *  the combined flow's staleness check ORs this in, so it simply plans an S3-only run. */
     fun updateAvailable(build: FirmwareBuild): Boolean {
+        if (!NRF_DFU_ENABLED) return false
         val nrf = build.nrf ?: return false
         val running = statusProvider()?.nrfVersion ?: return false
         return nrf.hasVerifiableImage && nrf.version > running
@@ -113,6 +154,13 @@ class NrfDfuCoordinator(
 
     fun startUpdate(build: FirmwareBuild) {
         if (_progress.value.isRunning) return
+        // Defence in depth behind the offer gate above: nothing should reach here with the flag
+        // off, and if some future path does, it must not put the co-processor into its bootloader.
+        if (!NRF_DFU_ENABLED) {
+            set(NrfDfuPhase.FAILED, 0,
+                "Second-radio updates aren't available in this version of the app. Your beacon keeps working as it is.")
+            return
+        }
         // Never overlap an S3 OTA: both flows drive the same radio, and a co-processor DFU started
         // mid-OTA would fight the S3 image stream. Parity with iOS BLEManager+NrfDFU.swift:39.
         if (otaInProgress()) {
@@ -302,6 +350,32 @@ class NrfDfuCoordinator(
             // We connect straight to the bootloader (AdaDFU), so there's no buttonless jump and no
             // address change to chase.
             .setForceScanningForNewAddressInLegacyDfu(false)
+            // OBSERVED (bench, Pixel 2 + rev-A, 2026-08-06): the library connects to the AdaDFU
+            // bootloader, reads DFU version 0.8, raises the MTU to 247, sends Start DFU (op 1,
+            // mode 4) and the image-size array, and the bootloader answers with status 2
+            // (INVALID_STATE). LegacyDfuImpl's only route to that reply is resetAndRestart(), so
+            // it writes Reset (op 6); the link drops with status 8 and the restarted service can
+            // no longer reach the device. Zero firmware bytes ship, and the nRF is left in its
+            // bootloader with BLE detection offline. A power cycle does NOT restore the erased
+            // application; recovery requires a physical USB UF2 reflash.
+            //
+            // PROVEN by A/B on hardware, same board / same zip / same phone / same library 2.5.0,
+            // this line the only variable:
+            //   WITH the MTU request  -> "Requesting MTU = 517", "MTU changed to: 247", then Start
+            //                            DFU answered status 2 and LegacyDfuImpl reset the device.
+            //                            Zero bytes transferred, co-processor left in its bootloader.
+            //   WITHOUT it (this line) -> no MTU negotiation at all, Start DFU accepted, Init DFU
+            //                            Parameters + the 14-byte init packet accepted, PRN set,
+            //                            Receive Firmware Image accepted, 123120 bytes in 96.1 s,
+            //                            Validate status 1, Activate and Reset, and the board then
+            //                            reported "[nrf] co-processor app version 2" with scanning
+            //                            and forwarding resumed. (2026-08-06, Pixel 2, rev-A.)
+            //
+            // Note the mechanism is NOT a transport-size problem - status 2 is a bootloader-level
+            // reply and both the Start DFU op code and the 12-byte size array fit inside the
+            // default 23-byte ATT payload. Raising the MTU upsets the stock Adafruit legacy-DFU
+            // bootloader itself. Do not re-enable the request to "speed up" the transfer.
+            .disableMtuRequest()
             .setPacketsReceiptNotificationsEnabled(true)
             .setPacketsReceiptNotificationsValue(PRN)
             .setZip(zipFile.absolutePath)
@@ -328,7 +402,7 @@ class NrfDfuCoordinator(
             sendAbortBroadcast()
             unregisterDfuListener()
             set(NrfDfuPhase.FAILED, 0,
-                "The co-processor didn't acknowledge the update after several tries. Power-cycle the beacon and try again.")
+                "The co-processor didn't acknowledge the update. Stop here and contact support; repeated attempts may require USB recovery.")
             return
         }
         // Abort the wedged transfer, then rescan for AdaDFU and retry from a fresh connection. The
@@ -356,13 +430,27 @@ class NrfDfuCoordinator(
     private fun registerDfuListener() {
         if (listenerRegistered) return
         DfuServiceListenerHelper.registerProgressListener(context, dfuListener)
+        // The library reports the protocol blow-by-blow (bootloader response op codes and status
+        // values, init-packet decisions, the exact reason it terminates) ONLY through this log
+        // broadcast - none of it reaches logcat. Without it a bench failure shows as "connected,
+        // then reset, then gone" with no cause. Debug builds only; it is noisy per-packet.
+        if (tech.acab.app.BuildConfig.DEBUG) {
+            DfuServiceListenerHelper.registerLogListener(context, dfuLogListener)
+        }
         listenerRegistered = true
     }
 
     private fun unregisterDfuListener() {
         if (!listenerRegistered) return
         DfuServiceListenerHelper.unregisterProgressListener(context, dfuListener)
+        if (tech.acab.app.BuildConfig.DEBUG) {
+            DfuServiceListenerHelper.unregisterLogListener(context, dfuLogListener)
+        }
         listenerRegistered = false
+    }
+
+    private val dfuLogListener = no.nordicsemi.android.dfu.DfuLogListener { _, level, message ->
+        android.util.Log.i("AcabDfuLog", "[$level] $message")
     }
 
     private val dfuListener = object : DfuProgressListenerAdapter() {

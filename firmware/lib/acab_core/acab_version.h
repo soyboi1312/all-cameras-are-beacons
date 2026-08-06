@@ -26,6 +26,22 @@
 // therefore un-shippable over the air: the apps compare unclamped, would keep offering the
 // update, and the board would refuse it forever. Bump the MINOR when the patch field runs out.
 //
+// 2.0.4: Arlo, and the first SSID match in the netcam category.
+//        DETECTION: Arlo Technology netcam OUIs 59 -> 62 (A4:11:62, FC:9C:98, 48:62:64). Arlo had
+//        been named on netcam_signatures.h's "why not" line with NO reason while Nest and Blink
+//        each had one, i.e. swept in by association. It holds 3 blocks and ships nothing with a
+//        radio but cameras, doorbells and the hubs that serve them, so it passes the narrowness
+//        test more cleanly than Wyze. FIRST VENDOR HERE ADMITTED ON OUR OWN CAPTURE rather than a
+//        registry pull: the 2026-07-24 drive logged 12 distinct Arlo devices, 3 of them
+//        broadcasting an ARLO_VMB_ SSID. Still validated=0 - the SSID proves the hardware, only
+//        an eyeball proves a camera.
+//        NEW MATCH METHOD: NETCAM_SSID_ARLO_PREFIX ("ARLO_VMB_", plus the uncaptured NETGEAR-era
+//        "NTGR_VMB_"), M_SSID at confidence 88 - ABOVE every OUI tier in that table including the
+//        eyeball-validated 75, for the same reason the Flock SSID earns 88: the device states its
+//        own vendor instead of being inferred from a block. Reports "Arlo base station", NOT
+//        "camera", because a hub is what the SSID proves. Checked BEFORE the OUI so a weaker 65 on
+//        the same frame cannot win. WiFi-only on purpose (the discontinued Arlo Security Light is
+//        BLE, and a porch light must never be labelled a camera).
 // 2.0.3: the BLE link round, plus two detection additions.
 //        DETECTION: Google Find Hub / FMDN separated trackers (Eddystone service data
 //        0xFEAA, frame type 0x41 ONLY - the near-owner 0x40 form is deliberately not
@@ -56,7 +72,7 @@
 // 2.0.0: the Colonel Panic builds pick up the full v2 detection set the beacon board ships
 // with (offline buffer, watchlist/custom category, ignore list, refreshed OUIs, glasses).
 #ifndef ACAB_FW_VERSION
-#define ACAB_FW_VERSION "2.0.3"
+#define ACAB_FW_VERSION "2.0.4"
 #endif
 
 #endif // ACAB_VERSION_H

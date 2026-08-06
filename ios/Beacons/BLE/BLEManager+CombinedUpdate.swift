@@ -366,6 +366,9 @@ extension BLEManager {
     // MARK: Terminals + helpers
 
     private func combinedFinish(_ phase: CombinedUpdatePhase) {
+        // Capture what actually landed BEFORE combinedCtx is torn down at the end of this function;
+        // the card reads it to word the terminal copy honestly (see combinedS3Updated).
+        combinedS3Updated = combinedCtx?.s3DidUpdate ?? false
         switch phase {
         case .done:
             combinedProgress = 1.0

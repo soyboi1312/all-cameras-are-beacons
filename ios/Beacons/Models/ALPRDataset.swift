@@ -96,6 +96,10 @@ final class ALPRStore: ObservableObject {
     private let lastCheckedKey = "acab.alpr.lastChecked"   // epoch seconds of the last completed manifest check
     private var inFlight = false
 
+    /// Bumped on every enable/disable. fetch() snapshots it and abandons itself if it changed,
+    /// so a download started before an opt-out can't publish or cache after one.
+    private var enableGen = 0
+
     private var cacheURL: URL {
         let dir = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
         try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
@@ -121,6 +125,10 @@ final class ALPRStore: ObservableObject {
         guard on != enabled else { return }
         enabled = on
         UserDefaults.standard.set(on, forKey: enabledKey)
+        // Retire any fetch already in the air. Clearing the arrays below does NOT stop a download
+        // that is mid-flight, and its publish step would repopulate them seconds after the user
+        // switched the layer off - the toggle would visibly undo itself. See fetch()'s gen checks.
+        enableGen &+= 1
         if on {
             loadFromDisk()
             refresh()
@@ -217,6 +225,10 @@ final class ALPRStore: ObservableObject {
         loading = true
         var outcome: RefreshOutcome = .failed
         defer { loading = false; lastOutcome = outcome }
+        // Every await below is a window in which the user can switch the layer off. Snapshot the
+        // enable generation now and re-check it after each one: a stale fetch must not spend the
+        // bandwidth, publish the points, or leave a cache file behind after an opt-out.
+        let gen = enableGen
         // 1) manifest
         var req = URLRequest(url: manifestURL)
         req.cachePolicy = .reloadIgnoringLocalCacheData
@@ -238,6 +250,8 @@ final class ALPRStore: ObservableObject {
             outcome = .upToDate
             return
         }
+        // Layer switched off while the manifest was in the air: stop before the expensive part.
+        guard gen == enableGen, enabled else { return }
         // 2) binary. Past this point we are committed to a real download, so the legend may
         // auto-open to surface the data credit. Everything above was a freshness check.
         downloading = true
@@ -249,7 +263,10 @@ final class ALPRStore: ObservableObject {
         // 3) integrity: size + sha256 must match the manifest, or we discard it
         guard bin.count == d.size,
               SHA256.hash(data: bin).map({ String(format: "%02x", $0) }).joined() == d.sha256.lowercased() else { return }
-        // 4) parse + publish + cache
+        // 4) parse + publish + cache. Last chance to catch an opt-out: publishing here is what
+        // would repopulate a map the user just cleared, and the cache write would put the dataset
+        // on disk after they declined it.
+        guard gen == enableGen, enabled else { return }
         guard let parsed = Self.parse(bin) else { return }
         nodes = parsed.coords
         nodeMakers = parsed.makers
@@ -275,14 +292,20 @@ final class ALPRStore: ObservableObject {
     /// Parse the "ALP3" binary into coordinates + parallel maker and confidence arrays. Also
     /// accepts a legacy "ALP2" (coords + makers) and "ALP1" (coords only), so a cache written by an
     /// older build still loads. Bounds-checked throughout; returns nil on any malformation (a bad
-    /// length, a table that runs past the buffer, an index past the table). Out-of-range coords are
+    /// length, a table that runs past the buffer). A maker index past the table is NOT a rejection:
+    /// it resolves to "" for that one node, same as Android, because a single unreadable label is a
+    /// display fault and blanking a whole city's map over it is not. Out-of-range coords are
     /// dropped WITH their maker and tier, so all three arrays stay in lockstep.
     ///
     /// A pre-ALP3 file defaults every node to CONFIRMED, never unverified. The tier is an
     /// accusation ("nobody picked this manufacturer from a preset, so it may be misidentified"),
     /// and a cache predating the field carries no evidence either way. Defaulting the other way
     /// would paint a whole stale map amber purely because the file is old.
-    private static func parse(_ data: Data) -> (coords: [CLLocationCoordinate2D], makers: [String], confirmed: [Bool])? {
+    ///
+    /// Internal rather than private so BeaconsTests can drive it directly (@testable raises
+    /// internal to public, it does not reach private). This is the one function in the app with a
+    /// history of shipping a schema mismatch to BOTH platforms at once, so it is worth the keyword.
+    static func parse(_ data: Data) -> (coords: [CLLocationCoordinate2D], makers: [String], confirmed: [Bool])? {
         let isV3 = data.count >= 4 && data.prefix(4).elementsEqual("ALP3".utf8)
         let isV2 = data.count >= 4 && data.prefix(4).elementsEqual("ALP2".utf8)
         let isV1 = data.count >= 4 && data.prefix(4).elementsEqual("ALP1".utf8)

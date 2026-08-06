@@ -12,6 +12,8 @@
 #include <Arduino.h>
 #include "esp_task_wdt.h"   // task watchdog: catch a wedged loop() (both single- and dual-radio)
 #include "acab_scanner.h"
+#include "coredump_report.h"
+#include "pair_window.h"   // acabPhysicalStart: the host-tested rule production must CALL, not restate
 #include "axon_detect.h"
 #include "police_detect.h"
 #include "tracker_detect.h"
@@ -584,6 +586,21 @@ void setup() {
     Serial.begin(115200);
     delay(200);
     Serial.print(acabBanner());
+    // Read the retained core dump BEFORE anything else can panic, and report it. The board has
+    // been capturing these to flash all along (the partition and IDF's espcoredump are already in
+    // the shipped image); nothing ever read them, so every field panic wrote a full post-mortem
+    // and then sat invisible until the next erase. Prints nothing on a clean boot.
+    acabCoredumpProbe();
+    acabCoredumpPrint();
+#ifdef ACAB_BENCH_COREDUMP_PANIC
+    // BENCH ONLY, USB serial only, and deliberately NOT reachable over BLE: a remotely triggerable
+    // abort() is risk with no upside. Panics ~2 s after boot so the dump can be captured and
+    // decoded against a known ELF, which is the only way to measure whether a real dump fits in
+    // the 64 KB partition. Sits in the same capture-build guard family as ACAB_BENCH_NO_SLEEP.
+    Serial.println("[bench] ACAB_BENCH_COREDUMP_PANIC set - forcing a panic in 2s");
+    delay(2000);
+    abort();
+#endif
     // Banner follows the BUILD, like the BLE fw label below it does. This used to be hardcoded
     // "ACAB OUI-Spy" from the original single-radio project, so a dual-radio beacon board booted
     // announcing itself as a Colonel Panic OUI-Spy. Cosmetic, but it is the first thing anyone
@@ -624,7 +641,10 @@ void setup() {
     const char* kFwLabel = "ACAB-ouispy";
 #endif
     // BLE service inits NimBLE + starts advertising for the app.
-    acabBleBegin(kBleName, kFwLabel);
+    // Advertising DEFERRED: the soft-power gate below can still decide this boot parks, and the
+    // pairing gate is configured after it. Going on air here meant a phone could connect before
+    // either decision, with enforcement still off. acabBleStartAdvertising() runs once both settle.
+    acabBleBegin(kBleName, kFwLabel, /*startAdvertising=*/false);
 
     // Offline detection buffer: mount the flash ring + bump the boot counter. Stays
     // inert (no capture) until the app enables it and pushes an at-rest key.
@@ -692,6 +712,26 @@ void setup() {
     // load). Restored BEFORE acabScannerBegin so the promiscuous filter is installed to match
     // the persisted choice from the first frame. See netcam_detect.cpp.
     netcamRestoreEnabled(false);
+
+    // Did a PERSON start this board? Set by whichever soft-power branch fires below. Derived from
+    // the gate's own decision rather than esp_reset_reason(): soft-off is deep sleep, so the
+    // recovery the apps instruct ("turn it off and on") wakes as ESP_RST_DEEPSLEEP, and a
+    // reset-reason test never opened a window for it. See acabPhysicalStart in pair_window.h.
+    //
+    // Declared OUTSIDE the dual-radio guard because the pairing decision below is outside it too.
+    // Targets with no soft-power gate never reach a branch that could set this, and for them
+    // booting IS starting, so they default to true rather than silently never becoming pairable.
+// INPUTS to acabPhysicalStart, collected by the power gate below. Production must COLLECT and
+// CALL, not hand-assign the answer: a helper that is tested but never invoked is not coverage, and
+// a mutation to any hand-written assignment would have failed no test at all.
+    bool pwrCellAbsent = false;  // USB-only board seeing fresh power
+    bool pwrButtonHeld = false;  // hold-to-start, i.e. the ext0 wake after a hold-to-off
+    bool pwrSwitchLow  = false;  // slide-switch SKU reading ON at boot
+#ifdef ACAB_BENCH_NO_SLEEP
+    const bool pwrBenchBuild = true;
+#else
+    const bool pwrBenchBuild = false;
+#endif
 
 #ifdef ACAB_DUAL_RADIO
     // BLE detection comes from the companion nRF52840 over UART, so this radio
@@ -794,6 +834,7 @@ void setup() {
     } else if (cellAbsent) {
         Serial.println("[pwr] no cell detected (USB-only build) + fresh power -> auto-on, button = hold-to-off");
         pwrCommit(true);
+        pwrCellAbsent = true;    // applying power to a USB-only board IS the intent to start it
     } else {
         // NOTE ON THE REAL HOLD TIME: kBtnOnHoldMs is measured from HERE, not from the press, and
         // this gate sits a long way into setup(). Serial.begin + delay(200), alertsBootJingle()
@@ -809,6 +850,10 @@ void setup() {
         }
         Serial.println("[pwr] button held -> powering on");
         pwrCommit(true);
+        // THE RECOVERY PATH the apps instruct. Soft-off is deep sleep, so this wakes with
+        // ESP_RST_DEEPSLEEP, never ESP_RST_POWERON - which is exactly why the old reset-reason
+        // test never opened a window here and "turn it off and on" did not work.
+        pwrButtonHeld = true;
         btnWaitRelease(3000);   // don't let the same press immediately read as an off-hold in loop()
     }
     } else {
@@ -817,9 +862,14 @@ void setup() {
         delay(3000);
         if (digitalRead(kSwSensePin) == HIGH) powerOffDeepSleep();
     }
+    // Records only that the switch READS ON. It does NOT mean a person just flipped it: the switch
+    // is still on after an OTA restart too, which is why this alone made every reflash open a
+    // window. acabPhysicalStart pairs it with the reset reason.
+    pwrSwitchLow = true;
     }
 #else
     Serial.println("[pwr] ACAB_BENCH_NO_SLEEP: soft-power park skipped (bench build, D10 ignored)");
+
 #endif
     // Running: pulse the nRF's RESET so it comes back from System OFF (harmless if it was
     // never asleep , it just reboots into a known-fresh co-processor state with us). Its
@@ -828,6 +878,45 @@ void setup() {
     delay(30);
     acabScannerSendCoProcCmd("V");   // mutex sink, same interleave class as the DFU relay fix
 #endif
+
+    // Open the new-phone pairing window, ONCE, and only now: every path above this line can still
+    // decide the board should be off (switch off at boot, button not held, cell absent), and a
+    // board that boots merely to conclude it should sleep must never advertise itself as pairable.
+    // Already-bonded phones are unaffected and reconnect whenever they like; this governs FIRST
+    // contact only. RAM-only, so a power cycle is exactly how a user reopens it, which is also the
+    // entire recovery instruction. See ACAB_PAIR_WINDOW_MS in acab_ble_service.h.
+    //
+    // ONLY ON A REAL POWER-ON. The user-facing promise is "turn it off and on", i.e. PHYSICAL
+    // presence. A warm reboot is not that: pwrCommittedOn() keeps the board up through an OTA
+    // restart, a task-watchdog panic (panic=true, so it reboots), a brownout on a sagging cell, and
+    // any crash loop. Arming on those would mean every update reopens pairing for two minutes, and
+    // worse, that anything able to induce a crash from radio range gets a pairing window handed to
+    // it. ESP_RST_POWERON covers the cold paths that matter: first power-up, the button-held start,
+    // the switch-on start, and the rev-B battery SKU's automatic boot gate (which has no button but
+    // is still a genuine physical power-on).
+    // ENFORCEMENT IS UNCONDITIONAL. It used to be switched on only inside the window opener, and
+    // the opener only ran on a physical start, so every OTA restart, panic, watchdog and brownout
+    // came back with the gate OFF and admitted any phone indefinitely. Enforcement and "a person
+    // just turned this on" are separate questions and are now separate calls.
+    // ONE call, ONE decision. The branches above only record what happened; the rule for turning
+    // that into "did a person start this board" lives in acabPhysicalStart and is host-tested.
+    // The reset reason is one INPUT here, not the whole answer. See acabPhysicalStart for the two
+    // wrong versions this replaced and why each failed.
+    const esp_reset_reason_t rr2 = esp_reset_reason();
+    const bool physicalStart = acabPhysicalStart(rr2 == ESP_RST_POWERON,
+                                                 rr2 == ESP_RST_DEEPSLEEP,
+                                                 pwrCellAbsent, pwrButtonHeld,
+                                                 pwrSwitchLow, pwrBenchBuild);
+    acabBlePairGateEnable();
+    if (physicalStart) {
+        acabBleOpenPairingWindow();
+    } else {
+        Serial.println("[pair] warm continuation (not a physical start) - window NOT opened; "
+                       "enforcement is ON, bonded phones still reconnect");
+    }
+    // Only NOW go on air: the board has committed to staying powered and the pairing gate is
+    // configured, so there is no window in which a phone can reach a board that has not decided.
+    acabBleStartAdvertising();
 
     acabScannerBegin(cfg, onDetection);
 
@@ -1023,10 +1112,16 @@ void loop() {
     static uint32_t lastDiag = 0;
     if (millis() - lastDiag > 5000) {
         lastDiag = millis();
-        Serial.printf("[diag] wifi_seen=%lu ble_seen=%lu | nRF adv=%lu fwd=%lu scan=%d bb=%lu bat_mv=%d\n",
+        // bonds + pairw make the pairing window observable from a USB console: bonds is how many
+        // phones the BOARD still has stored (a phone forgetting its side does NOT remove ours), and
+        // pairw is seconds left in the new-phone window, 0 once closed.
+        Serial.printf("[diag] wifi_seen=%lu ble_seen=%lu | nRF adv=%lu fwd=%lu scan=%d bb=%lu bat_mv=%d"
+                      " | bonds=%d pairw=%lus\n",
                       (unsigned long)acabScannerWifiSeen(), (unsigned long)acabScannerBleSeen(),
                       (unsigned long)acabScannerCoProcAdvSeen(), (unsigned long)acabScannerCoProcForwarded(),
-                      (int)acabScannerCoProcScanning(), (unsigned long)acabScannerCoProcBbCount(), gBatMv);
+                      (int)acabScannerCoProcScanning(), (unsigned long)acabScannerCoProcBbCount(), gBatMv,
+                      acabBleBondCount(),
+                      (unsigned long)(acabBlePairWindowRemainingMs() / 1000));
     }
 #endif
     // push a status notify every 5s to keep the app's uptime/count current

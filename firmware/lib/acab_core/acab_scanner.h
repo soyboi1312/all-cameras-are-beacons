@@ -94,6 +94,15 @@ uint32_t acabScannerTotalDetections();
 // seeing nothing at all."
 uint32_t acabScannerBleSeen();
 uint32_t acabScannerWifiSeen();
+// Sink-queue drop accounting. A nonzero buffered-drop count means the offline ring missed records
+// it was asked to keep (the claim was rolled back, so the device re-arms, but that sighting is
+// gone); a nonzero deliver-only count is benign, since a missed live notify simply re-arrives.
+// Reported as `sdrop` (the total) in periodic status, and individually in the {"diag":true} reply.
+uint32_t acabScannerSinkDropDeliverOnly();
+uint32_t acabScannerSinkDropBuffered();
+uint32_t acabScannerSinkDropReplay();
+uint32_t acabScannerSinkHighWater();
+uint32_t acabScannerSinkDropTotal();
 
 // Co-processor (dual-radio nRF) stats, mirrored up over UART for the two-radio
 // "is it working?" diagnostic. hasCoProc stays false on a single-board build.

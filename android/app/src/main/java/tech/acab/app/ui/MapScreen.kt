@@ -1,6 +1,7 @@
 package tech.acab.app.ui
 
 import android.content.Context
+import tech.acab.app.BuildConfig
 import android.graphics.Bitmap
 import android.graphics.Canvas
 import android.graphics.DashPathEffect
@@ -125,7 +126,11 @@ private val osmConfigured = java.util.concurrent.atomic.AtomicBoolean(false)
 internal fun configureOsmdroid(context: Context) {
     if (!osmConfigured.compareAndSet(false, true)) return
     val cfg = Configuration.getInstance()
-    cfg.userAgentValue = context.packageName
+    // OSM's tile usage policy requires a User-Agent that identifies the application and gives a
+    // way to make contact; a bare package name satisfies neither and is the shape that gets an app
+    // blocked from the public tile servers. Version comes from BuildConfig so it cannot drift from
+    // build.gradle.kts, which a hardcoded string inevitably would.
+    cfg.userAgentValue = "tech.acab.app/${BuildConfig.VERSION_NAME} (+https://soyboi.tech)"
     cfg.tileFileSystemCacheMaxBytes = 100L * 1024 * 1024
     cfg.tileFileSystemCacheTrimBytes = 80L * 1024 * 1024
     cfg.load(context, context.getSharedPreferences("osmdroid", Context.MODE_PRIVATE))

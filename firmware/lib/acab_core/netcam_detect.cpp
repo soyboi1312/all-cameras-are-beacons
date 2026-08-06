@@ -13,6 +13,7 @@
 #include <Preferences.h>    // persist the opt-in across reboots (NVS)
 #include <string.h>
 #include <stdio.h>
+#include <ctype.h>          // tolower, for the case-insensitive SSID prefix test
 
 // Opt-in flag (default OFF). NVS-backed in namespace "acab-netcam" key "on" so an app-set
 // toggle survives a reboot. Mirrors the drone-OUI opt-in (gEnabledOui) exactly.
@@ -53,6 +54,19 @@ static const NetcamOui* netcamEntry(const uint8_t mac[6]) {
     return nullptr;
 }
 
+// Case-insensitive prefix test for the base-station SSID rule. Mirrors ciEndsWith in
+// flock_detect.cpp (that one anchors at the tail, this one at the head). Case-insensitive
+// because an SSID is user-visible text and vendors have shipped both cases of their own
+// prefix before; anchored at the head so a network merely CONTAINING the string cannot match.
+static bool netcamSsidPrefix(const char* ssid, const char* pfx) {
+    if (!ssid || !pfx) return false;
+    while (*pfx) {
+        if (tolower((unsigned char)*ssid) != tolower((unsigned char)*pfx)) return false;
+        ssid++; pfx++;
+    }
+    return true;
+}
+
 const char* netcamVendorOui(const uint8_t mac[6]) {
     const NetcamOui* e = netcamEntry(mac);
     return e ? e->vendor : nullptr;
@@ -80,6 +94,67 @@ bool netcamClassifyWiFi(const uint8_t* frame, size_t len, bool isDataFrame,
         saOff = 10;
     }
     if (saOff + 6 > len) return false;
+
+    // SSID first: it outranks every OUI tier here, so checking it second would let a weaker
+    // OUI hit on the same frame win and report 65 where 88 was available.
+    //
+    // The IE offset differs by subtype and getting it wrong FAILS SILENTLY - walking a beacon
+    // from 24 parses the free-running TSF timestamp as an IE header and random-walks the frame.
+    // The full explanation lives at the SSID parse in flock_detect.cpp; it is deliberately NOT
+    // restated here, so there is one place to correct if it is ever found to be wrong. Keep
+    // these offsets identical to that one (and to desert_detect.cpp, which splits the same way).
+    if (!isDataFrame && len >= 24) {
+        const uint8_t subtype = (frame[0] >> 4) & 0x0F;
+        // BEACON (0x8) and PROBE-RESPONSE (0x5) ONLY. Probe REQUESTS (0x4) are deliberately
+        // excluded, and this is a correctness rule, not an oversight - do not "restore" 0x4 for
+        // symmetry with flock_detect.cpp.
+        //
+        // The 88 tier is justified in netcam_signatures.h by "this does not infer the vendor - the
+        // vendor STATES it". That holds for a beacon or probe-response, where the SSID IE is the
+        // transmitter's OWN network name. In a probe REQUEST the SSID is the network being SEARCHED
+        // FOR and addr2 is the searching station, so the frame attests nothing about the
+        // transmitter. Admitting 0x4 made an Arlo CAMERA hunting for its hub - or any phone with
+        // that SSID saved, on a randomized MAC - get reported as "Arlo base station" at confidence
+        // 88: the wrong box, at the highest non-watchlist tier, on an address never seen again.
+        // The codebase already grades that inference separately (M_PROBE, used by flock at 72/78).
+        if (subtype == 0x5 || subtype == 0x8) {
+            for (size_t ie = 36; ie + 2 <= len; ) {
+                const uint8_t id = frame[ie], ilen = frame[ie + 1];
+                if (ie + 2 + ilen > len) break;
+                if (id == 0x00) {                      // SSID IE
+                    if (ilen > 0 && ilen <= 32) {
+                        char ssid[33];
+                        memcpy(ssid, frame + ie + 2, ilen);
+                        ssid[ilen] = 0;
+                        if (netcamSsidPrefix(ssid, NETCAM_SSID_ARLO_PREFIX) ||
+                            netcamSsidPrefix(ssid, NETCAM_SSID_ARLO_LEGACY_PREFIX)) {
+                            // addr2 = the transmitter. On a beacon/probe-response that is the AP
+                            // itself, which is why only those two subtypes reach here.
+                            acabInit(out, ACAB_NETCAM, SRC_WIFI, frame + 10, (int16_t)rssi);
+                            out->method     = M_SSID;
+                            out->confidence = NETCAM_SSID_CONFIDENCE;
+                            // KEEP THE SSID. It is the entire justification for ranking this above
+                            // the eyeball-validated 75 tier, so discarding it would leave the log
+                            // with no way to check the claim - and no way to tell a CAPTURED
+                            // ARLO_VMB_ hit from an NTGR_VMB_ hit we have never actually seen. It
+                            // also gives the row a real title: with name empty both apps fall all
+                            // the way back to the bare type label "Network camera". Same as
+                            // flock_detect.cpp and desert_detect.cpp do with their SSID matches.
+                            // Straight off the frame, not via ssid[]: this is attacker-sourced
+                            // text and acabSanitizeAscii is the ingest clamp for exactly that.
+                            acabSanitizeAscii(out->name, frame + ie + 2, ilen, sizeof(out->name));
+                            // Names the box, not a lens: a base station serves cameras, but
+                            // saying "camera" here would claim more than the SSID proves.
+                            snprintf(out->detail, sizeof(out->detail), "Arlo base station");
+                            return true;
+                        }
+                    }
+                    break;                             // SSID IE is unique; stop either way
+                }
+                ie += 2 + ilen;
+            }
+        }
+    }
 
     const NetcamOui* e = netcamEntry(frame + saOff);
     if (!e) return false;

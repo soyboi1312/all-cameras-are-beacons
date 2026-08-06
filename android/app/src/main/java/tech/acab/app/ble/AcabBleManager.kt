@@ -270,6 +270,10 @@ class AcabBleManager(private val context: Context) {
     val combinedProgress: StateFlow<CombinedUpdateProgress> get() = combined.progress
     /** Either radio is behind: drives whether the single "Update" button is offered. */
     fun combinedUpdateStale(build: FirmwareBuild): Boolean = combined.updateStale(build)
+    /** The BOARD firmware specifically is behind. The card needs this separately from
+     *  [combinedUpdateStale] so it can name what is actually stale: an offer driven only by the
+     *  co-processor used to read "Update available: v2.0.4" while the board already ran 2.0.4. */
+    fun s3UpdateStale(build: FirmwareBuild): Boolean = combined.s3UpdateStale(build)
     fun startCombinedUpdate(build: FirmwareBuild) = combined.start(build)
     fun cancelCombinedUpdate() = combined.cancel()
     fun dismissCombinedUpdate() = combined.dismiss()
@@ -678,6 +682,16 @@ class AcabBleManager(private val context: Context) {
     // Set once the board reboots after a good "done"; the next READY checks the fw version and
     // sends confirm (or reports a rollback). Cleared when consumed.
     @Volatile private var otaAwaitingConfirm = false
+    // The connection generation the confirm was armed ON. "done" arms otaAwaitingConfirm while the
+    // OLD link is still up (the board reboots ~250 ms later, and Android's disconnect callback lags
+    // that by seconds), and the same handler clears otaStreaming, which re-opens the 5 s status
+    // poll. So a Status frame carrying the PRE-reboot version can reach checkPostRebootConfirm
+    // before the board has even rebooted, and it reads a successful update as "came back on its
+    // previous firmware" - failing the run, and in the combined flow aborting before the nRF leg
+    // ever starts (observed on hardware 2026-08-06: board booted 2.0.4, app said rollback).
+    // Only a frame from a LATER generation may decide. iOS carries the same guard as
+    // otaSawFreshStatus (BLEManager+OTA.swift otaHandleReconnected/decideRebootOutcome).
+    @Volatile private var otaRebootGen = -1
     // Bumps whenever the OTA session changes; a stale stall-watchdog checks this to bail out.
     @Volatile private var otaSessionId = 0
     // Wall-clock of the last progress signal from the board ("ready"/"prog"), for the stall watchdog.
@@ -720,6 +734,11 @@ class AcabBleManager(private val context: Context) {
     // row for a powered-off board, ~30 s status-133) must fail to the resting screen, not arm a
     // perpetual no-cancel "Connecting…".
     @Volatile private var sessionWasReady = false
+
+    // CCCD writes we've already retried once this session (see onDescriptorWrite). Per-session so a
+    // reconnect gets a clean shot at every subscription, and bounded to one retry apiece so a board
+    // that keeps rejecting can't spin the GATT queue forever.
+    private val cccdRetried = java.util.Collections.synchronizedSet(mutableSetOf<java.util.UUID>())
 
     // The startup reload of persisted detections. loadPersistedDetections() does AndroidKeyStore
     // IPC + an AES-GCM decrypt of the whole sealed blob + a JSONArray parse + sort (+ a re-seal on
@@ -824,7 +843,12 @@ class AcabBleManager(private val context: Context) {
                 val gen = scanGen
                 scope.launch {
                     delay(SCAN_RETRY_MS)
-                    if (gen == scanGen && _state.value == ConnState.SCANNING &&
+                    // appForegrounded is part of the guard because this is the ONLY scan start
+                    // that isn't already behind it, and it fires ~30 s late: background the app
+                    // inside that window and this would light a LOW_LATENCY scan back up behind
+                    // the user's back. _state stays SCANNING across a background pause (that's
+                    // how the resume works), so state alone can't tell the two apart.
+                    if (gen == scanGen && _state.value == ConnState.SCANNING && appForegrounded &&
                         adapter?.isEnabled == true && hasScanPermission()) {
                         runCatching { scanner?.stopScan(scanCb) }
                         beginScan()
@@ -892,7 +916,17 @@ class AcabBleManager(private val context: Context) {
 
     // ---- connection ----
 
+    /** Recovery hint shown when a connect attempt ends before the link is usable. On a board that is
+     *  present and advertising, the overwhelmingly likely cause is the PAIRING WINDOW: a phone that
+     *  has never bonded may only pair in the two minutes after power-on, and outside that the board
+     *  refuses at connect (see ACAB_PAIR_WINDOW_MS in the firmware). The board cannot tell us why,
+     *  because it hangs up before any characteristic exists to be read, so the app offers the one
+     *  recovery that covers this and most other stuck states. Mirrors iOS BLEManager.connectHint. */
+    private val _connectHint = MutableStateFlow<String?>(null)
+    val connectHint: StateFlow<String?> = _connectHint.asStateFlow()
+
     fun connect(board: FoundBoard) {
+        _connectHint.value = null   // fresh attempt: drop any stale hint from the last one
         // In-flight guard: two fast taps on the same board row (the recomposition to
         // ConnectingRow lags a frame) must not open two parallel clients feeding one callback
         // machine - the first would leak toward the ~30-client ceiling and callbacks from
@@ -933,6 +967,7 @@ class AcabBleManager(private val context: Context) {
                     target = null
                     _deviceName.value = null
                     _state.value = ConnState.DISCONNECTED
+                    if (!sessionWasReady) _connectHint.value = PAIR_WINDOW_HINT
                     if (appForegrounded && adapter?.isEnabled == true && hasScanPermission()) startScan()
                 }
             }
@@ -1096,6 +1131,7 @@ class AcabBleManager(private val context: Context) {
         // the next session only re-pulls the records we actually missed.
         synchronized(this) { gattQueue.clear(); gattBusy = false }
         sessionWasReady = false
+        cccdRetried.clear()            // fresh session gets a fresh retry per subscription
         reconnectClientArmed = false   // the pending client (if any) was just closed
         histReceived = 0
         histHighestContiguous = 0L
@@ -1265,6 +1301,7 @@ class AcabBleManager(private val context: Context) {
                         // otaHandleDisconnect's ended-session branch. otaAwaitingConfirm must be
                         // set before reconnectAfterOta, whose loop gates on it.
                         otaAwaitingConfirm = true
+                        otaRebootGen = connectGen   // this link is gone; only a later one decides
                         // And the phase must leave SENDING: the stall watchdog gates on phase, so
                         // without this transition a reboot+reconnect slower than the 20 s stall
                         // budget was failed as "went quiet ... not applied" on an update that
@@ -1297,7 +1334,23 @@ class AcabBleManager(private val context: Context) {
 
         override fun onDescriptorWrite(g: BluetoothGatt, d: BluetoothGattDescriptor, status: Int) {
             onGattOpComplete()   // CCCD write done - free the slot before queuing the next ops
-            when (d.characteristic.uuid) {
+            val cccdFor = d.characteristic.uuid
+            if (status != BluetoothGatt.GATT_SUCCESS) {
+                // The subscription did NOT take, so the board will never notify on this
+                // characteristic. Retry once, since a lone transient rejection is the usual cause.
+                if (cccdRetried.add(cccdFor)) {
+                    android.util.Log.w("ACAB-ble", "CCCD write failed for $cccdFor (status=$status), retrying once")
+                    subscribe(g, cccdFor)
+                    return
+                }
+                // Retry exhausted. The three characteristics are NOT interchangeable, so hand this
+                // to the policy rather than "continue degraded" for all of them - continuing on a
+                // dead DETECTIONS stream is how a link reaches READY showing a connected board that
+                // will never report anything.
+                onSubscribeFailed(g, cccdFor, "status=$status after retry")
+                return
+            }
+            when (cccdFor) {
                 AcabProfile.DETECTIONS -> {
                     // The Detections subscription is live, so the board can now NOTIFY the
                     // replay. Hand it our key + clock, then ask for everything past lastSeq.
@@ -1370,13 +1423,54 @@ class AcabBleManager(private val context: Context) {
         }
     }
 
+    /** A CCCD subscription did not take. Applies the per-characteristic policy.
+     *
+     *  The three characteristics are NOT equivalent and must not be treated as one "degrade"
+     *  case, which is what the previous version did:
+     *    DETECTIONS - FATAL. It is the entire product. A link that reaches READY with this dead
+     *                 shows a connected board that will never report anything, which is the one
+     *                 lie this app must never tell. Tear the link down and say why.
+     *    STATUS     - degrade. The app already polls status every ~5 s as a fallback, so losing
+     *                 the notify costs freshness, not function. Continue the chain.
+     *    OTA        - disable the feature. Progress notifies are dead, so an update would crawl to
+     *                 the stall watchdog and blame the board. Continue the chain without it.
+     *
+     *  Reached from BOTH failure shapes: an asynchronous non-SUCCESS status in onDescriptorWrite,
+     *  and a SYNCHRONOUS rejection inside subscribe() (missing characteristic, missing CCCD, or
+     *  writeDescriptor refusing outright). The synchronous ones used to just free the queue slot
+     *  and return, firing no callback at all - so the startup chain stalled forever with the
+     *  connect watchdog already cancelled, leaving the UI stuck mid-connect with no way out. */
+    private fun onSubscribeFailed(g: BluetoothGatt?, charUuid: java.util.UUID, why: String) {
+        android.util.Log.w("ACAB-ble", "subscribe FAILED for $charUuid ($why)")
+        when (charUuid) {
+            AcabProfile.DETECTIONS -> {
+                _connectHint.value =
+                    "This board connected but will not send detections. Turn it off and on, then try again."
+                userInitiatedDisconnect = true   // a deliberate teardown: do NOT auto-reconnect into it
+                runCatching { g?.disconnect() }
+                _state.value = ConnState.DISCONNECTED
+            }
+            AcabProfile.STATUS -> {
+                // Status polling covers it. Keep walking the chain so the link still becomes usable.
+                if (g != null && charOf(g, AcabProfile.OTA) != null) subscribe(g, AcabProfile.OTA)
+                else { _otaCapable.value = false; finishReady() }
+            }
+            AcabProfile.OTA -> { _otaCapable.value = false; finishReady() }
+            else -> { }
+        }
+    }
+
     private fun subscribe(g: BluetoothGatt, charUuid: java.util.UUID) {
         enqueueGatt { gg ->
             val c = charOf(gg, charUuid)
-            if (c == null) { onGattOpComplete(); return@enqueueGatt }
+            if (c == null) {
+                onGattOpComplete(); onSubscribeFailed(gg, charUuid, "characteristic absent"); return@enqueueGatt
+            }
             gg.setCharacteristicNotification(c, true)
             val cccd = c.getDescriptor(AcabProfile.CCCD)
-            if (cccd == null) { onGattOpComplete(); return@enqueueGatt }
+            if (cccd == null) {
+                onGattOpComplete(); onSubscribeFailed(gg, charUuid, "CCCD absent"); return@enqueueGatt
+            }
             val enable = BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE
             val queued = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
                 gg.writeDescriptor(cccd, enable) == BluetoothStatusCodes.SUCCESS
@@ -1388,7 +1482,7 @@ class AcabBleManager(private val context: Context) {
             // descriptor callback, so the op slot would never free and every later queued op
             // would silently pile up for the rest of the session. Free it ourselves (same
             // guard as readStatus/sendNextOtaChunk).
-            if (!queued) onGattOpComplete()
+            if (!queued) { onGattOpComplete(); onSubscribeFailed(gg, charUuid, "writeDescriptor rejected") }
         }
     }
 
@@ -1442,6 +1536,7 @@ class AcabBleManager(private val context: Context) {
      *  post-reboot OTA confirm: if we came back after a flash, check the version and confirm. */
     private fun finishReady() {
         sessionWasReady = true   // this session earned an unexpected-drop auto-reconnect
+        _connectHint.value = null   // link is usable; the hint no longer applies
         _state.value = ConnState.READY
         // Prime the Status characteristic once the CCCD chain is fully written (all queued
         // descriptor writes have drained by now), so this read can't collide with an in-flight
@@ -1521,6 +1616,7 @@ class AcabBleManager(private val context: Context) {
         }
         otaTargetVersion = build.version
         otaAwaitingConfirm = false
+        otaRebootGen = -1        // fresh run: no generation pinned until "done" arms one
         otaStreaming = false
         otaEnded = false
         val session = ++otaSessionId
@@ -1824,8 +1920,11 @@ class AcabBleManager(private val context: Context) {
      *  outcome. Runs off whichever status frame arrives first after READY (bounded by
      *  armPostRebootStatusCap). */
     private fun checkPostRebootConfirm() {
-        val s = _status.value ?: return          // wait for a status frame to land (30 s cap)
         if (!otaAwaitingConfirm) return
+        // Not on the pre-reboot link: see otaRebootGen. Return WITHOUT consuming the flag, so the
+        // real post-reconnect frame still gets to decide.
+        if (connectGen == otaRebootGen) return
+        val s = _status.value ?: return          // wait for a status frame to land (30 s cap)
         otaAwaitingConfirm = false
         val have = s.version
         // Confirm only on a PARSEABLE a.b[.c] version that is at least the target. A non-numeric
@@ -2102,6 +2201,9 @@ class AcabBleManager(private val context: Context) {
                 if (phase != OtaPhase.SENDING && phase != OtaPhase.CHECKING) return
                 otaStreaming = false
                 otaAwaitingConfirm = true
+                // The board has NOT rebooted yet (~250 ms away) and this link is still up, so pin
+                // the generation: no frame from it may decide the outcome. See otaRebootGen.
+                otaRebootGen = connectGen
                 setOtaPhase(OtaPhase.REBOOTING, pct = 100,
                     message = "Board is rebooting into the new firmware.")
             }
@@ -2611,7 +2713,9 @@ class AcabBleManager(private val context: Context) {
             }
             // A synchronous rejection fires NO write callback; free the slot ourselves so one
             // refused config write can't wedge the whole serialized queue for the session
-            // (same guard as readStatus/sendNextOtaChunk).
+            // (same guard as readStatus/sendNextOtaChunk). NOT a subscription failure: a dropped
+            // config write costs one setting, and the app reconciles settings against the next
+            // status frame anyway.
             if (!queued) onGattOpComplete()
         }
     }
@@ -2873,6 +2977,17 @@ class AcabBleManager(private val context: Context) {
         return if (validCoord(la, lo)) la!! to lo!! else synchronized(storeLock) { capturedLoc[d.id] }
     }
 
+    /** Where the PHONE was when it heard [d], or null when that is genuinely unknown.
+     *
+     *  Deliberately NOT mapCoord(): that prefers the detection's own wire lat/lon, which for a
+     *  DRONE is the aircraft's Remote ID broadcast rather than the observer. mapCoord is right for
+     *  the map (a drone pin belongs at the aircraft); it is wrong for approx_lat/lon and for the
+     *  GPX "Heard:" waypoint, both of which promise an observer position. A replayed drone has no
+     *  known observer position, and null is the honest answer. Mirrors iOS, where capturedLoc is
+     *  left nil for drones on history ingest. */
+    private fun mapCoordForExport(d: Detection): Pair<Double, Double>? =
+        if (d.type == DeviceType.DRONE) synchronized(storeLock) { capturedLoc[d.id] } else mapCoord(d)
+
     /** A drone's accumulated flight path (empty for anything else). */
     fun track(id: String): List<Pair<Double, Double>> = synchronized(storeLock) { trackHistory[id]?.toList() } ?: emptyList()
 
@@ -3027,8 +3142,13 @@ class AcabBleManager(private val context: Context) {
 
     /** CSV of the current log: when, what, and where for each detection. Location is
      *  the phone's rough position from when we first heard it (the board has no GPS),
-     *  or blank if we didn't have one. */
-    fun detectionsCsv(): String {
+     *  or blank if we didn't have one.
+     *
+     *  [category] is a DeviceType.category key (ALPR / DRONE / BODY CAM / TRACKER), or null for
+     *  everything. Callers pass the filter the user is already looking at in the log, so export
+     *  means "give me what is on screen" rather than silently handing over the whole history.
+     *  Mirrors iOS writeDetections(_:category:). */
+    fun detectionsCsv(category: String? = null): String {
         val rows = StringBuilder(
             // `maker` is appended LAST so an existing parser keyed on column order still reads
             // every field it knew about. Byte-identical to iOS's, which is why it moves in the
@@ -3040,6 +3160,7 @@ class AcabBleManager(private val context: Context) {
         // Snapshot the values under storeLock so the export can't collide with the BLE callback
         // thread mutating the shared map mid-iteration; build the CSV rows outside the lock.
         val snapshot = synchronized(storeLock) { store.values.toList() }.asReversed()
+            .filter { category == null || it.type.category == category }
         for (d in snapshot) {
             // Approx records (buffered before the board had a clock) carry only a synthetic
             // sort-time near epoch, not a real capture time. Leave the column blank rather than
@@ -3088,19 +3209,39 @@ class AcabBleManager(private val context: Context) {
                     basisName = TimeBasis.Exact.csvName
                 }
             }
-            val coord = mapCoord(d)
-            val lat = coord?.let { "%.6f".format(it.first) } ?: ""
-            val lon = coord?.let { "%.6f".format(it.second) } ?: ""
+            // approx_lat/lon is the PHONE's position, so this is NOT mapCoord(): that falls back
+            // to the detection's own wire lat/lon, which on a drone row is the AIRCRAFT's Remote ID
+            // broadcast (ble-protocol.md line 88). Ungated it exported the aircraft as the observer
+            // and made approx_lat identical to drone_lat. Matches iOS buildCSV.
+            val coord = mapCoordForExport(d)
+            val lat = coord?.let { f6(it.first) } ?: ""
+            val lon = coord?.let { f6(it.second) } ?: ""
             // Drone Remote ID telemetry, blank for a non-drone row. approx_lat/lon is the PHONE's
             // position when it heard the device; a drone also broadcasts its OWN position and the
             // OPERATOR (pilot) position, the single most valuable field in a drone capture, so it
             // must survive into the evidence export. Coords go through validCoord so a 0,0 blanks.
-            val dla = d.lat; val dlo = d.lon
-            val dLat = if (dla != null && dlo != null && validCoord(dla, dlo)) "%.6f".format(dla) else ""
-            val dLon = if (dla != null && dlo != null && validCoord(dla, dlo)) "%.6f".format(dlo) else ""
-            val pla = d.pilotLat; val plo = d.pilotLon
-            val opLat = if (pla != null && plo != null && validCoord(pla, plo)) "%.6f".format(pla) else ""
-            val opLon = if (pla != null && plo != null && validCoord(pla, plo)) "%.6f".format(plo) else ""
+            //
+            // THE TYPE GATE IS LOAD-BEARING (added 2026-08-05, fixing a real export defect).
+            // `lat`/`lon` on the wire is OVERLOADED: ble-protocol.md line 88 defines it as
+            // "drones: broadcast position; others: detector GPS". Without this gate every
+            // non-drone row copied the PHONE's own position into drone_lat/drone_lon. Measured on
+            // a real 2747-row export: 2746 of 2746 non-drone rows carried a bogus drone position,
+            // 555 of them byte-identical to that row's own approx_lat/lon. Anything reading the
+            // drone columns (a GPX/KML export, a map layer) would plot thousands of phantom
+            // aircraft. This comment already claimed "blank for a non-drone row"; now it is true.
+            val isDrone = d.type == DeviceType.DRONE
+            val dla = if (isDrone) d.lat else null
+            val dlo = if (isDrone) d.lon else null
+            val dLat = if (dla != null && dlo != null && validCoord(dla, dlo)) f6(dla) else ""
+            val dLon = if (dla != null && dlo != null && validCoord(dla, dlo)) f6(dlo) else ""
+            // Operator coords ride the same gate. Per ble-protocol.md line 90 `plat`/`plon` are
+            // drone-only anyway, so this is belt-and-braces rather than a second bug fixed, but the
+            // two column pairs must stand or fall together or a row could export an operator
+            // position with no aircraft. Kept byte-identical to iOS's detectionsCsv.
+            val pla = if (isDrone) d.pilotLat else null
+            val plo = if (isDrone) d.pilotLon else null
+            val opLat = if (pla != null && plo != null && validCoord(pla, plo)) f6(pla) else ""
+            val opLon = if (pla != null && plo != null && validCoord(pla, plo)) f6(plo) else ""
             rows.append('\n').append(
                 listOf(whenAt, basisName, precision, csvSafe(d.type.label), d.mac, d.rssi.toString(),
                     d.sourceLabel, d.methodLabel, d.confidence.toString(),
@@ -3111,6 +3252,122 @@ class AcabBleManager(private val context: Context) {
                     csvSafe(d.maker ?: "")).joinToString(","))
         }
         return rows.toString()
+    }
+
+    /** Six-decimal coordinate, ALWAYS with a dot.
+     *
+     *  Locale.US is not cosmetic here. Kotlin's String.format uses the DEFAULT locale, so on a
+     *  German/French/Spanish phone "%.6f".format(32.763243) yields "32,763243" - a comma INSIDE a
+     *  CSV field, which shifts every column after it and silently corrupts the one file that gets
+     *  handed over as evidence. It also emits invalid GPX (lat="32,763243"), which mapping apps
+     *  reject outright. iOS never had this: Swift's String(format:) is POSIX unless handed a
+     *  locale, so this was a live iOS/Android parity break on any non-dot-decimal device. */
+    private fun f6(v: Double): String = String.format(java.util.Locale.US, "%.6f", v)
+
+    /** XML text escape. Ampersand FIRST or it double-escapes the entities added after it. */
+    private fun xmlSafe(s: String): String =
+        s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;").replace("\"", "&quot;")
+
+    /** GPX 1.1 for import into a mapping app (Gaia GPS, Caltopo, OsmAnd).
+     *
+     *  THE ONE THING A READER MUST NOT MISUNDERSTAND: for everything except a drone, the pin is
+     *  where the PHONE was standing, NOT where the device is. A passive radio cannot tell you
+     *  where a transmitter is, only that it was audible from here, which at BLE range could be
+     *  most of a block in any direction. GPX has no way to express that uncertainty, so every
+     *  such waypoint is NAMED "Heard:" and its description says so in words. Do not "clean that
+     *  up": the whole file is misread the moment it looks like a map of camera positions.
+     *
+     *  A drone is the exception and gets up to three waypoints, because Remote ID broadcasts real
+     *  positions: where it was heard from, where the AIRCRAFT said it was, and where the OPERATOR
+     *  said they were. Those last two are the only true device positions this product can export.
+     *
+     *  NOT YET UNDER TEST, stated honestly. iOS's twin is covered by BeaconsTests/ExportTests.swift
+     *  (13 cases); this one cannot be unit-tested as written because it is an instance method that
+     *  reads the live store. Extracting a pure builder (snapshot -> String), the way iOS already
+     *  has, is the prerequisite - the JSON fixtures in ExportTests.swift are written to be reused
+     *  here verbatim when that lands. Treat any change on this side as unguarded until then. */
+    fun detectionsGpx(category: String? = null): String {
+        val out = StringBuilder(
+            "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n" +
+            "<gpx version=\"1.1\" creator=\"beacons\" xmlns=\"http://www.topografix.com/GPX/1/1\">")
+
+        // One waypoint. `time` is omitted rather than faked when the row has no single instant:
+        // a bracketed row's honest answer is a RANGE, and GPX <time> can only hold a point, so
+        // writing either end of the bracket would state a precision the data does not have. The
+        // basis always rides in <desc> instead.
+        fun wpt(lat: Double, lon: Double, name: String, desc: String, time: String?) {
+            out.append("\n  <wpt lat=\"").append(f6(lat))
+               .append("\" lon=\"").append(f6(lon)).append("\">")
+            if (!time.isNullOrEmpty()) out.append("\n    <time>").append(xmlSafe(time)).append("</time>")
+            out.append("\n    <name>").append(xmlSafe(name)).append("</name>")
+            out.append("\n    <desc>").append(xmlSafe(desc)).append("</desc>")
+            out.append("\n  </wpt>")
+        }
+
+        val snapshot = synchronized(storeLock) { store.values.toList() }.asReversed()
+            .filter { category == null || it.type.category == category }
+        for (d in snapshot) {
+            val fs = firstSeen(d.id)
+            val basis = timeBasis(d.id)
+            // A single instant, or null when the row is bracketed/unknown (see wpt above).
+            var stamp: String? = null
+            val basisNote: String
+            when {
+                basis is TimeBasis.Reconstructed -> {
+                    stamp = fs?.let { csvInstant(it) }
+                    basisNote = "reconstructed, +/-${basis.precisionSec}s"
+                }
+                basis is TimeBasis.Bracketed -> {
+                    val a = basis.afterMs?.let { csvInstant(it) } ?: ".."
+                    val z = basis.beforeMs?.let { csvInstant(it) } ?: ".."
+                    basisNote = "bracketed $a/$z"
+                }
+                // SAME GUARD AS detectionsCsv above, and it must not drift from it. A row buffered
+                // before the board had a clock carries a synthetic near-epoch sort key, not a
+                // capture time. Testing `fs == null` alone lets a NON-NULL pseudo stamp through and
+                // prints it as a real 2001 date inside a <time> element, i.e. a fabricated
+                // timestamp in a file handed over as evidence. d.approx AND isApproxTime(fs) are
+                // both needed: the row and its stamp disagree when a buffered device is later
+                // heard live.
+                basis is TimeBasis.Unknown || d.approx || isApproxTime(fs) || fs == null ->
+                    basisNote = "time unknown"
+                else -> { stamp = csvInstant(fs); basisNote = "exact" }
+            }
+            val label = d.maker?.let { "${d.type.label} ($it)" } ?: d.type.label
+            val facts = mutableListOf(d.mac, "${d.rssi} dBm", "conf ${d.confidence}",
+                "matched on ${d.methodLabel}", "${d.count}x", "time: $basisNote")
+            d.detail?.takeIf { it.isNotEmpty() }?.let { facts.add(it) }
+            val isDrone = d.type == DeviceType.DRONE
+
+            // Where we heard it FROM. mapCoord falls back to the detection's own wire lat/lon,
+            // which for a DRONE is the aircraft's Remote ID position, not the phone - the same
+            // overload that produced the CSV bug. Using it here would label the aircraft's
+            // position "Position is where the PHONE was", the exact inversion of the honesty rule
+            // this writer exists to enforce. A drone's real position gets its own waypoint below.
+            val heard = mapCoordForExport(d)
+            if (heard != null) {
+                wpt(heard.first, heard.second, "Heard: $label",
+                    "Position is where the PHONE was, not the device. Audible from here only. " +
+                        facts.joinToString(" | "), stamp)
+            }
+            // Real broadcast positions. Drone-only, matching the CSV's type gate.
+            if (isDrone) {
+                val dla = d.lat; val dlo = d.lon
+                if (dla != null && dlo != null && validCoord(dla, dlo)) {
+                    wpt(dla, dlo, "Drone (broadcast position): $label",
+                        "Aircraft position from its own Remote ID broadcast. " +
+                            facts.joinToString(" | "), stamp)
+                }
+                val pla = d.pilotLat; val plo = d.pilotLon
+                if (pla != null && plo != null && validCoord(pla, plo)) {
+                    wpt(pla, plo, "Drone OPERATOR: $label",
+                        "Operator position from the aircraft's Remote ID broadcast. " +
+                            facts.joinToString(" | "), stamp)
+                }
+            }
+        }
+        out.append("\n</gpx>")
+        return out.toString()
     }
 
     private fun csvSafe(s: String): String =
@@ -3709,7 +3966,17 @@ class AcabBleManager(private val context: Context) {
                 }.getOrNull() ?: return@withLock false
                 // The high-water mark advances only when the write LANDS, so a failed newer
                 // write can't make an older queued snapshot skip itself and leave the file stale.
-                val wrote = runCatching { detectionStore().writeText(gcmSeal(text.encodeToByteArray())) }.isSuccess
+                val wrote = runCatching {
+                    // Stage a sibling, then rename it in. writeText() TRUNCATES the live file and
+                    // then streams into it, so a kill or a dead battery mid-write leaves a partial
+                    // file where the whole log used to be - and a truncated GCM blob fails its tag
+                    // check on reload, so the loss is TOTAL, not the tail. rename(2) within one
+                    // directory is atomic, which is what iOS gets from its .atomic write option.
+                    val f = detectionStore()
+                    val tmp = File(f.parentFile, "${f.name}.tmp")
+                    tmp.writeText(gcmSeal(text.encodeToByteArray()))
+                    if (!tmp.renameTo(f)) { tmp.delete(); error("detections rename failed") }
+                }.isSuccess
                 if (wrote) persistSeqWritten = seq
                 wrote
             }
@@ -3860,6 +4127,10 @@ class AcabBleManager(private val context: Context) {
     }
 
     companion object {
+        /** The one sentence a user needs when a connect will not take. Kept byte-identical to iOS
+         *  BLEManager.pairWindowHint: this is user-facing copy and the two apps must not diverge. */
+        const val PAIR_WINDOW_HINT = "Turn the beacon off and on, then connect within two minutes."
+
         @Volatile private var INSTANCE: AcabBleManager? = null
 
         /** Process-wide singleton so the foreground service and the ViewModel share ONE

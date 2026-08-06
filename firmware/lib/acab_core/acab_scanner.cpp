@@ -18,6 +18,8 @@
 #include "netcam_detect.h"
 #include "desert_detect.h"
 #include "det_log.h"
+#include "sink_claim.h"   // acabClaimRollbackAllowed: the ABA-safe rollback decision
+#include "dedup_key.h"    // acabDedupKey: ONE derivation, shared with the host tests
 #include "acab_ble_service.h"
 
 #include <Arduino.h>
@@ -43,6 +45,16 @@ static portMUX_TYPE       gDedupMux = portMUX_INITIALIZER_UNLOCKED;
 static std::atomic<uint32_t> gTotal{0};      // both radios write it, so atomic
 static std::atomic<uint32_t> gBleSeen{0};    // raw BLE adverts seen (diagnostic)
 static std::atomic<uint32_t> gWifiSeen{0};   // raw 802.11 mgmt frames seen (diagnostic)
+// Sink-queue drop accounting. Atomic for the same reason as the counters above: both radio tasks
+// write them. The three drop categories are EXCLUSIVE by construction (one enqueue takes exactly
+// one branch), so their sum is the honest total and is what ships as `sdrop` in status.
+static std::atomic<uint32_t> gSinkDropDeliverOnly{0};  // live-notify item dropped; it just re-arrives
+static std::atomic<uint32_t> gSinkDropBuffered{0};     // buffer-bearing item dropped AFTER rollback
+static std::atomic<uint32_t> gSinkDropReplay{0};       // replay item dropped from one dump attempt
+static std::atomic<uint32_t> gSinkHighWater{0};        // deepest the queue has ever been
+// One definition for the queue depth: the high-water math derives depth from it, so a hand-edited
+// literal at the xQueueCreate call would silently skew every reported depth.
+#define ACAB_SINK_Q_LEN 32
 static volatile bool      gBleEnabled = true;   // app-toggleable BLE scan
 static volatile bool      gWifiEnabled = true;  // app-toggleable WiFi scan
 
@@ -59,6 +71,7 @@ struct DedupEntry {
     uint32_t      lastSeen;
     uint16_t      count;
     uint32_t      loggedGen;   // capture generation this entry last buffered in (0 = never)
+    uint32_t      logClaim;    // token of the claim that set loggedGen (see sink_claim.h)
     bool          alerted;     // tracker buzzer debounce: has the post-debounce alert fired yet
     int16_t       hnext;       // next entry index in this slot's hash bucket chain (-1 = end)
 };
@@ -102,6 +115,12 @@ static const uint32_t TRACKER_ALERT_DEBOUNCE_MS = 60000;
 // Offline-capture generation: bumped on each BLE disconnect so the first sighting of
 // every device AFTER the app leaves buffers once more, not just once per boot.
 static volatile uint32_t gCaptureGen = 1;
+// Monotonic token stamped on every offline-buffer claim. Only ever read/incremented while holding
+// gDedupMux, so a plain uint32_t is correct and an atomic would be misleading about the locking.
+// Wraparound is a non-issue: it would take ~4.3 billion buffered claims in one power cycle, and a
+// collision would additionally have to land on the same evicted-and-reinserted slot in the same
+// generation. See sink_claim.h for what the token defends against.
+static uint32_t gLogClaimCounter = 0;
 
 // Whitelist (app-pushed): MACs we drop silently - no report, beep, or mesh.
 #define ACAB_IGNORE_MAX 256
@@ -206,6 +225,37 @@ static void loadWatchList() {
 // O(1)-average bucket-chain walk instead of the old O(256) linear memcmp scan, so far less
 // runs with interrupts disabled; only a genuinely new device pays the O(256) free/oldest
 // search (and only that path mutates the hash chains).
+// LOOKUP ONLY: walks the bucket chain and returns nullptr on a miss. dedupFind (below) CREATES
+// OR EVICTS on a miss, which is right for ingest and catastrophic for failure recovery - a
+// rollback path that mutated the table merely by looking could evict a live entry to re-create one
+// the table had already decided to forget. Keep these two separate.
+// ---- the real dedup table, behind the injected interface acabSinkClaimRollback takes ----------
+// The rollback lives in sink_claim.h and can only see an AcabSinkClaim, so it is structurally
+// unable to look an entry up by d.mac. These three functions are the only bridge to the table.
+static DedupEntry* gRollbackHit = nullptr;   // set by claimTableLookup, consumed by claimTableRestore
+
+static DedupEntry* dedupLookup(AcabDeviceType type, const uint8_t mac[6], uint32_t bucket) {
+    for (int16_t i = gDedupBucket[bucket]; i >= 0; i = gDedup[i].hnext) {
+        DedupEntry* e = &gDedup[i];
+        if (e->type == type && memcmp(e->mac, mac, 6) == 0) return e;
+    }
+    return nullptr;
+}
+
+// (definitions for the claim-table bridge declared above)
+static bool claimTableLookup(void*, uint8_t type, const uint8_t key[6], uint32_t bucket,
+                             uint32_t* outLoggedGen, uint32_t* outLogClaim) {
+    gRollbackHit = dedupLookup((AcabDeviceType)type, key, bucket);
+    if (!gRollbackHit) return false;
+    *outLoggedGen = gRollbackHit->loggedGen;
+    *outLogClaim  = gRollbackHit->logClaim;
+    return true;
+}
+static void claimTableRestore(void*, uint32_t loggedGen) {
+    if (gRollbackHit) gRollbackHit->loggedGen = loggedGen;
+}
+static uint32_t claimTableGenNow(void*) { return gCaptureGen; }
+
 static DedupEntry* dedupFind(AcabDeviceType type, const uint8_t mac[6], uint32_t bucket) {
     // fast path: already tracked -> walk just this bucket's chain
     for (int16_t i = gDedupBucket[bucket]; i >= 0; i = gDedup[i].hnext) {
@@ -265,6 +315,13 @@ static void sinkTask(void*) {
         // flash write happens HERE, off both radio tasks. det_log no-ops when the app is
         // connected / buffering is disabled / no key - same guards as before, just now
         // evaluated on the sink task a beat later than at ingest.
+#ifdef ACAB_BENCH_SINK_STALL
+        // BENCH ONLY (capture builds; see the #error guard family in main.cpp). Makes the sink
+        // slow enough that the queue actually saturates on demand, so the rollback path can be
+        // exercised deliberately instead of waiting for a flash erase to collide with traffic.
+        // Never ship: this would drop most of a real capture on the floor.
+        vTaskDelay(pdMS_TO_TICKS(50));
+#endif
         if (it.buffer) detLogAppend(it.d);
         if (it.deliver && gSink) gSink(it.d, it.isNew);
     }
@@ -273,17 +330,8 @@ static void sinkTask(void*) {
 // Drones rotate their MAC and broadcast on both radios, so key them by UAS-ID
 // instead - the stable "one drone = one entry" identity. Everything else keys by
 // MAC. Returns d.mac, or a hashed 6-byte key written into scratch.
-static const uint8_t* dedupKey(const AcabDetection& d, uint8_t scratch[6]) {
-    if (d.type == ACAB_DRONE && d.id[0]) {
-        uint32_t h = 2166136261u;                  // FNV-1a over the UAS-ID
-        for (const char* p = d.id; *p; ++p) { h ^= (uint8_t)*p; h *= 16777619u; }
-        scratch[0] = (uint8_t)h;          scratch[1] = (uint8_t)(h >> 8);
-        scratch[2] = (uint8_t)(h >> 16);  scratch[3] = (uint8_t)(h >> 24);
-        scratch[4] = (uint8_t)d.id[0];    scratch[5] = 0xDD;   // tag byte, avoid MAC overlap
-        return scratch;
-    }
-    return d.mac;
-}
+// Moved to dedup_key.h so the rollback tests exercise the real derivation, not a copy.
+#define dedupKey acabDedupKey
 
 // Desert-mode notify gate. Desert mode reports every device in range, so it
 // emits a detection for every advert of every nearby device. Streaming all of
@@ -324,7 +372,14 @@ static void handleDetection(AcabDetection& d, bool isReplay = false) {
     if (isReplay) {
         d.replay = true;
         // replay delivers to the app but never buffers (no re-buffering of recovered records)
-        if (gSinkQ) { SinkItem it{d, false, true, false}; xQueueSend(gSinkQ, &it, 0); }
+        if (gSinkQ) {
+            SinkItem it{d, false, true, false};
+            // A dropped REPLAY record is lost from THIS dump attempt only - bbDump() does not
+            // erase the nRF ring (BCLR is a separate command), and the whole black box is a
+            // bench-only capture build. Counted, but not permanent loss; do not describe it as one.
+            if (xQueueSend(gSinkQ, &it, 0) != pdTRUE)
+                gSinkDropReplay.fetch_add(1, std::memory_order_relaxed);
+        }
         return;
     }
     uint32_t now = millis();
@@ -370,7 +425,38 @@ static void handleDetection(AcabDetection& d, bool isReplay = false) {
     // evicts the real ALPR / body-cam records the user synced to get. Live delivery of
     // nearby devices is unaffected; only the flash ring is gated.
     bool shouldBuffer = !debouncing && d.type != ACAB_NEARBY_DEVICE && (e->loggedGen != gCaptureGen);
-    if (shouldBuffer) e->loggedGen = gCaptureGen;
+    // Claim bookkeeping for the rollback path at the enqueue below. The claim is committed HERE,
+    // ~50 lines before the item actually reaches the sink queue, so if that send fails the claim
+    // has to be undoable - otherwise the device reads as "already buffered this generation" with
+    // nothing written. priorLoggedGen is restored rather than 0: gCaptureGen starts at 1 so 0
+    // happens to mean "never logged" today, but restoring the real prior value stays correct
+    // across generation wraparound and bakes in no sentinel assumption.
+    uint32_t priorLoggedGen = e->loggedGen;
+    uint32_t logClaim = 0;
+    uint32_t claimGen = gCaptureGen;
+    // COPY THE KEY THE CLAIM WAS MADE UNDER. The dedup key is NOT always the MAC: dedupKey()
+    // hashes the UAS ID for a Remote ID drone, deliberately, because drones rotate MACs across
+    // both radios. The rollback used to look the entry up by d.mac, which for exactly that device
+    // class never matches the entry it claimed - so entryFound came back false, the rollback
+    // refused, and the record stayed marked as already-buffered for the whole capture generation.
+    // The evidence-loss bug this whole mechanism exists to fix therefore survived intact for
+    // drones, while gSinkDropBuffered counted it as "dropped and rolled back".
+    //
+    // Copy once, here, and reuse the bytes: re-deriving in the rollback path would be a second
+    // chance to diverge (d.id could in principle differ by then).
+    AcabSinkClaim claim{};
+    claim.type           = (uint8_t)d.type;
+    memcpy(claim.key, key, 6);
+    claim.bucket         = bucket;
+    claim.priorLoggedGen = priorLoggedGen;
+    claim.captureGen     = claimGen;
+    claim.active         = shouldBuffer;
+    if (shouldBuffer) {
+        e->loggedGen = gCaptureGen;
+        logClaim = ++gLogClaimCounter;
+        e->logClaim = logClaim;
+        claim.token = logClaim;
+    }
     d.firstSeen = e->firstSeen;
     d.lastSeen  = e->lastSeen;
     d.count     = e->count;
@@ -423,7 +509,34 @@ static void handleDetection(AcabDetection& d, bool isReplay = false) {
         // committed loggedGen at ingest, so a dropped buffer item would be a non-retryable evidence
         // loss for this capture generation. deliver-only items still drop on overflow (a missed live
         // notify just re-arrives). the block only bites while the sink task is mid flash-erase.
-        xQueueSend(gSinkQ, &it, shouldBuffer ? pdMS_TO_TICKS(10) : 0);
+        // High-water mark BEFORE the send, so the depth reported is what this item faced.
+        {
+            uint32_t depth = ACAB_SINK_Q_LEN - (uint32_t)uxQueueSpacesAvailable(gSinkQ);
+            uint32_t hw = gSinkHighWater.load(std::memory_order_relaxed);
+            while (depth > hw &&
+                   !gSinkHighWater.compare_exchange_weak(hw, depth, std::memory_order_relaxed)) {}
+        }
+        if (xQueueSend(gSinkQ, &it, shouldBuffer ? pdMS_TO_TICKS(10) : 0) != pdTRUE) {
+            if (shouldBuffer) {
+                // THE FIX. Undo the claim so this device buffers again later in this same capture
+                // generation, instead of being silently marked done with nothing written. Guarded
+                // against the ABA race by the claim token - see sink_claim.h for why every
+                // condition is load-bearing. dedupLookup, never dedupFind: recovery must not
+                // create or evict.
+                // The rollback owns this: it takes ONLY the claim object, which carries the key
+                // copied at claim time. There is no AcabDetection in its scope, so reaching for
+                // d.mac here (the shipped bug, which made the rollback a no-op for every Remote ID
+                // drone) is now a compile error rather than a judgement call. See sink_claim.h.
+                static const AcabClaimTable kTable{ claimTableLookup, claimTableRestore,
+                                                    claimTableGenNow, nullptr };
+                portENTER_CRITICAL(&gDedupMux);
+                acabSinkClaimRollback(claim, kTable);
+                portEXIT_CRITICAL(&gDedupMux);
+                gSinkDropBuffered.fetch_add(1, std::memory_order_relaxed);
+            } else {
+                gSinkDropDeliverOnly.fetch_add(1, std::memory_order_relaxed);
+            }
+        }
     }
 }
 
@@ -981,6 +1094,15 @@ void acabScannerSetWatchList(const uint8_t macs[][6], int count) {
 uint32_t acabScannerTotalDetections() { return gTotal; }
 uint32_t acabScannerBleSeen()  { return gBleSeen; }
 uint32_t acabScannerWifiSeen() { return gWifiSeen; }
+uint32_t acabScannerSinkDropDeliverOnly() { return gSinkDropDeliverOnly.load(std::memory_order_relaxed); }
+uint32_t acabScannerSinkDropBuffered()    { return gSinkDropBuffered.load(std::memory_order_relaxed); }
+uint32_t acabScannerSinkDropReplay()      { return gSinkDropReplay.load(std::memory_order_relaxed); }
+uint32_t acabScannerSinkHighWater()       { return gSinkHighWater.load(std::memory_order_relaxed); }
+uint32_t acabScannerSinkDropTotal() {
+    // Valid as a plain sum: the three categories are exclusive by construction (one enqueue takes
+    // exactly one branch), so nothing is double-counted.
+    return acabScannerSinkDropDeliverOnly() + acabScannerSinkDropBuffered() + acabScannerSinkDropReplay();
+}
 
 // Co-processor (nRF) stats, fed by the dual-radio UART path.
 static std::atomic<uint32_t> gCoAdv{0}, gCoFwd{0}, gCoBb{0};
@@ -1080,9 +1202,29 @@ void acabScannerBegin(const AcabScannerConfig& cfg, AcabDetectionSink sink) {
     loadIgnoreList();   // restore the persisted whitelist before any frame arrives
     loadWatchList();    // restore the persisted starred-device watchlist too
 
+    // Reset the drop accounting for this session, so a counter can never read as the sum of two
+    // power cycles (acabScannerBegin is the one entry point that starts a capture session).
+    gSinkDropDeliverOnly.store(0, std::memory_order_relaxed);
+    gSinkDropBuffered.store(0, std::memory_order_relaxed);
+    gSinkDropReplay.store(0, std::memory_order_relaxed);
+    gSinkHighWater.store(0, std::memory_order_relaxed);
+
     // One sink task drains detections from both radios (see SinkItem above).
-    gSinkQ = xQueueCreate(32, sizeof(SinkItem));
-    xTaskCreatePinnedToCore(sinkTask, "acabSink", 8192, nullptr, 1, nullptr, 1);
+    //
+    // BOTH RETURNS ARE CHECKED, and failure is fatal rather than tolerated. An unchecked failure
+    // here is the worst shape this codebase has: a null queue makes every enqueue a silent no-op,
+    // and a created queue with no task to drain it fills once and then swallows everything
+    // forever - both look exactly like "nothing is out there" to the user, which is the one lie
+    // this product must never tell. Announce and restart; do not limp.
+    gSinkQ = xQueueCreate(ACAB_SINK_Q_LEN, sizeof(SinkItem));
+    if (!gSinkQ) {
+        Serial.println("[fatal] sink queue alloc failed - restarting");
+        delay(250); ESP.restart();
+    }
+    if (xTaskCreatePinnedToCore(sinkTask, "acabSink", 8192, nullptr, 1, nullptr, 1) != pdPASS) {
+        Serial.println("[fatal] sink task create failed - restarting");
+        delay(250); ESP.restart();
+    }
 
     if (cfg.enableWiFi) {
         WiFi.mode(WIFI_STA);
@@ -1095,10 +1237,17 @@ void acabScannerBegin(const AcabScannerConfig& cfg, AcabDetectionSink sink) {
         esp_wifi_set_promiscuous_rx_cb(&wifiRxCallback);
         esp_wifi_set_channel(cfg.wifiChannelHop ? 6 : cfg.wifiFixedChannel,
                              WIFI_SECOND_CHAN_NONE);
-        xTaskCreatePinnedToCore(wifiHopTask, "acabWifiHop", 4096, nullptr, 1, nullptr, 0);
+        if (xTaskCreatePinnedToCore(wifiHopTask, "acabWifiHop", 4096, nullptr, 1, nullptr, 0) != pdPASS) {
+            Serial.println("[fatal] wifi hop task create failed - restarting");
+            delay(250); ESP.restart();
+        }
 #ifdef ACAB_DIAG_WIFI
         gWifiDiagQ = xQueueCreate(64, sizeof(WifiDiagItem));
-        xTaskCreatePinnedToCore(wifiDiagTask, "acabWifiDiag", 4096, nullptr, 1, nullptr, 0);
+        if (!gWifiDiagQ ||
+            xTaskCreatePinnedToCore(wifiDiagTask, "acabWifiDiag", 4096, nullptr, 1, nullptr, 0) != pdPASS) {
+            Serial.println("[fatal] wifi diag task create failed - restarting");
+            delay(250); ESP.restart();
+        }
 #endif
     }
 

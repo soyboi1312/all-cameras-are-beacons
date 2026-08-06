@@ -13,6 +13,8 @@ import tech.acab.app.MainActivity
 class NrfDfuService : DfuBaseService() {
     override fun getNotificationTarget(): Class<out Activity> = MainActivity::class.java
 
-    // Release build: the library's verbose per-packet logging stays off.
-    override fun isDebug(): Boolean = false
+    // Follows the build type: off in release, on in debug, so a bench stall (bootloader response
+    // codes, PRN flow control) is diagnosable from logcat without a source edit. The library logs
+    // under the "DfuBaseService" / "DfuImpl" tags.
+    override fun isDebug(): Boolean = tech.acab.app.BuildConfig.DEBUG
 }

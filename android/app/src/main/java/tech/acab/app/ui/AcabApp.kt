@@ -29,6 +29,7 @@ import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Bluetooth
+import androidx.compose.material.icons.outlined.Info
 import androidx.compose.material.icons.filled.BluetoothDisabled
 import androidx.compose.material.icons.filled.ChevronRight
 import androidx.compose.material.icons.filled.Close
@@ -302,6 +303,34 @@ private fun ScanCtaPanel(permissionsGranted: Boolean, scanning: Boolean, onAllow
             else -> "Scan for boards"
         }
         PrimaryButton(label, onAllowScan)
+        PairWindowNote()
+    }
+}
+
+/** First-time pairing note, shown under the scan button whenever no board is connected.
+ *
+ *  A board that already belongs to a phone only accepts a NEW phone in the two minutes after it
+ *  powers on. That rule is invisible from the phone's side: the board hangs up before any
+ *  characteristic exists to explain itself, so a user who misses the window just sees a connect that
+ *  will not take. Stating it BEFORE the failure is worth more than any error message after it, which
+ *  is why this is always present rather than a dialog.
+ *
+ *  Deliberately says "already paired to another phone", not "your beacon": on a brand new board with
+ *  no bonds the rule does not apply at all (the firmware admits any phone until the board has an
+ *  owner), and telling a first-time customer to power-cycle would be a made-up ritual.
+ *  Mirrors iOS ConnectView.pairWindowNote. */
+@Composable
+private fun PairWindowNote() {
+    Spacer(Modifier.height(10.dp))
+    Row(verticalAlignment = Alignment.Top) {
+        Icon(Icons.Outlined.Info, contentDescription = null, tint = Acab.dim,
+             modifier = Modifier.size(14.dp))
+        Spacer(Modifier.width(8.dp))
+        Text(
+            "Connecting a beacon that is already paired to another phone? " +
+                AcabBleManager.PAIR_WINDOW_HINT,
+            color = Acab.dim, fontSize = 11.sp, fontFamily = Acab.mono, lineHeight = 15.sp,
+        )
     }
 }
 

@@ -403,7 +403,11 @@ int main() {
     { std::vector<uint8_t> f = mgmt(0x5, MAC_PUBLIC, MAC_PUBLIC); addSSID(f, "Flock-a1b2c3");
       chk("probe-response 'Flock-...' (IEs at 36)", runWiFi(f, &d), true, d.confidence, 88, d.detail); }
     { std::vector<uint8_t> f = mgmt(0x4, MAC_PUBLIC, MAC_PUBLIC); addSSID(f, "Flock-a1b2c3");
-      chk("probe-request 'Flock-...' (IEs at 24)", runWiFi(f, &d), true, d.confidence, 88, d.detail); }
+      // REGRADED 2026-08-05: a probe request names the network SOUGHT, not the transmitter, so it
+      // cannot carry the 88 self-attestation tier - that reported any phone with a "Flock-" network
+      // saved, on a rotating random MAC, as a Flock camera. Still detected, at the probe tier.
+      chk("probe-request 'Flock-...' (IEs at 24) -> probe tier, not 88", runWiFi(f, &d), true,
+          d.confidence, 72, d.detail, "probing for a Flock network"); }
     // No OUI gate on the SSID path on purpose: the camera's WiFi MAC belongs to the module maker.
     { std::vector<uint8_t> f = mgmt(0x8, MAC_RANDOM, MAC_RANDOM); addSSID(f, "Flock-a1b2c3");
       chk("SSID match needs no OUI (random MAC ok)", runWiFi(f, &d), true, d.confidence, 88, d.detail); }

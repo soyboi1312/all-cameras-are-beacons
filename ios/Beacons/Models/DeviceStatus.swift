@@ -45,6 +45,18 @@ struct DeviceStatus: Equatable {
                              // switch; "B" = button power + VBUS sense). nil on firmware older than
                              // 2026-07-28 and on single-radio builds, which never emit it.
 
+    /// BLE JSON contract version the board reports; 0 when the firmware predates the key.
+    let protoVersion: Int
+
+    /// The newest contract this build knows how to parse. Raise it in the SAME commit that teaches
+    /// the app that contract, never ahead of it.
+    static let supportedProtoVersion = 1
+
+    /// True when the BOARD speaks a newer contract than this app understands. The honest response
+    /// is to say so and stop trusting the parse, rather than keep reading fields whose meaning may
+    /// have changed underneath. Mirrors the firmware-update nudge, pointed the other way.
+    var needsNewerApp: Bool { protoVersion > DeviceStatus.supportedProtoVersion }
+
     var uptimeText: String {
         let h = uptime / 3600, m = (uptime % 3600) / 60, s = uptime % 60
         if h > 0 { return "\(h)h \(m)m" }
@@ -70,10 +82,15 @@ extension DeviceStatus: Decodable {
         case nrfv        // running nRF co-processor version (int); absent until the co-proc reports
         case chg         // battery charging flag
         case rev         // carrier revision, "A" or "B"; absent on older/single-radio firmware
+        case proto       // BLE JSON contract version; ABSENT MEANS 0 (see protoVersion)
     }
 
     init(from decoder: Decoder) throws {
         let k = try decoder.container(keyedBy: CodingKeys.self)
+        // ABSENT MEANS 0, not unknown. Every firmware shipped before 2026-08-06 omits this key and
+        // is fully compatible with this app, so a missing key must read as "fine", never as a
+        // warning. Only a board reporting a HIGHER proto than this app understands is a problem.
+        protoVersion = (try? k.decode(Int.self, forKey: .proto)) ?? 0
         firmware = (try? k.decode(String.self, forKey: .fw)) ?? "ESP32"
         uptime   = (try? k.decode(Int.self, forKey: .up)) ?? 0
         total    = (try? k.decode(Int.self, forKey: .total)) ?? 0
@@ -114,12 +131,12 @@ extension DeviceStatus {
     /// firmware manifest (see FirmwareManifestStore); bump this on a beacon-board release so the
     /// offline path still matches. The Colonel Panic single-board builds (oui-spy / mesh-detect)
     /// track a separate line now that the beacon board has moved ahead - see colonelLatestVersion.
-    static let latestVersion = "2.0.3"
+    static let latestVersion = "2.0.4"
 
     /// Latest firmware for the Colonel Panic single-board builds, which stayed on the shared
     /// acab_version.h default when the beacon board diverged. Offline fallback only; bump on a
     /// Colonel Panic release.
-    static let colonelLatestVersion = "2.0.3"
+    static let colonelLatestVersion = "2.0.4"
 
     /// Just the version number out of `fw` ("ACAB-ouispy 0.1.0" -> "0.1.0").
     var version: String { firmware.split(separator: " ").last.map(String.init) ?? firmware }

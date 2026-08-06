@@ -101,7 +101,7 @@ import tech.acab.app.ui.theme.tone
 
 /** Latest published beacon-board firmware; last-resort offline fallback for an unrecognized
  *  board label (known boards read their per-board version from the manifest). Bump on release. */
-private const val LATEST = "2.0.3"
+private const val LATEST = "2.0.4"
 
 /** Which config drawer section is open. Exactly one at a time (proposal 1g). */
 private enum class ConfigSection { NONE, FIRMWARE, RADIOS, DETECTORS, ALERTS, NOTIFY, DRIVE, DESERT, LED }
@@ -267,6 +267,9 @@ fun DeviceScreen(ble: AcabBleManager) {
     // Either radio behind (S3 OR nRF); a terminal we keep on screen (done / failed / partial).
     val combinedStale = (fwEntry?.let { ble.combinedUpdateStale(it) } ?: false) &&
         revisionMatchesManifest
+    // Which leg is behind, so the offer can name it. combinedStale is the OR of the two; without
+    // this the card said "Update available: v$latest" for a co-processor-only offer.
+    val s3Stale = (fwEntry?.let { ble.s3UpdateStale(it) } ?: false) && revisionMatchesManifest
     val combinedTerminal = combined.phase == CombinedUpdatePhase.DONE ||
         combined.phase == CombinedUpdatePhase.FAILED || combined.phase == CombinedUpdatePhase.PARTIAL
     // The crimson banner promotes only when the S3 firmware is behind, or the flow is live/just
@@ -283,6 +286,7 @@ fun DeviceScreen(ble: AcabBleManager) {
             entry = fwEntry,
             combined = combined,
             combinedStale = combinedStale,
+            s3Stale = s3Stale,
             onCombinedUpdate = { ble.startCombinedUpdate(it) },
             onCombinedCancel = { ble.cancelCombinedUpdate() },
             onCombinedDismiss = { ble.dismissCombinedUpdate() },
@@ -1097,6 +1101,9 @@ private fun FirmwareCard(
     entry: FirmwareBuild?,
     combined: CombinedUpdateProgress,
     combinedStale: Boolean,
+    /** The BOARD leg specifically is behind. [combinedStale] is the OR of both radios, so this is
+     *  what lets the offer copy tell "board is behind" from "only the co-processor is behind". */
+    s3Stale: Boolean,
     onCombinedUpdate: (FirmwareBuild) -> Unit,
     onCombinedCancel: () -> Unit,
     onCombinedDismiss: () -> Unit,
@@ -1137,8 +1144,13 @@ private fun FirmwareCard(
             // Either radio behind and self-updatable: offer the single one-click update. This is
             // the ONLY update button (no per-leg firmware/co-processor buttons anymore).
             combinedStale -> {
+                // Name what is ACTUALLY behind. When only the co-processor is stale the board is
+                // already on $latest, and the old unconditional "Update available: v$latest" read
+                // as a contradiction next to the "v$latest INSTALLED / v$latest LATEST" row right
+                // above it (seen on hardware 2026-08-06).
                 Text(
-                    "Update available: v$latest. You can install it here, over Bluetooth.",
+                    if (s3Stale) "Update available: v$latest. You can install it here, over Bluetooth."
+                    else "Co-processor update available. The board firmware is already current; this updates the second radio, over Bluetooth.",
                     color = Acab.warn, fontSize = 11.sp, fontFamily = Acab.mono,
                 )
                 CardButton("update", filled = true) { entry?.let { onCombinedUpdate(it) } }
@@ -1220,8 +1232,13 @@ private fun CombinedStatus(
 
     val detail = when (combined.phase) {
         CombinedUpdatePhase.FAILED -> combined.reason
+        // PARTIAL means "some leg didn't land", and which leg depends on the run. A co-processor-only
+        // run that fails never touched the board, so it must not claim the board was updated.
         CombinedUpdatePhase.PARTIAL ->
-            "Board updated. Second radio update didn't finish. Tap to finish the second radio, or dismiss - the button re-offers it on its own once the co-processor reports in."
+            if (combined.s3Updated)
+                "Board updated. Second radio update didn't finish. Tap to finish the second radio, or dismiss - the button re-offers it on its own once the co-processor reports in."
+            else
+                "Second radio update didn't finish. The board firmware is unchanged and still working. Tap to try the second radio again, or dismiss - the button re-offers it on its own once the co-processor reports in."
         CombinedUpdatePhase.DONE -> combined.notice ?: "Your beacon is up to date."
         else -> combined.notice
     }

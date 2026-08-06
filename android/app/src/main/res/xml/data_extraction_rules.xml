@@ -1,0 +1,24 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- API 31+ rules. Two INDEPENDENT sections, and both must be filled in: <cloud-backup> covers
+     Google's Auto-Backup, <device-transfer> covers the phone-to-phone migration flow. Excluding
+     only one leaves the other path open, which is the usual mistake here.
+
+     See backup_rules.xml for why everything is excluded. Short version: the detections log, the
+     ALPR cache, the tile cache and the prefs (which carry board key material) are exactly the data
+     this product promises never leaves the device. -->
+<data-extraction-rules>
+    <cloud-backup>
+        <exclude domain="root" />
+        <exclude domain="file" />
+        <exclude domain="database" />
+        <exclude domain="sharedpref" />
+        <exclude domain="external" />
+    </cloud-backup>
+    <device-transfer>
+        <exclude domain="root" />
+        <exclude domain="file" />
+        <exclude domain="database" />
+        <exclude domain="sharedpref" />
+        <exclude domain="external" />
+    </device-transfer>
+</data-extraction-rules>

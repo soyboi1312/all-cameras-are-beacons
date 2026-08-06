@@ -125,6 +125,17 @@ class AlprStore private constructor(context: Context) {
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     private val fetching = AtomicBoolean(false)
 
+    /** Bumped on every opt in/out. Work already in the air snapshots it and abandons itself if it
+     *  moved, so a download that started before an opt-out can't spend the bandwidth, publish the
+     *  points, or cache the file after one. Mirrors ALPRDataset.swift's enableGen. */
+    @Volatile private var enableGen = 0
+
+    /** Set when an opt-in arrived while a fetch was still running; honoured when it finishes. */
+    @Volatile private var restartWanted = false
+
+    /** True when [gen]'s work no longer speaks for the current opt-in state. */
+    private fun stale(gen: Int) = gen != enableGen || !_enabled.value
+
     init {
         if (_enabled.value) loadThenRefresh()
     }
@@ -135,6 +146,7 @@ class AlprStore private constructor(context: Context) {
         if (on == _enabled.value) return
         _enabled.value = on
         prefs.edit().putBoolean(KEY_ENABLED, on).apply()
+        enableGen++   // retire any load/fetch already running for the previous state
         if (on) {
             loadThenRefresh()
         } else {
@@ -163,9 +175,10 @@ class AlprStore private constructor(context: Context) {
         // this flow, so it must read in-flight before the tap handler returns, not whenever
         // the IO coroutine gets scheduled.
         _loading.value = true
+        val gen = enableGen
         scope.launch {
             try {
-                doFetch()
+                doFetch(gen)
             } finally {
                 fetching.set(false)
             }
@@ -180,18 +193,30 @@ class AlprStore private constructor(context: Context) {
      *  (and re-download a fresh cache), and a slow disk load can never land after, and
      *  clobber, a just-downloaded newer dataset. */
     private fun loadThenRefresh() {
-        if (!fetching.compareAndSet(false, true)) return
+        // A fetch already running is a real case, not a no-op: toggling the layer OFF and back ON
+        // quickly bumps enableGen twice, so the in-flight run abandons itself (correctly) - but it
+        // still holds [fetching], so this call used to return having done NOTHING, leaving the
+        // layer switched on with an empty map and no retry until the next app launch. Remember the
+        // request and let the finishing run honour it.
+        if (!fetching.compareAndSet(false, true)) { restartWanted = true; return }
+        val gen = enableGen
         scope.launch {
             try {
-                loadFromDisk()
-                doFetch()
+                loadFromDisk(gen)
+                doFetch(gen)
             } finally {
                 fetching.set(false)
+                // Re-run once for a request that arrived while this one was busy. Guarded on
+                // _enabled so an opt-out that landed last does not resurrect the layer.
+                if (restartWanted) {
+                    restartWanted = false
+                    if (_enabled.value) loadThenRefresh()
+                }
             }
         }
     }
 
-    private fun doFetch() {
+    private fun doFetch(gen: Int) {
         _loading.value = true
         var outcome = RefreshOutcome.FAILED
         try {
@@ -219,6 +244,8 @@ class AlprStore private constructor(context: Context) {
                 outcome = RefreshOutcome.UP_TO_DATE
                 return
             }
+            // Opted out while the manifest was in the air: stop before the expensive part.
+            if (stale(gen)) return
             // Past here we are committed to a real download, so the legend may auto-open to
             // surface the data credit. Everything above was a freshness check.
             _downloading.value = true
@@ -227,6 +254,9 @@ class AlprStore private constructor(context: Context) {
                 if (bytes.size.toLong() != size) return
                 if (sha256Hex(bytes) != sha) return
                 val parsed = parse(bytes) ?: return
+                // Last chance to catch an opt-out. Publishing below repopulates a map the user
+                // just cleared; the cache write puts ~1 MB on disk after they declined it.
+                if (stale(gen)) return
                 cacheFile.writeBytes(bytes)
                 prefs.edit().putString(KEY_VERSION, updated).apply()
                 makerIdx = parsed.makerIdx           // set BEFORE the nodes emit so a collector
@@ -255,12 +285,12 @@ class AlprStore private constructor(context: Context) {
         _lastChecked.value = now
     }
 
-    private fun loadFromDisk() {
+    private fun loadFromDisk(gen: Int) {
         if (!cacheFile.exists()) return
         val parsed = runCatching { parse(cacheFile.readBytes()) }.getOrNull() ?: return
         // Re-check after the read: the load is async now, and a quick toggle-on/off must not
         // leave ~1 MB of nodes resident while the layer is off ("opt out drops the points").
-        if (_enabled.value) {
+        if (!stale(gen)) {
             makerIdx = parsed.makerIdx
             makerTable = parsed.table
             confirmed = parsed.confirmed
@@ -272,6 +302,9 @@ class AlprStore private constructor(context: Context) {
     /** Nearest mapped camera to (lat, lon) for the detail screen's "matches a mapped camera" line.
      *  ~2km bounding-box prefilter keeps it cheap over the full set; equirectangular distance is
      *  accurate to well under 1% at these ranges. On-device only. null when the box is empty. */
+    // Coordinates here are range-guaranteed: parse() drops anything outside +/-90 / +/-180
+    // before it ever reaches this array, so no consumer re-checks. If a SECOND ingest path is
+    // ever added (bundled seed data, an import), it has to apply the same gate.
     fun nearest(lat: Double, lon: Double): Triple<Double, String, Boolean>? {
         val nd = _nodes.value; if (nd.isEmpty()) return null
         val idx = makerIdx; val tbl = makerTable; val conf = confirmed
@@ -318,8 +351,9 @@ class AlprStore private constructor(context: Context) {
                 INSTANCE ?: AlprStore(context.applicationContext).also { INSTANCE = it }
             }
 
-        /** Parsed dataset: interleaved latE7,lonE7 coords + a parallel maker index + the table. */
-        private class Parsed(val coords: IntArray, val makerIdx: IntArray, val table: Array<String>,
+        /** Parsed dataset: interleaved latE7,lonE7 coords + a parallel maker index + the table.
+         *  Internal, not private, only because [parse] returns it and [parse] is internal. */
+        internal class Parsed(val coords: IntArray, val makerIdx: IntArray, val table: Array<String>,
                             val confirmed: BooleanArray)
 
         /** Parse the "ALP3" binary (coords + per-node maker + per-node confidence tier). Also
@@ -332,8 +366,20 @@ class AlprStore private constructor(context: Context) {
          *  accusation ("nobody picked this manufacturer from a preset, so it may be misidentified")
          *  and a cache predating the field carries no evidence either way; defaulting the other way
          *  would paint a whole stale map amber purely because the file is old.
-         *  Mirrors iOS ALPRStore.parse constant for constant. */
-        private fun parse(bytes: ByteArray): Parsed? {
+         *
+         *  Mirrors iOS ALPRStore.parse constant for constant on the header, the table, the length
+         *  arithmetic and the coordinate range gate. Pinned on both sides in AlprDatasetTest /
+         *  ALPRDatasetTests off the same fixtures.
+         *
+         *  RESOLVED 2026-08-05, was a real divergence: iOS dropped an out-of-range coordinate and
+         *  this side kept it, so the same corrupt file gave the two apps a different node count and
+         *  a different unverifiedCount caption. Both now drop, together with the maker and tier. See
+         *  the WHY-DROP note on the range gate itself, ~40 lines below.
+         *
+         *  Internal rather than private so the unit tests can drive it on raw bytes instead of
+         *  through the network path. It is the one function in the app with a history of shipping a
+         *  schema mismatch to BOTH platforms at once, so it is worth the keyword. */
+        internal fun parse(bytes: ByteArray): Parsed? {
             if (bytes.size < 12) return null
             val a = 'A'.code.toByte(); val l = 'L'.code.toByte(); val pC = 'P'.code.toByte()
             if (bytes[0] != a || bytes[1] != l || bytes[2] != pC) return null
@@ -346,7 +392,7 @@ class AlprStore private constructor(context: Context) {
             buf.position(4)
             buf.int                                  // epochDay (unused here)
             val count = buf.int
-            if (count < 0 || count > 5_000_000) return null
+            if (count < 0 || count >= 5_000_000) return null   // >= to match iOS's `count < 5_000_000`
 
             var table = arrayOf("")
             if (hasMakers) {
@@ -366,12 +412,39 @@ class AlprStore private constructor(context: Context) {
             val idxBytes = if (hasMakers) count.toLong() else 0L
             val tierBytes = if (v3) count.toLong() else 0L
             if (bytes.size.toLong() != coordStart.toLong() + count.toLong() * 8 + idxBytes + tierBytes) return null
-            val coords = IntArray(count * 2)
-            for (i in 0 until count) { coords[i * 2] = buf.int; coords[i * 2 + 1] = buf.int }
-            val makerIdx = IntArray(count)
-            if (hasMakers) for (i in 0 until count) makerIdx[i] = buf.get().toInt() and 0xFF
-            val confirmed = BooleanArray(count) { true }          // pre-v3: no evidence, so no accusation
-            if (v3) for (i in 0 until count) confirmed[i] = (buf.get().toInt() and 0xFF) == 1
+            // Read the three parallel blocks, then DROP any node whose coordinate is out of range,
+            // together with its maker and tier so all three arrays stay in lockstep.
+            //
+            // WHY DROP RATHER THAN KEEP (aligned with iOS 2026-08-05, ALPRDataset.swift's
+            // CLLocationCoordinate2DIsValid guard). A latitude past +/-90 is not a camera in an
+            // odd place, it is corrupt bytes. It can never satisfy a viewport bounding box, so the
+            // map can never draw it, and nearest() can never meaningfully match it. Keeping it
+            // only inflates the "N cameras" caption with a node no surface can show. This is NOT
+            // the same call as the unverified-tier one, where the pin is a real location with
+            // uncertain attribution and staying counted keeps the data-quality problem visible.
+            // There is nothing to keep visible here.
+            //
+            // The parsers used to disagree: iOS dropped, Android kept, so the same corrupt file
+            // gave the two apps different node counts and different captions. The parity test
+            // suite added 2026-08-05 is what surfaced it. Keep both sides in step.
+            val rawLat = IntArray(count); val rawLon = IntArray(count)
+            for (i in 0 until count) { rawLat[i] = buf.int; rawLon[i] = buf.int }
+            val rawIdx = IntArray(count)
+            if (hasMakers) for (i in 0 until count) rawIdx[i] = buf.get().toInt() and 0xFF
+            val rawTier = BooleanArray(count) { true }            // pre-v3: no evidence, so no accusation
+            if (v3) for (i in 0 until count) rawTier[i] = (buf.get().toInt() and 0xFF) == 1
+
+            val keep = ArrayList<Int>(count)
+            for (i in 0 until count)
+                if (rawLat[i] in -900_000_000..900_000_000 && rawLon[i] in -1_800_000_000..1_800_000_000)
+                    keep.add(i)
+            val n = keep.size
+            val coords = IntArray(n * 2); val makerIdx = IntArray(n); val confirmed = BooleanArray(n)
+            for (k in 0 until n) {
+                val i = keep[k]
+                coords[k * 2] = rawLat[i]; coords[k * 2 + 1] = rawLon[i]
+                makerIdx[k] = rawIdx[i];   confirmed[k] = rawTier[i]
+            }
             return Parsed(coords, makerIdx, table, confirmed)
         }
 

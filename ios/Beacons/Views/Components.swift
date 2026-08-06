@@ -20,8 +20,20 @@ struct ACABWordmark: View {
             Text("beacons")
                 .font(ACABTheme.display(46, weight: .bold))
                 .foregroundStyle(ACABTheme.text)
-            if let subtitle { Kicker(subtitle, color: ACABTheme.faint) }
+                // A 46pt display face on the accessibility curve is wider than any iPhone. It also
+                // sets this VStack's width, which then dragged the subtitle off both edges with it,
+                // so this one line was the whole hero overflowing. Shrink to fit instead of
+                // truncating: the wordmark is the brand, and "Beac..." is worse than smaller type.
+                .lineLimit(1)
+                .minimumScaleFactor(0.4)
+            if let subtitle {
+                Kicker(subtitle, color: ACABTheme.faint)
+                    .multilineTextAlignment(.center)
+            }
         }
+        // Never wider than the screen, whatever the text size. Without this the VStack reports an
+        // ideal width larger than the viewport and everything inside it is clipped symmetrically.
+        .frame(maxWidth: .infinity)
     }
 }
 

@@ -38,6 +38,10 @@ import sys
 # has to carry it. Add a row when you cut a version, naming a string only that version introduces.
 CANARIES = {
     "2.0.3": ["Google Find Hub (separated)", "Ezviz"],
+    # "Arlo base station" is the ideal canary for this round: it is the detail string of the NEW
+    # SSID match path, so it exists in no earlier image. "Arlo" alone would also match the OUI
+    # table, which cannot prove the SSID rule shipped.
+    "2.0.4": ["Arlo base station", "Arlo"],
 }
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -101,6 +105,11 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--strings", nargs="*", default=[],
                     help="strings that MUST appear in every app image (this release's canaries)")
+    ap.add_argument("--production", action="store_true",
+                    help="RELEASE GATE mode: absence of an expected artifact is a FAILURE, not a "
+                         "skip; OTA signatures must be present and verify against the baked-in "
+                         "public key; the nRF DFU zip must be well-formed. Without this flag the "
+                         "script stays the lenient bench check it has always been.")
     args = ap.parse_args()
 
     src_mtime, src_path = newest_source_mtime()
@@ -112,6 +121,12 @@ def main():
     for p in glob.glob(os.path.join(SITE, "firmware/beacon-app.bin")):
         images.append(p)
     if not images:
+        # NOT a pass. Returning success here is how a release with NOTHING staged sails through
+        # the gate - the failure mode this script exists to prevent, in its own front door.
+        if args.production:
+            print("  FAIL  no staged app images found, and --production requires them")
+            FAIL.append("no staged app images")
+            return 1
         print("  no staged app images found; nothing to verify")
         return 0
 
@@ -167,6 +182,82 @@ def main():
             check(hashlib.sha256(data).hexdigest() == app.get("sha256"), f"{name}: sha256 matches {fn}")
             check(len(data) == app.get("size"), f"{name}: size matches {fn}")
             check(b.get("version") == want_ver, f"{name}: manifest version {b.get('version')} == {want_ver}")
+
+            # SIGNATURE. The staging scripts WARN-AND-CONTINUE when openssl fails, which produces a
+            # manifest carrying an empty signature - and until now this verifier accepted it. An
+            # unsigned image is one the board's OTA gate will reject in the field, so shipping it
+            # is a silent bricked-update release.
+            if args.production:
+                sig = (app.get("sig") or "").strip()
+                check(bool(sig), f"{name}: OTA signature present and non-empty")
+                if sig:
+                    # HEX, not Base64, and the key is beacon_ota_pub.pem (or .der). Both were wrong
+                    # in the first version of this gate: it looked for a beacon_ota_key.pub that has
+                    # never existed and b64decoded a hex DER signature. Either mistake fails EVERY
+                    # legitimate release, which is the worst possible failure for a release gate -
+                    # it trains you to ignore it. build-beacon-flasher.sh emits
+                    # `openssl dgst -sha256 -sign ... | xxd -p`, i.e. hex of a DER ECDSA signature,
+                    # which is why a real one starts with 3044/3045.
+                    pub = os.path.join(REPO, "firmware/tools/ota_signing/beacon_ota_pub.pem")
+                    if not os.path.exists(pub):
+                        pub = os.path.join(REPO, "firmware/tools/ota_signing/beacon_ota_pub.der")
+                    if not os.path.exists(pub):
+                        check(False, f"{name}: no OTA public key found to verify against")
+                    else:
+                        import binascii, subprocess, tempfile
+                        try:
+                            raw = binascii.unhexlify(sig.strip())
+                        except Exception as e:
+                            raw = None
+                            check(False, f"{name}: signature is not hex ({e}); "
+                                         f"expected hex DER from build-beacon-flasher.sh")
+                        if raw:
+                            with tempfile.NamedTemporaryFile(delete=False) as sf:
+                                sf.write(raw); sigf = sf.name
+                            keyform = "PEM" if pub.endswith(".pem") else "DER"
+                            r = subprocess.run(
+                                ["openssl", "dgst", "-sha256", "-verify", pub,
+                                 "-keyform", keyform, "-signature", sigf, p],
+                                capture_output=True)
+                            check(r.returncode == 0,
+                                  f"{name}: OTA signature VERIFIES against {os.path.basename(pub)}")
+                            os.unlink(sigf)
+
+        # nRF DFU package. Never validated before, so a corrupt or version-mismatched zip could
+        # ship: the phone drives that update, and a bad package fails mid-DFU on the user's board.
+        if args.production:
+            print("\nnRF DFU PACKAGE")
+            zips = glob.glob(os.path.join(SITE, "firmware", "*dfu*.zip"))
+            check(bool(zips), "an nRF DFU zip is staged")
+            for z in zips:
+                rel = os.path.relpath(z, os.path.dirname(REPO))
+                try:
+                    import zipfile
+                    with zipfile.ZipFile(z) as zf:
+                        bad = zf.testzip()
+                        check(bad is None, f"{rel} is a well-formed zip")
+                        names = zf.namelist()
+                        check(any(n.endswith("manifest.json") for n in names),
+                              f"{rel} contains a DFU manifest.json")
+                except Exception as e:
+                    check(False, f"{rel} could not be read as a zip ({e})")
+
+    # PROVENANCE. A commit SHA alone cannot identify the bytes when the tree is dirty, so the
+    # dirty digest is part of the record, not a footnote.
+    if args.production:
+        print("\nPROVENANCE")
+        import subprocess
+        for label, path in (("acab", REPO), ("soyboi.tech", SITE)):
+            try:
+                sha = subprocess.run(["git", "-C", path, "rev-parse", "HEAD"],
+                                     capture_output=True, text=True).stdout.strip()[:12]
+                dirty = subprocess.run(["git", "-C", path, "status", "--porcelain"],
+                                       capture_output=True, text=True).stdout
+                digest = hashlib.sha256(dirty.encode()).hexdigest()[:12] if dirty.strip() else "clean"
+                print(f"  --    {label}: {sha} (working tree: {digest})")
+            except Exception as e:
+                print(f"  --    {label}: provenance unavailable ({e})")
+        print("  --    toolchain: espressif32@6.13.0, NimBLE-Arduino@1.4.3")
 
     print(f"\n{len(OK)} passed, {len(FAIL)} failed\n")
     if FAIL:

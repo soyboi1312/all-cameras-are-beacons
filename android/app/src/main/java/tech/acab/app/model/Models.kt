@@ -496,6 +496,8 @@ data class DeviceStatus(
      *  DeviceStatus.boardRev, which Android was missing entirely, along with the OTA revision
      *  gate that reads it. */
     val boardRev: String?,
+    /** BLE JSON contract version the board reports; 0 when the firmware predates the key. */
+    val protoVersion: Int,
 ) {
     /** Just the version, e.g. "0.2.3" from "ACAB-ouispy 0.2.3". */
     val version: String get() = firmware.substringAfterLast(' ', firmware)
@@ -506,7 +508,16 @@ data class DeviceStatus(
     /** True for a Mesh-Detect board (no buzzer; its fw label starts "mesh-detect"). */
     val isMeshDetect: Boolean get() = firmware.startsWith("mesh-detect")
 
+    /** True when the BOARD speaks a newer contract than this app understands. The honest response
+     *  is to say so and stop trusting the parse, rather than keep reading fields whose meaning may
+     *  have changed underneath. Mirrors iOS DeviceStatus.needsNewerApp. */
+    val needsNewerApp: Boolean get() = protoVersion > SUPPORTED_PROTO_VERSION
+
     companion object {
+        /** Newest BLE JSON contract this build can parse. Raise it in the SAME commit that teaches
+         *  the app that contract, never ahead of it. Mirrors iOS supportedProtoVersion. */
+        const val SUPPORTED_PROTO_VERSION = 1
+
         fun fromJson(o: JSONObject) = DeviceStatus(
             firmware = o.optString("fw", ""),
             uptime = o.optInt("up", 0),
@@ -554,6 +565,10 @@ data class DeviceStatus(
             // carrier revision; null when the key is absent. optString would hand back "" for a
             // missing key, which is not the same thing as "not told", so screen it explicitly.
             boardRev = o.optString("rev", "").ifEmpty { null },
+            // ABSENT MEANS 0, not unknown. Every firmware shipped before 2026-08-06 omits this key
+            // and is fully compatible with this app, so a missing key must read as "fine". Only a
+            // board reporting a HIGHER proto than this build understands is a problem.
+            protoVersion = o.optInt("proto", 0),
         )
     }
 }

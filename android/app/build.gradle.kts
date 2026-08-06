@@ -18,14 +18,20 @@ val acabKeyPassword = (findProperty("ACAB_KEY_PASSWORD") as String?) ?: System.g
 
 android {
     namespace = "tech.acab.app"
-    compileSdk = 36   // Android 16: compile against the Live Update promote APIs (targetSdk stays 35)
+    compileSdk = 36   // Android 16: compile against the Live Update promote APIs
 
     defaultConfig {
         applicationId = "tech.acab.app"
         minSdk = 26
-        targetSdk = 35
-        versionCode = 20
-        versionName = "2.0.3"
+        // 36 from 2026-08-06. Play requires API 36 for UPDATES from 2026-08-31, so this is a
+        // deadline, not a preference. Raising it opts the app into Android 16's enforced
+        // behaviours (edge-to-edge is no longer opt-out-able being the big one), which is why the
+        // PR carries a manual QA checklist rather than a claim that it works: insets on Map,
+        // Device and Detail, orientation changes, the Drive foreground service, and large-screen
+        // layout all need eyes on a real 16 device.
+        targetSdk = 36
+        versionCode = 21
+        versionName = "2.0.4"
     }
 
     signingConfigs {
@@ -75,6 +81,10 @@ android {
 
     buildFeatures {
         compose = true
+        // BuildConfig.VERSION_NAME feeds the osmdroid tile User-Agent (see configureOsmdroid).
+        // OSM's tile usage policy wants a UA that identifies the app AND its version, and reading
+        // it from BuildConfig means the version can never drift from build.gradle.kts.
+        buildConfig = true
     }
 }
 
@@ -110,4 +120,10 @@ dependencies {
     // scorer is deliberately pure Kotlin with no Android types, so it runs on a plain JVM against
     // the same vectors the Swift side asserts. Run with `./gradlew :app:testDebugUnitTest`.
     testImplementation("junit:junit:4.13.2")
+    // Real org.json on the unit-test classpath. Android's bundled org.json is a STUB in local unit
+    // tests: every method throws "not mocked", so any test that parses a status or detection JSON
+    // fails for a reason that has nothing to do with the code under test. TEST-ONLY, so it does not
+    // ship and does not affect F-Droid cleanliness. The alternative (returnDefaultValues = true)
+    // would silently hand back nulls and make the fixtures pass while proving nothing.
+    testImplementation("org.json:json:20240303")
 }

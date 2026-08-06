@@ -267,9 +267,14 @@ struct DeviceView: View {
                         .foregroundStyle(open ? ACABTheme.accent : ACABTheme.dim)
                         .frame(width: 22)
                     VStack(alignment: .leading, spacing: 2) {
+                        // fixedSize(vertical:) lets both lines GROW DOWNWARD at large Dynamic Type
+                        // instead of widening the row. Without it the HStack is sized by the text's
+                        // ideal width and the whole page runs off the screen edge.
                         Text(title).font(ACABTheme.display(15, weight: .medium)).foregroundStyle(ACABTheme.text)
+                            .fixedSize(horizontal: false, vertical: true)
                         Kicker(kicker)
                     }
+                    .frame(maxWidth: .infinity, alignment: .leading)
                     Spacer(minLength: 8)
                     Image(systemName: open ? "chevron.up" : "chevron.down")
                         .font(.system(size: 13, weight: .semibold))
@@ -611,9 +616,32 @@ struct DeviceView: View {
         return fromManifest ?? URL(string: "https://soyboi1312.github.io/all-cameras-are-beacons/")!
     }
 
-    private var firmwareCard: some View {
+    /// TYPE-ERASED ON PURPOSE - do not "clean this up" back to `some View`.
+    ///
+    /// This is the deepest view in the app: a three-way state branch whose arms are themselves
+    /// stacks of heavily-modified buttons (`.background(_:in:)` + `.overlay(strokeBorder:)` each
+    /// add another `ModifiedContent` layer), and the whole thing is handed to the GENERIC
+    /// `foldRow<Content:>` as its Content. Left concrete, the composed static type nests deep
+    /// enough that flipping the branch - which is exactly what tapping "update" does - made
+    /// SwiftUI instantiate that type's metadata at runtime, and the Swift runtime's RECURSIVE
+    /// demangler overflowed the 1 MB main-thread stack. The app died on the tap, every time.
+    ///
+    /// Reproduced on device 2026-08-06 (Beacons-2026-08-06-115438.ips): EXC_BAD_ACCESS /
+    /// KERN_PROTECTION_FAILURE on the stack guard page, thread 0, frames
+    ///   closure #1 in DeviceView.firmwareCard.getter
+    ///   -> __swift_instantiateConcreteTypeFromMangledNameV2
+    ///   -> swift_getTypeByMangledNameInContext2
+    ///   -> decodeMangledType / decodeGenericArgs x37.
+    ///
+    /// `AnyView` boxes the branch so the mangled name stays shallow. The cost is that SwiftUI
+    /// cannot diff across the box, which is free here: the three arms are different types and
+    /// would be replaced wholesale anyway.
+    ///
+    /// VERIFIED on the same device that produced the crash: with this boxing (plus the matching
+    /// boxing on `combinedControlButtons`) tapping the firmware card no longer terminates the app.
+    private var firmwareCard: AnyView {
         let installed = ble.status?.version
-        return VStack(alignment: .leading, spacing: 12) {
+        return AnyView(VStack(alignment: .leading, spacing: 12) {
             Kicker("FIRMWARE")
             HStack(alignment: .firstTextBaseline) {
                 VStack(alignment: .leading, spacing: 2) {
@@ -634,20 +662,27 @@ struct DeviceView: View {
             // One-click combined update: ONE button that flashes the board firmware (S3) and, when
             // it applies, the co-processor (nRF) in a single determinate flow. The transfer engines
             // are unchanged; BLEManager+CombinedUpdate sequences them and merges their progress.
-            if ble.combinedState.isRunning || combinedTerminal {
-                combinedProgressView                // running, or just finished (done / failed / partial)
-            } else if combinedStale {
-                combinedOfferView                   // either radio is behind: offer the single update
-            } else {
-                firmwareStatusLine                  // up to date, or outdated with browser guidance
-            }
+            firmwareCardState
             // Manual refresh stays reachable except mid-update, so a stale cached manifest can be
             // re-fetched even when an update already looks available.
             if !ble.combinedState.isRunning {
                 checkForUpdatesButton
             }
         }
-        .panel()
+        .panel())
+    }
+
+    /// The three-way state branch, boxed so `firmwareCard`'s type does not carry the whole
+    /// progress/offer/status subtree inside two nested `_ConditionalContent` layers. See the
+    /// stack-overflow note on `firmwareCard`.
+    private var firmwareCardState: AnyView {
+        if ble.combinedState.isRunning || combinedTerminal {
+            return AnyView(combinedProgressView)   // running, or just finished (done / failed / partial)
+        }
+        if combinedStale {
+            return AnyView(combinedOfferView)      // either radio is behind: offer the single update
+        }
+        return AnyView(firmwareStatusLine)         // up to date, or outdated with browser guidance
     }
 
     // MARK: one-click combined update UI
@@ -666,6 +701,12 @@ struct DeviceView: View {
         guard let e = fwEntry, revisionMatchesManifest else { return false }
         return ble.combinedUpdateStale(entry: e, latest: latestVersion)
     }
+    /// The BOARD leg specifically is behind. `combinedStale` is the OR of both radios, so this is
+    /// what lets the offer copy tell "board is behind" from "only the co-processor is behind".
+    private var s3Stale: Bool {
+        guard let e = fwEntry, revisionMatchesManifest else { return false }
+        return ble.s3UpdateStale(entry: e, latest: latestVersion)
+    }
     /// The combined flow is at a terminal point we keep on screen (done / failed / partial).
     private var combinedTerminal: Bool {
         switch ble.combinedState { case .done, .failed, .partial: return true; default: return false }
@@ -676,7 +717,12 @@ struct DeviceView: View {
             HStack(spacing: 8) {
                 Image(systemName: "arrow.down.circle.fill")
                     .font(.system(size: 13)).foregroundStyle(ACABTheme.accent)
-                Text("Update available: v\(latestVersion). You can install it here, over Bluetooth.")
+                // Name what is ACTUALLY behind. When only the co-processor is stale the board is
+                // already on latestVersion, and the old unconditional wording read as a
+                // contradiction next to the "vX INSTALLED / vX LATEST" row directly above it.
+                Text(s3Stale
+                     ? "Update available: v\(latestVersion). You can install it here, over Bluetooth."
+                     : "Co-processor update available. The board firmware is already current; this updates the second radio, over Bluetooth.")
                     .font(ACABTheme.mono(11)).foregroundStyle(ACABTheme.dim)
                     .fixedSize(horizontal: false, vertical: true)
                 Spacer(minLength: 0)
@@ -732,39 +778,46 @@ struct DeviceView: View {
         }
     }
 
-    @ViewBuilder
-    private var combinedControlButtons: some View {
+    /// Boxed for the same reason as `firmwareCard`: three arms, each a Button carrying a
+    /// `.background(_:in:)` and an `.overlay(strokeBorder:)`, sitting inside the progress arm of
+    /// the card's own branch. This is the single biggest contributor to the nesting depth that
+    /// overflowed the demangler's stack.
+    private var combinedControlButtons: AnyView {
         if ble.combinedState.isRunning {
-            Button(role: .destructive) { ble.combinedCancel() } label: {
-                Text("Cancel").font(ACABTheme.display(14, weight: .semibold))
-                    .frame(maxWidth: .infinity).padding(.vertical, 11)
-                    .foregroundStyle(ACABTheme.accent)
-                    .background(ACABTheme.bg2, in: RoundedRectangle(cornerRadius: ACABTheme.radiusSm, style: .continuous))
-                    .overlay(RoundedRectangle(cornerRadius: ACABTheme.radiusSm).strokeBorder(ACABTheme.lineStrong, lineWidth: 1))
-            }
-            .buttonStyle(.plain)
-        } else if case .partial = ble.combinedState {
+            return AnyView(secondaryButton("Cancel", tone: ACABTheme.accent,
+                                           border: ACABTheme.lineStrong, role: .destructive) {
+                ble.combinedCancel()
+            })
+        }
+        if case .partial = ble.combinedState {
             // S3 took; the second radio didn't finish. The same primary button re-offers just the
             // nRF leg (the S3 is current now, so a fresh run does the co-processor only).
-            combinedUpdateButton(title: "finish second radio")
-            Button { ble.dismissCombinedUpdate() } label: {
-                Text("Not now").font(ACABTheme.display(14, weight: .semibold))
-                    .frame(maxWidth: .infinity).padding(.vertical, 11)
-                    .foregroundStyle(ACABTheme.dim)
-                    .background(ACABTheme.bg2, in: RoundedRectangle(cornerRadius: ACABTheme.radiusSm, style: .continuous))
-                    .overlay(RoundedRectangle(cornerRadius: ACABTheme.radiusSm).strokeBorder(ACABTheme.line, lineWidth: 1))
-            }
-            .buttonStyle(.plain)
-        } else {
-            Button { ble.dismissCombinedUpdate() } label: {
-                Text("Done").font(ACABTheme.display(14, weight: .semibold))
-                    .frame(maxWidth: .infinity).padding(.vertical, 11)
-                    .foregroundStyle(ACABTheme.dim)
-                    .background(ACABTheme.bg2, in: RoundedRectangle(cornerRadius: ACABTheme.radiusSm, style: .continuous))
-                    .overlay(RoundedRectangle(cornerRadius: ACABTheme.radiusSm).strokeBorder(ACABTheme.line, lineWidth: 1))
-            }
-            .buttonStyle(.plain)
+            // Spacing 12 matches what the enclosing VStack gave these when they were loose
+            // siblings in a ViewBuilder tuple, so the box does not change the layout.
+            return AnyView(VStack(alignment: .leading, spacing: 12) {
+                combinedUpdateButton(title: "finish second radio")
+                secondaryButton("Not now") { ble.dismissCombinedUpdate() }
+            })
         }
+        return AnyView(secondaryButton("Done") { ble.dismissCombinedUpdate() })
+    }
+
+    /// The card's flat secondary button. Factored out because all three control arms drew the same
+    /// stack of modifiers inline, and every repetition of it deepened the composed view type that
+    /// overflowed the demangler (see `firmwareCard`).
+    private func secondaryButton(_ title: String,
+                                 tone: Color = ACABTheme.dim,
+                                 border: Color = ACABTheme.line,
+                                 role: ButtonRole? = nil,
+                                 action: @escaping () -> Void) -> some View {
+        Button(role: role, action: action) {
+            Text(title).font(ACABTheme.display(14, weight: .semibold))
+                .frame(maxWidth: .infinity).padding(.vertical, 11)
+                .foregroundStyle(tone)
+                .background(ACABTheme.bg2, in: RoundedRectangle(cornerRadius: ACABTheme.radiusSm, style: .continuous))
+                .overlay(RoundedRectangle(cornerRadius: ACABTheme.radiusSm).strokeBorder(border, lineWidth: 1))
+        }
+        .buttonStyle(.plain)
     }
 
     private var combinedStatusLabel: String {
@@ -776,7 +829,12 @@ struct DeviceView: View {
     private var combinedDetailText: String? {
         switch ble.combinedState {
         case .failed(let r): return r
-        case .partial:       return "Board updated. Second radio update didn't finish. Tap to finish the second radio, or dismiss - the button re-offers it on its own once the co-processor reports in."
+        // PARTIAL means "some leg didn't land", and which leg depends on the run. A co-processor-only
+        // run that fails never touched the board, so it must not claim the board was updated.
+        case .partial:
+            return ble.combinedS3Updated
+                ? "Board updated. Second radio update didn't finish. Tap to finish the second radio, or dismiss - the button re-offers it on its own once the co-processor reports in."
+                : "Second radio update didn't finish. The board firmware is unchanged and still working. Tap to try the second radio again, or dismiss - the button re-offers it on its own once the co-processor reports in."
         case .done:          return ble.combinedNotice ?? "Your beacon is up to date."
         default:             return ble.combinedNotice
         }

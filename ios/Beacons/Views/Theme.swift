@@ -60,11 +60,31 @@ enum ACABTheme {
     // MARK: Type
     // Display = Space Grotesk, data = JetBrains Mono (bundled in Resources/Fonts).
     // Each weight maps to the nearest bundled cut.
+    //
+    // relativeTo: is the only thing making this app honour Dynamic Type. Font.custom(_:size:)
+    // without it is frozen at the literal point size, so someone running the largest text
+    // setting saw no change anywhere in the app. Everything renders through these two
+    // helpers, so this is the single place it has to be fixed.
     static func display(_ size: CGFloat, weight: Font.Weight = .regular) -> Font {
-        Font.custom(spaceGrotesk(weight), size: size)
+        Font.custom(spaceGrotesk(weight), size: size, relativeTo: scaleAnchor(size))
     }
     static func mono(_ size: CGFloat, weight: Font.Weight = .regular) -> Font {
-        Font.custom(jetBrains(weight), size: size)
+        Font.custom(jetBrains(weight), size: size, relativeTo: scaleAnchor(size))
+    }
+
+    /// Which system curve a point size rides as the user's text size changes.
+    /// Derived from the size rather than fixed per helper because the curves diverge hard at
+    /// accessibility sizes: caption roughly quadruples, largeTitle less than doubles. Putting
+    /// 9pt chrome and a 62pt counter on the same curve either leaves the chrome unreadable or
+    /// bursts the counter out of the radar scope. Base sizes are untouched, so the layout at
+    /// the default text setting is unchanged.
+    private static func scaleAnchor(_ size: CGFloat) -> Font.TextStyle {
+        switch size {
+        case ..<12:  return .caption      // kickers, RSSI, timestamps, MAC tails
+        case ..<18:  return .body         // device names, prose, anything actually read
+        case ..<34:  return .title        // screen titles, stat values
+        default:     return .largeTitle   // radar count, connect-screen wordmark
+        }
     }
 
     private static func spaceGrotesk(_ w: Font.Weight) -> String {
@@ -113,12 +133,29 @@ struct Kicker: View {
     let text: String
     var color: Color = ACABTheme.faint
     init(_ text: String, color: Color = ACABTheme.faint) { self.text = text; self.color = color }
+
+    /// Dynamic Type only started reaching this label when ACABTheme.mono gained `relativeTo:`.
+    /// Before that, Font.custom(_:size:) was frozen at the literal point size, so the
+    /// `fixedSize(horizontal: true)` below could never do any harm. Once the text actually scaled,
+    /// that modifier - which means "never compress me, take my ideal width" - made every row
+    /// carrying a Kicker wider than the screen, and the Device page ran off the left edge.
+    @Environment(\.dynamicTypeSize) private var dynamicTypeSize
+
+    /// True at any size above the system default. The threshold is deliberately "larger than
+    /// default" rather than "accessibility size": the overflow starts well before the
+    /// accessibility range, and the point is that DEFAULT layout is byte-for-byte what it was.
+    private var scaled: Bool { dynamicTypeSize > .large }
+
     var body: some View {
         Text(text)
             .font(ACABTheme.mono(10.5, weight: .medium))
             .tracking(1.6)
             .foregroundStyle(color)
-            .lineLimit(1)
-            .fixedSize(horizontal: true, vertical: false)
+            // At default size: one line, hug the content, exactly as before. Above it: let the
+            // label WRAP instead of forcing its row past the screen edge. A kicker is a short
+            // uppercase caption, so two lines at large text reads fine; a row you cannot see the
+            // left half of does not.
+            .lineLimit(scaled ? nil : 1)
+            .fixedSize(horizontal: !scaled, vertical: true)
     }
 }

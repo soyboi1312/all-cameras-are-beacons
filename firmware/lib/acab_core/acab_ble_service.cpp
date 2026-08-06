@@ -11,6 +11,10 @@
 #include "drone_detect.h"
 #include "netcam_detect.h"
 #include "acab_scanner.h"
+#include "coredump_report.h"
+#include "detect_elide.h"   // live-notify field elision order (small-MTU links)
+#include "pair_window.h"    // rollover-safe window comparison (host-tested)
+#include <atomic>
 #include "det_log.h"
 #include "ota_update.h"
 
@@ -163,6 +167,36 @@ static portMUX_TYPE      gGpsMux = portMUX_INITIALIZER_UNLOCKED;
 // Build label for the status "fw" string (oui-spy vs mesh-detect). Set in acabBleBegin.
 static const char* gFwLabel = "ACAB-ouispy";
 static int gBatteryPct = -1;   // battery %; stays -1 until a sense-divider board reports it
+// Live-notify MTU accounting. gNotifyElided counts records that FIT after giving up optional RID
+// enrichment (the alert still went out, just shorter); gNotifyOverCap counts the residual case
+// where even the minimal record does not fit, which IS a lost live sighting. Both are surfaced in
+// the {"diag":true} reply. Atomic because the notify runs off the sink task.
+// Pairing-window deadline in millis(). 0 = never opened, i.e. closed. RAM ONLY, deliberately: a
+// power cycle is the documented way to reopen it, so persisting it would defeat the whole design.
+static volatile uint32_t gPairWindowUntil = 0;
+static volatile bool     gPairWindowArmed = false;
+// One-way latch. See pair_window.h: the signed millis() comparison flips sign after ~24.8 days of
+// uptime and would report the window OPEN again. Once closed, stays closed until a power cycle,
+// which is already the only documented way to reopen it.
+static volatile bool     gPairWindowLatchedClosed = false;
+// Does THIS TARGET enforce the pairing window at all? False unless the target armed the window at
+// least once, which only beacon-board does.
+//
+// This flag exists because the gate lives in shared code. Without it, a target that never calls
+// acabBleOpenPairingWindow() (mesh-detect) inherits the REJECTION with no way to ever open a
+// window, i.e. no phone could pair to it again, ever. That is strictly worse than not having the
+// feature. Enforcement is therefore opt-in, and a target that does not opt in behaves exactly as it
+// did before this feature existed. Deliberately NOT a compile-time flag: the arming call site is
+// the honest declaration of intent, and one mechanism beats two.
+static volatile bool     gPairGateEnabled = false;
+// Has advertising been INTENTIONALLY started? False between acabBleBegin() and
+// acabBleStartAdvertising() on targets that defer. The advertising supervisor in the tick below
+// must respect this: it exists to restart an advertisement that stopped unexpectedly, and without
+// the flag it would helpfully start the one we are deliberately holding back.
+static volatile bool     gAdvIntended = false;
+
+static std::atomic<uint32_t> gNotifyElided{0};
+static std::atomic<uint32_t> gNotifyOverCap{0};
 static bool gCharging = false; // battery charging (dual-radio "chg"); set by acabBleSetCharging
 
 static NimBLEServer*         gServer = nullptr;
@@ -338,7 +372,7 @@ static bool     gWatchHadContent  = false;
 
 // ---- server connection lifecycle ----
 class ServerCb : public NimBLEServerCallbacks {
-    void onConnect(NimBLEServer*, ble_gap_conn_desc* d) override {
+    void onConnect(NimBLEServer* srv, ble_gap_conn_desc* d) override {
         // desc overload: peer_id_addr is the RESOLVED identity when the bond resolved, and still
         // the rotating RPA when it did not. That one field separates the two cases at connect
         // time, before security has had a chance to fail.
@@ -346,6 +380,34 @@ class ServerCb : public NimBLEServerCallbacks {
                              d->peer_id_addr.type, d->peer_id_addr.val[5], d->peer_id_addr.val[4],
                              d->peer_id_addr.val[3], d->peer_id_addr.val[2],
                              d->peer_id_addr.val[1], d->peer_id_addr.val[0]);
+        // ---- PAIRING WINDOW GATE -------------------------------------------------------------
+        // A peer we have never bonded with may only proceed while the post-power-on window is open.
+        // Rejecting HERE is the point of the whole design: this runs before any SMP traffic, so the
+        // stranger never reaches the pairing exchange that NimBLE-Arduino 1.4.3 can service by
+        // DELETING the legitimate owner's bond. Refusing later, at authentication-complete, would
+        // be too late to protect it. See ACAB_PAIR_WINDOW_MS in the header.
+        //
+        // Both addresses are checked because a bonded phone can present either: peer_id_addr is the
+        // resolved identity once the controller matched its IRK, peer_ota_addr is what is on air
+        // (still the rotating RPA when resolution has not happened). Treating "known" as the OR of
+        // the two is what lets an existing iPhone reconnect outside the window.
+        if (d) {
+            const bool known = NimBLEDevice::isBonded(NimBLEAddress(d->peer_id_addr)) ||
+                               NimBLEDevice::isBonded(NimBLEAddress(d->peer_ota_addr));
+            // See acabPairAdmit for what each input means and why. Short version: the only peer
+            // ever refused is a stranger, outside the window, on a board that ALREADY has an owner.
+            // A board with no bonds pairs freely, so an out-of-box unit never makes the customer
+            // learn the recovery step on their very first connect.
+            if (!acabPairAdmit(gPairGateEnabled, acabBleBondCount() > 0, known,
+                               acabBlePairWindowOpen())) {
+                Serial.println("[pair] window CLOSED and peer is not bonded -> rejecting. "
+                               "Power-cycle the board to open a fresh 2-minute window.");
+                // Disconnect, and do NOT touch the bond store: the existing owner's bond is
+                // untouched by this path, which is the property the whole gate exists to preserve.
+                if (srv) srv->disconnect(d->conn_handle);
+                return;
+            }
+        }
         gConnected = true;
         gPeerMtu = 23;   // reset to the BLE default; the MTU exchange bumps it right after connect
         gIgnoreStageN = 0; gWatchStageN = 0;   // fresh connection: drop any half-staged chunk sequence
@@ -487,6 +549,11 @@ class CfgCb : public NimBLECharacteristicCallbacks {
         if (v.empty()) return;
         JsonDocument doc;
         if (deserializeJson(doc, v) != DeserializationError::Ok) return;
+
+        // One-shot diagnostic request. Answered on the STATUS characteristic (Config is
+        // write-only), NOT here. Handled first and independently of the toggles below so a diag
+        // request can never be mistaken for a settings change.
+        if (doc["diag"].is<bool>() && doc["diag"].as<bool>()) acabBleSendDiag();
 
         // Body-cam detector (Axon 00:25:DF). Accept both the new "bodycam" key and
         // the legacy "axon" key, so older app builds keep working.
@@ -683,7 +750,7 @@ class CfgCb : public NimBLECharacteristicCallbacks {
     }
 };
 
-void acabBleBegin(const char* deviceName, const char* fwLabel) {
+void acabBleBegin(const char* deviceName, const char* fwLabel, bool startAdvertising) {
     gFwLabel = fwLabel ? fwLabel : "ACAB-ouispy";
     if (!gJsonMux) gJsonMux = xSemaphoreCreateMutex();   // guards the shared JSON scratch pool
     if (!gNotifyMux) gNotifyMux = xSemaphoreCreateMutex();   // serializes every setValue+notify pair
@@ -835,10 +902,19 @@ void acabBleBegin(const char* deviceName, const char* fwLabel) {
 #endif
 
     adv->setScanResponseData(scanResp);
-    adv->start(0, advCompleteCb);
+    // DEFERRABLE. beacon-board passes false and starts advertising itself AFTER the soft-power gate
+    // and after the pairing gate is configured. Previously the radio went live here, ~160 lines
+    // before the board decided whether this boot even stays on and ~230 before enforcement was
+    // configured, so a phone could connect in that gap with the gate still false - including during
+    // a boot that ends in powerOffDeepSleep(). Default true keeps mesh-detect's call site unchanged.
+    if (startAdvertising) {
+        adv->start(0, advCompleteCb);
+        gAdvIntended = true;
+    }
 
     acabBleUpdateStatus();
-    Serial.printf("[ACAB] BLE service up, advertising as '%s'\n", deviceName);
+    Serial.printf("[ACAB] BLE service up%s\n",
+                  startAdvertising ? ", advertising" : " (advertising deferred)");
     // Report the advertised address and whether privacy is on. This is the ONLY way to verify the
     // RPA change from a laptop: macOS and iOS never hand a peer's MAC to an application, they
     // substitute a per-host UUID, so a scan from a development machine cannot tell a rotating
@@ -885,9 +961,12 @@ void acabBleBegin(const char* deviceName, const char* fwLabel) {
 // pass seq + atUnix (atUnix==0 -> "approx":true), plus whenMs/bootCount so the app can verify or
 // redo the time reconstruction and bracket an unanchored boot. NOTE: mirrors the field set in
 // acabBleNotifyDetection below - keep the two in sync (or consolidate later).
+// `elide` trims optional RID enrichment for a small-MTU live notify; see detect_elide.h for the
+// order and why. 0 (the default, and what the replay path always passes) is the full record.
 static size_t serializeDetection(const AcabDetection& d, bool isNew, char* buf, size_t bufsz,
                                  bool hist, uint32_t seq, uint32_t atUnix,
-                                 uint32_t whenMs = 0, uint32_t bootCount = 0) {
+                                 uint32_t whenMs = 0, uint32_t bootCount = 0,
+                                 uint8_t elide = ACAB_ELIDE_NONE) {
     char macStr[18];
     acabFormatMac(d.mac, macStr);
     JsonPoolLock jp;
@@ -903,14 +982,16 @@ static size_t serializeDetection(const AcabDetection& d, bool isNew, char* buf, 
     if (d.detail[0]) doc["det"]  = d.detail;
     if (d.lat || d.lon)           { doc["lat"]  = d.lat;  doc["lon"]  = d.lon; }
     if (d.gpsAgeMs)               doc["gage"] = (uint32_t)(d.gpsAgeMs / 1000);   // GPS fix age (s)
-    if (d.pilotLat || d.pilotLon) { doc["plat"] = d.pilotLat; doc["plon"] = d.pilotLon; }
-    if (d.altitude)  doc["alt"]  = d.altitude;
-    if (d.speedH)    doc["spd"]  = (int)d.speedH;
-    if (d.speedV)    doc["vspd"] = (int)d.speedV;
-    if (d.heading)   doc["hdg"]  = (int)d.heading;
-    if (d.heightAGL) doc["hgt"]  = (int)d.heightAGL;
-    if (d.pilotAlt)  doc["palt"] = d.pilotAlt;
-    if (d.ridStatus) doc["sta"]  = d.ridStatus;
+    if ((d.pilotLat || d.pilotLon) && acabElideKeeps(ACAB_FIELD_PILOT, elide)) {
+        doc["plat"] = d.pilotLat; doc["plon"] = d.pilotLon;
+    }
+    if (d.altitude)  doc["alt"]  = d.altitude;   // aircraft altitude is NOT elidable
+    if (d.speedH   && acabElideKeeps(ACAB_FIELD_SPD,  elide)) doc["spd"]  = (int)d.speedH;
+    if (d.speedV   && acabElideKeeps(ACAB_FIELD_VSPD, elide)) doc["vspd"] = (int)d.speedV;
+    if (d.heading  && acabElideKeeps(ACAB_FIELD_HDG,  elide)) doc["hdg"]  = (int)d.heading;
+    if (d.heightAGL&& acabElideKeeps(ACAB_FIELD_HGT,  elide)) doc["hgt"]  = (int)d.heightAGL;
+    if (d.pilotAlt && acabElideKeeps(ACAB_FIELD_PALT, elide)) doc["palt"] = d.pilotAlt;
+    if (d.ridStatus&& acabElideKeeps(ACAB_FIELD_STA,  elide)) doc["sta"]  = d.ridStatus;
     doc["n"]   = d.count;
     doc["new"] = isNew;
     if (hist) {
@@ -947,7 +1028,7 @@ void acabBleDrainTick() {
     // lands while the callback pointer is momentarily unset. Rate-limited so a genuinely failing
     // start() cannot spin, and it logs, because a board recovering itself in silence teaches
     // nobody anything.
-    if (!gConnected) {
+    if (!gConnected && gAdvIntended) {
         NimBLEAdvertising* adv = NimBLEDevice::getAdvertising();
         static uint32_t lastKick = 0;
         const uint32_t now = millis();
@@ -1053,58 +1134,160 @@ void acabBleOtaWatchdog() {
 void acabBleNotifyDetection(const AcabDetection& d, bool isNew) {
     if (!gDetChar || !gConnected) return;
 
-    char macStr[18];
-    acabFormatMac(d.mac, macStr);
-
+    // ONE builder for both paths. This function used to carry its OWN copy of the field assembly,
+    // with a comment on serializeDetection asking whoever edited one to remember the other; that is
+    // not a contract, it is a countdown. serializeDetection(hist=false) produces the identical
+    // record, so the live path now calls it.
     char buf[512];
-    size_t len;
-    {
-        JsonPoolLock jp;
-        JsonDocument doc(jp.alloc());
-        doc["t"]    = (int)d.type;
-        doc["s"]    = (int)d.src;
-        doc["meth"] = (int)d.method;
-        doc["c"]    = d.confidence;
-        doc["mac"]  = macStr;
-        doc["rssi"] = d.rssi;
-        if (d.name[0])   doc["name"] = d.name;
-        if (d.id[0])     doc["id"]   = d.id;
-        if (d.detail[0]) doc["det"]  = d.detail;
-        if (d.companyId) doc["cid"]  = d.companyId;   // BLE mfg company ID (SIG #); app shows/logs it
-        if (d.lat || d.lon)           { doc["lat"]  = d.lat;  doc["lon"]  = d.lon; }
-        if (d.gpsAgeMs)               doc["gage"] = (uint32_t)(d.gpsAgeMs / 1000);   // GPS fix age (s)
-        if (d.pilotLat || d.pilotLon) { doc["plat"] = d.pilotLat; doc["plon"] = d.pilotLon; }
-        if (d.altitude)  doc["alt"]  = d.altitude;
-        if (d.speedH)    doc["spd"]  = (int)d.speedH;
-        if (d.speedV)    doc["vspd"] = (int)d.speedV;
-        if (d.heading)   doc["hdg"]  = (int)d.heading;
-        if (d.heightAGL) doc["hgt"]  = (int)d.heightAGL;
-        if (d.pilotAlt)  doc["palt"] = d.pilotAlt;
-        if (d.ridStatus) doc["sta"]  = d.ridStatus;
-        doc["n"]   = d.count;
-        doc["new"] = isNew;
-        len = serializeJson(doc, buf, sizeof(buf));
-    }
+    size_t len = serializeDetection(d, isNew, buf, sizeof(buf), /*hist=*/false, 0, 0, 0, 0,
+                                    ACAB_ELIDE_NONE);
     if (len == 0) return;
+
+    // DEGRADE, DO NOT DROP. Over the peer's usable MTU budget (an iPhone negotiating 185 leaves
+    // ~182 usable bytes, and a fully-populated drone Remote ID record exceeds that), give up the
+    // optional enrichment one field at a time in the documented order until it fits, instead of
+    // skipping the sighting. The COMPLETE record still reaches the offline buffer, whose drain path
+    // has seq/resync; the live notify's job is the alert, not the archive. See detect_elide.h.
+    uint8_t used = ACAB_ELIDE_NONE;
+    while (len > notifyCap() && used < ACAB_ELIDE_MAX) {
+        used++;
+        len = serializeDetection(d, isNew, buf, sizeof(buf), /*hist=*/false, 0, 0, 0, 0, used);
+        if (len == 0) return;
+    }
     if (len > notifyCap()) {
-        // Over the peer's usable MTU budget: a small-MTU link (e.g. an iPhone that negotiates 185) can't
-        // carry a big detection (a fully-populated drone RemoteID record). We skip rather than send
-        // truncated JSON, but unlike the drain path the live notify has no seq/resync, so this DROPS the
-        // sighting. Count + warn (throttled) so the gap is visible on bring-up instead of silent.
-        static uint32_t sDropped = 0, sLastWarn = 0;
-        sDropped++;
+        // Even the minimal record does not fit. Near-impossible now (it needs a long name/detail on
+        // a 23-byte MTU), but if it ever happens it is a real gap in the live feed and must stay
+        // visible rather than becoming silence. Counter is surfaced in the {"diag":true} reply.
+        gNotifyOverCap++;
+        static uint32_t sLastWarn = 0;
         if (millis() - sLastWarn > 5000) {
             sLastWarn = millis();
-            Serial.printf("[ACAB] detection %uB over MTU cap %u - notify skipped (%u dropped, peer MTU %u)\n",
-                          (unsigned)len, (unsigned)notifyCap(), (unsigned)sDropped, (unsigned)gPeerMtu);
+            Serial.printf("[ACAB] detection %uB over MTU cap %u even fully elided - skipped "
+                          "(%u total, peer MTU %u)\n",
+                          (unsigned)len, (unsigned)notifyCap(), (unsigned)gNotifyOverCap,
+                          (unsigned)gPeerMtu);
         }
         return;
+    }
+    if (used != ACAB_ELIDE_NONE) {
+        gNotifyElided++;
+        static uint32_t sLastElideWarn = 0;
+        if (millis() - sLastElideWarn > 5000) {
+            sLastElideWarn = millis();
+            Serial.printf("[ACAB] live notify elided through %s to fit MTU cap %u (%u total)\n",
+                          acabElideKey((AcabElidableField)(used - 1)), (unsigned)notifyCap(),
+                          (unsigned)gNotifyElided);
+        }
     }
     { NotifyLock nl; gDetChar->setValue((uint8_t*)buf, len); gDetChar->notify(); }
 }
 
+void acabBleStartAdvertising() {
+    if (gAdvIntended) return;                       // idempotent
+    NimBLEAdvertising* adv = NimBLEDevice::getAdvertising();
+    if (!adv) return;
+    gAdvIntended = true;                            // set BEFORE start so the supervisor can help
+    adv->start(0, advCompleteCb);
+    Serial.println("[ACAB] advertising started (deferred until the power + pairing gates settled)");
+}
+
+void acabBlePairGateEnable() {
+    // ENFORCEMENT ONLY. Leaves the window shut, which is the state a warm boot must land in:
+    // strangers refused, owner reconnects. Splitting this out fixes a composition bug between two
+    // individually-correct changes - enforcement used to be switched on ONLY inside the window
+    // opener, and the opener was gated on a physical start, so every OTA restart, panic, watchdog
+    // and brownout came back with enforcement OFF and admitted ANY phone indefinitely. That was
+    // worse than either behaviour on its own.
+    gPairGateEnabled = true;
+}
+
+void acabBleOpenPairingWindow() {
+    gPairWindowUntil = millis() + ACAB_PAIR_WINDOW_MS;
+    gPairWindowArmed = true;
+    gPairWindowLatchedClosed = false;
+    // Also enables the gate, so a target that only ever calls THIS still enforces correctly.
+    gPairGateEnabled = true;
+    Serial.printf("[pair] window OPEN for %lus - a new phone may bond now\n",
+                  (unsigned long)(ACAB_PAIR_WINDOW_MS / 1000));
+}
+bool acabBlePairWindowOpen() {
+    const bool open = acabPairWindowOpenAt(millis(), gPairWindowUntil, gPairWindowArmed,
+                                           gPairWindowLatchedClosed);
+    // Trip the latch the first time we observe closure. Called from every connect and every ~5 s
+    // status build, so this happens within seconds of expiry, long before the comparison could go
+    // wrong. Deliberately NOT persisted: RAM-only, because a power cycle is the reopen mechanism.
+    if (!open && gPairWindowArmed) gPairWindowLatchedClosed = true;
+    return open;
+}
+uint32_t acabBlePairWindowRemainingMs() {
+    return acabPairWindowRemainingAt(millis(), gPairWindowUntil, gPairWindowArmed,
+                                     gPairWindowLatchedClosed);
+}
+
+int acabBleBondCount() { return NimBLEDevice::getNumBonds(); }
+
+uint32_t acabBleNotifyElidedCount()  { return gNotifyElided; }
+uint32_t acabBleNotifyOverCapCount() { return gNotifyOverCap; }
+
 void acabBleSetBatteryPct(int pct) { gBatteryPct = pct; }
 void acabBleSetCharging(bool charging) { gCharging = charging; }
+
+// ONE-SHOT expanded diagnostic, pushed through the STATUS characteristic.
+//
+// Why Status and not a reply on Config: the GATT contract (see this file's header) is Detections
+// NOTIFY, Config WRITE, Status READ|NOTIFY, OTA WRITE_NR|NOTIFY. Config is write-only - there is
+// no command-response characteristic to answer on - so a request/response pair has to land on
+// Status, which is the same transport the OTA acks already use. Triggered by {"diag":true}.
+//
+// Kept OUT of the periodic status on purpose: that JSON is already close to the ATT budget on a
+// small-MTU peer, and everything here is only interesting when someone is actually looking.
+void acabBleSendDiag() {
+    if (!gStatChar) return;
+    char buf[512];
+    size_t len;
+    {
+    JsonPoolLock jp;
+    JsonDocument doc(jp.alloc());
+    doc["diag"]   = true;                                  // marks this as the one-shot, not periodic
+    doc["sdrop"]  = acabScannerSinkDropTotal();
+    doc["sdDeliv"]= acabScannerSinkDropDeliverOnly();      // benign: a missed live notify re-arrives
+    doc["sdBuf"]  = acabScannerSinkDropBuffered();         // THE ONE THAT COSTS EVIDENCE
+    doc["sdRepl"] = acabScannerSinkDropReplay();           // lost from one dump attempt, ring intact
+    doc["sqHigh"] = acabScannerSinkHighWater();            // deepest the queue has been, of 32
+    doc["nElide"] = acabBleNotifyElidedCount();            // live notifies that fit only after trimming
+    doc["nOver"]  = acabBleNotifyOverCapCount();           // live notifies lost even fully trimmed
+    doc["up"]     = (uint32_t)(millis() / 1000);
+    // Retained core dump, if any. Metadata ONLY - the 64 KB image itself is not shipped over this
+    // path (see coredump_report.h; a raw dump over unacked notifies is not acceptable and its
+    // export is a separate, explicitly-consented flow). cdElf is the app ELF SHA, which is the
+    // dump's only identity: it does NOT imply the running firmware version, because a dump
+    // survives an OTA.
+    {
+        const AcabCoredumpInfo& cd = acabCoredumpInfo();
+        if (cd.present) {
+            doc["cd"]     = true;
+            doc["cdTask"] = cd.task;
+            doc["cdPc"]   = cd.pc;
+            doc["cdSize"] = cd.sizeBytes;
+            doc["cdElf"]  = cd.elfSha;
+        } else if (cd.corrupt) {
+            doc["cd"]     = false;          // present-but-invalid, i.e. truncated or corrupted
+            doc["cdSize"] = cd.sizeBytes;
+        }
+    }
+    len = serializeJson(doc, buf, sizeof(buf));
+    }
+    if (len > 0) {
+        NotifyLock nl;
+        gStatChar->setValue((uint8_t*)buf, len);
+        if (gConnected && len <= notifyCap()) gStatChar->notify();
+    }
+    // Serial too, so a USB-only bench sees the same numbers without an app.
+    Serial.printf("[diag] sink drops: total=%u deliver-only=%u buffered=%u replay=%u  qhigh=%u/%u\n",
+                  (unsigned)acabScannerSinkDropTotal(), (unsigned)acabScannerSinkDropDeliverOnly(),
+                  (unsigned)acabScannerSinkDropBuffered(), (unsigned)acabScannerSinkDropReplay(),
+                  (unsigned)acabScannerSinkHighWater(), 32u);
+}
 
 // Rebuild the status JSON and update the characteristic (notify if connected).
 void acabBleUpdateStatus() {
@@ -1117,6 +1300,11 @@ void acabBleUpdateStatus() {
     char fwbuf[40];
     snprintf(fwbuf, sizeof(fwbuf), "%s %s", gFwLabel, ACAB_FW_VERSION);
     doc["fw"]     = fwbuf;
+    doc["proto"]  = ACAB_BLE_PROTO_VERSION;   // BLE JSON contract version; absent = 0 = compatible
+    // Seconds left in the new-phone pairing window, emitted ONLY while it is open (absent = closed,
+    // which is the normal steady state and costs no MTU). Lets the app show a countdown during
+    // setup instead of the user guessing how long they have.
+    if (uint32_t rem = acabBlePairWindowRemainingMs()) doc["pairw"] = rem / 1000;
     doc["up"]     = (uint32_t)(millis() / 1000);
     doc["total"]  = acabScannerTotalDetections();
     doc["ble"]    = acabScannerBLEEnabled();
@@ -1143,6 +1331,11 @@ void acabBleUpdateStatus() {
     doc["wat"]    = acabScannerWatchCount();    // watchlist size, for app reconciliation
     doc["wseen"]  = acabScannerWifiSeen();      // two-radio diag: 802.11 mgmt frames seen
     doc["bseen"]  = acabScannerBleSeen();       // BLE adverts ingested (= the nRF's forwards in dual mode)
+    // Sink-queue drops, TOTAL only - the per-category split rides the {"diag":true} reply so the
+    // periodic JSON stays under the ATT budget. Emitted only when nonzero: on a healthy board this
+    // is always 0, and spending MTU on a constant would push a fuller status past notifyCap().
+    // Nonzero means the sink queue overflowed; the buffered share is the part that cost evidence.
+    if (uint32_t sd = acabScannerSinkDropTotal()) doc["sdrop"] = sd;
     if (acabScannerHasCoProc()) doc["nbb"] = acabScannerCoProcBbCount();  // nRF black-box record count
     if (gBatteryPct >= 0)       doc["bat"] = gBatteryPct;                 // battery %, sense-divider boards only
 #ifdef ACAB_DUAL_RADIO

@@ -13,7 +13,13 @@ name: Android release
 on:
   push:
     tags:
-      - 'v*'
+      # 'android-v*', NOT 'v*'. A bare v* fired this workflow on FIRMWARE tags too, building and
+      # publishing an Android release nobody asked for and attaching it to a tag that has nothing
+      # to do with the app. Tag convention (also written up in hardware/SUBMITTING.md):
+      #   android-v2.0.4    -> builds + publishes the signed APK/AAB (this workflow)
+      #   firmware-v2.0.4   -> firmware release; no app build
+      #   v2.0.4            -> plain source tag, triggers nothing
+      - 'android-v*'
   workflow_dispatch:
 
 permissions:
@@ -42,6 +48,27 @@ jobs:
         run: |
           chmod +x ./gradlew
           ./gradlew :app:lintRelease --no-daemon
+
+      # UNIT TESTS, as their own gate, BEFORE anything is signed or published. Without this step a
+      # tag could ship a build whose tests fail: lint and assemble do not run them, so every
+      # regression test in the repo was unenforced at exactly the moment it mattered most.
+      #
+      # --rerun-tasks is MANDATORY, not tidiness. A bare `test` reports UP-TO-DATE off the Gradle
+      # cache and runs ZERO tests, which in a CI log is indistinguishable from a green suite. That
+      # is the failure this step exists to prevent, so it must not be able to fail that way itself.
+      - name: Unit tests (gates the release)
+        working-directory: android
+        run: ./gradlew :app:testDebugUnitTest --rerun-tasks --no-daemon
+
+      # Publish the XML even on failure, so a red release names the failing assertion in the run
+      # summary instead of making someone re-run it locally to find out.
+      - name: Upload test results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: android-unit-test-results
+          path: android/app/build/test-results/testDebugUnitTest/*.xml
+          if-no-files-found: warn
 
       - name: Decode keystore
         env:

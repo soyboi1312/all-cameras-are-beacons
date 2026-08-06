@@ -38,6 +38,13 @@ data class CombinedUpdateProgress(
     val elapsedSeconds: Int = 0,
     val notice: String? = null,      // soft note shown on DONE / PARTIAL (e.g. S3-only)
     val reason: String? = null,      // user-facing failure reason on FAILED
+    /** Did the BOARD firmware leg actually flash during this run? The PARTIAL copy has to say what
+     *  really happened: a co-processor-only run that fails never touched the board, and telling the
+     *  user "Board updated" there is simply false. */
+    val s3Updated: Boolean = false,
+    /** Was a co-processor leg part of this run's plan? Lets the UI distinguish "the board updated
+     *  and the second radio didn't" from "only the second radio was ever in scope". */
+    val nrfPlanned: Boolean = false,
 ) {
     /** True while the flow is actively working (drives banner suppression + the progress UI). */
     val isRunning: Boolean
@@ -496,6 +503,8 @@ class CombinedUpdateCoordinator(
             elapsedSeconds = elapsed,
             notice = notice,
             reason = reason,
+            s3Updated = s3DidUpdate,
+            nrfPlanned = nrfPlanned,
         )
     }
 

@@ -12,7 +12,9 @@
  *     openly disclosed), NOT that someone planted a covert camera.
  *   - It CANNOT find every camera: a no-name / white-label cam on a generic Wi-Fi module,
  *     or any camera not transmitting right now, will not match. Never imply completeness.
- *   The category is "Network camera" and the detail names the vendor + "on wifi".
+ *   The category is "Network camera". The detail names the vendor + "on wifi" for an OUI match,
+ *   and is "Arlo base station" for the SSID match added 2026-08-05 - that one names the BOX, not a
+ *   lens, because a broadcast SSID proves the hardware is there and nothing about what it sees.
  *
  * Every block below is the vendor's OWN corporate MA-L registration, VERIFIED against the
  * live IEEE registry on 2026-07-17 (queried api.maclookup.app, which mirrors
@@ -82,12 +84,18 @@ static const NetcamOui CAMERA_VENDOR_OUI[] = {
     // on the EXACT registrant name rather than a substring: a first substring pass on "ring"
     // returned 24 blocks because it also matched "ENGINEERING". These are the real ones.
     //
-    // Why these brands and not Nest / Blink / Arlo: a vendor OUI is only worth having when the
+    // Why these brands and not Nest / Blink: a vendor OUI is only worth having when the
     // REGISTRANT is narrow. Ring LLC and Wyze Labs register in their own names and ship little
     // but cameras. Nest Labs holds only 2 blocks and current Nest cameras sit under Google's
     // 108 blocks (shared with Pixel, Chromecast, Home) - unusable. Blink rides Amazon
     // Technologies' 209 blocks (Echo, Fire TV, Kindle, eero) - unusable. A lot of budget
     // camera hardware transmits under Espressif's 335 blocks - unusable. Narrowness is the test.
+    //
+    // ARLO USED TO BE LISTED ON THAT "not" LINE AND IT WAS WRONG (corrected 2026-08-05). It was
+    // named without a reason while Nest and Blink each got one, i.e. swept in by association.
+    // Arlo Technology holds THREE blocks and ships nothing with a radio but cameras, doorbells,
+    // and the hubs that serve them. It passes the narrowness test more cleanly than Wyze does.
+    // It is also the only block in this table we have already HEARD: see the Arlo entries below.
 
     // Ring LLC. Doorbells and security cameras, i.e. the most street-facing camera class there
     // is. Camera/doorbell-only registrant, so the OUI is a strong vendor read. src: IEEE MA-L.
@@ -105,6 +113,40 @@ static const NetcamOui CAMERA_VENDOR_OUI[] = {
     { { 0xb0, 0x09, 0xda }, "Ring", 0 },      // registered as "Ring Solutions"
     { { 0xc4, 0xdb, 0xad }, "Ring", 0 },
     { { 0xcc, 0x3b, 0xfb }, "Ring", 0 },
+
+    // Arlo Technology. THE ONLY BLOCKS IN THIS TABLE WE HAVE ACTUALLY HEARD OURSELVES, and they
+    // are STILL validated=0 (see below). The 2026-07-24 A/B drive logged TWELVE
+    // distinct Arlo-OUI devices spread across the route (compare-devices-dual.csv), all three
+    // blocks firing, and THREE of them named themselves in the SSID: A4:11:62:0B:2D:62,
+    // A4:11:62:6C:8F:24 and FC:9C:98:B4:E5:18 were beaconing "ARLO_VMB_<digits>" (see
+    // NETCAM_SSID_ARLO_PREFIX below - that rule is the stronger half of this signature).
+    // Until now every one of those hits fell through to a bare "Nearby device", conf 0.
+    //
+    // WHY validated STAYS 0 DESPITE THE CAPTURE: this flag means "seen in our own capture AND
+    // confirmed a real camera BY EYE" (see NetcamOui). We have the first half only. The SSID
+    // proves the hardware is genuinely Arlo; it does not prove anyone stood at that address and
+    // saw a camera, which is what the Axon 75 tier was earned by. Promote these to 1 only after
+    // an eyeball pass - the three SSID-named hub MACs above are the ones to go looking for.
+    //
+    // WHAT A HIT REALLY IS: usually the SmartHub/base station, not a lens. Arlo base stations are
+    // mains-powered 802.11 APs that beacon continuously, while the battery cameras sleep with the
+    // radio down - which is exactly why 11 of the 12 drive hits were single sightings. A hub has
+    // no purpose except serving Arlo cameras, so "Arlo on wifi" stays honest, but do NOT read it
+    // as "a camera is pointed at you right now".
+    //
+    // STATED MISSES, so nobody thinks this is complete. (1) VINTAGE: all three blocks are
+    // post-spinoff (A4:11:62 2018, FC:9C:98 2020, 48:62:64 2024). Everything Arlo shipped while
+    // it was part of NETGEAR - original Wire-Free, Pro, Pro 2, Q, Baby, Go 1st gen, and the
+    // VMB3000/VMB4000 hubs - rides NETGEAR's 76 blocks and fails the narrowness test the same way
+    // TP-Link does. Those are reachable ONLY by the NTGR_VMB_ SSID form, never by OUI. (2) BAND:
+    // Ultra-class cameras on a VMB5000 hub, and dual-band Pro 5S/6 direct to a router, can sit on
+    // 5GHz where this radio cannot hear them. (3) LINK: Arlo Go 1st gen is LTE-only, never
+    // detectable. (4) The discontinued Arlo Security Light talks BLE to a bridge - KEEP THIS
+    // MATCH WIFI-ONLY (netcamClassifyWiFi already is) or a porch light gets labelled a camera.
+    // src: IEEE MA-L + our own captures.
+    { { 0xa4, 0x11, 0x62 }, "Arlo", 0 },
+    { { 0xfc, 0x9c, 0x98 }, "Arlo", 0 },
+    { { 0x48, 0x62, 0x64 }, "Arlo", 0 },
 
     // Wyze Labs Inc. Camera-dominant, but they also ship plugs, bulbs, locks and scales, so a
     // hit is "a Wyze device" first and a camera second. CAVEAT to settle in the field: some
@@ -170,7 +212,7 @@ static const size_t CAMERA_VENDOR_OUI_COUNT = sizeof(CAMERA_VENDOR_OUI) / sizeof
 // FIRST FIELD VALIDATION 2026-07-23. An airport capture returned 8 network-camera rows across
 // four OUIs (Dahua 4C:11:BF x2, BC:32:5F x2, E0:50:8B x1; Reolink EC:71:DB x3) and the user
 // confirmed all 8 were real network cameras. So both halves held: the OUI named the vendor
-// correctly AND the device really was a camera. The other 39 OUIs in this table remain
+// correctly AND the device really was a camera. The other 58 OUIs in this table remain
 // REGISTRY-SOURCED ONLY and unconfirmed.
 //
 // The confidence below is deliberately NOT raised on that result, and this is the important
@@ -187,7 +229,33 @@ static const size_t CAMERA_VENDOR_OUI_COUNT = sizeof(CAMERA_VENDOR_OUI) / sizeof
 // fallback (60). Honesty over alarm.
 #define NETCAM_OUI_CONFIDENCE  65
 // A field-validated block earns the same tier as the field-validated Axon OUI (75). Only the
-// four entries flagged validated=1 get it; the other 39 stay registry-only at 65.
+// four entries flagged validated=1 get it; the other 58 stay registry-only at 65.
 #define NETCAM_OUI_CONFIDENCE_VALIDATED  75
+
+// ---------------------------------------------------------------------------
+// WiFi SSID prefix (added 2026-08-05) - the strongest network-camera signal we have.
+// ---------------------------------------------------------------------------
+// An Arlo SmartHub / Base Station broadcasts an SSID of the literal form "ARLO_VMB_<digits>"
+// (VMB is Arlo's own base-station model prefix). We have three in our own logs:
+// ARLO_VMB_1164328298, ARLO_VMB_2983159490, ARLO_VMB_8967923929. Same shape and same reasoning
+// as FLOCK_SSID_PREFIX in flock_signatures.h: an SSID is a VENDOR SELF-ATTESTATION, so it beats
+// an OUI on both halves of the question - it names the vendor AND says what the box is.
+//
+// It also catches what the OUI structurally cannot. The hub is mains-powered and beacons ~10x a
+// second, where the battery cameras sleep with their radios down; and PRE-SPINOFF Arlo hardware
+// broadcasts this same SSID form while its MAC sits in NETGEAR's 76 unusable blocks. That gear
+// is reachable ONLY here.
+//
+// Deliberately matched case-insensitively and as a PREFIX, not an exact string, because the
+// numeric tail is per-unit. FP risk is negligible: nothing else names an AP "ARLO_VMB_".
+#define NETCAM_SSID_ARLO_PREFIX  "ARLO_VMB_"
+// The NETGEAR-era form of the same box. NOT YET CAPTURED BY US - listed because it is the only
+// route to pre-2018 Arlo, and because the downside of an uncaptured SSID literal is a MISS, never
+// a false positive. Promote the comment to "captured" if one ever lands in a log.
+#define NETCAM_SSID_ARLO_LEGACY_PREFIX  "NTGR_VMB_"
+// Same tier as the Flock SSID match (88) and for the identical reason: the device broadcast its
+// own vendor and model class in the clear. Above every OUI tier in this file, including the
+// eyeball-validated 75, because this does not infer the vendor - the vendor states it.
+#define NETCAM_SSID_CONFIDENCE  88
 
 #endif // ACAB_NETCAM_SIGNATURES_H

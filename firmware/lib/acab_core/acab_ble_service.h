@@ -18,8 +18,11 @@
  *     {"ota":"ready","size":N} {"ota":"prog","rx":B,"pct":P} {"ota":"done"}
  *     {"ota":"ok"} {"ota":"err","e":"crc"}
  *   crc is a standard zlib CRC-32 (hex) over the whole image; ver must be newer than the
- *   running firmware (send "force":true to override). On the dual board the new S3 image
- *   carries the matching nRF app, which the S3 reflashes over SWD after the reboot.
+ *   running firmware (send "force":true to override). On the dual board the S3 image carries NO
+ *   nRF payload and there is no SWD path (that was abandoned 2026-07-21 and the code deleted):
+ *   the S3 only forwards a "DFU" trigger over UART, the nRF reboots into its Adafruit/Seeed
+ *   bootloader, and the PHONE drives the nRF update over Nordic BLE DFU. See main.cpp's header
+ *   and nrf-ble-scan/src/main.cpp for the trigger handling.
  *
  * Detection record (one BLE notify, fits the negotiated ATT MTU; we negotiate 512):
  *   {"t":1,"s":0,"meth":1,"c":85,"mac":"aa:bb:..","rssi":-67,"name":"Flock",
@@ -125,13 +128,83 @@ bool acabBleTakeNrfDfuRequest();
 
 // Init NimBLE, build the service, and start advertising as `deviceName`. `fwLabel`
 // is this build's name in the status "fw" string (e.g. "mesh-detect-ACAB").
-void acabBleBegin(const char* deviceName, const char* fwLabel = "ACAB-ouispy");
+// `startAdvertising = false` brings the GATT service up WITHOUT going on air, so a target can
+// finish deciding whether it is even staying powered, and configure the pairing gate, before any
+// phone can reach it. Call acabBleStartAdvertising() once those decisions are made. Default true
+// preserves every existing call site.
+void acabBleBegin(const char* deviceName, const char* fwLabel = "ACAB-ouispy",
+                  bool startAdvertising = true);
+
+// Go on air. Idempotent, and safe to call even if acabBleBegin already started advertising.
+void acabBleStartAdvertising();
 
 // Push one detection to subscribed clients (call from the scanner sink).
 void acabBleNotifyDetection(const AcabDetection& d, bool isNew);
 
 // Refresh + notify the Status characteristic. Call periodically from loop().
+// BLE JSON contract version, emitted as `proto` in the status JSON. Bump ONLY on a BREAKING change
+// to the wire contract (a field changing meaning or type, a mandatory field removed) - never for an
+// additive one, because both apps already ignore keys they do not know.
+//
+// ABSENCE MEANS 0, NOT UNKNOWN. Firmware older than 2026-08-06 omits the key entirely, and that
+// firmware is fully compatible with every app shipped to date, so an app that sees no `proto` must
+// behave exactly as it does today. An app should refuse to interpret a board whose proto EXCEEDS
+// the version it was built against, and say so, rather than silently misparse.
+#define ACAB_BLE_PROTO_VERSION 1
+
+// ---------------------------------------------------------------------------
+// Pairing window
+// ---------------------------------------------------------------------------
+// A NEW phone may only bond during a short window after the board powers on. Already-bonded
+// phones reconnect whenever they like; the window governs FIRST contact only.
+//
+// The threat this closes: without it, anyone within radio range of an unattended board can pair to
+// it and read the log. The recovery is deliberately something a user can be told in one sentence
+// ("turn it off and on, then connect within two minutes"), which is why this shipped and the
+// QR-secret / challenge-response ownership scheme did not: no secret to lose, no server, nothing
+// per-device to provision, and nothing to transfer when the board changes hands.
+//
+// WHY THE GATE IS AT CONNECT AND NOT AT PAIRING. NimBLE-Arduino 1.4.3 has onSecurityRequest
+// commented out (NimBLEServer.h), so there is no hook to refuse an SMP request once it starts, and
+// this version can DELETE an existing bond while servicing a repeat pairing. Rejecting at connect,
+// before any SMP traffic, is therefore the only placement that cannot cost the legitimate owner
+// their bond. See ServerCb::onConnect.
+#define ACAB_PAIR_WINDOW_MS 120000UL
+
+// Open the window. Call ONCE, only after the soft-power gate has committed the board ON, so a
+// board that boots merely to decide it should be off never becomes pairable. Touches no NVS: the
+// window is RAM-only and a power cycle is exactly how a user reopens it.
+// Turn ON enforcement without opening a window: strangers refused, already-bonded phones still
+// reconnect. Call unconditionally on every boot of a target that wants the gate. Separate from
+// acabBleOpenPairingWindow because enforcement and "a person just turned this on" are different
+// questions, and folding them together left every warm reboot (OTA, panic, watchdog, brownout)
+// running with enforcement OFF, admitting any phone indefinitely.
+void acabBlePairGateEnable();
+
+// Calling this ALSO opts the target into enforcement. A target that never calls it keeps the
+// pre-feature behaviour (any phone may pair, any time): mesh-detect deliberately does not opt in,
+// because inheriting the rejection without ever arming a window would make it permanently
+// unpairable, which is worse than not having the feature at all.
+void acabBleOpenPairingWindow();
+// True while a new phone may bond. False before the window opens and after it expires.
+bool acabBlePairWindowOpen();
+// Milliseconds left, 0 when closed. For the status JSON so the app can say how long is left.
+uint32_t acabBlePairWindowRemainingMs();
+// How many phones the BOARD still has bonded. A phone forgetting its side of the pairing does NOT
+// remove ours, which is why a previously-bonded phone can still reconnect (and re-pair) outside the
+// window: the connect gate sees a known address. Surfaced on the [diag] serial line.
+int acabBleBondCount();
+
 void acabBleUpdateStatus();
+// One-shot expanded diagnostic pushed through the STATUS characteristic, in response to a
+// {"diag":true} write on Config. Config is WRITE-only, so this is the only shape a
+// request/response can take on this profile. See the implementation for what it carries.
+void acabBleSendDiag();
+// Live-notify MTU accounting, surfaced in the {"diag":true} reply. Elided = the alert still went
+// out with optional RID enrichment trimmed (see detect_elide.h); over-cap = the record could not
+// be made to fit at all, i.e. a genuinely lost live sighting.
+uint32_t acabBleNotifyElidedCount();
+uint32_t acabBleNotifyOverCapCount();
 
 // Report battery percentage (0-100) in the status JSON. Boards with no sense divider
 // never call this, so "bat" stays out of the JSON (pass -1 for unknown).

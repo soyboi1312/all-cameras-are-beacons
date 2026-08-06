@@ -1,4 +1,4 @@
-// Host regression test for the network-camera classifier: 59 branded IP-camera vendor OUIs matched
+// Host regression test for the network-camera classifier: 62 branded IP-camera vendor OUIs matched
 // off an 802.11 source MAC.
 //
 // WHY THIS FILE EXISTS. Three separate contracts run through netcam_detect.cpp, and none of them is
@@ -67,6 +67,22 @@ static void chkStr(const char* name, const char* got, const char* want) {
     printf("\n");
 }
 
+// Copied byte-for-byte from acabSanitizeAscii in acab_scanner.cpp (same stub test_axon,
+// test_flock and test_drone carry). The SSID path runs the matched name through it, so a
+// lazy memcpy stub would let a control-byte SSID pass for the wrong reason. Resync if the
+// real one ever changes.
+void acabSanitizeAscii(char* dst, const uint8_t* src, size_t n, size_t cap) {
+    if (!dst || cap == 0) return;
+    size_t m = n;
+    if (m > cap - 1) m = cap - 1;
+    size_t j = 0;
+    for (; j < m; j++) {
+        uint8_t c = src ? src[j] : 0;
+        dst[j] = (c >= 0x20 && c <= 0x7E) ? (char)c : '.';
+    }
+    dst[j] = 0;
+}
+
 // ---- 802.11 frame builders -------------------------------------------------------------------
 // The classifier reads exactly two things: frame[1] (the ToDS/FromDS bits) and the 6 bytes at the
 // source-address offset those bits select. Everything else is padding, so the padding is 0x11:
@@ -75,8 +91,11 @@ static void chkStr(const char* name, const char* got, const char* want) {
 // silently hide an off-by-one that read the wrong offset. 0x11 lets a wrong read fail loudly.
 static std::vector<uint8_t> frame(size_t len, uint8_t fc1) {
     std::vector<uint8_t> f(len, 0x11);
-    if (len > 0) f[0] = 0x08;   // frame-control byte 0. The classifier never reads it; the CALLER
-                                // decides data vs mgmt via the isDataFrame argument.
+    if (len > 0) f[0] = 0x08;   // frame-control byte 0. The CALLER decides data vs mgmt via the
+                                // isDataFrame argument. Since 2026-08-05 the classifier DOES read
+                                // this byte, but only on the mgmt path and only for the subtype
+                                // (SSID rule). 0x08 is subtype 0, which carries no SSID IE, so
+                                // every test built here is unaffected - see beacon() for that path.
     if (len > 1) f[1] = fc1;
     return f;
 }
@@ -94,6 +113,22 @@ static std::vector<uint8_t> uplink(const uint8_t* mac) {
     putMac(f, 10, mac);
     return f;
 }
+// A beacon (subtype 0x8) carrying one SSID IE. Beacons put a 12-byte fixed body
+// (timestamp/interval/capability) before their IEs, so the IEs start at 36, NOT 24. Getting that
+// wrong fails silently, which is why the tests below pin both offsets in both directions.
+// NOTE: unlike the other builders, this one sets frame[0] - the SSID path reads the subtype from
+// it. The other builders leave it at 0x08, whose subtype (0) is not an SSID-bearing type, which is
+// why every pre-existing mgmt test is untouched by the SSID rule.
+static std::vector<uint8_t> beacon(const char* ssid, const uint8_t* mac) {
+    const size_t sl = strlen(ssid);
+    std::vector<uint8_t> f = frame(36 + 2 + sl, 0x00);
+    f[0] = 0x80;                 // type 00 (mgmt), subtype 1000 (beacon)
+    putMac(f, 10, mac);          // addr2 = transmitter
+    f[36] = 0x00;                // IE id 0 = SSID
+    f[37] = (uint8_t)sl;
+    for (size_t i = 0; i < sl; i++) f[38 + i] = (uint8_t)ssid[i];
+    return f;
+}
 
 // Table OUIs, each with distinct trailing bytes so a copied MAC is checkable.
 static const uint8_t MAC_HIK[6]    = { 0x18, 0x68, 0xcb, 0x0a, 0x0b, 0x0c };   // Hikvision, registry-only
@@ -105,12 +140,18 @@ static const uint8_t MAC_AXIS[6]   = { 0x00, 0x40, 0x8c, 0x77, 0x88, 0x99 };   /
 static const uint8_t MAC_RING[6]   = { 0x00, 0xb4, 0x63, 0x0d, 0x0e, 0x0f };   // Ring (leading 0x00)
 static const uint8_t MAC_WYZE[6]   = { 0x2c, 0xaa, 0x8e, 0x31, 0x32, 0x33 };   // Wyze
 static const uint8_t MAC_ANKER[6]  = { 0xe8, 0xee, 0xcc, 0x5a, 0x5b, 0x5c };   // Anker/eufy
+static const uint8_t MAC_ARLO[6]   = { 0xa4, 0x11, 0x62, 0x0b, 0x2d, 0x62 };   // Arlo, from our own 2026-07-24 capture
+static const uint8_t MAC_ARLO2[6]  = { 0xfc, 0x9c, 0x98, 0xb4, 0xe5, 0x18 };   // Arlo, ditto
+static const uint8_t MAC_ARLO3[6]  = { 0x48, 0x62, 0x64, 0x28, 0xd8, 0x59 };   // Arlo, ditto
+// A well-formed PUBLIC MAC in NO vendor table. Used where the test is about the SSID alone, so an
+// accidental OUI hit cannot be mistaken for the SSID rule working.
+static const uint8_t MAC_PAD[6]    = { 0x11, 0x11, 0x11, 0x11, 0x11, 0x11 };
 
-// The eleven vendor labels the apps are allowed to see. Exact strings: casing and the slash are
+// The twelve vendor labels the apps are allowed to see. Exact strings: casing and the slash are
 // part of the wire contract, not cosmetics. Ezviz/Lorex/Swann added 2026-08-02.
 static const char* const KNOWN_VENDORS[] = {
     "Hikvision", "Dahua", "Amcrest", "Axis", "Reolink", "Ring", "Wyze", "Anker/eufy",
-    "Ezviz", "Lorex", "Swann"
+    "Ezviz", "Lorex", "Swann", "Arlo"
 };
 
 int main() {
@@ -186,10 +227,11 @@ int main() {
       chkBool("exactly 4 entries are flagged field-validated", validated == 4); }
     // A TRIPWIRE, not a fact: it exists so nobody grows this table without re-confirming the
     // blocks against the IEEE registry and thinking about the false-positive cost. 43 -> 59 on
-    // 2026-08-02 (Ezviz 14, Lorex 1, Swann 1), all re-confirmed against a fresh
+    // 2026-08-02 (Ezviz 14, Lorex 1, Swann 1), then 59 -> 62 on 2026-08-05 (Arlo 3), all
+    // re-confirmed against a fresh
     // standards-oui.ieee.org pull. If you are here because this failed, go read the DELIBERATELY
     // ABSENT block at the bottom of netcam_signatures.h before you bump the number.
-    chkBool("table still holds exactly 59 OUIs", CAMERA_VENDOR_OUI_COUNT == 59);
+    chkBool("table still holds exactly 62 OUIs", CAMERA_VENDOR_OUI_COUNT == 62);
     { note[0] = 0;
       for (size_t i = 0; i < CAMERA_VENDOR_OUI_COUNT; i++) {
           bool known = false;
@@ -198,7 +240,7 @@ int main() {
           if (!known && !note[0]) snprintf(note, sizeof(note), "idx %zu unknown label \"%s\"", i,
                                            CAMERA_VENDOR_OUI[i].vendor);
       }
-      chkBool("every label is one of the 11 exact known vendor strings", note[0] == 0, note); }
+      chkBool("every label is one of the 12 exact known vendor strings", note[0] == 0, note); }
     // A table OUI with the locally-administered bit set could never match, because netcamEntry()
     // rejects LA addresses before it looks at the table. Such an entry would be dead weight and a
     // sign the block was transcribed wrong, so assert none exists.
@@ -252,6 +294,76 @@ int main() {
     { std::vector<uint8_t> f = frame(16, 0x00); putMac(f, 10, MAC_RING);
       chk("mgmt frame of exactly 16 bytes (the minimum) still hits", run(f, false, &d), true,
           d.confidence, 65, d.detail, "Ring on wifi"); }
+
+    // ---- Arlo base-station SSID rule (added 2026-08-05) -----------------------------------------
+    // The SSID outranks every OUI tier, so these also pin the PRECEDENCE: a frame that could match
+    // both must report 88, not the OUI's 65/75.
+    { std::vector<uint8_t> f = beacon("ARLO_VMB_1164328298", MAC_PAD);
+      chk("beacon SSID ARLO_VMB_ -> base station at the SSID tier", run(f, false, &d), true,
+          d.confidence, 88, d.detail, "Arlo base station"); }
+    { std::vector<uint8_t> f = beacon("arlo_vmb_2983159490", MAC_PAD);
+      chk("SSID match is case-insensitive", run(f, false, &d), true,
+          d.confidence, 88, d.detail, "Arlo base station"); }
+    { std::vector<uint8_t> f = beacon("NTGR_VMB_8967923929", MAC_PAD);
+      chk("legacy NETGEAR-era NTGR_VMB_ form also hits", run(f, false, &d), true,
+          d.confidence, 88, d.detail, "Arlo base station"); }
+    { std::vector<uint8_t> f = beacon("ARLO_VMB_1", MAC_ARLO);
+      chk("SSID BEATS the Arlo OUI on the same frame (88, not 65)", run(f, false, &d), true,
+          d.confidence, 88, d.detail, "Arlo base station"); }
+    // Anchoring: the prefix must be at the HEAD. An SSID that merely contains it is somebody
+    // else's network name and must fall through to the OUI path (here: no OUI, so no hit).
+    { std::vector<uint8_t> f = beacon("MY_ARLO_VMB_1164328298", MAC_PAD);
+      chk("prefix is anchored, not a substring -> no SSID hit", run(f, false, &d), false); }
+    { std::vector<uint8_t> f = beacon("ARLO", MAC_PAD);
+      chk("SSID shorter than the prefix -> no hit, no overrun", run(f, false, &d), false); }
+    { std::vector<uint8_t> f = beacon("ARLO_VMB_1164328298", MAC_HIK);
+      chk("non-Arlo OUI still reports the base station when the SSID says so", run(f, false, &d),
+          true, d.confidence, 88, d.detail, "Arlo base station"); }
+    // THE OFFSET TRAP, pinned. A beacon's IEs start at 36, not 24. Planting the SSID IE at 24
+    // (the probe-REQUEST offset) must NOT match: that is the exact silent-failure mode the parse
+    // comment in flock_detect.cpp warns about, and the only way to catch it is a negative test.
+    { std::vector<uint8_t> f = beacon("ARLO_VMB_1164328298", MAC_PAD);
+      std::vector<uint8_t> g = frame(f.size(), 0x00);
+      g[0] = 0x80;
+      // rebuild with the IE at the probe-req offset instead of the beacon offset
+      g[24] = 0x00; g[25] = 19; for (int i = 0; i < 19; i++) g[26 + i] = "ARLO_VMB_1164328298"[i];
+      putMac(g, 10, MAC_PAD);
+      chk("beacon with its SSID IE at offset 24 (wrong) -> no hit", run(g, false, &d), false); }
+    // PROBE REQUESTS ARE EXCLUDED ON PURPOSE, and this test guards that, not an offset.
+    // A probe request's SSID IE is the network being SEARCHED FOR and addr2 is the searching
+    // station, so the frame attests NOTHING about the transmitter - which is what the 88 tier is
+    // sold on. Admitting 0x4 reported an Arlo CAMERA hunting its hub (or any phone with that SSID
+    // saved, on a randomized MAC) as "Arlo base station" at 88: wrong box, top tier, address never
+    // seen again. If this ever starts hitting, the tier is lying.
+    { std::vector<uint8_t> g = frame(64, 0x00);
+      g[0] = 0x40;   // subtype 0x4 = probe request
+      g[24] = 0x00; g[25] = 19; for (int i = 0; i < 19; i++) g[26 + i] = "ARLO_VMB_1164328298"[i];
+      putMac(g, 10, MAC_PAD);
+      chk("probe-request for an ARLO_VMB_ SSID -> NO hit (asks for it, isn't it)",
+          run(g, false, &d), false); }
+    // PROBE RESPONSE (0x5) shares the beacon's offset-36 body and IS a self-attestation, so it
+    // must hit. Without this the 24-vs-36 rule is only half pinned.
+    { std::vector<uint8_t> f = beacon("ARLO_VMB_1164328298", MAC_PAD);
+      f[0] = 0x50;   // subtype 0x5 = probe response
+      chk("probe-response SSID at offset 36 -> hits", run(f, false, &d), true,
+          d.confidence, 88, d.detail, "Arlo base station"); }
+    // The SSID itself must survive into the record: it is the evidence for the 88, and the row
+    // title falls back to a bare "Network camera" without it.
+    { std::vector<uint8_t> f = beacon("ARLO_VMB_1164328298", MAC_PAD);
+      chk("matched SSID is kept as the detection name", run(f, false, &d), true,
+          -1, -1, d.name, "ARLO_VMB_1164328298"); }
+    // The OUI half of the Arlo add, on the ordinary uplink path.
+    { std::vector<uint8_t> f = uplink(MAC_ARLO);
+      chk("Arlo a4:11:62 OUI on a data frame -> registry tier", run(f, true, &d), true,
+          d.confidence, 65, d.detail, "Arlo on wifi"); }
+    { std::vector<uint8_t> f = uplink(MAC_ARLO2);
+      chk("Arlo fc:9c:98 OUI", run(f, true, &d), true, d.confidence, 65, d.detail, "Arlo on wifi"); }
+    { std::vector<uint8_t> f = uplink(MAC_ARLO3);
+      chk("Arlo 48:62:64 OUI", run(f, true, &d), true, d.confidence, 65, d.detail, "Arlo on wifi"); }
+    // A DATA frame carries no SSID IE. The SSID path must not run on it at all, or a byte sequence
+    // in an encrypted payload could be parsed as an IE and matched.
+    { std::vector<uint8_t> f = beacon("ARLO_VMB_1164328298", MAC_PAD);
+      chk("same bytes as a DATA frame -> SSID path never runs", run(f, true, &d), false); }
 
     // ---- adversarial input ---------------------------------------------------------------------
     { std::vector<uint8_t> f;

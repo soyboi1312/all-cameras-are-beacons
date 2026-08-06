@@ -5,6 +5,8 @@ import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.horizontalScroll
+import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -26,6 +28,7 @@ import androidx.compose.material.icons.filled.ChevronRight
 import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.DeleteOutline
 import androidx.compose.material.icons.filled.DoneAll
+import androidx.compose.material.icons.filled.Place
 import androidx.compose.material.icons.automirrored.filled.PlaylistAddCheck
 import androidx.compose.material.icons.filled.NotificationsOff
 import androidx.compose.material.icons.filled.Pause
@@ -220,15 +223,27 @@ fun LogScreen(ble: AcabBleManager, onSelect: (Detection) -> Unit, initialFilter:
 
     fun exitSelect() { selectMode = false; selected = emptySet() }
 
-    fun exportCsv() {
+    /** [gpx] false = the CSV evidence file, true = GPX for a mapping app.
+     *
+     *  Exports whatever the log is CURRENTLY FILTERED TO, not the whole history. That is what the
+     *  button appears to promise while a category tile is lit, and the alternative (silently
+     *  handing over everything) is the worse surprise for this product in particular. The chosen
+     *  category also lands in the FILENAME, so a partial export cannot be mistaken for a complete
+     *  one once it has left the app. */
+    fun exportLog(gpx: Boolean = false, wholeLog: Boolean = false) {
         // The file write goes to IO (a Desert-mode log can be thousands of rows, which
         // would jank the main thread); the share sheet fires back on Main once it's done.
+        val cat = if (wholeLog) null else catFilter
         coScope.launch(Dispatchers.IO) {
-            val file = File(context.cacheDir, "acab-detections.csv")
-            file.writeText(ble.detectionsCsv())
+            val slug = cat?.let { "-" + it.lowercase().replace(' ', '-') } ?: ""
+            val ext = if (gpx) "gpx" else "csv"
+            val file = File(context.cacheDir, "acab-detections$slug.$ext")
+            file.writeText(if (gpx) ble.detectionsGpx(cat) else ble.detectionsCsv(cat))
             val uri = FileProvider.getUriForFile(context, "${context.packageName}.fileprovider", file)
             val send = Intent(Intent.ACTION_SEND).apply {
-                type = "text/csv"
+                // application/gpx+xml is the registered type; mapping apps key their share-sheet
+                // filters off it, and text/xml would hide beacons from Gaia's importer.
+                type = if (gpx) "application/gpx+xml" else "text/csv"
                 putExtra(Intent.EXTRA_STREAM, uri)
                 addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
             }
@@ -265,13 +280,24 @@ fun LogScreen(ble: AcabBleManager, onSelect: (Detection) -> Unit, initialFilter:
                 // SEEN would clear the new-dots mid-triage).
                 // Clear lives at the end of the list, not up here with the routine actions.
                 if (!selectMode && detections.isNotEmpty()) {
-                    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    // horizontalScroll because this row is now FOUR chips: at 411dp phone width
+                    // minus 20dp padding each side there is ~371dp, and SELECT + EXPORT + GPX +
+                    // MARK SEEN exceeds it, so the last chip was clipped with no way to reach it.
+                    // A filtered label ("DRONE CSV") makes it wider still.
+                    Row(horizontalArrangement = Arrangement.spacedBy(8.dp),
+                        modifier = Modifier.horizontalScroll(rememberScrollState())) {
                         ActionChip(Icons.AutoMirrored.Filled.PlaylistAddCheck, "SELECT") {
                             // resume first: bulk-ignore acts on live rows (iOS parity)
                             paused = false; frozen = emptyList()
                             selectMode = true; selected = emptySet()
                         }
-                        ActionChip(Icons.Filled.IosShare, "EXPORT CSV", ::exportCsv)
+                        // Labels name the SCOPE when a category tile is lit, so the button says
+                        // what it will actually hand over ("EXPORT DRONE CSV") instead of
+                        // implying the whole log.
+                        ActionChip(Icons.Filled.IosShare,
+                            catFilter?.let { "$it CSV" } ?: "EXPORT CSV") { exportLog(false) }
+                        ActionChip(Icons.Filled.Place,
+                            catFilter?.let { "$it GPX" } ?: "EXPORT GPX") { exportLog(true) }
                         // scope resets to ALL so the user is never stranded on an empty NEW lens
                         ActionChip(Icons.Filled.DoneAll, "MARK SEEN") {
                             ble.markAllSeen(); scope = LogScope.All
@@ -448,7 +474,10 @@ fun LogScreen(ble: AcabBleManager, onSelect: (Detection) -> Unit, initialFilter:
                 )
                 Spacer(Modifier.size(4.dp))
                 OutlinedButton(
-                    onClick = { exportCsv(); confirmClear = false },
+                    // ALWAYS the whole log, never the category filter. The button beside it
+                    // deletes EVERYTHING, so a filtered export here would hand back a subset and
+                    // then destroy the rest - the one place a partial export is silent data loss.
+                    onClick = { exportLog(gpx = false, wholeLog = true); confirmClear = false },
                     modifier = Modifier.fillMaxWidth(),
                     border = BorderStroke(1.dp, Acab.line),
                     colors = ButtonDefaults.outlinedButtonColors(contentColor = Acab.dim),

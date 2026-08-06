@@ -1,0 +1,20 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Legacy (API 30 and below) Auto-Backup rules. Paired with data_extraction_rules.xml, which
+     covers API 31+; BOTH are required because the platform picks by API level, and declaring only
+     one leaves the other era unconstrained.
+
+     EVERYTHING is excluded, and that is the point rather than an oversight. This app's data is
+     the detections file (MACs, capture GPS, timestamps), the ALPR dataset cache, the osmdroid tile
+     cache, and SharedPreferences, which include the key material the app pushes to boards for the
+     offline buffer. None of it should ever ride Google's cloud backup or a device-to-device
+     transfer: the whole product promise is that the log lives on the phone and nowhere else.
+
+     android:allowBackup="false" in the manifest already blocks this, but release lint wants the
+     rule files present, and a future allowBackup flip must not silently start exporting data. -->
+<full-backup-content>
+    <exclude domain="root" />
+    <exclude domain="file" />
+    <exclude domain="database" />
+    <exclude domain="sharedpref" />
+    <exclude domain="external" />
+</full-backup-content>

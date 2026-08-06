@@ -36,6 +36,7 @@ struct DetectionsView: View {
     @State private var selecting = false   // bulk-select mode
     @State private var selection: Set<String> = []   // selected Detection.id
     @State private var exportFile: ExportFile?
+    @State private var gpxHadNothing = false
     @State private var confirmClear = false           // gate the destructive log wipe
     // Pause the live feed so a fast-scrolling list can actually be read. Paused freezes the
     // DISPLAYED rows to a snapshot; the store keeps accumulating in BLEManager (nothing is
@@ -215,6 +216,12 @@ struct DetectionsView: View {
                 UserDefaults.standard.removeObject(forKey: "acab.pendingNewFilter")
             }
             .sheet(item: $exportFile) { ShareSheet(items: [$0.url]) }
+            .alert("Nothing to map", isPresented: $gpxHadNothing) {
+                Button("OK", role: .cancel) {}
+            } message: {
+                Text("None of these detections has a location, so there is nothing to put on a map. "
+                     + "Export CSV instead - it keeps every row, with the location columns blank.")
+            }
             .confirmationDialog("Clear \(ble.detections.count) detection\(ble.detections.count == 1 ? "" : "s")?",
                                 isPresented: $confirmClear, titleVisibility: .visible) {
                 Button("Export CSV first") {
@@ -253,15 +260,30 @@ struct DetectionsView: View {
     /// Labeled action chips under the title row (replaces the old anonymous
     /// icon buttons). Clear lives in the filter row (statusFilter), always reachable.
     private var actionChips: some View {
+        // Horizontally scrollable because this row is now FOUR chips, and a filtered label
+        // ("EXPORT BODY CAM CSV") is far wider than the unfiltered one. Android's twin got the
+        // same treatment; without it the last chip is clipped with no way to reach it.
+        ScrollView(.horizontal, showsIndicators: false) {
         HStack(spacing: 8) {
             actionChip("checkmark.circle", "SELECT") { resumeFeed(); selecting = true }   // bulk-ignore acts on live rows
-            actionChip("square.and.arrow.up", "EXPORT CSV") {
-                ble.writeDetectionsCSV { url in
+            // Both exports carry the CURRENT category filter, and the labels name it, so the chip
+            // says what it will actually hand over ("EXPORT DRONE CSV") rather than implying the
+            // whole log. Mirrors Android LogScreen.exportLog.
+            actionChip("square.and.arrow.up", filter.map { "\($0) CSV" } ?? "EXPORT CSV") {
+                ble.writeDetections(.csv, category: filter) { url in
                     if let url { exportFile = ExportFile(url: url) }
                 }
             }
+            actionChip("mappin.and.ellipse", filter.map { "\($0) GPX" } ?? "EXPORT GPX") {
+                ble.writeDetections(.gpx, category: filter) { url in
+                    // nil here means "nothing mappable", not "write failed": buildGPX refuses to
+                    // hand back a waypoint-less document. Say so, or the share sheet opens on an
+                    // empty file and looks like a broken export.
+                    if let url { exportFile = ExportFile(url: url) } else { gpxHadNothing = true }
+                }
+            }
             actionChip("checkmark", "MARK SEEN") { ble.markAllSeen(); scope = .all }
-            Spacer(minLength: 0)
+        }
         }
     }
 

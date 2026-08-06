@@ -852,7 +852,12 @@ struct MapTabView: View {
                     .font(ACABTheme.mono(8.5)).foregroundStyle(ACABTheme.faint)
             }
         }
-        .fixedSize(horizontal: true, vertical: false)   // hug content, never the whole screen
+        // Hug the content, but never past the screen. fixedSize(horizontal:) alone means "take my
+        // ideal width" with no upper bound, which was safe only while the fonts ignored Dynamic
+        // Type; once ACABTheme.mono started scaling, a large-text legend could run off the map.
+        // The frame caps it so it still hugs when small and wraps when it cannot.
+        .fixedSize(horizontal: false, vertical: true)
+        .frame(maxWidth: 260, alignment: .leading)
         .padding(11)
         .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: ACABTheme.radiusSm, style: .continuous))
         .overlay(RoundedRectangle(cornerRadius: ACABTheme.radiusSm, style: .continuous)

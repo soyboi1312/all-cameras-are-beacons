@@ -163,6 +163,7 @@ struct ConnectView: View {
         VStack(spacing: 14) {
             if btGranted {
                 scanCTA
+                pairWindowNote
             } else {
                 VStack(alignment: .leading, spacing: 13) {
                     Kicker("BEFORE THE SYSTEM ASKS")
@@ -171,6 +172,7 @@ struct ConnectView: View {
                     rationaleRow("location.fill", "Location",
                                  "pins hits to the map. Nothing leaves this phone, no accounts, no cloud.")
                     scanCTA
+                    pairWindowNote
                 }
                 .panel()
             }
@@ -218,6 +220,31 @@ struct ConnectView: View {
         }
         .buttonStyle(.plain)
         .padding(.top, 2)
+    }
+
+    /// First-time pairing note, shown under the scan button whenever no board is connected.
+    ///
+    /// A board that already belongs to a phone only accepts a NEW phone in the two minutes after it
+    /// powers on. That rule is invisible from the phone's side: the board hangs up before any
+    /// characteristic exists to explain itself, so a user who misses the window just sees a connect
+    /// that will not take. Stating it BEFORE the failure is worth more than any error message
+    /// after it, which is why this is always present rather than an alert.
+    ///
+    /// Deliberately says "already paired to another phone", not "your beacon": on a brand new board
+    /// with no bonds the rule does not apply at all (the firmware admits any phone until the board
+    /// has an owner), and telling a first-time customer to power-cycle would be a made-up ritual.
+    private var pairWindowNote: some View {
+        HStack(alignment: .top, spacing: 8) {
+            Image(systemName: "info.circle")
+                .font(ACABTheme.mono(11))
+                .foregroundStyle(ACABTheme.dim)
+            Text("Connecting a beacon that is already paired to another phone? "
+                 + BLEManager.pairWindowHint)
+                .font(ACABTheme.mono(11))
+                .foregroundStyle(ACABTheme.dim)
+                .fixedSize(horizontal: false, vertical: true)
+        }
+        .padding(.top, 10)
     }
 
     private func boardRow(_ dev: DiscoveredDevice) -> some View {
