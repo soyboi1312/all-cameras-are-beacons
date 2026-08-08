@@ -21,7 +21,10 @@ android {
     compileSdk = 36   // Android 16: compile against the Live Update promote APIs
 
     defaultConfig {
-        applicationId = "tech.acab.app"
+        // The PERMANENT public identity on Play: it becomes the store URL and can never be
+        // changed after publishing. Deliberately NOT the namespace below, which stays tech.acab.app
+        // so no Kotlin package has to move; applicationId exists precisely for this split.
+        applicationId = "tech.soyboi.beacons"
         minSdk = 26
         // 36 from 2026-08-06. Play requires API 36 for UPDATES from 2026-08-31, so this is a
         // deadline, not a preference. Raising it opts the app into Android 16's enforced
