@@ -29,10 +29,10 @@ jobs:
   build:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Set up JDK 17
-        uses: actions/setup-java@v4
+        uses: actions/setup-java@v5
         with:
           distribution: temurin
           java-version: '17'
@@ -64,7 +64,7 @@ jobs:
       # summary instead of making someone re-run it locally to find out.
       - name: Upload test results
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v5
         with:
           name: android-unit-test-results
           path: android/app/build/test-results/testDebugUnitTest/*.xml
@@ -98,7 +98,7 @@ jobs:
           cp android/app/build/outputs/bundle/release/app-release.aab "dist/beacons-${GITHUB_REF_NAME}.aab"
 
       - name: Upload build artifacts
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v5
         with:
           name: beacons-${{ github.ref_name }}
           path: dist/*
