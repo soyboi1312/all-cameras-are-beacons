@@ -1,4 +1,4 @@
-// Host regression test for the network-camera classifier: 62 branded IP-camera vendor OUIs matched
+// Host regression test for the network-camera classifier: 180 branded IP-camera vendor OUIs matched
 // off an 802.11 source MAC.
 //
 // WHY THIS FILE EXISTS. Three separate contracts run through netcam_detect.cpp, and none of them is
@@ -147,11 +147,13 @@ static const uint8_t MAC_ARLO3[6]  = { 0x48, 0x62, 0x64, 0x28, 0xd8, 0x59 };   /
 // accidental OUI hit cannot be mistaken for the SSID rule working.
 static const uint8_t MAC_PAD[6]    = { 0x11, 0x11, 0x11, 0x11, 0x11, 0x11 };
 
-// The twelve vendor labels the apps are allowed to see. Exact strings: casing and the slash are
-// part of the wire contract, not cosmetics. Ezviz/Lorex/Swann added 2026-08-02.
+// The vendor labels the apps are allowed to see. Exact strings: casing, the slash and the
+// hyphen are part of the wire contract, not cosmetics. Ezviz/Lorex/Swann added 2026-08-02;
+// the six on the second row added 2026-08-07 with the registry expansion.
 static const char* const KNOWN_VENDORS[] = {
     "Hikvision", "Dahua", "Amcrest", "Axis", "Reolink", "Ring", "Wyze", "Anker/eufy",
-    "Ezviz", "Lorex", "Swann", "Arlo"
+    "Ezviz", "Lorex", "Swann", "Arlo",
+    "Verkada", "i-PRO", "Vivotek", "Uniview", "Hanwha", "Samsung Techwin"
 };
 
 int main() {
@@ -227,11 +229,13 @@ int main() {
       chkBool("exactly 4 entries are flagged field-validated", validated == 4); }
     // A TRIPWIRE, not a fact: it exists so nobody grows this table without re-confirming the
     // blocks against the IEEE registry and thinking about the false-positive cost. 43 -> 59 on
-    // 2026-08-02 (Ezviz 14, Lorex 1, Swann 1), then 59 -> 62 on 2026-08-05 (Arlo 3), all
-    // re-confirmed against a fresh
+    // 2026-08-02 (Ezviz 14, Lorex 1, Swann 1), 59 -> 62 on 2026-08-05 (Arlo 3), then 62 -> 180 on
+    // 2026-08-07: Hikvision 7 -> 86 and Dahua 6 -> 33 (the vendors' COMPLETE MA-L sets, the table
+    // had held under a tenth of what those two companies own), plus Verkada, i-PRO, Vivotek,
+    // Uniview x4, Amcrest x2, Hanwha x2 and Samsung Techwin. All re-confirmed against a fresh
     // standards-oui.ieee.org pull. If you are here because this failed, go read the DELIBERATELY
     // ABSENT block at the bottom of netcam_signatures.h before you bump the number.
-    chkBool("table still holds exactly 62 OUIs", CAMERA_VENDOR_OUI_COUNT == 62);
+    chkBool("table still holds exactly 180 OUIs", CAMERA_VENDOR_OUI_COUNT == 180);
     { note[0] = 0;
       for (size_t i = 0; i < CAMERA_VENDOR_OUI_COUNT; i++) {
           bool known = false;
@@ -240,7 +244,7 @@ int main() {
           if (!known && !note[0]) snprintf(note, sizeof(note), "idx %zu unknown label \"%s\"", i,
                                            CAMERA_VENDOR_OUI[i].vendor);
       }
-      chkBool("every label is one of the 12 exact known vendor strings", note[0] == 0, note); }
+      chkBool("every label is one of the 18 exact known vendor strings", note[0] == 0, note); }
     // A table OUI with the locally-administered bit set could never match, because netcamEntry()
     // rejects LA addresses before it looks at the table. Such an entry would be dead weight and a
     // sign the block was transcribed wrong, so assert none exists.

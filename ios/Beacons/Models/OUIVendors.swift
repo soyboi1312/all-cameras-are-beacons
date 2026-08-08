@@ -136,7 +136,7 @@ extension Detection {
     /// WHY THIS EXISTS: an unnamed detection used to lead its log row with the category label, so
     /// twelve cameras in a row all read "Network camera" beside a glyph that already said network
     /// camera. The manufacturer was on the wire the whole time and both apps threw it away:
-    /// netcam_detect.cpp writes "<vendor> on wifi" off a 43-OUI table, and not one of those
+    /// netcam_detect.cpp writes "<vendor> on wifi" off a 180-OUI table, and not one of those
     /// vendors is in OUIVendors.table, so `ouiVendor` is nil for 100% of network cameras.
     ///
     /// READ THIS BEFORE ADDING A STEP: the maker is a WEAKER claim than the category label it

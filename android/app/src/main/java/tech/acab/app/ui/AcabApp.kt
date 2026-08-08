@@ -280,7 +280,7 @@ private fun BeaconHearsPanel() {
             color = Acab.dim, fontSize = 10.sp, fontFamily = Acab.mono, lineHeight = 15.sp,
         )
         Text(
-            "trackers and body cams are opt-in, switch them on in Device settings.",
+            "trackers and network cameras are opt-in, switch them on in Device settings.",
             color = Acab.faint, fontSize = 9.5.sp, fontFamily = Acab.mono, lineHeight = 14.sp,
         )
     }

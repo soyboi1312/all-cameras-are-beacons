@@ -160,4 +160,17 @@ void acabScannerRefreshWifiFilter();
 typedef void (*AcabCmdSink)(const char* line);
 void acabScannerSetCmdSink(AcabCmdSink sink);
 
+
+#ifdef ACAB_DIAG_WIFI
+// Diagnostic-queue accounting (capture builds). dropped>0 means the promiscuous callback
+// produced diag records faster than the serial task drained them, so the log is INCOMPLETE and
+// an absent signal proves nothing. Reported on the [diag] line.
+uint32_t acabScannerWifiDiagSent();
+uint32_t acabScannerWifiDiagDropped();
+#ifdef ACAB_CAPTURE_BUILD
+// Every watched DATA frame seen, counted even when the rate limiter printed no line for it.
+uint32_t acabScannerWatchDataSeen();
+#endif
+#endif
+
 #endif // ACAB_SCANNER_H

@@ -70,7 +70,7 @@ struct ConnectView: View {
             Text("a passive listener. it never jams, spoofs, or transmits, it writes down what's already shouting.")
                 .font(ACABTheme.mono(10)).foregroundStyle(ACABTheme.dim)
                 .fixedSize(horizontal: false, vertical: true)
-            Text("trackers and body cams are opt-in, switch them on in Device settings.")
+            Text("trackers and network cameras are opt-in, switch them on in Device settings.")
                 .font(ACABTheme.mono(9.5)).foregroundStyle(ACABTheme.faint)
                 .fixedSize(horizontal: false, vertical: true)
         }

@@ -1122,6 +1122,22 @@ void loop() {
                       (int)acabScannerCoProcScanning(), (unsigned long)acabScannerCoProcBbCount(), gBatMv,
                       acabBleBondCount(),
                       (unsigned long)(acabBlePairWindowRemainingMs() / 1000));
+#ifdef ACAB_DIAG_WIFI
+        // Capture builds only. diag_drop>0 means the promiscuous callback outran the serial
+        // task and records were thrown away, so the capture is INCOMPLETE: an absent signal in
+        // that log proves nothing. Printed on its own line so a grep for it is unambiguous.
+        Serial.printf("[diag] wifi_diag sent=%lu dropped=%lu"
+#ifdef ACAB_CAPTURE_BUILD
+                      " watch_data=%lu"
+#endif
+                      "\n",
+                      (unsigned long)acabScannerWifiDiagSent(),
+                      (unsigned long)acabScannerWifiDiagDropped()
+#ifdef ACAB_CAPTURE_BUILD
+                      , (unsigned long)acabScannerWatchDataSeen()
+#endif
+                      );
+#endif
     }
 #endif
     // push a status notify every 5s to keep the app's uptime/count current

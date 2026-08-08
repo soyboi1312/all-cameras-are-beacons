@@ -65,4 +65,28 @@ static const uint8_t POLICE_OUI[][3] = {
 };
 static const size_t POLICE_OUI_COUNT = sizeof(POLICE_OUI) / sizeof(POLICE_OUI[0]);
 
+// FIELD-VALIDATION QUEUE, NOT COMPILED IN. Two in-car/body-video vendors whose own corporate
+// MA-L blocks are registry-confirmed (2026-08-07 pull of standards-oui.ieee.org/oui/oui.csv):
+//
+//   00:1D:96   WatchGuard Video
+//   00:23:BD   Digital Ally, Inc.
+//
+// Both are narrow registrants, so they would pass the no-shared-silicon rule that keeps
+// Espressif and TP-Link out of these tables. They are still absent on purpose, for two reasons.
+//
+// First, an OUI establishes the VENDOR, never the equipment type. Both companies ship in-car
+// video, interview-room recorders, evidence storage and fleet hardware alongside anything
+// body-worn, so a hit would not mean what the category name says it means. That is the exact
+// error the crowdsourced lists reviewed on 2026-08-07 make dozens of times over.
+//
+// Second, this table has been measured, and the measurement was humbling: the "3 distinct MACs
+// at one site" note that once justified it turned out to be 0/27 when properly counted, and the
+// field-observed rows above are ceiling and infrastructure gear rather than anything worn. A
+// vendor block earns a place here after a capture pins it to a device somebody actually saw,
+// not because the registration is real.
+//
+// To promote either one: capture near a confirmed unit with the capture build
+// (pio run -e beacon-board-capture), which now logs every prober and its frame type, then record
+// the co-signals the way the netcam table records its own field validations.
+
 #endif // ACAB_POLICE_SIGNATURES_H

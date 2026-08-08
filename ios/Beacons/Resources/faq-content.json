@@ -40,6 +40,11 @@
           "a": "yes, hit watch (the star) on any detection. it becomes its own category and the beacon calls it out when it's near, even if it would otherwise be ignored. to star something the beacon does not already recognize, switch desert mode on so it shows up at all, star it, then switch desert mode back off: the star keeps working either way. rename it under managed devices so the log reads like your log. holds up to 256. one caveat: watching matches the exact hardware address, and phones rotate theirs every few minutes, so the app warns you when a star probably won't stick."
         },
         {
+          "id": "q-detectors",
+          "q": "can i turn individual detectors on or off?",
+          "a": "yes, all of them, on the device tab under detectors. flip any category and the beacon obeys straight away, no reflash: flock/ALPR, drones, body cams, glasses, trackers, network cameras. scan radios above it turns a whole radio off if you only want bluetooth or only wifi.\n\nout of the box flock/ALPR, drones, body cams and glasses are on, and trackers and network cameras are off, because both are noisy in ordinary places and are worth switching on deliberately. the settings live on the beacon, so they survive a power cycle and keep working with your phone away.\n\nif a category is quieter than you expect, check here first, it may simply be switched off."
+        },
+        {
           "id": "q-desert",
           "q": "what is desert mode, and when would i use it?",
           "a": "normally the beacon only calls out surveillance gear it recognizes. desert mode flips that: it reports every device broadcasting nearby, phones, watches, earbuds. it's for proof of life, sparse areas, and capturing an unknown device so a new signature can be built, or so you can star it. anything you star while it's on stays starred after you switch it off. a busy street turns it into a firehose, so switch it back off when you're done."
@@ -62,7 +67,7 @@
         {
           "id": "q-pair-window",
           "q": "my other phone won't connect to the beacon",
-          "a": "a beacon that already belongs to a phone only accepts a new phone in the first two minutes after it powers on. turn the beacon off and on, then connect within two minutes. that is the whole fix.\n\nthe phone that already paired reconnects whenever it likes, forever, and never has to do this. a brand new beacon that has never been paired is not affected at all, the first phone connects whenever you are ready.\n\nit works this way so that someone who happens to be near your beacon cannot pair to it and read where you have been. the beacon hangs up before it can explain itself, which is why a blocked attempt just looks like a connection that will not take."
+          "a": "a beacon that already belongs to a phone only accepts a new phone in the first two minutes after it powers on. turn the beacon off and on, then connect within two minutes. that is the whole fix.\n\nthe phone that already paired reconnects whenever it likes, forever, and never has to do this. a brand new beacon that has never been paired is not affected at all, the first phone connects whenever you are ready.\n\nit works this way so that someone who happens to be near your beacon cannot pair to it and read where you have been. the beacon hangs up before it can explain itself, which is why a blocked attempt just looks like a connection that will not take.\n\nonly a real power-up opens the window. a firmware update restarting the board does not, so an update cannot quietly reopen pairing to whoever is standing nearby."
         },
         {
           "id": "q-restart",
@@ -147,7 +152,7 @@
         {
           "id": "q-better",
           "q": "does it get better over time?",
-          "a": "yes, and for free. detection is signature based, and new surveillance hardware keeps appearing, so signatures keep coming. when new firmware lands, the app flags it and installs it over the air over bluetooth. one purchase; it keeps learning."
+          "a": "yes, and for free. detection is signature based, and new surveillance hardware keeps appearing, so signatures keep coming. when new firmware lands, the app flags it and installs it over the air over bluetooth from one button, which updates both radios in the beacon in a single pass. one purchase; it keeps learning."
         },
         {
           "id": "q-opensource",

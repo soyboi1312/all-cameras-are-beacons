@@ -723,6 +723,22 @@ static void bleScanTask(void*) {
 // Parsing + serial run off the promiscuous callback via a queue and task.
 struct WifiDiagItem { uint8_t bssid[6]; int8_t rssi; char ssid[33]; };
 static QueueHandle_t gWifiDiagQ = nullptr;
+
+// EVERY diagnostic enqueue goes through wifiDiagPush so a full queue is COUNTED, never silently
+// swallowed. xQueueSend(..., 0) drops on a full queue by design, because the promiscuous
+// callback must not block; the cost is that loss is invisible at the point it happens. That
+// matters now: the capture build logs every probe request, which is a large step up in queue
+// pressure, and "nothing appeared in the capture" is only evidence of absence if the log can
+// also say nothing was dropped. The [diag] line reports both counters.
+static volatile uint32_t gWifiDiagSent = 0;
+static volatile uint32_t gWifiDiagDropped = 0;
+static inline void wifiDiagPush(const WifiDiagItem& it) {
+    if (!gWifiDiagQ) return;
+    if (xQueueSend(gWifiDiagQ, &it, 0) == pdTRUE) gWifiDiagSent++;
+    else                                          gWifiDiagDropped++;
+}
+uint32_t acabScannerWifiDiagDropped() { return gWifiDiagDropped; }
+uint32_t acabScannerWifiDiagSent()    { return gWifiDiagSent; }
 static void wifiDiagTask(void*) {
     WifiDiagItem it;
     for (;;)
@@ -741,6 +757,34 @@ static inline bool falconOui(const uint8_t* m) {
            (m[0]==0x24 && m[1]==0xB2 && m[2]==0xB9) ||   // 24:B2:B9
            (m[0]==0xF4 && m[1]==0x6A && m[2]==0xDD);     // F4:6A:DD
 }
+
+#ifdef ACAB_CAPTURE_BUILD
+// DIAGNOSTIC WATCHLIST - capture builds only, and deliberately NOT a classifier.
+//
+// OUIs that are interesting enough to want every frame of, but nowhere near good enough to
+// label a device by. A match logs the frame type and lets the co-signals in the surrounding
+// capture speak; it never produces a detection, never reaches the apps, and is compiled out of
+// every shipping build.
+//
+// 08:3A:88 is the current occupant. A crowdsourced list called it "Espressif Flock Falcon V2
+// Wi-Fi module" AND, on the same page, flagged a Ring conflict; IEEE actually assigns it to
+// Universal Global Scientific Industrial. It showed up twice in the 2026-08-07 capture eight
+// seconds after the confirmed FS-BEC46A hit, which is the only reason it is here, but it carried
+// an unrelated-looking "MH1M-PEB200827-000975" payload and was completely absent from the
+// six-minute capture taken ten feet from a camera. So: worth watching, not worth believing.
+static inline bool diagWatchOui(const uint8_t* m) {
+    return (m[0]==0x08 && m[1]==0x3A && m[2]==0x88);     // 08:3A:88  UGSI; see note above
+}
+// Rate limit for watched DATA frames, and the true count of them. A streaming device emits
+// hundreds of data packets a second; one serial record each would overflow the diag queue and
+// crowd out the probe/beacon co-signals that make a sighting interpretable. We log the first
+// match and then every WATCH_DATA_EVERY-th, while gWatchDataSeen counts every one, so the
+// [diag] line can state the real volume no matter how few lines were printed. Management-frame
+// watch hits are NOT rate limited: they are rare and each one is informative.
+static const uint32_t WATCH_DATA_EVERY = 250;
+static volatile uint32_t gWatchDataSeen = 0;
+uint32_t acabScannerWatchDataSeen() { return gWatchDataSeen; }
+#endif
 #endif
 
 // Compute + install the promiscuous frame filter. Production is MGMT-only (beacons + probe
@@ -776,7 +820,13 @@ static void IRAM_ATTR wifiRxCallback(void* buf, wifi_promiscuous_pkt_type_t type
     if (type == WIFI_PKT_DATA && gWifiDiagQ) {
         static uint32_t gDataN = 0; gDataN++;
         const uint8_t* aa[3] = { payload + 4, payload + 10, payload + 16 };
-        bool matched = false;
+        // The two scans below are INDEPENDENT, and deliberately so. An earlier version made the
+        // watchlist conditional on the Falcon scan missing, which meant a frame carrying BOTH a
+        // known Falcon address and a watched OUI logged only the Falcon and hid the watch hit.
+        // That co-occurrence, a watched device exchanging data with a confirmed Falcon, is the
+        // single most valuable thing this capture path could ever record, and it was the one
+        // case suppressed. loggedAnything exists ONLY to suppress the generic DATA-sample below.
+        bool loggedAnything = false;
         for (int k = 0; k < 3; k++) {
             const uint8_t* m = aa[k];
             if (falconOui(m)) {
@@ -784,17 +834,47 @@ static void IRAM_ATTR wifiRxCallback(void* buf, wifi_promiscuous_pkt_type_t type
                 memcpy(it.bssid, m, 6);
                 it.rssi = (int8_t)rssi;
                 memcpy(it.ssid, "DATA-FALCON", 12);
-                xQueueSend(gWifiDiagQ, &it, 0);
-                matched = true;
+                wifiDiagPush(it);
+                loggedAnything = true;
                 break;
             }
         }
-        if (!matched && (gDataN % 300) == 0) {   // sample: proves data frames are arriving
+#ifdef ACAB_CAPTURE_BUILD
+        // Diagnostic watchlist on the DATA path too (see diagWatchOui). The mgmt-side copy of
+        // this check only fires on management frames, so a watched device that is ASSOCIATED to
+        // a network and sending nothing but data would have been invisible unless it happened to
+        // probe. That is exactly the case worth catching: a camera on a backhaul link. Checked
+        // against all three address fields, like the Falcon match above, since a client's MAC
+        // lands in addr1/2/3 depending on the frame's direction.
+        //
+        // RATE LIMITED, because a watched device that is actively streaming emits data packets
+        // by the hundred per second. One serial record each would overflow the diag queue within
+        // a second and throw away the probe/beacon co-signals that give the sighting its meaning,
+        // i.e. the logging would destroy the evidence it exists to collect. So: log the FIRST
+        // match, then one line every WATCH_DATA_EVERY frames, each carrying the running total.
+        // gWatchDataSeen keeps the true count regardless of how few lines were printed, and is
+        // reported on the [diag] line, so the log always states the real volume.
+        for (int k = 0; k < 3; k++) {
+            if (!diagWatchOui(aa[k])) continue;
+            gWatchDataSeen++;
+            if (gWatchDataSeen == 1 || (gWatchDataSeen % WATCH_DATA_EVERY) == 0) {
+                WifiDiagItem it;
+                memcpy(it.bssid, aa[k], 6);
+                it.rssi = (int8_t)rssi;
+                snprintf(it.ssid, sizeof(it.ssid), "WATCH DATA addr%d n=%lu",
+                         k + 1, (unsigned long)gWatchDataSeen);
+                wifiDiagPush(it);
+            }
+            loggedAnything = true;   // suppress DATA-sample even on a rate-limited frame
+            break;
+        }
+#endif
+        if (!loggedAnything && (gDataN % 300) == 0) {   // sample: proves data frames are arriving
             WifiDiagItem it;
             memcpy(it.bssid, aa[1], 6);           // addr2 = source
             it.rssi = (int8_t)rssi;
             memcpy(it.ssid, "DATA-sample", 12);
-            xQueueSend(gWifiDiagQ, &it, 0);
+            wifiDiagPush(it);
         }
     }
 #endif
@@ -813,15 +893,57 @@ static void IRAM_ATTR wifiRxCallback(void* buf, wifi_promiscuous_pkt_type_t type
     gWifiSeen++;
 
 #ifdef ACAB_DIAG_WIFI
-    // probe request (0x40): Falcon cams scan for networks as WiFi clients - match
-    // their OUI in addr2 (the prober). Lighter path: we already receive mgmt frames.
-    if (gWifiDiagQ && payload[0] == 0x40 && falconOui(payload + 10)) {
+    // probe request (0x40): Falcon cams scan for networks as WiFi clients, so addr2 is the
+    // prober. A KNOWN Falcon OUI is called out by name; in a capture build EVERY prober is
+    // logged instead, with the SSID it is asking for.
+    //
+    // Why the unconditional arm exists: gating this on falconOui() made the capture build
+    // circular. Its whole job is to discover a signature we do NOT have yet, but a client on an
+    // unknown OUI could not reach the log at all - the mgmt path below only records beacons and
+    // probe-responses (i.e. APs), and a client's data frames only surface through the 1-in-300
+    // "DATA-sample" heartbeat further up. So a camera that associates to a backhaul network,
+    // which is exactly what the comment above says Falcons do, was effectively invisible unless
+    // it already matched a signature we had. Field capture 2026-08-07 was read against that
+    // blind spot before it was found. Probe requests are chatty, which is the point here and the
+    // reason this stays out of shipping builds.
+    if (gWifiDiagQ && payload[0] == 0x40) {
+        const bool known = falconOui(payload + 10);
+#ifndef ACAB_CAPTURE_BUILD
+        if (known)
+#endif
+        {
+            WifiDiagItem it;
+            memcpy(it.bssid, payload + 10, 6);
+            it.rssi = (int8_t)rssi;
+            if (known) {
+                memcpy(it.ssid, "PROBE-FALCON", 13);
+            } else {
+                // "PROBE:<ssid>", or "PROBE:*" for the broadcast (wildcard) probe every client
+                // sends. SSID IE sits at [24] for a probe request: tag 0x00, len, then the name.
+                memcpy(it.ssid, "PROBE:", 6);
+                uint8_t sl = (len >= 26 && payload[24] == 0x00) ? payload[25] : 0;
+                if (sl > sizeof(it.ssid) - 7) sl = sizeof(it.ssid) - 7;
+                if (sl && 26 + sl <= len) { memcpy(it.ssid + 6, payload + 26, sl); it.ssid[6 + sl] = 0; }
+                else                      { it.ssid[6] = '*'; it.ssid[7] = 0; }
+            }
+            wifiDiagPush(it);
+        }
+    }
+#ifdef ACAB_CAPTURE_BUILD
+    // Diagnostic watchlist (see diagWatchOui): log the FRAME TYPE, so the capture shows whether
+    // the MAC is currently acting as an access point (0x80 beacon), as a client hunting for one
+    // (0x40 probe request), or as an associated client (data, logged on the other path).
+    // That is BEHAVIOUR AT THAT MOMENT, not identity: plenty of ordinary gear beacons, and a
+    // roadside unit on a cellular backhaul may never do any of it. Frame type narrows what a
+    // sighting could be; the co-signals around it in the capture are what decide.
+    if (gWifiDiagQ && diagWatchOui(payload + 10)) {
         WifiDiagItem it;
         memcpy(it.bssid, payload + 10, 6);
         it.rssi = (int8_t)rssi;
-        memcpy(it.ssid, "PROBE-FALCON", 13);
-        xQueueSend(gWifiDiagQ, &it, 0);
+        snprintf(it.ssid, sizeof(it.ssid), "WATCH type=0x%02X", payload[0]);
+        wifiDiagPush(it);
     }
+#endif
     // beacon (0x80) or probe-response (0x50): grab BSSID + SSID for the bench log
     if (gWifiDiagQ && (payload[0] == 0x80 || payload[0] == 0x50) && len >= 38) {
         WifiDiagItem it;
@@ -832,7 +954,7 @@ static void IRAM_ATTR wifiRxCallback(void* buf, wifi_promiscuous_pkt_type_t type
         if (payload[36] == 0x00 && sl <= 32 && 38 + sl <= len) {
             memcpy(it.ssid, payload + 38, sl); it.ssid[sl] = 0;
         }
-        xQueueSend(gWifiDiagQ, &it, 0);      // non-blocking: drop on overflow
+        wifiDiagPush(it);                    // counted; drops on overflow rather than blocking
     }
 #endif
 

@@ -30,7 +30,7 @@ android {
         // Device and Detail, orientation changes, the Drive foreground service, and large-screen
         // layout all need eyes on a real 16 device.
         targetSdk = 36
-        versionCode = 21
+        versionCode = 22
         versionName = "2.0.4"
     }
 
