@@ -212,6 +212,28 @@ fun AcabApp(
 
     val otaActive = ota.phase != OtaPhase.IDLE && ota.phase != OtaPhase.DONE && ota.phase != OtaPhase.FAILED
     val reconnectUsable = shouldUseReconnectShell(shellEstablished, hadLink, state, otaActive)
+
+    // THE TWO HOMES THE RESTORE OFFER WAS MISSING. Every other surface that carries it lives on the
+    // Beacon tab, and while either of the two screens below draws, MainScreen is either not
+    // composed at all or parked pointer-disabled with its semantics cleared, so the Beacon tab is
+    // not reachable: the board ended Desert, the owner came back with the board off or gone, and
+    // alerts stayed silent with nothing on screen and no way out of it.
+    //
+    // Decided HERE, above the early returns, because this is the one place composed in both states,
+    // so `mainShellVisible` is a real input and not a constant. It is the negation of the hand-off
+    // below, so this copy and the Beacon tab's detached copy can never draw together.
+    //
+    // ONE FLAG, TWO SCREENS, because the shell is just as unreachable during an OTA reboot: the
+    // OtaWaitScreen return below is above the pre-connect list, and shouldUseReconnectShell is
+    // false while otaActive, so that window used to compute this true and draw nothing. Each of
+    // the two reads the flag on its own side of that early return, so they can never both draw.
+    // iOS twin: connectScreenCarriesRestore in RootView.swift, which needs one screen only because
+    // RootView keeps the tab shell up through the reboot.
+    val pendingAlertRestore by ble.pendingAlertModeRestore.collectAsState()
+    val preConnectRestoreOffer = desertRestoreNeedsPreConnectSurface(
+        restoreOffered = alertRestoreIsOffered(demoMode, pendingAlertRestore),
+        mainShellVisible = state == ConnState.READY || reconnectUsable,
+    )
     // Hoisted so the shell can be removed from the semantics tree while an orientation overlay is
     // visible. Sample data gets its own non-persisting orientation and never spends the real tour.
     var tourDone by rememberSaveable { mutableStateOf(FirstRunTour.hasSeen(context)) }
@@ -377,8 +399,24 @@ fun AcabApp(
     // An OTA reboot drops the link to non-READY while the update is still in flight. Show a locked
     // "updating" screen instead of the interactive scan/connect UI, so the user can't fire a second
     // connect that would collide with the post-reboot reconnect loop.
+    //
+    // IT CARRIES THE RESTORE OFFER TOO, from the same flag the pre-connect list below reads. This
+    // return is ABOVE that list, and shouldUseReconnectShell withholds the reconnect shell while an
+    // update runs, so a state that reaches here computes preConnectRestoreOffer true whenever a
+    // mode is owed, with nothing else on screen to draw it: the parked MainScreen sits under this
+    // opaque screen with its pointer events consumed and its semantics cleared, so its own copy is
+    // neither visible, tappable, nor readable. This screen's own copy puts that window at up to a
+    // minute, which is a long time to hold a silence the app imposed with no way out of it. A
+    // combined update reaches this screen in its S3 leg only: the nRF leg runs FIRST (the
+    // beginFirstLeg comment in CombinedUpdateCoordinator says why) and leaves the S3 engine idle,
+    // so otaActive is false there, and that leg keeps whichever ordinary surface its link state
+    // selects. iOS needs no equivalent: RootView's mainIsUsable keeps the tab shell up through the
+    // reboot (isRebootingForUpdate), so the Beacon screen's own detached panel carries it there.
+    //
+    // EXCLUSIVE WITH THE LIST BY CONSTRUCTION: the two homes sit on opposite sides of this one
+    // early return, so exactly one of them draws for any state.
     if (otaActive) {
-        OtaWaitScreen(ota)
+        OtaWaitScreen(ota, showAlertRestore = preConnectRestoreOffer, ble = ble)
         return@Box
     }
 
@@ -416,6 +454,17 @@ fun AcabApp(
                 Modifier.weight(1f).fillMaxWidth(),
                 verticalArrangement = Arrangement.spacedBy(16.dp),
             ) {
+                // A SILENCE THIS APP IMPOSED LEADS EVEN THIS SCREEN, above the scan panel: this is
+                // the only reachable copy of the offer right now, and the state that arms it (a
+                // board reboot, a factory reset) is exactly the state that lands the owner here.
+                // Nothing about taking it needs a board - the alert mode is a phone preference.
+                // The board write it also makes is dropped while there is no link (the config
+                // enqueue bails with no gatt); the next connect re-sends the wanted mode, and
+                // reconcileBuzzer re-asserts it from the first status frame if the board still
+                // disagrees. That is the same path as any other mode picked while offline. Same
+                // panel, same strings and the same take as the Beacon tab's copy, from the one
+                // AlertRestorePanel definition.
+                if (preConnectRestoreOffer) item { AlertRestorePanel(ble) }
                 when (state) {
                     ConnState.CONNECTING ->
                         if (hadLink) item { ReconnectingPanel(onStop = { ble.stopConnectionAndScan() }) }
@@ -1178,30 +1227,52 @@ private fun SavedLogScreen(
 private const val KEY_LIVE_PERMISSION_EXPLAINED = "live_permission_explained"
 
 /** Locked screen shown while an OTA is in flight but the link is down (the reboot/reconnect
- *  window). No scan/connect controls, so the reconnect loop can finish uninterrupted. */
+ *  window). No scan/connect controls, so the reconnect loop can finish uninterrupted.
+ *
+ *  [showAlertRestore] is the ONE exception to "no controls", and it is decided by the caller
+ *  (AcabApp's preConnectRestoreOffer), not here: a silence this app imposed has to stay one tap
+ *  from undone for as long as it lasts, and the copy on this screen puts that window at up to a
+ *  minute. Taking it needs no board (the alert mode is a phone preference), and it cannot disturb
+ *  the reconnect loop: the board write it also makes is dropped while there is no link; the next
+ *  connect re-sends the wanted mode, and reconcileBuzzer re-asserts it from the first status frame
+ *  if the board still disagrees.
+ *
+ *  It LEADS, above the spinner, the same position the offer takes on the other two panel surfaces.
+ *  The wait content keeps its own centred column under it, so this screen looks exactly as it did
+ *  whenever nothing is owed. */
 @Composable
-private fun OtaWaitScreen(ota: OtaProgress) {
+private fun OtaWaitScreen(ota: OtaProgress, showAlertRestore: Boolean, ble: AcabBleManager) {
     Surface(modifier = Modifier.fillMaxSize(), color = Acab.bg) {
         Column(
             Modifier.fillMaxSize()
                 .windowInsetsPadding(WindowInsets.safeDrawing)
                 .padding(Acab.pad),
             horizontalAlignment = Alignment.CenterHorizontally,
-            verticalArrangement = Arrangement.Center,
         ) {
-            CircularProgressIndicator(color = Acab.accent, strokeWidth = 3.dp)
-            Spacer(Modifier.height(20.dp))
-            Text("Updating firmware", color = Acab.text, fontSize = 18.sp,
-                fontWeight = FontWeight.Bold, fontFamily = Acab.mono)
-            Spacer(Modifier.height(8.dp))
-            Text(
-                ota.message.ifBlank { "The beacon is rebooting into the new firmware. Keep the app open, it reconnects on its own." },
-                color = Acab.dim, fontSize = 12.sp, fontFamily = Acab.mono,
-                textAlign = TextAlign.Center, modifier = Modifier.padding(horizontal = 24.dp),
-            )
-            Spacer(Modifier.height(6.dp))
-            Text("this can take up to a minute. don't unplug the beacon.",
-                color = Acab.faint, fontSize = 10.sp, fontFamily = Acab.mono, textAlign = TextAlign.Center)
+            if (showAlertRestore) {
+                AlertRestorePanel(ble)
+                Spacer(Modifier.height(28.dp))
+            }
+            Column(
+                Modifier.fillMaxWidth().weight(1f),
+                horizontalAlignment = Alignment.CenterHorizontally,
+                verticalArrangement = Arrangement.Center,
+            ) {
+                CircularProgressIndicator(color = Acab.accent, strokeWidth = 3.dp)
+                Spacer(Modifier.height(20.dp))
+                Text("Updating firmware", color = Acab.text, fontSize = 18.sp,
+                    fontWeight = FontWeight.Bold, fontFamily = Acab.mono)
+                Spacer(Modifier.height(8.dp))
+                Text(
+                    ota.message.ifBlank { "The beacon is rebooting into the new firmware. Keep the app open, it reconnects on its own." },
+                    color = Acab.dim, fontSize = 12.sp, fontFamily = Acab.mono,
+                    textAlign = TextAlign.Center, modifier = Modifier.padding(horizontal = 24.dp),
+                )
+                Spacer(Modifier.height(6.dp))
+                Text("this can take up to a minute. don't unplug the beacon.",
+                    color = Acab.faint, fontSize = 10.sp, fontFamily = Acab.mono,
+                    textAlign = TextAlign.Center)
+            }
         }
     }
 }

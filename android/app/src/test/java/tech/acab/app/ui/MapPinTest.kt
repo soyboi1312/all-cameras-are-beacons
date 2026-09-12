@@ -6,6 +6,7 @@ import org.junit.Assert.assertSame
 import org.junit.Assert.assertTrue
 import org.junit.Test
 import androidx.compose.ui.graphics.Color
+import tech.acab.app.ble.MapDetectionEvidence
 import tech.acab.app.ui.theme.Acab
 import tech.acab.app.model.Detection
 import tech.acab.app.model.DeviceType
@@ -14,6 +15,12 @@ import tech.acab.app.model.DeviceType
  * The two pure decisions behind map pin presentation: which rows share a pin, and how old a pin
  * is allowed to look. Both are shared rules with iOS, so the numbers in here are a cross-platform
  * contract and a change to any of them is a change on both phones.
+ *
+ * Same-spot grouping is exercised where it LIVES: buildMapRenderPlan (MapProjection.kt) at street
+ * zoom, whose SymbolBucket.finish orders each exact-pin bucket with sameSpotOrder, and
+ * orderSameSpotMembers, the draw loop's re-application of that order on its live last-seen read.
+ * An earlier copy of the grouper in MapScreen.kt had thirteen tests of its own here while the live
+ * rule had none; those were retargeted rather than kept, because a test of dead code cannot fail.
  *
  * Neither decision needs a map, a bitmap or a device, and both are the part that can quietly go
  * wrong: a priority table in the wrong order buries a body cam under an older nearby device, and
@@ -53,12 +60,21 @@ class MapPinTest {
         approx = false,
     )
 
-    /** Group [items] with per-row coordinates and stamps supplied by id. */
+    /** What buildMapRenderPlan hands the draw loop for [items] at street zoom over the whole
+     *  world: one MapSymbolGroup per spot, coordinates and stamps supplied by id. Zoom 16 sits
+     *  above MAP_FAR_ZOOM, so the individually pinned types take the PIN_GROUP_EPSILON_DEG cell,
+     *  the same-spot rule under test, while a clusterable type takes the adaptive grid. */
     private fun group(
         items: List<Detection>,
         coords: Map<String, Pair<Double, Double>>,
         seen: Map<String, Long> = emptyMap(),
-    ) = groupPinsBySpot(items, { coords[it.id] }, { seen[it.id] })
+    ): List<MapSymbolGroup> = buildMapRenderPlan(
+        items.map { MapDetectionEvidence(it, coords[it.id], seen[it.id]) },
+        MapViewport.WORLD, zoom = 16.0, markerCap = 100, showBreadcrumbs = false,
+    ).symbols
+
+    /** The member whose pin actually draws, and whose detail opens for a group of one. */
+    private val MapSymbolGroup.lead: Detection get() = members.first()
 
     // ---- the shared numbers -------------------------------------------------------------
 
@@ -73,7 +89,7 @@ class MapPinTest {
     // ---- grouping tolerance -------------------------------------------------------------
 
     /** The case the whole feature exists for: everything logged from one standing position
-     *  carries the identical phone fix. */
+     *  carries the identical phone fix. An exact-pin group, never a grid bubble. */
     @Test
     fun identicalCoordinatesAreOneGroup() {
         val a = row(DeviceType.BODY_CAM)
@@ -82,12 +98,18 @@ class MapPinTest {
         val groups = group(listOf(a, b), mapOf(a.id to here, b.id to here))
 
         assertEquals(1, groups.size)
+        assertFalse(groups.single().cluster)
         assertEquals(2, groups.single().members.size)
         assertEquals(here.first, groups.single().lat, 0.0)
         assertEquals(here.second, groups.single().lon, 0.0)
     }
 
-    /** Sub-metre drift inside the tolerance still lands on one pin. */
+    /** Sub-metre drift inside the tolerance still lands on one pin, and that pin sits on the
+     *  lead's own recorded coordinate rather than an average of the members. `a` leads: equal
+     *  priority, both undated, so the stable sort keeps the feed order. This is the only
+     *  multi-member case whose members differ in coordinate, so it is the one that can see
+     *  averaging. FAILS IF SymbolBucket.finish averages an exact-pin group: the mean latitude is
+     *  34.0000063, not 34.0000053. */
     @Test
     fun aTinyOffsetInsideTheToleranceStaysInTheGroup() {
         val a = row(DeviceType.BODY_CAM)
@@ -96,12 +118,16 @@ class MapPinTest {
             listOf(a, b),
             mapOf(
                 a.id to (34.0000053 to -117.0000053),
-                // +2e-6 degrees on each axis, a fifth of the tolerance
+                // 2e-6 degrees away on each axis, a fifth of the tolerance
                 b.id to (34.0000073 to -117.0000073),
             ),
         )
         assertEquals(1, groups.size)
-        assertEquals(2, groups.single().members.size)
+        val g = groups.single()
+        assertEquals(2, g.members.size)
+        assertEquals(a, g.lead)
+        assertEquals(34.0000053, g.lat, 0.0)
+        assertEquals(-117.0000053, g.lon, 0.0)
     }
 
     /** Genuinely separate spots stay separate pins, in the order they arrived. */
@@ -147,7 +173,7 @@ class MapPinTest {
         assertEquals(listOf(placed), groups.single().members)
     }
 
-    // ---- which rows reach the grouper at all --------------------------------------------
+    // ---- which rows reach same-spot grouping at all --------------------------------------
 
     /** There are exactly TWO map treatments and the split is [clusterable] alone: a type either
      *  grid-clusters into a count bubble, or it pins individually and therefore takes part in
@@ -158,7 +184,7 @@ class MapPinTest {
      *  won the spot, so absorbing a drone pin costs no artwork. Keeping drones out cost the drone
      *  its tap, because a co-located infra pin simply covered it. */
     @Test
-    fun theIndividuallyPinnedTypesIncludingDronesReachTheGrouper() {
+    fun theIndividuallyPinnedTypesIncludingDronesReachSameSpotGrouping() {
         for (t in listOf(DeviceType.WATCHED, DeviceType.FLOCK_CAMERA, DeviceType.FLOCK_RAVEN,
                          DeviceType.BODY_CAM, DeviceType.DRONE, DeviceType.UNKNOWN)) {
             assertFalse("$t pins individually, so it groups", clusterable(t))
@@ -167,6 +193,16 @@ class MapPinTest {
                          DeviceType.NETWORK_CAMERA)) {
             assertTrue("$t belongs to the clustered mass", clusterable(t))
         }
+        // The split as the projection applies it: a body cam and a tracker on the IDENTICAL
+        // coordinate are two symbols at street zoom, the body cam an exact pin and the tracker
+        // a grid cell, so no clusterable row is ever absorbed into an exact-pin group.
+        val bodyCam = row(DeviceType.BODY_CAM)
+        val tracker = row(DeviceType.TRACKER)
+        val here = 34.0000053 to -117.0000053
+        val groups = group(listOf(bodyCam, tracker), mapOf(bodyCam.id to here, tracker.id to here))
+        assertEquals(2, groups.size)
+        assertEquals(listOf(bodyCam), groups.single { !it.cluster }.members)
+        assertEquals(listOf(tracker), groups.single { it.cluster }.members)
     }
 
     /** The reachability fix, end to end: a drone sharing a body cam's spot is a MEMBER of that
@@ -212,10 +248,10 @@ class MapPinTest {
 
     /** The stated order: watched device, ALPR, Raven, body cam, drone, then anything else.
      *
-     *  DRONE's rank is live, not decorative: drone rows reach the grouper, so this is what decides
-     *  whether a drone or its neighbour draws the shared pin. The table is the cross-platform
-     *  contract and iOS keeps `.drone` in its copy too. Asserting the ORDER rather than five
-     *  numbers keeps renumbering free and reordering caught. */
+     *  DRONE's rank is live, not decorative: drone rows reach same-spot grouping, so this is what
+     *  decides whether a drone or its neighbour draws the shared pin. The table is the
+     *  cross-platform contract and iOS keeps `.drone` in its copy too. Asserting the ORDER rather
+     *  than five numbers keeps renumbering free and reordering caught. */
     @Test
     fun priorityRunsWatchedAlprRavenBodyCamDroneThenTheRest() {
         val order = listOf(
@@ -234,8 +270,8 @@ class MapPinTest {
     }
 
     /** The defect this fixes: the pin drawn for a stacked spot is the one that matters, not
-     *  whichever row happened to be added last. Every type that reaches the grouper is in this
-     *  feed, drone included. */
+     *  whichever row happened to be added last. Every type that reaches same-spot grouping is in
+     *  this feed, drone included. */
     @Test
     fun theHighestPriorityMemberLeadsTheGroup() {
         val unknown = row(DeviceType.UNKNOWN)
@@ -314,6 +350,39 @@ class MapPinTest {
         ).single()
 
         assertEquals(listOf(first, second), g.members)
+    }
+
+    /** The draw loop's half of the rule. The projection ordered this pair on the snapshot's
+     *  stamps; by the time the rebuild runs the snapshot has landed on a ceiling and the older
+     *  member has been heard again, so the live read must put it in front, while priority still
+     *  beats any stamp and a group of one is handed back as the identical list. FAILS IF
+     *  orderSameSpotMembers keeps the incoming order, ranks recency above priority, sorts the
+     *  stamp ascending, or copies a lone member's list. */
+    @Test
+    fun theDrawLoopReordersAGroupOnTheLiveLastSeen() {
+        val a = row(DeviceType.BODY_CAM)
+        val b = row(DeviceType.BODY_CAM)
+        val here = 34.0000053 to -117.0000053
+        val g = group(
+            listOf(a, b),
+            mapOf(a.id to here, b.id to here),
+            mapOf(a.id to 9_000L, b.id to 1_000L),
+        ).single()
+        assertEquals(listOf(a, b), g.members)
+
+        // b heard since the snapshot: it leads the rebuild.
+        val live = mapOf(a.id to 9_000L, b.id to 20_000L)
+        assertEquals(listOf(b, a), orderSameSpotMembers(g.members) { live[it] })
+
+        // Priority still wins over the fresher stamp, and an undated member still sorts last.
+        val alpr = row(DeviceType.FLOCK_CAMERA)
+        val stale = row(DeviceType.BODY_CAM)
+        val liveWithAlpr = live + (alpr.id to 0L)
+        assertEquals(listOf(alpr, b, a, stale),
+            orderSameSpotMembers(listOf(stale, a, b, alpr)) { liveWithAlpr[it] })
+
+        val lone = listOf(a)
+        assertSame(lone, orderSameSpotMembers(lone) { null })
     }
 
     // ---- the three age tiers ------------------------------------------------------------

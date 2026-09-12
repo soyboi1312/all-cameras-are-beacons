@@ -6,6 +6,7 @@ import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotEquals
 import org.junit.Assert.assertTrue
 import org.junit.Test
+import tech.acab.app.ui.mapInfoColors
 import kotlin.math.max
 import kotlin.math.min
 import kotlin.math.pow
@@ -118,6 +119,44 @@ class AcabPaletteTest {
         val p = AcabPalette.High
         assertTrue(luminance(p.bg) < luminance(p.bg2))
         assertTrue(luminance(p.bg2) < luminance(p.bg3))
+    }
+
+    /**
+     * Map callouts float over arbitrary tiles. What keeps them readable is that the info surface
+     * is OPAQUE: an opaque layer screens the tile off, so the composited backdrop IS the surface
+     * and one measurement covers every tile. The two inks are therefore measured once, not
+     * re-measured per tile for the same number.
+     *
+     * The opacity assertion is also the only reliable detector of a surface going translucent,
+     * which is why it is asserted directly: a DARK tile bleeding through a sheer surface RAISES
+     * contrast against pale ink, so a tile sweep alone could miss it.
+     *
+     * The sweep instead runs a deliberately sheer cut of the same surface, the one arrangement in
+     * which a tile reaches the ink, and asserts every tile MOVES the measurement. That is the
+     * compositing path this whole file rests on, kept live. It deliberately does not assert how
+     * far the bleed hurts: that number is a fact about this palette being dark, not about the
+     * invariant, and it would fire spuriously if the callout were ever restyled light-on-dark.
+     * iOS twin: `testMapInformationStaysOpaqueAndReadableOverAnyMapTile`.
+     */
+    @Test
+    fun mapInformationSurfaceIsOpaqueAndItsTextStaysReadableOverAnyTile() {
+        val pale = Color.White
+        val mid = Color(0xFF888888)
+        val dark = Color.Black
+        for (p in listOf(AcabPalette.Normal, AcabPalette.High)) {
+            val info = mapInfoColors(p)
+            assertEquals(1f, info.surface.alpha, 0f)
+            val primaryOnSurface = ratio(info.primaryText, info.surface)
+            assertTrue("map primary = $primaryOnSurface", primaryOnSurface >= 7.0)
+            assertTrue("map secondary = ${ratio(info.secondaryText, info.surface)}",
+                ratio(info.secondaryText, info.surface) >= 4.5)
+
+            val sheer = info.surface.copy(alpha = 0.5f)
+            for (tile in listOf(pale, mid, dark)) {
+                assertNotEquals("a sheer surface must let $tile through",
+                    primaryOnSurface, ratio(info.primaryText, over(sheer, tile)), 0.01)
+            }
+        }
     }
 
     @Test

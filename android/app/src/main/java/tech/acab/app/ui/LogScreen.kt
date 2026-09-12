@@ -15,6 +15,8 @@ import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.BoxWithConstraints
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.ExperimentalLayoutApi
+import androidx.compose.foundation.layout.FlowRow
 import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
@@ -35,11 +37,13 @@ import androidx.compose.material.icons.filled.DeleteOutline
 import androidx.compose.material.icons.filled.DoneAll
 import androidx.compose.material.icons.filled.Place
 import androidx.compose.material.icons.automirrored.filled.PlaylistAddCheck
+import androidx.compose.material.icons.automirrored.filled.Sort
 import androidx.compose.material.icons.filled.NotificationsOff
 import androidx.compose.material.icons.filled.Pause
 import androidx.compose.material.icons.filled.PlayArrow
 import androidx.compose.material.icons.filled.Schedule
 import androidx.compose.material.icons.filled.IosShare
+import androidx.compose.material.icons.filled.Search
 import androidx.compose.material.icons.outlined.Circle
 import androidx.compose.material.icons.outlined.FilterAlt
 import androidx.compose.material.icons.outlined.Inbox
@@ -58,6 +62,8 @@ import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.ModalBottomSheet
 import androidx.compose.material3.OutlinedButton
+import androidx.compose.material3.OutlinedTextField
+import androidx.compose.material3.OutlinedTextFieldDefaults
 import androidx.compose.material3.TextButton
 import androidx.compose.material3.minimumInteractiveComponentSize
 import androidx.compose.runtime.getValue
@@ -95,9 +101,14 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import tech.acab.app.ble.AcabBleManager
 import tech.acab.app.model.Detection
+import tech.acab.app.model.DeviceNames
 import tech.acab.app.model.DeviceType
 import tech.acab.app.model.TimeBasis
 import tech.acab.app.model.displayName
+import tech.acab.app.model.customName
+import tech.acab.app.model.maker
+import tech.acab.app.model.ouiVendor
+import tech.acab.app.model.vendor
 import tech.acab.app.model.methodLabel
 import tech.acab.app.model.sourceLabel
 import tech.acab.app.model.bufferHealthNotices
@@ -105,6 +116,7 @@ import tech.acab.app.ui.theme.Acab
 import tech.acab.app.ui.theme.textTone
 import tech.acab.app.ui.theme.tone
 import java.io.File
+import java.text.Normalizer
 import tech.acab.app.model.hasName
 import androidx.compose.ui.text.style.TextOverflow
 
@@ -123,19 +135,268 @@ sealed interface LogFilter {
  *  only offline-buffered records. Composes with the nullable category filter, matching
  *  iOS StatusScope, so ALPR+NEW is one lens rather than two mutually exclusive ones. */
 internal enum class LogScope { All, New, Offline }
+internal enum class LogSort { Newest, Strongest }
 
+/** The three Unicode general categories NFD leaves behind once it has split an accent off its
+ *  base letter. Three raw Int comparisons and deliberately NOT a set: this question is asked once
+ *  per code point of every searchable field of every row that is (re)folded, and a `setOf(...)`
+ *  written inside that loop allocates a vararg array, a LinkedHashSet and its backing map PER
+ *  CHARACTER. */
+private fun isCombiningMarkType(type: Int): Boolean =
+    type == Character.NON_SPACING_MARK.toInt() ||
+        type == Character.COMBINING_SPACING_MARK.toInt() ||
+        type == Character.ENCLOSING_MARK.toInt()
+
+/** ONE fold on both platforms: NFD, drop every combining mark (Mn / Mc / Me), then the SIMPLE
+ *  per-code-point lowercase mapping. "Café" -> "cafe", "Straße" stays "straße" (no ß -> ss
+ *  expansion, no ligature expansion: NFD is not NFKD), "İ" -> "i" because NFD splits its dot off
+ *  first. Walked by code point, not UTF-16 unit, so a supplementary letter lowercases instead of
+ *  passing through as two untouched surrogates. TWIN: iOS `DetectionLogQuery.fold` in
+ *  DetectionLogLens.swift - same three steps, same answers; LogExportLensTest and
+ *  DetectionLogLensTests pin "Café", "Straße" and U+00A0. */
+private fun normalizedLogSearch(value: String): String {
+    // ASCII fast path. Lowercasing maps only A-Z within ASCII and there are no combining marks to
+    // strip there, so for a pure-ASCII value the transform below is exactly `lowercase()`. MACs,
+    // OUI vendors, type labels and category keys are all ASCII and are most of what a row
+    // contributes; the full transform still runs for anything a device (or the user) actually
+    // spelled with accents.
+    if (value.all { it.code < 0x80 }) return value.lowercase()
+    val decomposed = Normalizer.normalize(value, Normalizer.Form.NFD)
+    return buildString(decomposed.length) {
+        var i = 0
+        while (i < decomposed.length) {
+            val cp = decomposed.codePointAt(i)
+            if (!isCombiningMarkType(Character.getType(cp))) {
+                appendCodePoint(Character.toLowerCase(cp))
+            }
+            i += Character.charCount(cp)
+        }
+    }
+}
+
+/** The Unicode White_Space set, spelled out: Zs / Zl / Zp (`isSpaceChar`, which is what admits a
+ *  no-break space, U+2007 and U+202F) plus the five ASCII controls and NEL. Spelled out rather
+ *  than `\\s`, because that class is ICU-backed on a device but ASCII-only on the host JVM the
+ *  unit tests run on, and a tokenizer that behaves differently under test is no tokenizer.
+ *  TWIN: iOS `Character.isWhitespace`, the same property, in DetectionLogQuery.init. */
+private fun isLogTokenSeparator(cp: Int): Boolean =
+    Character.isSpaceChar(cp) || cp in 0x09..0x0D || cp == 0x85
+
+/** Split a folded query on [isLogTokenSeparator]; empty pieces (leading, trailing, or between two
+ *  separators) are dropped, so any run of whitespace is one boundary. */
+private fun splitLogTokens(folded: String): List<String> {
+    val out = ArrayList<String>()
+    var start = -1
+    var i = 0
+    while (i < folded.length) {
+        val cp = folded.codePointAt(i)
+        val width = Character.charCount(cp)
+        if (isLogTokenSeparator(cp)) {
+            if (start >= 0) { out.add(folded.substring(start, i)); start = -1 }
+        } else if (start < 0) {
+            start = i
+        }
+        i += width
+    }
+    if (start >= 0) out.add(folded.substring(start))
+    return out
+}
+
+/** Per-row folded haystack, kept ACROSS publishes. The store republishes every ~300 ms while
+ *  detections stream and hands the lens a new list each time, but a re-sighted row differs from
+ *  its predecessor in RSSI / count / lastSeen only: nothing the search reads moved. Without this,
+ *  every publish re-derived the nine identity fields and re-folded them for all 5,000 retained
+ *  rows, in composition on the main thread, for as long as a query was typed.
+ *
+ *  An entry is reused while the row's identity text is unchanged: the six wire fields the nine
+ *  searched strings derive from (mac, name, rid, detail, type, method) plus the
+ *  [DeviceNames.revision] the customName rung reads through. Any of those moving refolds that one
+ *  row; a rename refolds all of them, once, on the next pass. Entries are pruned only when the map
+ *  has outgrown the feed by [PRUNE_SLACK], so an unchanged feed never pays a walk.
+ *  TWIN: iOS `DetectionLogSearchIndex` in DetectionLogLens.swift - same key, same reuse rule,
+ *  same prune. */
+internal class LogSearchIndex {
+    private class Entry(
+        val mac: String,
+        val name: String?,
+        val rid: String?,
+        val detail: String?,
+        val type: DeviceType,
+        val method: Int,
+        val namesRevision: Int,
+        val searchable: String,
+        var lastPass: Int,
+    ) {
+        /** Built on first demand only: an ordinary word query never consults it. */
+        var compactMac: String? = null
+    }
+
+    private val entries = HashMap<String, Entry>()
+    private var pass = 0
+    private var touched = 0
+
+    /** Folds performed since construction. Tests read it to prove that a publish which changed
+     *  only RSSI reused the entry, and that a name change did not. */
+    var folds = 0
+        private set
+
+    /** Bracket one lens pass: [endPass] prunes entries no row touched, but only once the map has
+     *  outgrown the feed, and never after a pass that consulted nothing (an empty query). */
+    fun beginPass() {
+        pass++
+        touched = 0
+    }
+
+    fun endPass(feedSize: Int) {
+        if (touched == 0 || entries.size <= feedSize + PRUNE_SLACK) return
+        val current = pass
+        entries.values.removeIf { it.lastPass != current }
+    }
+
+    fun searchable(d: Detection): String = entry(d).searchable
+
+    fun compactMac(d: Detection): String {
+        val e = entry(d)
+        e.compactMac?.let { return it }
+        // The MAC is ASCII, so its fold is a plain lowercase; the separators come out so a hex
+        // token pasted with or without ':'/'-' matches either way.
+        val compact = normalizedLogSearch(d.mac).filter { it != ':' && it != '-' }
+        e.compactMac = compact
+        return compact
+    }
+
+    private fun entry(d: Detection): Entry {
+        val revision = DeviceNames.revision
+        touched++
+        val cached = entries[d.id]
+        if (cached != null && cached.namesRevision == revision && cached.mac == d.mac &&
+            cached.name == d.name && cached.rid == d.rid && cached.detail == d.detail &&
+            cached.type == d.type && cached.method == d.method
+        ) {
+            cached.lastPass = pass
+            return cached
+        }
+        folds++
+        val built = Entry(
+            d.mac, d.name, d.rid, d.detail, d.type, d.method, revision, foldRow(d), pass,
+        )
+        entries[d.id] = built
+        return built
+    }
+
+    private companion object {
+        /** Entries beyond the feed size tolerated before a prune walks the map. */
+        const val PRUNE_SLACK = 512
+
+        /** The one place the Log derives a row's whole identity instead of reading stored fields. */
+        fun foldRow(d: Detection): String {
+            // THE SAME FIELD SET iOS SEARCHES, in the same order: DetectionLogQuery.foldedHaystack
+            // in DetectionLogLens.swift. One lens, one owner - it decides both what the list shows
+            // and what the CSV/GPX export carries, so a field on one platform only means the same
+            // query returns different evidence on the two phones.
+            //
+            // `displayName` is deliberately absent, and leaving it out searches exactly the same
+            // text: it returns customName, name, rid, maker or type.label and nothing else, and
+            // all five are listed in their own right, so naming them directly drops a second
+            // `maker` derivation per row. The NODE handle is absent for a different reason: the
+            // visible "NODE 1A2B" chip is the row's last four address characters, which the
+            // compact-address path already answers, and baking the constant word "node" into
+            // every row's haystack made a bare `node` query match the whole feed while the lens
+            // chip and the export slug both claimed a search was narrowing it.
+            val fields = listOfNotNull(
+                d.customName, d.name, d.maker, d.ouiVendor, d.vendor, d.mac, d.rid,
+                d.type.label, d.type.category,
+            )
+            return normalizedLogSearch(fields.joinToString(" "))
+        }
+    }
+}
+
+/** Parsed once for a Log lens. Ordinary words remain literal after case/diacritic folding: a
+ * hyphenated query does not accidentally match two words. Only an all-hex token (at least two
+ * digits, after removing ':'/'-') gains separator-insensitive matching against the MAC itself. */
+internal class PreparedLogQuery(query: String) {
+    private data class Token(val text: String, val compactAddress: String?)
+
+    private val tokens = splitLogTokens(normalizedLogSearch(query))
+        .map { text ->
+            val address = text.filter { it != ':' && it != '-' }
+            Token(text, address.takeIf { compact ->
+                compact.length >= 2 && compact.all { it in '0'..'9' || it in 'a'..'f' }
+            })
+        }
+
+    val isEmpty: Boolean get() = tokens.isEmpty()
+
+    /** Answered once for the whole lens rather than once per row: without a hex-shaped token
+     * nothing ever consults the separator-stripped MAC, so no row needs to build one. */
+    private val hasAddressToken = tokens.any { it.compactAddress != null }
+
+    /** Called for every retained row on every pass, so the folded haystack comes from [index],
+     *  which keeps it across publishes; only a row whose identity text moved is derived and folded
+     *  again (see [LogSearchIndex]). Treat it as a hot path: nothing here may grow to a per-row
+     *  allocation on the reuse path. */
+    fun matches(d: Detection, index: LogSearchIndex): Boolean {
+        if (isEmpty) return true
+        val searchable = index.searchable(d)
+        // The MAC is already inside `searchable`; the compact form exists only so a hex token can
+        // match across ':'/'-'. An ordinary word query never asks the index for it.
+        val compactMac = if (hasAddressToken) index.compactMac(d) else ""
+        return tokens.all { token ->
+            if (searchable.contains(token.text)) return@all true
+            val address = token.compactAddress
+            address != null && compactMac.contains(address)
+        }
+    }
+}
+
+/** [index] is the caller's cross-publish haystack cache (LogScreen remembers one for the life of
+ *  the screen); a one-shot caller may let the default build a throwaway. */
 internal fun filterLogRows(
     feed: List<Detection>,
     category: String?,
     scope: LogScope,
     newIds: Set<String>,
-): List<Detection> = feed.filter { d ->
-    (category == null || d.type.category == category) && when (scope) {
-        LogScope.All -> true
-        LogScope.New -> d.id in newIds
-        LogScope.Offline -> d.offline
+    watchedMacs: Set<String> = emptySet(),
+    query: String = "",
+    sort: LogSort = LogSort.Newest,
+    index: LogSearchIndex = LogSearchIndex(),
+): List<Detection> {
+    val preparedQuery = PreparedLogQuery(query)
+    index.beginPass()
+    val filtered = feed.filter { d ->
+        d.matchesCategoryFilter(category, watchedMacs) && when (scope) {
+            LogScope.All -> true
+            LogScope.New -> d.id in newIds
+            LogScope.Offline -> d.offline
+        } && preparedQuery.matches(d, index)
     }
+    index.endPass(feed.size)
+    if (sort == LogSort.Newest) return filtered
+    // Explicit source index makes the newest-first input order the deterministic tie-breaker even
+    // if the standard-library sort implementation changes.
+    return filtered.withIndex()
+        .sortedWith(compareByDescending<IndexedValue<Detection>> { it.value.rssi }
+            .thenBy { it.index })
+        .map { it.value }
 }
+
+/** The lens-summary line under the search field: how many rows the lens shows out of the list it
+ *  is reading, which is the FROZEN list while paused. It names that list, because the header
+ *  kicker beside it counts the live store: "5 of 5 paused" under "200 NEW" must not read as 195
+ *  lost sightings. [category] is the lit tile's key, appended as " · ALPR".
+ *  TWIN: iOS `logLensSummary` in DetectionsView.swift, byte-identical text; pinned by
+ *  LogExportLensTest. */
+internal fun logLensSummaryText(shown: Int, total: Int, paused: Boolean, category: String?): String =
+    "$shown of $total" + (if (paused) " paused" else " retained") + (category?.let { " · $it" } ?: "")
+
+/** The spoken form of [logLensSummaryText]. TWIN: the accessibilityLabel on iOS `logLensSummary`,
+ *  byte-identical. */
+internal fun logLensSummaryDescription(
+    shown: Int, total: Int, paused: Boolean, category: String?,
+): String =
+    "$shown matching detections of $total" +
+        (if (paused) " in the paused log" else " retained") + (category?.let { " · $it" } ?: "")
 
 private tailrec fun Context.hostActivity(): Activity? = when (this) {
     is Activity -> this
@@ -156,6 +417,9 @@ private val LOG_CATEGORIES = listOf(
     LogCategory(DeviceType.TRACKER, "TRACKER", "TRKR"),
     LogCategory(DeviceType.GLASSES, "GLASSES", "GLAS"),
     LogCategory(DeviceType.NETWORK_CAMERA, "CAMERA", "NETCAM"),
+    // Overlay lens: current stars keep their underlying type; historical firmware t=8 rows also
+    // belong. Membership is resolved by isWatchedFilterMember, not DeviceType.category alone.
+    LogCategory(DeviceType.WATCHED, WATCHED_FILTER_KEY, "WATCH"),
 )
 
 /** AND-PERF-2: header tallies computed in one pass over the list, instead of ~seven full
@@ -174,7 +438,7 @@ private class LogTallies(
  *  deep-link here with NewOnly); null keeps the default ALL lens.
  *  [selectedId] is the currently open dossier in the tablet two-pane layout; the matching
  *  row gets a subtle highlight. null (the phone default) means no row is highlighted. */
-@OptIn(ExperimentalMaterial3Api::class)
+@OptIn(ExperimentalMaterial3Api::class, ExperimentalLayoutApi::class)
 @Composable
 fun LogScreen(
     ble: AcabBleManager,
@@ -185,6 +449,10 @@ fun LogScreen(
 ) {
     // Evidence history keeps prior sightings even while an active mute suppresses Status/Map.
     val detections by ble.logDetections.collectAsState()
+    val watchedList by ble.watched.collectAsState()
+    val watchedMacs = remember(watchedList) {
+        watchedList.mapTo(HashSet(watchedList.size)) { it.mac.lowercase() }
+    }
     val ignoredRules by ble.ignored.collectAsState()
     // A HERE mute can cross its boundary without changing the persisted rule. The active
     // projection is therefore an invalidation input for the row's current MUTED state.
@@ -210,6 +478,8 @@ fun LogScreen(
             }
         )
     }
+    var searchQuery by rememberSaveable { mutableStateOf("") }
+    var sort by rememberSaveable { mutableStateOf(LogSort.Newest) }
 
     // First ordinary open of the log baselines the New dots to what is already here, so a fresh
     // install / first offline backlog is not a wall of red dots. Once-only (persisted flag inside).
@@ -249,11 +519,17 @@ fun LogScreen(
 
     // one traversal per (detections, watermark) change; category counts via groupingBy, with
     // new/offline derived in the same pass. newIdSet reads the watermark, so it keys here.
-    // Built off the LIVE store (iOS parity): while paused only the ROWS freeze; the header,
-    // tiles, and seg-chip counts keep climbing, and the PAUSED pill words the frozen list.
+    // Built off the LIVE store (iOS parity): while paused only the ROWS freeze; the tiles, the
+    // seg-chip counts, the header's DETECTED count and the NEW tally keep climbing, and the
+    // PAUSED pill words the frozen list. The lens-summary line under the search field is the one
+    // exception - it counts the frozen `feed` it is describing, which is why that line names the
+    // list it counted rather than leaving the number bare.
     // The per-row isNewSinceWatermark would take storeLock once per row; newIdSet is ONE take.
-    val tallies = remember(detections, watermark) {
-        val byCategory = detections.groupingBy { it.type.category }.eachCount()
+    val tallies = remember(detections, watermark, watchedMacs) {
+        val byCategory = detections.groupingBy { it.type.category }.eachCount().toMutableMap()
+        // WATCHED overlaps every ordinary category: a starred tracker counts in both TRACKER and
+        // WATCHED, while a historical t=8 row counts only once in WATCHED.
+        byCategory[WATCHED_FILTER_KEY] = watchedDetectionCount(detections, watchedMacs)
         val newIds = ble.newIdSet(detections)
         var offlineCount = 0
         for (d in detections) {
@@ -285,11 +561,28 @@ fun LogScreen(
     val newCount = tallies.newIds.size
     val offlineCount = tallies.offlineCount
 
+    // WATCHED is the sole category that can disappear because the user unstarred its last current
+    // member. Historical t=8 rows keep the count nonzero. Reset instead of leaving a hidden active
+    // lens with no chip available to clear it.
+    LaunchedEffect(catFilter, count(WATCHED_FILTER_KEY)) {
+        if (catFilter == WATCHED_FILTER_KEY && count(WATCHED_FILTER_KEY) == 0) catFilter = null
+    }
+
     // memoized per (feed, axes, rowNewIds) so a filtered list isn't re-scanned on every
     // unrelated recomposition (select-mode taps, pause chip, sheet state). Both axes AND
-    // together, so ALPR+NEW is a real lens (iOS parity).
-    val shown = remember(feed, catFilter, scope, rowNewIds) {
-        filterLogRows(feed, catFilter, scope, rowNewIds)
+    // together, so ALPR+NEW is a real lens (iOS parity). A publish that DID change the feed (a
+    // re-sighted row's RSSI) still re-lenses, but through `searchIndex`, which keeps every row's
+    // folded haystack across publishes and refolds only a row whose identity text moved
+    // (LogSearchIndex says which fields), so the rebuild is a substring test per row, not a
+    // nine-field derivation plus a fold. `DeviceNames.revision` is a key because the search
+    // reads custom names and `watchedMacs` cannot see a relabel; iOS keys its LogLensMemo on the
+    // watched and ignored lists for the same reason.
+    val searchIndex = remember { LogSearchIndex() }
+    val namesRevision = DeviceNames.revision
+    val shown = remember(
+        feed, catFilter, scope, rowNewIds, watchedMacs, searchQuery, sort, namesRevision,
+    ) {
+        filterLogRows(feed, catFilter, scope, rowNewIds, watchedMacs, searchQuery, sort, searchIndex)
     }
     // O(1) invalidation token; only visible lazy rows evaluate isIgnored. Building a 5,000-row
     // muted set at the ~3 Hz feed cadence would turn a UI badge into an avoidable hot-path scan.
@@ -324,6 +617,10 @@ fun LogScreen(
                 }
             else -> ble.freezeLogExport(shown.toList())
         }
+        // The filename slug's vocabulary is ONE rule on both platforms, in this order: the
+        // category key, new or offline, search, strongest, paused, joined by "-". TWIN: iOS
+        // `exportQualifier` in DetectionsView.swift, same words, same order; writeDetections
+        // lowercases the whole slug there the way the category is lowercased here.
         val slugParts = if (wholeLog) emptyList() else buildList {
             catFilter?.let { add(it.lowercase().replace(' ', '-')) }
             when (scope) {
@@ -331,6 +628,8 @@ fun LogScreen(
                 LogScope.New -> add("new")
                 LogScope.Offline -> add("offline")
             }
+            if (searchQuery.isNotBlank()) add("search")
+            if (sort == LogSort.Strongest) add("strongest")
             if (paused) add("paused")
         }
         val appContext = context.applicationContext
@@ -398,7 +697,9 @@ fun LogScreen(
             .fillMaxSize()
             .padding(horizontal = Acab.pad)
             .padding(top = 8.dp),
-        contentPadding = PaddingValues(bottom = 16.dp),
+        // The select bar is an overlay; reserve its full two-row/large-text height so the final
+        // evidence rows remain scrollable above it rather than disappearing underneath.
+        contentPadding = PaddingValues(bottom = if (selectMode) 136.dp else 16.dp),
     ) {
         // No spacedBy here: the log rows below must sit flush so they read as one panel,
         // so each section item carries its own bottom padding instead.
@@ -409,7 +710,15 @@ fun LogScreen(
             ) {
                 Column(verticalArrangement = Arrangement.spacedBy(3.dp)) {
                     Text("Logbook", color = Acab.text, fontSize = 26.sp, fontWeight = FontWeight.SemiBold)
-                    Kicker("${detections.size} DETECTED · $newCount NEW")
+                    // The live store's count and the NEW tally, both counting the live store
+                    // even while paused (the PAUSED pill on the card heading words the frozen
+                    // list, and the lens-summary line under the search field carries the
+                    // shown/feed ratio). In select mode the count is the selection.
+                    // TWIN: iOS `header` in DetectionsView.swift, byte-identical kicker.
+                    Kicker(
+                        if (selectMode) "${selected.size} SELECTED"
+                        else "${detections.size} DETECTED · $newCount NEW"
+                    )
                 }
                 // Board-side loss/censoring flags belong beside the evidence, not buried in
                 // settings. They are persistent and intentionally cannot be dismissed locally.
@@ -471,17 +780,16 @@ fun LogScreen(
 
         // All / New / Offline scope chips; they compose with the category tiles below.
         item {
-            Row(
-                Modifier.padding(bottom = 16.dp),
+            FlowRow(
+                Modifier.fillMaxWidth().padding(bottom = 16.dp),
                 horizontalArrangement = Arrangement.spacedBy(8.dp),
-                verticalAlignment = Alignment.CenterVertically,
+                verticalArrangement = Arrangement.spacedBy(8.dp),
             ) {
                 // R7: grey ALL, crimson NEW (match iOS), so "new" is the one that pops.
                 SegChip("ALL", detections.size, scope == LogScope.All) { scope = LogScope.All }
                 SegChip("NEW", newCount, scope == LogScope.New, activeTone = Acab.accent) { scope = LogScope.New }
                 SegChip("OFFLINE", offlineCount, scope == LogScope.Offline) { scope = LogScope.Offline }
                 if (!selectMode) {
-                    Spacer(Modifier.weight(1f))
                     // Pause/resume the live feed so a fast-scrolling log can be read. Only offered
                     // once there's something to freeze (or while already paused).
                     if (feed.isNotEmpty() || paused) {
@@ -512,6 +820,45 @@ fun LogScreen(
             }
         }
 
+        // Search and ordering apply INSIDE the category + ALL/NEW/OFFLINE lens. At large text the
+        // sort control drops under the field rather than squeezing its hint into an unreadable sliver.
+        item {
+            Column(
+                Modifier.fillMaxWidth().padding(bottom = 16.dp),
+                verticalArrangement = Arrangement.spacedBy(8.dp),
+            ) {
+                BoxWithConstraints(Modifier.fillMaxWidth()) {
+                    val stack = maxWidth < 380.dp || LocalDensity.current.fontScale >= 1.3f
+                    if (stack) {
+                        Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                            LogSearchField(searchQuery, { searchQuery = it }, Modifier.fillMaxWidth())
+                            LogSortControl(sort, { sort = it })
+                        }
+                    } else {
+                        Row(
+                            Modifier.fillMaxWidth(),
+                            horizontalArrangement = Arrangement.spacedBy(8.dp),
+                            verticalAlignment = Alignment.CenterVertically,
+                        ) {
+                            LogSearchField(searchQuery, { searchQuery = it }, Modifier.weight(1f))
+                            LogSortControl(sort, { sort = it })
+                        }
+                    }
+                }
+                // The shown/feed ratio in its own line, like iOS logLensSummary: it counts the
+                // list the lens is reading (the FROZEN one while paused) and names it, so the
+                // header kicker above can count the live store the way its NEW tally does.
+                Text(
+                    logLensSummaryText(shown.size, feed.size, paused, catFilter),
+                    color = Acab.dim, fontSize = 11.sp, fontFamily = Acab.mono,
+                    modifier = Modifier.semantics {
+                        contentDescription =
+                            logLensSummaryDescription(shown.size, feed.size, paused, catFilter)
+                    },
+                )
+            }
+        }
+
         // Category tile strip; each tile toggles the list filter. Dynamic: a tile appears
         // only once its category has a detection this session, so the strip grows with the
         // categories the board actually saw instead of a fixed hardcoded row.
@@ -521,13 +868,19 @@ fun LogScreen(
             // current filter even if its live count falls to 0 (eviction/staleness); without
             // it the tile would vanish out from under the user, leaving the list filtered with
             // no tile left to tap to clear it.
-            val visibleCats = LOG_CATEGORIES.filter { count(it.key) > 0 || it.key == catFilter }
+            val visibleCats = LOG_CATEGORIES.filter {
+                val n = count(it.key)
+                if (it.key == WATCHED_FILTER_KEY) n > 0 else n > 0 || it.key == catFilter
+            }
             if (visibleCats.isNotEmpty()) {
                 // At large font scales a six-across strip squeezes each label into a sliver;
                 // wrap to rows of three so the numbers stay legible instead of truncating.
                 BoxWithConstraints(Modifier.fillMaxWidth().padding(bottom = 16.dp)) {
-                    val perRow = if (maxWidth < 360.dp || LocalDensity.current.fontScale >= 1.5f)
-                        3 else visibleCats.size
+                    val perRow = when {
+                        maxWidth < 360.dp || LocalDensity.current.fontScale >= 1.5f -> 3
+                        visibleCats.size > 6 -> 4
+                        else -> visibleCats.size
+                    }
                     Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
                         visibleCats.chunked(perRow.coerceAtLeast(1)).forEach { rowCats ->
                             Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
@@ -560,13 +913,20 @@ fun LogScreen(
             }
         } else if (shown.isEmpty()) {
             // Rows exist but the active lens hides them all (NEW with everything seen,
-            // OFFLINE with no buffered rows, a pinned category tile at count 0): explain
-            // instead of a kicker over a blank void. Mirrors iOS noMatchState.
-            item { NoMatchState(scope, catFilter) }
+            // OFFLINE with no buffered rows, a pinned category tile at count 0, a query no row
+            // matches): explain instead of a kicker over a blank void, and offer the same
+            // one-tap reset iOS does (search, category and scope back to their defaults).
+            item {
+                NoMatchState(scope, catFilter, searchQuery) {
+                    searchQuery = ""; catFilter = null; scope = LogScope.All
+                }
+            }
         } else {
             item {
-                // Both axes read in one heading, like iOS: "ALL DETECTIONS" when no
-                // category, "ALPR · NEW" when both lenses are on.
+                // Both axes read in one heading, the same literal as iOS `logHeading` in
+                // DetectionsView.swift: "ALL DETECTIONS" when no category, "ALPR · NEW" when
+                // both lenses are on. The search and the sort are not named here: the sort
+                // control and the lens-summary line under the search field already word them.
                 val scopeTag = when (scope) {
                     LogScope.All -> "ALL"
                     LogScope.New -> "NEW"
@@ -807,6 +1167,93 @@ private fun PanelSegment(isFirst: Boolean, isLast: Boolean, highlighted: Boolean
     ) { content() }
 }
 
+@Composable
+private fun LogSearchField(
+    value: String,
+    onValueChange: (String) -> Unit,
+    modifier: Modifier = Modifier,
+) {
+    OutlinedTextField(
+        value = value,
+        onValueChange = onValueChange,
+        modifier = modifier,
+        singleLine = true,
+        leadingIcon = {
+            Icon(Icons.Filled.Search, contentDescription = null, tint = Acab.dim,
+                modifier = Modifier.size(17.dp))
+        },
+        trailingIcon = if (value.isNotEmpty()) ({
+            Box(
+                Modifier.minimumInteractiveComponentSize().clickable { onValueChange("") },
+                contentAlignment = Alignment.Center,
+            ) {
+                Icon(Icons.Filled.Close, contentDescription = "Clear search", tint = Acab.dim,
+                    modifier = Modifier.size(16.dp))
+            }
+        }) else null,
+        placeholder = {
+            // TWIN: the iOS search field's placeholder in DetectionsView.searchAndSort.
+            Text("Search name, MAC or vendor", color = Acab.faint, fontSize = 13.sp)
+        },
+        textStyle = androidx.compose.ui.text.TextStyle(
+            color = Acab.text, fontSize = 14.sp, fontFamily = Acab.mono),
+        shape = RoundedCornerShape(Acab.radiusSm),
+        colors = OutlinedTextFieldDefaults.colors(
+            focusedTextColor = Acab.text,
+            unfocusedTextColor = Acab.text,
+            cursorColor = Acab.accent,
+            focusedBorderColor = Acab.accent,
+            unfocusedBorderColor = Acab.line,
+            focusedContainerColor = Acab.bg2,
+            unfocusedContainerColor = Acab.bg2,
+        ),
+    )
+}
+
+@Composable
+private fun LogSortControl(sort: LogSort, onSort: (LogSort) -> Unit) {
+    var open by remember { mutableStateOf(false) }
+    Box {
+        Row(
+            Modifier.minimumInteractiveComponentSize()
+                .clip(RoundedCornerShape(50))
+                .border(1.dp, Acab.line, RoundedCornerShape(50))
+                .clickable { open = true }
+                .semantics(mergeDescendants = true) {
+                    contentDescription = "Sort detections, ${if (sort == LogSort.Newest) "newest" else "strongest signal"}"
+                }
+                .padding(horizontal = 12.dp, vertical = 9.dp),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(6.dp),
+        ) {
+            Icon(Icons.AutoMirrored.Filled.Sort, contentDescription = null, tint = Acab.dim,
+                modifier = Modifier.size(15.dp))
+            Text(if (sort == LogSort.Newest) "NEWEST" else "STRONGEST",
+                color = Acab.dim, fontSize = 10.5.sp, fontFamily = Acab.mono,
+                fontWeight = FontWeight.Bold, letterSpacing = 0.5.sp)
+        }
+        DropdownMenu(
+            expanded = open,
+            onDismissRequest = { open = false },
+            containerColor = Acab.bg3,
+        ) {
+            listOf(LogSort.Newest to "Newest", LogSort.Strongest to "Strongest signal")
+                .forEach { (choice, label) ->
+                    DropdownMenuItem(
+                        text = { Text(label) },
+                        leadingIcon = {
+                            if (sort == choice) Icon(Icons.Filled.CheckCircle,
+                                contentDescription = null, modifier = Modifier.size(16.dp))
+                        },
+                        colors = MenuDefaults.itemColors(
+                            textColor = Acab.text, leadingIconColor = Acab.accent),
+                        onClick = { open = false; onSort(choice) },
+                    )
+                }
+        }
+    }
+}
+
 /** All / New-only segmented chip. */
 @Composable
 private fun SegChip(label: String, n: Int, active: Boolean, activeTone: Color = Acab.dim, onClick: () -> Unit) {
@@ -844,6 +1291,7 @@ private fun CategoryTile(
         "GLAS" -> "Glasses"
         "NETCAM" -> "Network camera"
         "BODY" -> "Body camera"
+        "WATCH" -> "Watched or starred"
         else -> label
     }
     val shape = RoundedCornerShape(Acab.radiusSm)
@@ -1073,55 +1521,61 @@ private fun ConfidenceBadge(pct: Int) {
 
 /** Floating action bar shown in select mode: cancel, count, select-all, and mute-selected. */
 @Composable
+@OptIn(ExperimentalLayoutApi::class)
 private fun SelectBar(count: Int, onCancel: () -> Unit, onSelectAll: () -> Unit, onIgnore: () -> Unit) {
     Box(Modifier.fillMaxSize(), contentAlignment = Alignment.BottomCenter) {
-        Row(
+        Column(
             Modifier
                 .padding(Acab.pad)
                 .fillMaxWidth()
                 .background(Acab.bg2, RoundedCornerShape(Acab.radius))
                 .border(1.dp, Acab.line, RoundedCornerShape(Acab.radius))
                 .padding(horizontal = 14.dp, vertical = 12.dp),
-            verticalAlignment = Alignment.CenterVertically,
+            verticalArrangement = Arrangement.spacedBy(8.dp),
         ) {
-            Box(Modifier.minimumInteractiveComponentSize().size(32.dp)
-                .clickable(onClick = onCancel), contentAlignment = Alignment.Center) {
-                Icon(Icons.Filled.Close, contentDescription = "Cancel selection",
-                    tint = Acab.dim, modifier = Modifier.size(18.dp))
+            Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+                Box(Modifier.minimumInteractiveComponentSize().size(32.dp)
+                    .clickable(onClick = onCancel), contentAlignment = Alignment.Center) {
+                    Icon(Icons.Filled.Close, contentDescription = "Cancel selection",
+                        tint = Acab.dim, modifier = Modifier.size(18.dp))
+                }
+                Spacer(Modifier.size(10.dp))
+                Text("$count selected", color = Acab.text, fontSize = 13.sp,
+                    fontWeight = FontWeight.Medium, fontFamily = Acab.mono)
             }
-            Spacer(Modifier.size(10.dp))
-            Text("$count selected", color = Acab.text, fontSize = 13.sp,
-                fontWeight = FontWeight.Medium, fontFamily = Acab.mono)
-            Spacer(Modifier.weight(1f))
-            // Bulk-select every shown row (iOS parity): the whole point of select mode is
-            // batch-ignoring a filtered pile, not tapping hundreds of rows one by one.
-            Row(
-                Modifier
-                    .minimumInteractiveComponentSize()
-                    .clip(RoundedCornerShape(50))
-                    .border(1.dp, Acab.line, RoundedCornerShape(50))
-                    .clickable(onClick = onSelectAll)
-                    .padding(horizontal = 12.dp, vertical = 9.dp),
-                verticalAlignment = Alignment.CenterVertically,
+            FlowRow(
+                Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.spacedBy(8.dp, Alignment.End),
+                verticalArrangement = Arrangement.spacedBy(8.dp),
             ) {
-                Text("SELECT ALL", color = Acab.dim,
-                    fontSize = 11.sp, letterSpacing = 0.5.sp, fontWeight = FontWeight.Bold, fontFamily = Acab.mono)
-            }
-            Spacer(Modifier.size(8.dp))
-            val enabled = count > 0
-            Row(
-                Modifier
-                    .minimumInteractiveComponentSize()
-                    .background(if (enabled) Acab.accent else Acab.bg3, RoundedCornerShape(50))
-                    .clickable(enabled = enabled, onClick = onIgnore)
-                    .padding(horizontal = 14.dp, vertical = 9.dp),
-                verticalAlignment = Alignment.CenterVertically,
-                horizontalArrangement = Arrangement.spacedBy(6.dp),
-            ) {
-                Icon(Icons.Filled.NotificationsOff, contentDescription = null,
-                    tint = if (enabled) Acab.onAccent else Acab.faint, modifier = Modifier.size(14.dp))
-                Text("MUTE", color = if (enabled) Acab.onAccent else Acab.faint,
-                    fontSize = 11.sp, letterSpacing = 0.5.sp, fontWeight = FontWeight.Bold, fontFamily = Acab.mono)
+                // Bulk-select every shown row (iOS parity): the whole point of select mode is
+                // batch-ignoring a filtered pile, not tapping hundreds of rows one by one.
+                Row(
+                    Modifier.minimumInteractiveComponentSize()
+                        .clip(RoundedCornerShape(50))
+                        .border(1.dp, Acab.line, RoundedCornerShape(50))
+                        .clickable(onClick = onSelectAll)
+                        .padding(horizontal = 12.dp, vertical = 9.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    Text("SELECT ALL", color = Acab.dim, fontSize = 11.sp,
+                        letterSpacing = 0.5.sp, fontWeight = FontWeight.Bold, fontFamily = Acab.mono)
+                }
+                val enabled = count > 0
+                Row(
+                    Modifier.minimumInteractiveComponentSize()
+                        .background(if (enabled) Acab.accent else Acab.bg3, RoundedCornerShape(50))
+                        .clickable(enabled = enabled, onClick = onIgnore)
+                        .padding(horizontal = 14.dp, vertical = 9.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(6.dp),
+                ) {
+                    Icon(Icons.Filled.NotificationsOff, contentDescription = null,
+                        tint = if (enabled) Acab.onAccent else Acab.faint, modifier = Modifier.size(14.dp))
+                    Text("MUTE", color = if (enabled) Acab.onAccent else Acab.faint,
+                        fontSize = 11.sp, letterSpacing = 0.5.sp,
+                        fontWeight = FontWeight.Bold, fontFamily = Acab.mono)
+                }
             }
         }
     }
@@ -1130,13 +1584,23 @@ private fun SelectBar(count: Int, onCancel: () -> Unit, onSelectAll: () -> Unit,
 // (The EXP tag now lives in Components.kt as the one shared ExpTag composable.)
 
 /** Shown when the log has rows but the active lens hides every one (NEW with everything
- *  seen, OFFLINE with nothing buffered, a pinned category tile at count 0). Mirrors the
- *  iOS noMatchState copy so a filtered-to-empty list explains itself; the seg chips and
- *  tiles stay right above it, so clearing the lens is one tap away. */
+ *  seen, OFFLINE with nothing buffered, a pinned category tile at count 0, a query no row
+ *  matches). The title and body are byte-identical to iOS `noMatchTitle` / `noMatchBody` in
+ *  DetectionsView.swift, branch for branch, and [onClearFilters] is the same "Clear filters"
+ *  reset iOS `noMatchState` renders in every branch: search, category and scope back to their
+ *  defaults in one tap. The icons are this platform's own. */
 @Composable
-private fun NoMatchState(scope: LogScope, catFilter: String? = null) {
+private fun NoMatchState(
+    scope: LogScope,
+    catFilter: String?,
+    query: String,
+    onClearFilters: () -> Unit,
+) {
     val shape = RoundedCornerShape(Acab.radius)
-    val (icon, title, body) = when (scope) {
+    val (icon, title, body) = if (query.isNotBlank()) Triple(
+        Icons.Filled.Search, "No matching detections",
+        "Try a shorter name, vendor or MAC address, or clear the current filters.",
+    ) else when (scope) {
         LogScope.New -> Triple(
             Icons.Filled.DoneAll, "Nothing new",
             "Everything here is marked seen. New hits show up as they arrive.",
@@ -1147,7 +1611,7 @@ private fun NoMatchState(scope: LogScope, catFilter: String? = null) {
         )
         // ALPR gets a specific line: a quiet result there means something different, most current
         // installs are RF-silent (see the site + faq), so absence is expected and the map is the
-        // primary ALPR surface. Mirrors iOS noMatchBody.
+        // primary ALPR surface.
         LogScope.All -> if (catFilter == "ALPR") Triple(
             Icons.Outlined.FilterAlt, "No ALPR radio signal",
             "No compatible ALPR radio signal was observed. Some cameras do not broadcast a detectable " +
@@ -1172,6 +1636,9 @@ private fun NoMatchState(scope: LogScope, catFilter: String? = null) {
         Text(title, color = Acab.dim, fontSize = 15.sp, fontWeight = FontWeight.SemiBold)
         Text(body, color = Acab.faint, fontSize = 11.sp, fontFamily = Acab.mono,
             textAlign = TextAlign.Center)
+        TextButton(onClick = onClearFilters, modifier = Modifier.minimumInteractiveComponentSize()) {
+            Text("Clear filters", color = Acab.text, fontSize = 14.sp, fontWeight = FontWeight.SemiBold)
+        }
     }
 }
 

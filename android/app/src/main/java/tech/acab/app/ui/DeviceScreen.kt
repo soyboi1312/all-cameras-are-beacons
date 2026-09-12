@@ -94,6 +94,7 @@ import androidx.compose.ui.draw.alpha
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.vector.ImageVector
+import androidx.compose.ui.platform.LocalConfiguration
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.platform.LocalView
@@ -112,13 +113,18 @@ import androidx.lifecycle.LifecycleEventObserver
 import androidx.lifecycle.compose.LocalLifecycleOwner
 import kotlin.math.roundToInt
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.flow.distinctUntilChanged
+import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.launch
 import tech.acab.app.MainActivity
 import tech.acab.app.ble.AcabBleManager
 import tech.acab.app.ble.AlertMode
+import tech.acab.app.ble.AlertModeOrigin
+import tech.acab.app.ble.ConnState
 import tech.acab.app.ble.CombinedUpdatePhase
 import tech.acab.app.ble.CombinedUpdateProgress
 import tech.acab.app.ble.DetectionNotifier
+import tech.acab.app.ble.DemoStatusToggle
 import tech.acab.app.ble.isBoardBackedMute
 import tech.acab.app.ble.isFirmwareVersionOlder
 import tech.acab.app.ble.unrepresentedBoardRuleCount
@@ -138,6 +144,296 @@ private val NotificationToggleMapSaver = mapSaver<Map<Int, Boolean>>(
 
 internal fun shouldHandleOpenToken(token: Int, handledWatermark: Int): Boolean =
     token > handledWatermark
+
+internal data class BeaconConnectionPresentation(
+    val headerKicker: String,
+    val heroPrefix: String,
+    val connected: Boolean,
+)
+
+/** The Device tab survives an automatic reconnect, so a retained status frame is not proof that
+ * the board is currently connected. The shell's reconnect flag is authoritative for that seam.
+ *
+ *  [rebootingForUpdate] is the phone's own update reboot ([otaPhaseIsUpdateReboot], the twin of
+ *  iOS isRebootingForUpdate). It feeds the header kicker and the hero, which is how the top of
+ *  the Beacon tab says what the Scan radios row inside it says through that window. It is the
+ *  LAST parameter and defaults to false, so the positional calls in StatusBeaconPresentationTest
+ *  still describe a link with no update running, the way iOS also defaults isRebootingForUpdate;
+ *  the one call site in this file must pass it, or the header silently loses the arm below. */
+internal fun beaconConnectionPresentation(
+    demo: Boolean,
+    reconnecting: Boolean,
+    state: ConnState,
+    hasStatus: Boolean,
+    rebootingForUpdate: Boolean = false,
+): BeaconConnectionPresentation = when {
+    demo -> BeaconConnectionPresentation("SAMPLE DATA", "SAMPLE DATA · no live board", false)
+    reconnecting || state == ConnState.CONNECTING || state == ConnState.BONDING ->
+        BeaconConnectionPresentation(
+            "RECONNECTING · BOARD STATUS UNAVAILABLE",
+            "RECONNECTING · last reported",
+            false,
+        )
+    // POWERED_OFF is the PHONE's adapter, never the beacon: AcabBleManager sets it from
+    // BluetoothAdapter.STATE_OFF (adapterReceiver / restingState), and the board's own power-off
+    // ends in a plain GATT drop. So no "last reported" here: the beacon reported nothing about
+    // this, the phone did it to itself. Both strings are the iOS beaconRadioPresentation
+    // .poweredOff arm (scanLabel, then connectionLabel) with ONE deliberate word swapped, IPHONE
+    // to PHONE; nothing else differs. The app shell covers the tabs with its own Bluetooth-off
+    // page for this state (shellCovered / RadioOffPanel in AcabApp.kt: only READY or the
+    // CONNECTING reconnect shell leaves them uncovered), so this is what the covered Beacon tab
+    // says, and what it will say if that cover ever changes.
+    state == ConnState.POWERED_OFF -> BeaconConnectionPresentation(
+        "PHONE BLUETOOTH OFF · BOARD STATUS UNAVAILABLE",
+        "PHONE BLUETOOTH OFF",
+        false,
+    )
+    state != ConnState.READY -> BeaconConnectionPresentation(
+        "CONNECTION LOST · BOARD STATUS UNAVAILABLE",
+        "CONNECTION LOST · last reported",
+        false,
+    )
+    // The phone's own update reboot, ranked where [beaconRadioStatusLabel] ranks it: under the
+    // connection facts above, over the missing frame below. The reboot drop clears the frame
+    // (AcabBleManager cleanup) and the reconnect lands READY before the next one, so without this
+    // the header kicker and the hero read CONNECTED · WAITING FOR BOARD STATUS through every S3
+    // update, while the Scan radios row further down the same screen and the Status tab one tap
+    // away read UPDATING FIRMWARE · DETECTION MAY PAUSE and the iOS header reads its own short
+    // UPDATING FIRMWARE. The wording here is this app's long kicker family, the literal
+    // [beaconRadioStatusLabel] and statusScanPresentation already return, rather than that short
+    // iOS connectionLabel: one board state, one sentence, inside this app.
+    // `connected` stays true, because the link is up and this arm sits below the state checks, so
+    // only these two lines move and nothing that hangs off `connected` does (the refresh button,
+    // currentStatus, the power-off row, the not-connected arm of unavailableBoardKicker). The arm
+    // clears when the OTA engine leaves REBOOTING and CONFIRMING for DONE or FAILED, and a reboot
+    // that never comes back is claimed by the reconnect and lost-link arms above, so the settled
+    // state always renders.
+    rebootingForUpdate -> BeaconConnectionPresentation(
+        "UPDATING FIRMWARE · DETECTION MAY PAUSE",
+        "UPDATING FIRMWARE · detection may pause",
+        true,
+    )
+    !hasStatus -> BeaconConnectionPresentation(
+        "CONNECTED · WAITING FOR BOARD STATUS",
+        "CONNECTED · waiting for board status",
+        true,
+    )
+    else -> BeaconConnectionPresentation("CONNECTED OVER BLE", "CONNECTED", true)
+}
+
+/** Collapsed Scan radios copy. A missing/stale frame must never be rendered as healthy radios.
+ *
+ *  ONE OWNER FOR THE WORDING: the live-board strings below are the same family iOS returns as
+ *  scanLabel from beaconRadioPresentation (BeaconPresentation.swift), which fills the same
+ *  "Scan radios" fold row there, and the same family Android's own Status header already uses
+ *  ([statusScanPresentation]). One board state has to read the same on both tabs and both phones,
+ *  so these three move together. StatusBeaconPresentationTest pins the two Android functions to
+ *  each other and pins the words; nothing mechanical holds iOS to them, so a reword is a by-hand
+ *  edit on both platforms.
+ *
+ *  THE ARM ORDER MATCHES THROUGH THE LINK FACTS. Sample mode, the connection (through
+ *  [beaconConnectionPresentation]), the phone's own update reboot and the missing frame come first
+ *  here, in that order, as in [statusScanPresentation] and iOS beaconRadioPresentation.
+ *  [rebootingForUpdate] is the fact those two rank in the same slot ([otaPhaseIsUpdateReboot]; iOS
+ *  isRebootingForUpdate) and it returns their sentence. It has to be here: the reboot drop clears
+ *  the frame (AcabBleManager cleanup) and the reconnect lands READY with the tabs uncovered, so
+ *  without this arm that gap read CONNECTED · WAITING FOR BOARD STATUS on this row while the Status
+ *  header one tap away and both iOS surfaces read UPDATING FIRMWARE · DETECTION MAY PAUSE. The arm
+ *  withholds the radio line for exactly the window those two withhold it, and it clears when the
+ *  OTA engine leaves REBOOTING and CONFIRMING for DONE or FAILED, so the settled state always
+ *  renders. THE HEADER TAKES THIS ONE FACT AND NOTHING ELSE OF AN UPDATE. The kicker and the hero
+ *  above this row read the same update reboot through [beaconConnectionPresentation]'s own arm, so
+ *  those two lines and this row say the same thing from the board's reboot to the confirm. That is
+ *  the whole overlap: that presenter is handed neither [combinedPhase] nor [nrfUpdating], so with a
+ *  frame in hand outside the reboot window the kicker still reads CONNECTED OVER BLE and the hero
+ *  CONNECTED plus the firmware label, while this row names the update through the download, the S3
+ *  stream, the co-processor leg and the verify. iOS has no such gap: its one beaconRadioPresentation
+ *  takes combinedUpdateRunning and the frame's nrfUpdating as well, and both top lines of that
+ *  screen come from it, the header Kicker from connectionLabel and SettingsView heroStatusText from
+ *  scanLabel whenever a current frame is missing or the coordinator is running. The config folds below
+ *  this row are split too, deliberately: unavailableBoardKicker ranks no update reboot at all, so
+ *  Detectors, Alerts, Desert mode + buffer and Board LED read CONNECTED · WAITING FOR BOARD STATUS
+ *  through the no-frame gap and LOCKED · FIRMWARE UPDATE once a frame is back (the reason sits
+ *  beside that arm). Closing the rest means handing this tab's connection presenter those same two
+ *  facts the way the single iOS presenter takes them, and pinning the arm order that results, which
+ *  is an owner call rather than a cleanup.
+ *  After the link facts this still ranks the coordinator's CHECKING, UPDATING_S3 and
+ *  RECONNECTING phases above the nrfup bit, where those two rank the nrfup bit first. So a frame
+ *  that carries nrfup during one of those three phases, outside the update reboot, reads UPDATING
+ *  FIRMWARE · DETECTION MAY PAUSE here and names the co-processor update on the Status header and
+ *  on iOS. That is now the only place the three disagree.
+ *
+ *  SAMPLE MODE IS SHARED TOO, as of 2026-09-08. BOTH tours echo the sample radio switches into
+ *  the synthetic status (here previewDemoStatusToggle; on iOS writeConfig ->
+ *  demoStatusKeyByConfigKey -> setDemoStatusValue in BLEManager.swift), and BOTH presenters now
+ *  read that echo: this one and iOS beaconRadioPresentation name which sample radios the tour has
+ *  on, using the same four literals, exactly as each Status header does. iOS previously returned
+ *  a flat "SAMPLE DATA · NO LIVE RADIOS" without reading the frame. The sample frame never
+ *  carries "co" or "nrfup", so no fault or update branch below is reachable in the tour. */
+internal fun beaconRadioStatusLabel(
+    demo: Boolean,
+    connection: BeaconConnectionPresentation,
+    rebootingForUpdate: Boolean,
+    hasStatus: Boolean,
+    bleIntent: Boolean,
+    wifiIntent: Boolean,
+    coAlive: Boolean?,
+    nrfUpdating: Boolean,
+    combinedPhase: CombinedUpdatePhase,
+): String {
+    if (demo) return when {
+        bleIntent && wifiIntent -> "SAMPLE DATA"
+        bleIntent -> "SAMPLE DATA · BLUETOOTH ONLY"
+        wifiIntent -> "SAMPLE DATA · WI-FI ONLY"
+        else -> "SAMPLE DATA · RADIOS OFF"
+    }
+    if (!connection.connected) return connection.headerKicker
+    // The phone's own update reboot, in the slot [statusScanPresentation] and iOS
+    // beaconRadioPresentation give it: above the missing frame, because the reboot drop clears the
+    // frame and the reconnect lands READY before the next one, and that gap is what the arm is
+    // for. Same sentence as those two, so one board state reads one way inside this app.
+    if (rebootingForUpdate) return "UPDATING FIRMWARE · DETECTION MAY PAUSE"
+    if (!hasStatus) return "CONNECTED · WAITING FOR BOARD STATUS"
+    val genericFirmwareUpdate = combinedPhase == CombinedUpdatePhase.CHECKING ||
+        combinedPhase == CombinedUpdatePhase.UPDATING_S3 ||
+        combinedPhase == CombinedUpdatePhase.RECONNECTING ||
+        ((combinedPhase == CombinedUpdatePhase.UPDATING_COPROC ||
+            combinedPhase == CombinedUpdatePhase.VERIFYING) && !nrfUpdating)
+    if (genericFirmwareUpdate) return "UPDATING FIRMWARE · DETECTION MAY PAUSE"
+    // Only the board's current nrfup frame proves the second radio is the leg being updated and
+    // makes its Wi-Fi bit current enough to claim continued coverage. A coordinator phase alone
+    // can span reboot/reconnect gaps and therefore gets the generic may-pause copy above.
+    val intentionalNrfUpdate = nrfUpdating
+    return when {
+        intentionalNrfUpdate && wifiIntent -> "SCANNING · WI-FI ONLY · UPDATING CO-PROCESSOR"
+        intentionalNrfUpdate -> "UPDATING CO-PROCESSOR · NOT SCANNING"
+        bleIntent && coAlive == false && wifiIntent -> "SCANNING · WI-FI ONLY · BLE RADIO FAULT"
+        bleIntent && coAlive == false -> "BLE RADIO FAULT · NOT SCANNING"
+        bleIntent && wifiIntent -> "SCANNING · BLE · WI-FI"
+        bleIntent -> "SCANNING · BLE"
+        wifiIntent -> "SCANNING · WI-FI"
+        else -> "RADIOS OFF · NOT SCANNING"
+    }
+}
+
+internal enum class FirmwareBannerKind { READY, UPDATING, COMPLETED, CANCELLED, FAILED, PARTIAL }
+
+internal data class FirmwareBannerPresentation(
+    val title: String,
+    val kicker: String,
+    val kind: FirmwareBannerKind,
+)
+
+/** TWIN: iOS `beaconFirmwareBannerPresentation` in BeaconPresentation.swift. EVERY arm is
+ *  byte-identical to its iOS arm - title and kicker (iOS's `detail`) - and the two test suites
+ *  (StatusBeaconPresentationTest, BeaconPresentationTests) pin the same literals. The shape differs
+ *  (this switches on the phase and shouldPromoteFirmwareBanner gates the banner; iOS returns nil
+ *  for a healthy idle board), the words do not. A reword is a by-hand edit on both platforms;
+ *  there is no deliberate platform difference in this presenter. The running arms carry the phase
+ *  label and the merged 0..1 bar as a percent, so the collapsed header still reports progress. */
+internal fun firmwareBannerPresentation(
+    latest: String,
+    installed: String?,
+    combined: CombinedUpdateProgress,
+    combinedStale: Boolean,
+    s3Stale: Boolean,
+): FirmwareBannerPresentation {
+    // "installed version unavailable", never a made-up "v-": the one-click offer can exist on a
+    // co-processor package before the board's own version has been read.
+    val installedCopy = installed?.let { "installed v$it" } ?: "installed version unavailable"
+    val percent = combined.progress.takeIf { it.isFinite() }?.coerceIn(0f, 1f)
+        ?.let { Math.round(it * 100f) } ?: 0
+    fun running(title: String, fallback: String) = FirmwareBannerPresentation(
+        title,
+        "${combined.label.ifBlank { fallback }} · $percent%",
+        FirmwareBannerKind.UPDATING,
+    )
+    return when (combined.phase) {
+        // The one-click path exists only while combinedStale is true (an OTA-capable listing with
+        // a verifiable image, or a co-processor package). shouldPromoteFirmwareBanner also
+        // promotes on an outdated board alone, and in that state FirmwareCard's `outdated` arm one
+        // tap below offers ONLY the browser flasher, so the header may not promise Bluetooth.
+        // Pinned by StatusBeaconPresentationTest and, word for word, by BeaconPresentationTests.
+        CombinedUpdatePhase.IDLE -> when {
+            combinedStale && !s3Stale -> FirmwareBannerPresentation(
+                "Second radio update ready",
+                "co-processor firmware · installs over Bluetooth",
+                FirmwareBannerKind.READY,
+            )
+            combinedStale -> FirmwareBannerPresentation(
+                "Firmware v$latest ready",
+                "$installedCopy · updates over Bluetooth",
+                FirmwareBannerKind.READY,
+            )
+            else -> FirmwareBannerPresentation(
+                "Firmware v$latest ready",
+                "$installedCopy · open for update options",
+                FirmwareBannerKind.READY,
+            )
+        }
+        CombinedUpdatePhase.CHECKING ->
+            running("Checking firmware", "finding the right update for this beacon")
+        CombinedUpdatePhase.UPDATING_S3 ->
+            running("Updating board firmware", "installing board firmware")
+        CombinedUpdatePhase.RECONNECTING ->
+            running("Firmware update · reconnecting", "the board is restarting")
+        CombinedUpdatePhase.UPDATING_COPROC ->
+            running("Updating second radio", "Bluetooth detection is temporarily paused")
+        CombinedUpdatePhase.VERIFYING ->
+            running("Verifying firmware update", "confirming the installed version")
+        CombinedUpdatePhase.DONE -> FirmwareBannerPresentation(
+            "Firmware update complete",
+            combined.notice ?: "this beacon is up to date",
+            FirmwareBannerKind.COMPLETED,
+        )
+        CombinedUpdatePhase.FAILED -> {
+            val cancelled = combined.label.contains("cancel", ignoreCase = true) ||
+                combined.reason?.contains("cancel", ignoreCase = true) == true
+            FirmwareBannerPresentation(
+                if (cancelled) "Firmware update cancelled" else "Firmware update failed",
+                if (cancelled) "no further update work is running"
+                else "tap for details and recovery steps",
+                if (cancelled) FirmwareBannerKind.CANCELLED else FirmwareBannerKind.FAILED,
+            )
+        }
+        CombinedUpdatePhase.PARTIAL -> FirmwareBannerPresentation(
+            "Firmware update incomplete",
+            if (combined.s3Updated) "board updated · second radio still needs attention"
+            else "second radio still needs attention",
+            FirmwareBannerKind.PARTIAL,
+        )
+    }
+}
+
+internal fun shouldPromoteFirmwareBanner(
+    boardFirmwareOutdated: Boolean,
+    combinedUpdateAvailable: Boolean,
+    combined: CombinedUpdateProgress,
+): Boolean = boardFirmwareOutdated || combinedUpdateAvailable || combined.isRunning ||
+    combined.phase == CombinedUpdatePhase.DONE || combined.phase == CombinedUpdatePhase.FAILED ||
+    combined.phase == CombinedUpdatePhase.PARTIAL
+
+internal fun beaconBoardControlsAvailable(
+    demo: Boolean,
+    reconnecting: Boolean,
+    state: ConnState,
+    hasStatus: Boolean,
+    combinedRunning: Boolean,
+    nrfUpdating: Boolean,
+): Boolean = demo || (!reconnecting && state == ConnState.READY && hasStatus &&
+    !combinedRunning && !nrfUpdating)
+
+internal fun canStartBeaconFirmwareAction(
+    demo: Boolean,
+    reconnecting: Boolean,
+    state: ConnState,
+    hasStatus: Boolean,
+    combinedRunning: Boolean,
+    nrfUpdating: Boolean,
+    revisionCompatible: Boolean = true,
+): Boolean = !demo && revisionCompatible && beaconBoardControlsAvailable(
+    demo, reconnecting, state, hasStatus, combinedRunning, nrfUpdating,
+)
 
 /** A retained/key-mismatched log must remain erasable even when offline capture is switched off. */
 internal fun shouldOfferBufferClear(
@@ -165,9 +461,179 @@ internal fun bufferClearConfirmationCopy(
     )
 }
 
+/** The Desert card's still-silent notice, byte-identical to the iOS twin
+ *  (desertSilenceNotice in SettingsView.swift). Named so a test can pin the bytes. */
+internal const val DESERT_SILENCE_NOTICE =
+    "alerts are still silent after desert mode. they stay that way until you turn sound back on in alerts."
+
+/** The offer that replaces that notice when the app is holding a mode to give back, byte-identical
+ *  to the iOS twin (desertRestoreOffer in SettingsView.swift). Named so a test can pin the bytes.
+ *
+ *  It says "your alert mode is still silent", not "the board is quiet", on purpose. The mode is a
+ *  fact this app owns and can always assert truthfully. Whether the BOARD is actually quiet is a
+ *  different question, and reconcileBuzzer has a terminal state where the answer is no: the board
+ *  refuses the mute and keeps beeping while the mode reads SILENT. A sentence about the mode stays
+ *  true there; a sentence about sound would not. */
+internal const val DESERT_RESTORE_OFFER =
+    "desert mode ended on the beacon, so your alert mode is still silent. the app does not change it on its own. restore alerts puts back the mode you had before desert mode."
+
+/** The label on the control that sentence names. Uppercase pill, same anatomy as ERASE. */
+internal const val DESERT_RESTORE_OFFER_ACTION = "RESTORE ALERTS"
+
+/** Show the still-silent notice when Desert mode has ended and alerts stayed silent, so silence
+ *  does not read as a broken detector.
+ *
+ *  [sawDesertOn] is "the BOARD reported Desert on at least once this app run"
+ *  (AcabBleManager.desertRanThisRun), NOT the saved restore token. The token answers a DIFFERENT
+ *  question - "did this app capture a mode it owes back" - and the two come apart in both
+ *  directions, so it cannot stand in for this one. THE THREE STATES, so no reading of this is left
+ *  to inference:
+ *   1. A phone that never enabled Desert itself (first pair with a board already in Desert, or a
+ *      second paired phone) has no token and is exactly the owner who needs the notice; its alert
+ *      mode reads SILENT because reconcileBuzzer followed the muted board down.
+ *   2. A phone that enabled Desert AND saw the board end it gets a restore or an offer, both of
+ *      which the slot below carries instead of this sentence. Both halves of that token persist,
+ *      so a relaunch does not lose the offer.
+ *   3. A phone that captured a mode but whose run NEVER saw the board report Desert on gets
+ *      nothing here, which the earlier wording of this paragraph denied. It is reachable: quit the
+ *      app while Desert is running and come back to a board that is off, gone, or already out of
+ *      Desert - reconcileDesert's off-branch is guarded by desertSeenOn, so it arms no offer, and
+ *      this flag never goes true either. The token is still held and still spends correctly later
+ *      (the next user-ended Desert restores it, the next board-ended one offers it back), but this
+ *      run says nothing, and the honest reason is that the app cannot tell that silence apart from
+ *      a SILENT the user chose: it has no in-run evidence of a Desert run at all.
+ *  Gating on "saw Desert on this run" is also what keeps the notice away from a user who chose
+ *  silence deliberately and never used Desert.
+ *
+ *  [isMeshDetect] is a narrowing of that rule, not part of it: the Alerts row is not rendered on
+ *  a mesh-detect board (DeviceScreen's Alerts FoldRow is gated on isMeshDetect, and
+ *  reconcileBuzzer bails on that board type because it has no buzzer hardware), so "turn sound
+ *  back on in alerts" would name a control its owner cannot reach. The case is reachable rather
+ *  than dead: mesh-detect runs the shared BLE service and persists its own Desert default
+ *  (acabBleBegin + desertRestoreEnabled(false) in firmware/src/mesh-detect/main.cpp), and the
+ *  Desert row is NOT gated on the board type.
+ *
+ *  iOS twin: shouldShowDesertSilenceNotice in SettingsView.swift, same four inputs. */
+internal fun shouldShowDesertSilenceNotice(
+    sawDesertOn: Boolean,
+    desertOn: Boolean,
+    alertsSilent: Boolean,
+    isMeshDetect: Boolean,
+): Boolean = sawDesertOn && !desertOn && alertsSilent && !isMeshDetect
+
+/** What the Desert card draws in its one silence slot.
+ *  iOS twin: DesertSilenceSlot in SettingsView.swift. */
+internal enum class DesertSilenceSlot {
+    NONE,
+    NOTICE,   // alerts are silent and the app is holding nothing for you
+    OFFER,    // alerts are silent and the app has a mode to give back, one tap away
+}
+
+/** Pick the slot: PRECEDENCE ONLY, which is why it takes [noticeApplies] already decided rather than
+ *  re-deciding it. The OFFER OUTRANKS THE NOTICE and they never both draw: they are the same message
+ *  about the same silence, and the offer is the one with a way out of it.
+ *
+ *  That [noticeApplies] is a separate input is also where the mesh asymmetry lives. The notice's own
+ *  gate suppresses it on a mesh board because it names an Alerts row that board does not draw; the
+ *  offer never consults that gate, because it carries its own control right here on the Desert card,
+ *  and a mesh board is the one place the offer is the ONLY way back to a mode, since its owner
+ *  cannot open Alerts and pick one by hand at all.
+ *
+ *  WHICH STATES STILL REACH [DesertSilenceSlot.NOTICE] once a hand-picked SILENT clears the saved
+ *  mode: (1) a phone that never enabled Desert itself and followed the muted board down to SILENT,
+ *  which is the report the notice was built for and where it is plainly true; (2) the user chose
+ *  SILENT themselves, before Desert, during it, or after declining the offer. In (2) the sentence is
+ *  still true in every clause, but "after desert mode" reads as a cause when the cause was the user.
+ *  That was true before this change too; what this change does is take the one state where the app
+ *  owes something out of the notice's hands entirely. The wording is deliberately left alone: on a
+ *  detector, over-reporting silence is the safe direction to err, and rewording a sentence that is
+ *  true in every state it can still reach would be churn.
+ *
+ *  AFTER A RELAUNCH the offer comes back (it is persisted) and this function's [sawDesertOn] does
+ *  not (it is per-run, see AcabBleManager.desertRanThisRun for why that asymmetry is deliberate).
+ *  The card is coherent anyway, because [DesertSilenceSlot.OFFER] never consults [noticeApplies]:
+ *  the offer's own sentence names the cause and carries the way out, so it explains itself with
+ *  nothing under it. The one visible difference is arm (2) above, and only the decline half of it:
+ *  hand-picking SILENT to turn the offer down shows the notice in the run the board ended Desert
+ *  in, and shows nothing after a relaunch. That is the arm this comment already calls the weaker
+ *  one. */
+internal fun desertSilenceSlot(
+    restoreOffered: Boolean,
+    noticeApplies: Boolean,
+): DesertSilenceSlot = when {
+    restoreOffered -> DesertSilenceSlot.OFFER
+    noticeApplies -> DesertSilenceSlot.NOTICE
+    else -> DesertSilenceSlot.NONE
+}
+
+/** Does the offer need a home OUTSIDE the board-gated config panel right now?
+ *
+ *  Both of its usual homes (the Desert card's silence slot and the Alerts card) live inside that
+ *  panel, and the panel goes unusable as one unit when the board is away: this side's fold rows
+ *  take `enabled = boardControlsAvailable` and COLLAPSE when it is false ([FoldRow]'s
+ *  displayedExpanded), so the offer is not merely untappable there, it stops drawing; iOS
+ *  `.disabled`s the whole panel, which a child cannot opt out of. A board reboot or a factory reset
+ *  is exactly what arms the offer, so that is the wrong moment to take the way back away, and
+ *  nothing about taking it needs the board: the alert mode is a phone preference, and the board
+ *  write it also does is the same one any offline mode pick makes.
+ *
+ *  The result is the NEGATION of the panel's own gate, so the detached copy and a usable in-panel
+ *  copy can never draw at the same time. iOS twin: desertRestoreNeedsDetachedSurface in
+ *  SettingsView.swift. */
+internal fun desertRestoreNeedsDetachedSurface(
+    restoreOffered: Boolean,
+    boardControlsAvailable: Boolean,
+): Boolean = restoreOffered && !boardControlsAvailable
+
+/** Does the PRE-CONNECT screen have to carry the offer?
+ *
+ *  [desertRestoreNeedsDetachedSurface] above covers the board going away while the Beacon tab is
+ *  still on the phone. This covers the case UNDER that one: with no READY link and no reconnect
+ *  running over a shell that already mounted, AcabApp draws a full-screen surface of its own (the
+ *  connect screen, or the locked wait screen while an update runs) and either never composes
+ *  MainScreen or parks it pointer-disabled and cleared out of the semantics tree, so this screen is
+ *  not reachable and every other home of the offer is off screen. That is the exact state
+ *  the durability work was built for, because the board ending Desert is usually a reboot or a
+ *  factory reset, and the next thing the owner does is relaunch to a board that is off or gone.
+ *  Before this surface existed that owner saw nothing, and alerts stayed silent with no way back.
+ *
+ *  [mainShellVisible] is AcabApp's own "READY, or a reconnect over an established shell", so this
+ *  is the NEGATION of the condition that hands off to the tab shell, exactly as the detached gate
+ *  is the negation of the config panel's. What this gate draws and what the detached gate draws can
+ *  therefore never appear together: the pre-connect copies need the shell gone, and the detached
+ *  copy needs it there. AcabApp calls it ABOVE its early returns, where both states are reachable
+ *  and [mainShellVisible] is a real input rather than a constant.
+ *
+ *  TWO SCREENS READ IT ON THIS SIDE, not one. "The shell is gone" covers the OTA reboot window as
+ *  well, where AcabApp draws its locked OtaWaitScreen instead of the connect screen and the shell
+ *  is parked pointer-disabled behind it; shouldUseReconnectShell withholds the reconnect shell for
+ *  exactly that window, so this gate is true there too. The wait screen and the connect list sit on
+ *  opposite sides of one early return, so the two still cannot draw together.
+ *
+ *  iOS twin: desertRestoreNeedsPreConnectSurface in SettingsView.swift, called from RootView, where
+ *  ONE screen reads it: RootView keeps the tab shell visible through the reboot. */
+internal fun desertRestoreNeedsPreConnectSurface(
+    restoreOffered: Boolean,
+    mainShellVisible: Boolean,
+): Boolean = restoreOffered && !mainShellVisible
+
+/** Is the app holding a mode to give back right now? NEVER during the sample tour: the offer
+ *  reports a real board's Desert run, and its control writes real alert state, while every
+ *  phone-owned setting in the tour is a preview. reconcileDesert only runs off real status frames,
+ *  so the tour cannot arm it either; this keeps an offer armed BEFORE the tour started from
+ *  appearing inside it. NO BOARD GATE, deliberately: the offer survives a relaunch and the board
+ *  being away, and the state that arms it is a board reboot or a factory reset.
+ *
+ *  ONE definition, because there are now two screens asking (this one and the pre-connect screen in
+ *  AcabApp). Written as a function rather than repeating the expression so the sample-tour gate
+ *  cannot be spelled two ways.
+ *  iOS twin: alertRestoreIsOffered in SettingsView.swift. */
+internal fun alertRestoreIsOffered(demoMode: Boolean, pending: AlertMode?): Boolean =
+    !demoMode && pending != null
+
 /** Latest published beacon-board firmware; last-resort offline fallback for an unrecognized
  *  board label (known boards read their per-board version from the manifest). Bump on release. */
-private const val LATEST = "2.0.7"
+private const val LATEST = "2.0.8"
 
 /** Which config drawer section is open. Exactly one at a time (proposal 1g). */
 private enum class ConfigSection { NONE, FIRMWARE, RADIOS, DETECTORS, ALERTS, NOTIFY, DISPLAY, DRIVE, DESERT, LED }
@@ -190,6 +656,8 @@ private class BoardControl(
     val caughtUp: (DeviceStatus) -> Boolean,
     /** Adopt the frame's value; keep the local value when there is no frame (timeout with no status). */
     val restore: (DeviceStatus?) -> Unit,
+    /** Sample taps for this control echo into the manager's synthetic status for cross-tab parity. */
+    val demoStatusBacked: Boolean = false,
 )
 
 /** Device tab: board status, scan radios, detectors, and the alert buzzer. */
@@ -197,6 +665,7 @@ private class BoardControl(
 @Composable
 fun DeviceScreen(
     ble: AcabBleManager,
+    reconnecting: Boolean = false,
     openDetectorsToken: Int = 0,
     openHelpToken: Int = 0,
     openReadinessToken: Int = 0,
@@ -204,18 +673,47 @@ fun DeviceScreen(
     onRequestLocation: () -> Unit = {},
 ) {
     val status by ble.status.collectAsState()
+    val connectionState by ble.state.collectAsState()
     val logDetections by ble.logDetections.collectAsState()
     val name by ble.deviceName.collectAsState()
     val ignored by ble.ignored.collectAsState()
     val watched by ble.watched.collectAsState()
     val mode by ble.alertMode.collectAsState()
+    // Flips at most once a run (false -> true), so this collector costs one recomposition, not one
+    // per status frame. Feeds the Desert card's still-silent notice.
+    val desertRanThisRun by ble.desertRanThisRun.collectAsState()
+    // The alert mode the app is offering back after a Desert run it did not end. Null almost
+    // always, and it changes at most once per Desert cycle, so this collector is not a hot path.
+    val pendingAlertRestore by ble.pendingAlertModeRestore.collectAsState()
     val driveMode by ble.driveMode.collectAsState()
     val driveModeWanted by ble.driveModeWanted.collectAsState()
     val redactLock by ble.redactLockScreen.collectAsState()
     // One value drives the whole firmware card now: the combined S3-then-nRF update flow.
     val combined by ble.combinedProgress.collectAsState()
     val demo by ble.demoMode.collectAsState()
+    // The phone's own update reboot as ONE Boolean, mapped before collectAsState: the OTA engine
+    // republishes OtaProgress at every SENDING step, and this collector must not add a
+    // recomposition per step for a fact that flips at most twice a run (combinedProgress above is
+    // what carries the transfer-rate updates into the firmware card). Reading a StateFlow's value
+    // inside composition is a lint error (StateFlowValueCalledInComposition), so the first
+    // composition's value is seeded once inside remember. Same three lines as StatusScreen, which
+    // feeds this same fact to statusScanPresentation.
+    val rebootingSeed = remember(ble) { otaPhaseIsUpdateReboot(ble.otaProgress.value.phase) }
+    val rebootingForUpdate by remember(ble) {
+        ble.otaProgress.map { otaPhaseIsUpdateReboot(it.phase) }.distinctUntilChanged()
+    }.collectAsState(initial = rebootingSeed)
     val context = LocalContext.current
+    val connectionPresentation = beaconConnectionPresentation(
+        demo = demo,
+        reconnecting = reconnecting,
+        state = connectionState,
+        hasStatus = status != null,
+        rebootingForUpdate = rebootingForUpdate,
+    )
+    // A reconnecting shell may retain a last frame. Only currentStatus can drive values that are
+    // otherwise presented without a "last reported" qualifier; the explicitly labelled SAMPLE
+    // tour keeps its canned status so its hardware readouts remain useful.
+    val currentStatus = status.takeIf { demo || connectionPresentation.connected }
 
     // The firmware manifest is the source of truth for "latest" and the in-app OTA gate; the
     // hardcoded LATEST is only an offline fallback. Collect the singleton's flow directly.
@@ -303,11 +801,41 @@ fun DeviceScreen(
     var dronePending by rememberSaveable { mutableStateOf(false) }
     var droneOuiOn by rememberSaveable { mutableStateOf(status?.droui == true) }  // OUI fallback, default off
     var droneOuiPending by rememberSaveable { mutableStateOf(false) }
-    var bodyCamOn by rememberSaveable { mutableStateOf(status?.bodyCam == true) }
+    // Body-cam CATEGORY. Seeded from the shipped firmware default (ON), like flock, drone and
+    // glasses: every target ships the category on (axonRestoreEnabled(true) in beacon-board and
+    // mesh-detect main.cpp, and the `axon` row of docs/ble-protocol.md), and the body-cam rule in
+    // check-signature-drift.py pins this seed to that default on both phones.
+    // With no frame yet the seed reaches nothing here, the way the motoOn comment below describes:
+    // the Detectors row draws unavailableBoardKicker in place of detectorsKicker, and the fold
+    // that holds this switch cannot draw its content, because FoldRow draws it only while enabled
+    // and beaconBoardControlsAvailable needs a frame outside sample mode. The pre-frame "4 ON"
+    // count is an iOS surface only: hardwareConfigPanel passes detectorsKicker through and dims
+    // the panel instead of substituting it.
+    // What the seed does decide is the one composition where the frame arrives:
+    // boardControlsAvailable flips true during it while the restore below is still an un-run
+    // LaunchedEffect, so that first drawn kicker counts this value. Seeded ON, that frame agrees
+    // with what every board ships. Nothing is pending before the user touches the switch, so the
+    // LaunchedEffect then copies s.bodyCam over the seed, and a board whose category is genuinely
+    // off (axonRestoreEnabled restores an NVS value, so a user who turned it off keeps it off)
+    // reads off from the next composition on. DeviceStatus reads an absent key as false, which is
+    // the wire rule for a key the board writes on every status frame (acab_ble_service.cpp
+    // doc["axon"], which both apps read after "bodycam"), so no supported firmware reaches the
+    // app through that default.
+    var bodyCamOn by rememberSaveable { mutableStateOf(status?.bodyCam ?: true) }
     var bodyCamPending by rememberSaveable { mutableStateOf(false) }
-    // Motorola-OUI proxy, the sub-toggle under body cams. Seed on: pre-split firmware has it
-    // fused to the category, and the board ships it enabled, so on is the honest starting read.
-    var motoOn by rememberSaveable { mutableStateOf(status?.moto != false) }
+    // Motorola-OUI proxy, the sub-toggle under body cams. The board ships it OFF on every target
+    // (policeRestoreEnabled(false) in both main.cpp, flipped 2026-07-23 on 0/27 field precision;
+    // docs/ble-protocol.md `motorola`), so seed off like the other opt-in proxies. Pre-split
+    // firmware reports no "moto" key and DeviceStatus reads that absence as on (the proxy was
+    // fused to the category), so a frame from such a board still seeds on. With no frame yet the
+    // row below cannot draw: it needs motoSupported, which reads the frame, and the Detectors fold
+    // that holds it stays shut, because FoldRow draws its content only while enabled and
+    // beaconBoardControlsAvailable needs a frame outside sample mode (seedDemoData sets the sample
+    // frame before READY). A fold restored open restores motoOn with it. So the seed never reaches
+    // the switch, short of a link drop in the one frame between a Status tile tap that opens
+    // Detectors and this tab's first composition. It is OFF so the code never claims a default the
+    // board does not ship; the SHARED_SHAPES Motorola rule in check-signature-drift.py pins it.
+    var motoOn by rememberSaveable { mutableStateOf(status?.moto == true) }
     var motoPending by rememberSaveable { mutableStateOf(false) }
     var trackerOn by rememberSaveable { mutableStateOf(status?.tracker == true) }
     var trackerPending by rememberSaveable { mutableStateOf(false) }
@@ -347,27 +875,32 @@ fun DeviceScreen(
     val boardControls = remember {
         listOf(
             BoardControl("Bluetooth scanning", { blePending }, { blePending = it },
-                { s -> s.ble == bleOn }, { s -> bleOn = s?.ble ?: bleOn }),
+                { s -> s.ble == bleOn }, { s -> bleOn = s?.ble ?: bleOn }, demoStatusBacked = true),
             BoardControl("Wi-Fi scanning", { wifiPending }, { wifiPending = it },
-                { s -> s.wifi == wifiOn }, { s -> wifiOn = s?.wifi ?: wifiOn }),
+                { s -> s.wifi == wifiOn }, { s -> wifiOn = s?.wifi ?: wifiOn }, demoStatusBacked = true),
             BoardControl("Wi-Fi Eco", { wifiEcoPending }, { wifiEcoPending = it },
                 { s -> s.wifiEco == wifiEco }, { s -> wifiEco = s?.wifiEco ?: wifiEco }),
             BoardControl("ALPR detection", { flockPending }, { flockPending = it },
-                { s -> s.flock == flockOn }, { s -> flockOn = s?.flock ?: flockOn }),
+                { s -> s.flock == flockOn }, { s -> flockOn = s?.flock ?: flockOn }, demoStatusBacked = true),
             BoardControl("Drone detection", { dronePending }, { dronePending = it },
-                { s -> s.drone == droneOn }, { s -> droneOn = s?.drone ?: droneOn }),
+                { s -> s.drone == droneOn }, { s -> droneOn = s?.drone ?: droneOn }, demoStatusBacked = true),
             BoardControl("Non-broadcasting drone detection", { droneOuiPending }, { droneOuiPending = it },
-                { s -> s.droui == droneOuiOn }, { s -> droneOuiOn = s?.droui ?: droneOuiOn }),
+                { s -> s.droui == droneOuiOn }, { s -> droneOuiOn = s?.droui ?: droneOuiOn },
+                demoStatusBacked = true),
             BoardControl("Body-camera detection", { bodyCamPending }, { bodyCamPending = it },
-                { s -> s.bodyCam == bodyCamOn }, { s -> bodyCamOn = s?.bodyCam ?: bodyCamOn }),
+                { s -> s.bodyCam == bodyCamOn }, { s -> bodyCamOn = s?.bodyCam ?: bodyCamOn },
+                demoStatusBacked = true),
             BoardControl("Motorola vendor detection", { motoPending }, { motoPending = it },
-                { s -> s.moto == motoOn }, { s -> motoOn = s?.moto ?: motoOn }),
+                { s -> s.moto == motoOn }, { s -> motoOn = s?.moto ?: motoOn }, demoStatusBacked = true),
             BoardControl("Tracker detection", { trackerPending }, { trackerPending = it },
-                { s -> s.tracker == trackerOn }, { s -> trackerOn = s?.tracker ?: trackerOn }),
+                { s -> s.tracker == trackerOn }, { s -> trackerOn = s?.tracker ?: trackerOn },
+                demoStatusBacked = true),
             BoardControl("Recording-glasses detection", { glassesPending }, { glassesPending = it },
-                { s -> s.glasses == glassesOn }, { s -> glassesOn = s?.glasses ?: glassesOn }),
+                { s -> s.glasses == glassesOn }, { s -> glassesOn = s?.glasses ?: glassesOn },
+                demoStatusBacked = true),
             BoardControl("Network-camera detection", { netcamPending }, { netcamPending = it },
-                { s -> s.ncam == netcamOn }, { s -> netcamOn = s?.ncam ?: netcamOn }),
+                { s -> s.ncam == netcamOn }, { s -> netcamOn = s?.ncam ?: netcamOn },
+                demoStatusBacked = true),
             BoardControl("Offline buffer", { bufferPending }, { bufferPending = it },
                 { s -> s.bufOn == bufferOn }, { s -> bufferOn = s?.bufOn ?: bufferOn }),
             // The one inverted control: the switch is "lights out" but the board reports ledOn.
@@ -395,18 +928,18 @@ fun DeviceScreen(
 
     // Re-sync the local copies whenever a fresh status frame lands, but only overwrite
     // a toggle when no flip is pending, or when the board has caught up (the frame
-    // matches the local value), which also clears the pending flag.
+    // matches the local value), which also clears the pending flag. Sample radio/detector
+    // controls now echo through the synthetic status too, so they use the same convergence path;
+    // sample-only controls with no shared status owner remain local previews.
     LaunchedEffect(status, demo) {
-        // Sample choices have no board echo by design. On tab re-entry the same canned status is
-        // emitted again; treating it as an acknowledgement reset every preview toggle to its seed.
-        if (demo) return@LaunchedEffect
         status?.let { s ->
             for (c in boardControls) {
+                if (demo && !c.demoStatusBacked) continue
                 if (!c.pending() || c.caughtUp(s)) { c.restore(s); c.setPending(false) }
             }
             // The drag shield is absolute: even a matching frame must not rewrite the thumb
             // mid-drag (the write would quantize the float position under the user's finger).
-            if (!volumeDragging && (!volumePending || s.volume == masterVolume.roundToInt())) {
+            if (!demo && !volumeDragging && (!volumePending || s.volume == masterVolume.roundToInt())) {
                 masterVolume = s.volume.toFloat(); volumePending = false
             }
         }
@@ -473,7 +1006,9 @@ fun DeviceScreen(
     fun toggleSection(s: ConfigSection) { openSection = if (openSection == s) ConfigSection.NONE else s }
 
     // Firmware: the SAME update-available check FirmwareCard uses (manifest entry vs installed).
-    // An update exists -> crimson banner; otherwise firmware is a plain "UP TO DATE" fold row.
+    // An update exists -> crimson banner; otherwise firmware is a plain fold row at the foot of
+    // the BEACON HARDWARE group, whose healthy arm says "LATEST KNOWN" (the catalog-relative
+    // wording both platforms' fold rows and firmware cards share), never "UP TO DATE".
     val fwEntry = manifest.build(status?.firmwareLabel)
     val fwLatest = fwEntry?.version ?: LATEST
     val fwInstalled = status?.version
@@ -505,15 +1040,33 @@ fun DeviceScreen(
     // Which leg is behind, so the offer can name it. combinedStale is the OR of the two; without
     // this the card said "Update available: v$latest" for a co-processor-only offer.
     val s3Stale = (fwEntry?.let { ble.s3UpdateStale(it) } ?: false) && revisionMatchesManifest
-    val combinedTerminal = combined.phase == CombinedUpdatePhase.DONE ||
-        combined.phase == CombinedUpdatePhase.FAILED || combined.phase == CombinedUpdatePhase.PARTIAL
-    // The crimson banner promotes only when the S3 firmware is behind, or the flow is live/just
-    // finished; an nRF-only update stays a fold row (kicker "UPDATE READY"). Mirrors iOS updateExists.
-    val showBanner = fwOutdated || combined.isRunning || combinedTerminal
+    // Any actionable update promotes: a co-processor-only offer must not hide at the foot of the
+    // hardware group or masquerade as an already-current board version.
+    val showBanner = shouldPromoteFirmwareBanner(fwOutdated, combinedStale, combined)
     // Collapsible even mid-update (matches iOS): the crimson banner header stays on screen the
     // whole flow (showBanner includes isRunning), so progress/Cancel is one re-tap away.
     val fwExpanded = openSection == ConfigSection.FIRMWARE
+    val fwBanner = firmwareBannerPresentation(
+        latest = fwLatest,
+        installed = fwInstalled,
+        combined = combined,
+        combinedStale = combinedStale,
+        s3Stale = s3Stale,
+    )
+    val canStartFirmwareAction = canStartBeaconFirmwareAction(
+        demo = demo,
+        reconnecting = reconnecting,
+        state = connectionState,
+        hasStatus = status != null,
+        combinedRunning = combined.isRunning,
+        nrfUpdating = status?.nrfUpdating == true,
+        revisionCompatible = revisionMatchesManifest,
+    )
 
+    // The manual "check for updates" spinner state, hoisted out of CheckForUpdatesRow (which
+    // lives inside the expanded card) so the collapsed Firmware fold row can say CHECKING FOR
+    // UPDATES while it runs. TWIN: iOS `checkingForUpdate` in SettingsView.swift.
+    var fwChecking by remember { mutableStateOf(false) }
     // Today's firmware card verbatim, reused as banner / fold-row expanded content.
     val firmwareCard: @Composable () -> Unit = {
         FirmwareCard(
@@ -522,6 +1075,10 @@ fun DeviceScreen(
             combined = combined,
             combinedStale = combinedStale,
             s3Stale = s3Stale,
+            canStartUpdate = canStartFirmwareAction,
+            revisionCompatible = revisionMatchesManifest,
+            checkingForUpdate = fwChecking,
+            onCheckingForUpdateChange = { fwChecking = it },
             onCombinedUpdate = { ble.startCombinedUpdate(it) },
             onCombinedCancel = { ble.cancelCombinedUpdate() },
             onCombinedDismiss = { ble.dismissCombinedUpdate() },
@@ -534,25 +1091,72 @@ fun DeviceScreen(
     val shownAlertMode = if (demo) {
         runCatching { AlertMode.valueOf(sampleAlertModeName) }.getOrDefault(AlertMode.BUZZER)
     } else mode
+    // This screen's read of the one sample-tour gate. The expression itself lives at file scope
+    // ([alertRestoreIsOffered]) because the pre-connect screen in AcabApp asks the same question,
+    // and a gate spelled twice is a gate that can drift on one screen.
+    // iOS twin: alertRestoreOffered in SettingsView.swift.
+    val alertRestoreOffered = alertRestoreIsOffered(demo, pendingAlertRestore)
+    // ONE action behind the Alerts card's copy of the offer. The Desert card writes the same call
+    // inline, and the two panel surfaces reach it through AlertRestorePanel, so no surface can grow
+    // a take of its own.
+    val takeAlertRestore: () -> Unit = { ble.takePendingAlertModeRestore() }
     val shownLiveWanted = if (demo) sampleLiveWanted else driveModeWanted
     val shownRedactLock = if (demo) sampleRedactLock else redactLock
 
     // Live-state kickers (terse ALL-CAPS), computed from the same status/prefs the cards read.
-    val radiosKicker = when {
-        bleOn && wifiOn -> "BLE + WI-FI ON"
-        bleOn -> "BLE ON · WI-FI OFF"
-        wifiOn -> "WI-FI ON · BLE OFF"
-        else -> "ALL RADIOS OFF"
+    val boardControlsAvailable = beaconBoardControlsAvailable(
+        demo = demo,
+        reconnecting = reconnecting,
+        state = connectionState,
+        hasStatus = status != null,
+        combinedRunning = combined.isRunning,
+        nrfUpdating = status?.nrfUpdating == true,
+    )
+    val unavailableBoardKicker = when {
+        reconnecting -> "UNAVAILABLE · RECONNECTING"
+        !connectionPresentation.connected -> connectionPresentation.headerKicker
+        // Connected, no frame yet: the same literal beaconConnectionPresentation and the Status
+        // header use for this state outside an update. The header kicker, the hero and the three
+        // radio surfaces rank the phone's own update reboot above this state and read UPDATING
+        // FIRMWARE · DETECTION MAY PAUSE there (beaconConnectionPresentation's own arm,
+        // [beaconRadioStatusLabel], statusScanPresentation, iOS scanLabel); this row does not,
+        // because it answers whether the board controls can be driven, and with no frame the
+        // answer is the same whatever the phone is doing. The LOCKED · FIRMWARE UPDATE arm below
+        // names the update once a frame is back.
+        status == null -> "CONNECTED · WAITING FOR BOARD STATUS"
+        combined.isRunning || status?.nrfUpdating == true -> "LOCKED · FIRMWARE UPDATE"
+        else -> "BOARD CONTROLS UNAVAILABLE"
     }
+    val radiosKicker = beaconRadioStatusLabel(
+        demo = demo,
+        connection = connectionPresentation,
+        rebootingForUpdate = rebootingForUpdate,
+        hasStatus = status != null,
+        bleIntent = bleOn,
+        wifiIntent = wifiOn,
+        coAlive = status?.coAlive,
+        nrfUpdating = status?.nrfUpdating == true,
+        combinedPhase = combined.phase,
+    )
     val detOn = listOf(flockOn, droneOn, bodyCamOn, trackerOn, glassesOn, netcamOn).count { it }
     // Body cam is a shipped detector now, not experimental; only glasses still carries the tag.
     val expOn = listOf(glassesOn).count { it }
     // The EXP segment always renders (even "0 EXP"), same as iOS, so the kicker shape is stable.
     val detectorsKicker = "$detOn ON · $expOn EXP · TRACKERS ${if (trackerOn) "ON" else "OFF"}"
+    // The collapsed Alerts row. The SILENT arm grows a second segment while the app is holding a
+    // mode to give back, because "SILENT" alone is what a user who CHOSE silence sees, and this is
+    // a silence the app imposed: at a glance the two read identically, and the way out is a row the
+    // user has no reason to open. Byte-identical to the iOS alertsKicker silent arm.
+    //
+    // Only the SILENT arm needs it. An offer can only exist while the mode reads SILENT
+    // (BOARD_ENDED_DESERT requires current == SILENT to arm it) and every path that moves the mode
+    // off SILENT goes through setAlertMode, where origin USER clears the offer and origin APP
+    // cannot reach a non-SILENT mode with an offer armed (the restore arm needs `saved`, and arming
+    // the offer empties that half).
     val alertsKicker = when (shownAlertMode) {
         AlertMode.BUZZER -> "BUZZER · VOLUME ${masterVolume.toInt()}"
         AlertMode.VIBRATE -> "VIBRATE · PHONE BUZZES"
-        AlertMode.SILENT -> "SILENT"
+        AlertMode.SILENT -> if (alertRestoreOffered) "SILENT · RESTORE WAITING" else "SILENT"
     }
     // "3 ON" / "OFF", so the collapsed row says whether anything will interrupt you.
     val displayKicker = when {
@@ -571,11 +1175,12 @@ fun DeviceScreen(
     }
     val ledKicker = if (lightsOut) "LIGHTS OUT" else "HEARTBEAT ON"
     val boardOnlyMuteCount = unrepresentedBoardRuleCount(
-        boardCount = status?.ignoreCount ?: 0,
+        boardCount = currentStatus?.ignoreCount ?: 0,
         localBoardBackedCount = ignored.count(::isBoardBackedMute),
     )
+    val boardWatchCopy = currentStatus?.watchCount?.let { "$it ON BOARD" } ?: "BOARD N/A"
     val managedKicker = buildString {
-        append("${watched.size} WATCHED · ${status?.watchCount ?: 0} ON BOARD · ${ignored.size} MUTED")
+        append("${watched.size} WATCHED · $boardWatchCopy · ${ignored.size} MUTED")
         if (boardOnlyMuteCount > 0) append(" · $boardOnlyMuteCount BOARD ONLY")
     }
 
@@ -584,11 +1189,13 @@ fun DeviceScreen(
         Column(Modifier.fillMaxWidth().panel(), verticalArrangement = Arrangement.spacedBy(14.dp)) {
             Kicker("SCAN RADIOS")
             ToggleRow("bluetooth", "ALPR · drone · trackers", checked = bleOn, pending = blePending && !demo) {
-                bleOn = it; blePending = true; if (!demo) ble.setBleScan(it)
+                bleOn = it; blePending = true
+                if (demo) ble.previewDemoStatusToggle(DemoStatusToggle.BLE, it) else ble.setBleScan(it)
             }
             HorizontalDivider(color = Acab.line)
             ToggleRow("Wi-Fi", "2.4 GHz · ALPR · drone RID", checked = wifiOn, pending = wifiPending && !demo) {
-                wifiOn = it; wifiPending = true; if (!demo) ble.setWifiScan(it)
+                wifiOn = it; wifiPending = true
+                if (demo) ble.previewDemoStatusToggle(DemoStatusToggle.WIFI, it) else ble.setWifiScan(it)
             }
             // Eco: battery boards only (the board reports "bat" only with the sense divider), and
             // only while Wi-Fi is on. Duty-cycles the Wi-Fi RX to stretch runtime; Bluetooth is
@@ -643,14 +1250,16 @@ fun DeviceScreen(
     val detectorsContent: @Composable () -> Unit = {
         Column(Modifier.fillMaxWidth().panel(), verticalArrangement = Arrangement.spacedBy(14.dp)) {
             Kicker("DETECTORS")
-            ToggleRow("alpr radio signals", "flock, raven, when they broadcast over bluetooth or 2.4 GHz wifi · many installs now stay silent",
+            ToggleRow("alpr radio signals", "flock over bluetooth or 2.4 GHz wifi · raven over bluetooth · many installs now stay silent",
                 checked = flockOn, pending = flockPending && !demo) {
-                flockOn = it; flockPending = true; if (!demo) ble.setFlock(it)
+                flockOn = it; flockPending = true
+                if (demo) ble.previewDemoStatusToggle(DemoStatusToggle.FLOCK, it) else ble.setFlock(it)
             }
             HorizontalDivider(color = Acab.line)
             ToggleRow("drones (remote ID)", "FAA remote ID · operator location",
                 checked = droneOn, pending = dronePending && !demo) {
-                droneOn = it; dronePending = true; if (!demo) ble.setDrone(it)
+                droneOn = it; dronePending = true
+                if (demo) ble.previewDemoStatusToggle(DemoStatusToggle.DRONE, it) else ble.setDrone(it)
             }
             // Subordinate to the drones toggle: inset + shown-disabled while drone detection is
             // off, so the sub-option stays discoverable (mirrors iOS). Default off - it can flag a
@@ -658,37 +1267,45 @@ fun DeviceScreen(
             ToggleRow("non-broadcasting drones", "OUI match only, off by default, may false-positive",
                 checked = droneOuiOn, enabled = droneOn, pending = droneOuiPending && !demo,
                 modifier = Modifier.padding(start = 22.dp).alpha(if (droneOn) 1f else 0.4f)) {
-                droneOuiOn = it; droneOuiPending = true; if (!demo) ble.setDroneOuiEnabled(it)
+                droneOuiOn = it; droneOuiPending = true
+                if (demo) ble.previewDemoStatusToggle(DemoStatusToggle.DRONE_OUI, it)
+                else ble.setDroneOuiEnabled(it)
             }
             HorizontalDivider(color = Acab.line)
             ToggleRow("body cams", "Axon · Utility BodyWorn · Motorola vendor match",
                 checked = bodyCamOn, pending = bodyCamPending && !demo) {
-                bodyCamOn = it; bodyCamPending = true; if (!demo) ble.setBodyCam(it)
+                bodyCamOn = it; bodyCamPending = true
+                if (demo) ble.previewDemoStatusToggle(DemoStatusToggle.BODY_CAM, it) else ble.setBodyCam(it)
             }
             // Subordinate to the body-cam toggle, same shape as the drone-OUI row above:
             // classification needs BOTH, so it sits inset + disabled while the category is off.
             // Hidden entirely only on firmware that predates the split (motoSupported false),
             // where the proxy is welded to the category and the board would just ignore the
-            // write. Off by default it is NOT - the board ships it on, and it's the noisy half
-            // of the category, which is the whole reason it gets its own switch.
+            // write. The board ships it OFF (policeRestoreEnabled(false) in both main.cpp, flipped
+            // 2026-07-23 when an airport capture scored 0/27 on it): it is the noisy half of the
+            // category, which is the whole reason it gets its own switch.
             if (status?.motoSupported == true) {
                 // Say what the switch matches and what it costs, not "off still detects X", which
                 // reads as a riddle. Kept in step with the iOS row.
                 ToggleRow("motorola solutions", "vendor match only · their radios and docks too",
                     checked = motoOn, enabled = bodyCamOn, pending = motoPending && !demo,
                     modifier = Modifier.padding(start = 22.dp).alpha(if (bodyCamOn) 1f else 0.4f)) {
-                    motoOn = it; motoPending = true; if (!demo) ble.setMotorolaOui(it)
+                    motoOn = it; motoPending = true
+                    if (demo) ble.previewDemoStatusToggle(DemoStatusToggle.MOTOROLA, it)
+                    else ble.setMotorolaOui(it)
                 }
             }
             HorizontalDivider(color = Acab.line)
             ToggleRow("bluetooth trackers", "AirTag · Tile · SmartTag · opt-in",
                 checked = trackerOn, pending = trackerPending && !demo) {
-                trackerOn = it; trackerPending = true; if (!demo) ble.setTracker(it)
+                trackerOn = it; trackerPending = true
+                if (demo) ble.previewDemoStatusToggle(DemoStatusToggle.TRACKER, it) else ble.setTracker(it)
             }
             HorizontalDivider(color = Acab.line)
             ToggleRow("recording glasses", "Ray-Ban / Oakley Meta · Snap · Vuzix · Luxottica · experimental",
                 checked = glassesOn, exp = true, pending = glassesPending && !demo) {
-                glassesOn = it; glassesPending = true; if (!demo) ble.setGlasses(it)
+                glassesOn = it; glassesPending = true
+                if (demo) ble.previewDemoStatusToggle(DemoStatusToggle.GLASSES, it) else ble.setGlasses(it)
             }
             HorizontalDivider(color = Acab.line)
             // Opt-in + default off: it enables 802.11 DATA-frame source-MAC inspection (off by default).
@@ -696,7 +1313,9 @@ fun DeviceScreen(
             // camera and NEVER claims a "hidden camera". Mirrors the drone-OUI opt-in.
             ToggleRow("network cameras", "known IP-camera brands on wifi, opt-in, cannot find every camera",
                 checked = netcamOn, pending = netcamPending && !demo) {
-                netcamOn = it; netcamPending = true; if (!demo) ble.setNetcamEnabled(it)
+                netcamOn = it; netcamPending = true
+                if (demo) ble.previewDemoStatusToggle(DemoStatusToggle.NETWORK_CAMERA, it)
+                else ble.setNetcamEnabled(it)
             }
         }
     }
@@ -870,6 +1489,29 @@ fun DeviceScreen(
                 Text("Detection alerts are muted while Desert mode runs. With every nearby device reporting in, a beep for each would never let up. The shutdown cue still plays unless volume is 0; the startup jingle is muted along with everything else.",
                     color = Acab.warn, fontSize = 11.sp, fontFamily = Acab.mono)
             }
+            // Desert is over and the alert mode stayed SILENT. Nothing above says so, and a user
+            // who left Desert expecting their beeps back reads the silence as a dead detector.
+            // faint, the same tone as the secondary line above, NEVER warn: this reports a state
+            // the user can leave from the Alerts row, and it is not an alert.
+            //
+            // When the app is holding a mode to give back, THIS SAME PLACE carries the tap instead
+            // of stacking a second sentence about the same silence next to the first.
+            // iOS twin: the same strings and the same slot in SettingsView.swift's desertModeCard.
+            when (desertSilenceSlot(
+                restoreOffered = alertRestoreOffered,
+                noticeApplies = shouldShowDesertSilenceNotice(
+                    sawDesertOn = desertRanThisRun,
+                    desertOn = desertOn,
+                    alertsSilent = shownAlertMode == AlertMode.SILENT,
+                    isMeshDetect = status?.isMeshDetect == true,
+                ),
+            )) {
+                DesertSilenceSlot.NOTICE ->
+                    Text(DESERT_SILENCE_NOTICE,
+                        color = Acab.faint, fontSize = 11.sp, fontFamily = Acab.mono)
+                DesertSilenceSlot.OFFER -> AlertRestoreOffer { ble.takePendingAlertModeRestore() }
+                DesertSilenceSlot.NONE -> Unit
+            }
         }
     }
     val ledContent: @Composable () -> Unit = {
@@ -886,8 +1528,10 @@ fun DeviceScreen(
         }
     }
 
+    // Real setup only, never the tour: the readiness slot is added below only outside demo, the
+    // same rule the Status tab's finish-setup card follows (shouldShowFinishSetupCard), so there
+    // is no sample arm here; one would never draw.
     val liveReadiness = when {
-        demo -> "SAMPLE DATA"
         !driveModeWanted -> "OFF"
         !notifGranted -> "BLOCKED"
         driveMode -> "ACTIVE"
@@ -970,38 +1614,39 @@ fun DeviceScreen(
                         .background(Acab.bg2)
                         .border(1.dp, Acab.line, RoundedCornerShape(Acab.radius)),
                 ) {
-                    // Firmware folds in as row 1 when it's UP TO DATE (matches iOS anatomy). When an
-                    // update EXISTS it promotes to the crimson banner under the hero instead.
-                    if (!showBanner) {
-                        FoldRow(
-                            Icons.Filled.Memory, "Firmware",
-                            // An nRF-only update leaves the S3 version current, so it lives here
-                            // rather than the crimson banner; say "UPDATE READY" so it isn't
-                            // misleadingly "UP TO DATE".
-                            fwInstalled?.let { "v$it · ${if (combinedStale) "UPDATE READY" else "UP TO DATE"}" } ?: "FIRMWARE",
-                            openSection == ConfigSection.FIRMWARE, { toggleSection(ConfigSection.FIRMWARE) },
-                            content = firmwareCard,
-                        )
-                        HorizontalDivider(color = Acab.line)
-                    }
+                    ConfigGroupLabel("BEACON HARDWARE")
+                    HorizontalDivider(color = Acab.line)
                     FoldRow(Icons.Filled.SettingsInputAntenna, "Scan radios", radiosKicker,
                         openSection == ConfigSection.RADIOS, { toggleSection(ConfigSection.RADIOS) },
+                        enabled = boardControlsAvailable,
                         content = radiosContent)
                     HorizontalDivider(color = Acab.line)
-                    FoldRow(Icons.Filled.Radar, "Detectors", detectorsKicker,
+                    FoldRow(Icons.Filled.Radar, "Detectors",
+                        if (boardControlsAvailable) detectorsKicker else unavailableBoardKicker,
                         openSection == ConfigSection.DETECTORS, { toggleSection(ConfigSection.DETECTORS) },
+                        enabled = boardControlsAvailable,
                         targetModifier = Modifier.bringIntoViewRequester(detectorsRequester),
                         content = detectorsContent)
                     HorizontalDivider(color = Acab.line)
                     if (status?.isMeshDetect != true) {   // mesh board has no buzzer
-                        FoldRow(Icons.Filled.Notifications, "Alerts", alertsKicker,
-                            openSection == ConfigSection.ALERTS, { toggleSection(ConfigSection.ALERTS) }) {
+                        FoldRow(Icons.Filled.Notifications, "Alerts",
+                            if (boardControlsAvailable) alertsKicker else unavailableBoardKicker,
+                            openSection == ConfigSection.ALERTS, { toggleSection(ConfigSection.ALERTS) },
+                            enabled = boardControlsAvailable) {
                             BuzzerCard(
                                 mode = shownAlertMode,
                                 master = masterVolume,
+                                // The SAME offer the Desert card carries, so whichever of the two
+                                // rows the user opens has the way back in it. No gate of its own
+                                // beyond "a mode is pending": this card is already skipped on a mesh
+                                // board by the FoldRow above, and the pending mode is cleared the
+                                // moment Desert comes back on or the user picks anything by hand.
+                                restoreOffered = alertRestoreOffered,
+                                onRestore = takeAlertRestore,
                                 onMasterChange = { masterVolume = it; volumeDragging = true },
                                 onMode = {
-                                    if (demo) sampleAlertModeName = it.name else ble.setAlertMode(it)
+                                    if (demo) sampleAlertModeName = it.name
+                                    else ble.setAlertMode(it, AlertModeOrigin.USER)
                                 },
                                 onVolumeCommit = {
                                     volumeDragging = false
@@ -1017,6 +1662,66 @@ fun DeviceScreen(
                         }
                         HorizontalDivider(color = Acab.line)
                     }
+                    FoldRow(Icons.Filled.Landscape, "Desert mode + buffer",
+                        if (boardControlsAvailable) desertBufKicker else unavailableBoardKicker,
+                        openSection == ConfigSection.DESERT, { toggleSection(ConfigSection.DESERT) },
+                        enabled = boardControlsAvailable) {
+                        desertContent()
+                        Spacer(Modifier.size(12.dp))
+                        bufferContent()
+                    }
+                    HorizontalDivider(color = Acab.line)
+                    // Board LED remains a board control, but follows the capture modes that most
+                    // directly change what the beacon records.
+                    FoldRow(Icons.Filled.Lightbulb, "Board LED",
+                        if (boardControlsAvailable) ledKicker else unavailableBoardKicker,
+                        openSection == ConfigSection.LED, { toggleSection(ConfigSection.LED) },
+                        enabled = boardControlsAvailable,
+                        content = ledContent)
+                    HorizontalDivider(color = Acab.line)
+                    // Maintenance follows the everyday board controls. When an update is active or
+                    // needs attention it promotes above this panel instead of being duplicated here.
+                    if (!showBanner) {
+                        // TWIN: iOS `firmwareRowKicker` in ios/Beacons/Views/SettingsView.swift;
+                        // the five arms below are its five, byte for byte, in the same order.
+                        // The version comes from currentStatus,
+                        // the connection-gated frame, not the retained `status` the banner and
+                        // card read: a frame kept through a reconnect, or a board that has not
+                        // sent one yet, cannot be called "latest known", and a label the catalog
+                        // has no entry for has nothing to be latest AGAINST. The row is only
+                        // built when no banner is promoted, so no UPDATE READY arm could ever
+                        // draw. The manual check's `fwChecking` is hoisted out of
+                        // CheckForUpdatesRow so this header can name it while the spinner runs
+                        // inside the expanded card, exactly as iOS's `checkingForUpdate` does.
+                        val currentInstalled = currentStatus?.version
+                        FoldRow(
+                            Icons.Filled.Memory, "Firmware",
+                            when {
+                                fwChecking -> "CHECKING FOR UPDATES"
+                                currentInstalled == null -> "BOARD STATUS UNAVAILABLE"
+                                fwEntry == null -> "v$currentInstalled · NOT IN CATALOG"
+                                !revisionMatchesManifest -> "UPDATE BLOCKED · REVISION MISMATCH"
+                                else -> "v$currentInstalled · LATEST KNOWN"
+                            },
+                            openSection == ConfigSection.FIRMWARE,
+                            { toggleSection(ConfigSection.FIRMWARE) },
+                            content = firmwareCard,
+                        )
+                        HorizontalDivider(color = Acab.line)
+                    }
+                    // "THIS TABLET" on a tablet. TWIN: iOS SettingsView.thisDeviceName, which
+                    // reads UIDevice.current.userInterfaceIdiom for the same reason - a heading
+                    // that calls the device something it plainly is not reads as a port nobody
+                    // finished. smallestScreenWidthDp is Android's own device-class test and is
+                    // the right one here: it does not move with orientation or window width, so
+                    // a phone turned landscape (there is no screenOrientation lock, see the
+                    // manifest) keeps saying PHONE, and the >= 840.dp `wide` flag that picks the
+                    // NavigationRail would not.
+                    ConfigGroupLabel(
+                        if (LocalConfiguration.current.smallestScreenWidthDp >= 600) "THIS TABLET"
+                        else "THIS PHONE",
+                    )
+                    HorizontalDivider(color = Acab.line)
                     // NOT gated on isMeshDetect, unlike Alerts: these are PHONE notifications, so
                     // they work the same on a board with no buzzer, which is where they matter most.
                     FoldRow(Icons.Filled.PhoneAndroid, "Notifications", notifyKicker,
@@ -1056,26 +1761,14 @@ fun DeviceScreen(
                         )
                     }
                     HorizontalDivider(color = Acab.line)
-                    // Phone-side like Notifications: nothing here touches the board.
-                    FoldRow(Icons.Filled.Contrast, "Display", displayKicker,
-                        openSection == ConfigSection.DISPLAY, { toggleSection(ConfigSection.DISPLAY) }) {
-                        DisplayCard()
-                    }
-                    HorizontalDivider(color = Acab.line)
-                    // Board LED sits with Alerts (both are local feedback), above the situational modes.
-                    FoldRow(Icons.Filled.Lightbulb, "Board LED", ledKicker,
-                        openSection == ConfigSection.LED, { toggleSection(ConfigSection.LED) },
-                        content = ledContent)
-                    HorizontalDivider(color = Acab.line)
                     FoldRow(Icons.Filled.Radar, "Live Mode", driveKicker,
                         openSection == ConfigSection.DRIVE, { toggleSection(ConfigSection.DRIVE) },
                         content = driveContent)
                     HorizontalDivider(color = Acab.line)
-                    FoldRow(Icons.Filled.Landscape, "Desert mode + buffer", desertBufKicker,
-                        openSection == ConfigSection.DESERT, { toggleSection(ConfigSection.DESERT) }) {
-                        desertContent()
-                        Spacer(Modifier.size(12.dp))
-                        bufferContent()
+                    // Phone-side like Notifications: nothing here touches the board.
+                    FoldRow(Icons.Filled.Contrast, "Display", displayKicker,
+                        openSection == ConfigSection.DISPLAY, { toggleSection(ConfigSection.DISPLAY) }) {
+                        DisplayCard()
                     }
                 }
             }
@@ -1100,7 +1793,7 @@ fun DeviceScreen(
             //    phone-side log (same source as iOS), not the board's since-boot session total,
             //    so the two platforms show the same number for the same board.
             val statsSlot: @Composable () -> Unit = {
-                StatsGrid(uptime = status?.uptime, detections = logDetections.size)
+                StatsGrid(uptime = currentStatus?.uptime, detections = logDetections.size)
             }
             val disconnectSlot: @Composable () -> Unit = {
                 // In demo there is no GATT to disconnect; the same button exits sample data instead.
@@ -1118,7 +1811,7 @@ fun DeviceScreen(
             // mid-reboot strands the flow). The board drops the link itself; the manager pre-arms the
             // expected-teardown flags so that drop is clean.
             val powerOffSlot: @Composable () -> Unit = {
-                DisconnectButton(label = "Power off beacon", enabled = !combined.isRunning) {
+                DisconnectButton(label = "Power off beacon", enabled = boardControlsAvailable) {
                     confirmPowerOff = true
                 }
                 if (confirmPowerOff) {
@@ -1167,14 +1860,18 @@ fun DeviceScreen(
             // re-wake the instant it slept, and absent boardRev (older firmware without the poweroff
             // handler) it would do nothing - so the button never appears where it can't work.
             val slots = buildList<Pair<String, @Composable () -> Unit>> {
-                add("stats" to statsSlot)
-                if (!demo) add("readiness" to readinessSlot)
+                // Daily controls lead. Readiness and stats explain the surrounding system but do
+                // not make the person scroll past the switches they came to Beacon to change.
                 add("config" to configPanel)
+                if (!demo) add("readiness" to readinessSlot)
+                add("stats" to statsSlot)
                 add("managed" to managedRow)
                 add("contribute" to contributeRow)
                 add("help" to helpRow)
                 add("disconnect" to disconnectSlot)
-                if (!demo && boardRev == "B") add("poweroff" to powerOffSlot)
+                if (!demo && connectionPresentation.connected && status != null && boardRev == "B") {
+                    add("poweroff" to powerOffSlot)
+                }
                 add("aboutfooter" to aboutFooter)
             }
 
@@ -1194,9 +1891,11 @@ fun DeviceScreen(
                         // "Beacon", matching the tab label (Tab.DEVICE renders "Beacon"); the
                         // header saying "Device" was a leftover from before the tab rename.
                         Text("Beacon", color = Acab.text, fontSize = 26.sp, fontWeight = FontWeight.SemiBold)
-                        Kicker(if (demo) "SAMPLE DATA" else "PAIRED OVER BLE")
+                        Kicker(connectionPresentation.headerKicker)
                     }
-                    StatusRefreshButton { ble.refreshStatus() }
+                    StatusRefreshButton(
+                        enabled = !demo && connectionPresentation.connected && !combined.isRunning,
+                    ) { ble.refreshStatus() }
                 }
 
                 // Carrier revision rides on the firmware label, matching iOS boardRevSuffix, so
@@ -1211,8 +1910,19 @@ fun DeviceScreen(
                         !label.lowercase().contains("rev-${boardRev.lowercase()}"))
                         "$label · rev-$boardRev" else label
                 }
-                DeviceHero(name = name, firmware = fwWithRev, battery = status?.battery,
-                    charging = status?.charging == true, connected = !demo && status != null, demo = demo)
+                val heroStatus = when {
+                    demo -> connectionPresentation.heroPrefix
+                    fwWithRev != null -> "${connectionPresentation.heroPrefix} · $fwWithRev"
+                    connectionPresentation.connected -> connectionPresentation.heroPrefix
+                    else -> connectionPresentation.headerKicker
+                }
+                DeviceHero(
+                    name = name,
+                    statusLine = heroStatus,
+                    battery = currentStatus?.battery,
+                    charging = currentStatus?.charging == true,
+                    connected = connectionPresentation.connected,
+                )
 
                 settingFeedback?.let { SettingFailureBanner(it) }
 
@@ -1225,24 +1935,63 @@ fun DeviceScreen(
                 // runs we KNOW the nRF is being reset-pulsed / reflashed, so the FAULT banner is
                 // forced off regardless of what "co"/"nrfup" report this frame. The calm "updating"
                 // banner still shows during the actual DFU window.
-                // The updating banner keys on "nrfup" alone (not coAlive): the S3 flags the DFU
+                // The updating banner keys on "nrfup", never on coAlive: the S3 flags the DFU
                 // window the moment it forwards the trigger, but "co" can hold true for several
                 // more seconds of UART-silence grace, and the calm banner should show through
-                // that whole window. Same gating as iOS.
-                if (status?.nrfUpdating == true) NrfUpdatingBanner()
-                else if (status?.coAlive == false && !combined.isRunning) NrfFaultBanner()
+                // that whole window. It ALSO ORs in the coordinator's own UPDATING_COPROC and
+                // VERIFYING phases, so the banner survives the reboot/reconnect window where there
+                // is no current board frame to read "nrfup" from. NOT the same gate as iOS:
+                // SettingsView.nrfUpdating is board-frame-only, and iOS covers that same window
+                // with the firmware card's determinate progress view instead.
+                val currentBoardStatus = connectionPresentation.connected && status != null
+                val nrfUpdateVisible = (currentBoardStatus && status?.nrfUpdating == true) ||
+                    combined.phase == CombinedUpdatePhase.UPDATING_COPROC ||
+                    combined.phase == CombinedUpdatePhase.VERIFYING
+                val currentNrfUpdateFrame = currentBoardStatus && status?.nrfUpdating == true
+                if (nrfUpdateVisible) {
+                    NrfUpdatingBanner(
+                        wifiScanning = if (currentNrfUpdateFrame) status?.wifi == true else null,
+                    )
+                } else if (currentBoardStatus && !combined.isRunning &&
+                    status?.ble == true && status?.coAlive == false) {
+                    NrfFaultBanner(wifiScanning = status?.wifi == true)
+                }
 
                 // 2. Firmware: crimson update banner directly under the hero when an update exists.
-                //    When UP TO DATE the firmware folds into the config drawer as row 1 (below),
-                //    so nothing is rendered here. Both expand to today's firmware card.
+                //    Otherwise the firmware folds into the config drawer as the LAST row of the
+                //    BEACON HARDWARE group (below), with a "LATEST KNOWN" kicker, so nothing is
+                //    rendered here. Both expand to today's firmware card.
                 if (showBanner) {
                     FirmwareBanner(
-                        title = "Firmware v$fwLatest ready",
-                        kicker = "installed v${fwInstalled ?: "-"} · updates over Bluetooth",
+                        presentation = fwBanner,
                         expanded = fwExpanded,
                         onToggle = { toggleSection(ConfigSection.FIRMWARE) },
                         content = firmwareCard,
                     )
+                }
+
+                // THE ONE CONTROL THAT SURVIVES THE BOARD GATE, AND IT LEADS THE PAGE. Both of the
+                // offer's usual homes live inside configPanel, whose Alerts and Desert fold rows
+                // take `enabled = boardControlsAvailable` and COLLAPSE when that is false (FoldRow's
+                // displayedExpanded), so the way back vanished exactly when the board went away -
+                // and a board reboot or a factory reset is what arms the offer in the first place.
+                // This copy sits outside that panel, and its condition is the negation of the
+                // panel's, so a live in-panel offer and this one never draw together.
+                //
+                // It is drawn HERE rather than as the first entry of `slots` so that the wide
+                // layout cannot demote it: a slot is split into one of two columns, and a silence
+                // this app imposed should not be half a page wide beside the stats. Full width,
+                // above the split, on both platforms. Its absence also no longer shifts where the
+                // slot list divides. iOS twin: the same AlertRestorePanel above settingsCards'
+                // statsGrid and above the regular-width HStack in SettingsView.swift.
+                //
+                // Nothing about taking it needs the board: the alert mode is a phone preference.
+                // The board write it also makes is dropped while there is no link; the next connect
+                // re-sends the wanted mode, and reconcileBuzzer re-asserts it from the first status
+                // frame if the board still disagrees. That is the same path as any other mode
+                // picked while offline.
+                if (desertRestoreNeedsDetachedSurface(alertRestoreOffered, boardControlsAvailable)) {
+                    AlertRestorePanel(ble)
                 }
 
                 if (twoCol) {
@@ -1293,7 +2042,7 @@ fun DeviceScreen(
                 if (watched.isNotEmpty()) {
                     WatchedCard(
                         watched = watched,
-                        boardCount = status?.watchCount ?: 0,
+                        boardCount = currentStatus?.watchCount,
                         onUnwatch = { ble.unwatch(it) },
                         onRename = { mac, label -> ble.renameWatched(mac, label) },
                     )
@@ -1332,6 +2081,22 @@ fun DeviceScreen(
     }
 }
 
+/** Separates controls that write to the beacon from phone-only presentation/notification options.
+ * The wording is deliberately explicit: the old undifferentiated drawer made similarly-shaped
+ * switches look as though they all changed firmware behavior. */
+@Composable
+private fun ConfigGroupLabel(label: String) {
+    Text(
+        label,
+        color = Acab.dim,
+        fontSize = 10.sp,
+        fontWeight = FontWeight.Bold,
+        fontFamily = Acab.mono,
+        letterSpacing = 1.4.sp,
+        modifier = Modifier.fillMaxWidth().padding(horizontal = Acab.padCard, vertical = 10.dp),
+    )
+}
+
 /** A fold row in the config drawer: accent-tinted glyph + title + live kicker, a chevron that
  *  flips, and a faint accent wash while open. The expanded body is today's card, verbatim. */
 @Composable
@@ -1341,34 +2106,39 @@ private fun FoldRow(
     kicker: String,
     expanded: Boolean,
     onToggle: () -> Unit,
+    enabled: Boolean = true,
     targetModifier: Modifier = Modifier,
     content: @Composable () -> Unit,
 ) {
+    val displayedExpanded = expanded && enabled
     Column(
         Modifier
             .fillMaxWidth()
-            .background(if (expanded) Acab.accent.copy(alpha = 0.04f) else Color.Transparent),
+            .background(if (displayedExpanded) Acab.accent.copy(alpha = 0.04f) else Color.Transparent),
     ) {
         Row(
-            targetModifier.fillMaxWidth().clickable(onClick = onToggle)
+            targetModifier.fillMaxWidth().clickable(enabled = enabled, onClick = onToggle)
                 // Expand/collapse state for TalkBack: the flipping chevron is invisible to it.
-                .semantics { stateDescription = if (expanded) "Expanded" else "Collapsed" }
+                .semantics { stateDescription = if (displayedExpanded) "Expanded" else "Collapsed" }
                 .padding(Acab.padCard),
             verticalAlignment = Alignment.CenterVertically,
         ) {
             Icon(glyph, contentDescription = null,
-                tint = if (expanded) Acab.accent else Acab.dim, modifier = Modifier.size(18.dp))
+                tint = if (!enabled) Acab.faint else if (displayedExpanded) Acab.accent else Acab.dim,
+                modifier = Modifier.size(18.dp))
             Spacer(Modifier.size(12.dp))
             Column(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(3.dp)) {
-                Text(title, color = Acab.text, fontSize = 15.sp, fontWeight = FontWeight.Medium)
-                Text(kicker, color = if (expanded) Acab.accent else Acab.dim, fontSize = 10.sp,
+                Text(title, color = if (enabled) Acab.text else Acab.dim,
+                    fontSize = 15.sp, fontWeight = FontWeight.Medium)
+                Text(kicker, color = if (!enabled) Acab.faint else if (displayedExpanded) Acab.accent else Acab.dim, fontSize = 10.sp,
                     letterSpacing = 1.5.sp, fontWeight = FontWeight.Medium, fontFamily = Acab.mono)
             }
-            Icon(if (expanded) Icons.Filled.ExpandLess else Icons.Filled.ExpandMore,
-                contentDescription = null, tint = if (expanded) Acab.accent else Acab.dim,
+            Icon(if (displayedExpanded) Icons.Filled.ExpandLess else Icons.Filled.ExpandMore,
+                contentDescription = null,
+                tint = if (!enabled) Acab.faint else if (displayedExpanded) Acab.accent else Acab.dim,
                 modifier = Modifier.size(20.dp))
         }
-        AnimatedVisibility(visible = expanded) {
+        AnimatedVisibility(visible = displayedExpanded) {
             Column(Modifier.fillMaxWidth().padding(start = Acab.padCard, end = Acab.padCard, bottom = Acab.padCard)) {
                 content()
             }
@@ -1376,21 +2146,32 @@ private fun FoldRow(
     }
 }
 
-/** The crimson "update ready" banner under the hero. Filled accent, radiusSm; taps to reveal
- *  today's firmware card (which owns all OTA progress/failed UI). */
+/** Promoted firmware state under the hero. Ready is the call-to-action accent; active and
+ * terminal phases use state-specific outlined surfaces so success never looks like failure. */
 @Composable
 private fun FirmwareBanner(
-    title: String,
-    kicker: String,
+    presentation: FirmwareBannerPresentation,
     expanded: Boolean,
     onToggle: () -> Unit,
     content: @Composable () -> Unit,
 ) {
+    val filled = presentation.kind == FirmwareBannerKind.READY
+    val tone = when (presentation.kind) {
+        FirmwareBannerKind.READY, FirmwareBannerKind.FAILED -> Acab.accent
+        FirmwareBannerKind.UPDATING -> Acab.accentText
+        FirmwareBannerKind.COMPLETED -> Acab.trackerTone
+        FirmwareBannerKind.CANCELLED -> Acab.dim
+        FirmwareBannerKind.PARTIAL -> Acab.warn
+    }
+    val titleColor = if (filled) Acab.onAccent else Acab.text
+    val kickerColor = if (filled) Acab.onAccent.copy(alpha = 0.78f) else tone
     Column(
         Modifier
             .fillMaxWidth()
             .clip(RoundedCornerShape(Acab.radiusSm))
-            .background(Acab.accent),
+            .background(if (filled) Acab.accent else Acab.bg2)
+            .border(1.dp, if (filled) Acab.accent else tone.copy(alpha = 0.65f),
+                RoundedCornerShape(Acab.radiusSm)),
     ) {
         Row(
             Modifier.fillMaxWidth().clickable(onClick = onToggle)
@@ -1399,12 +2180,14 @@ private fun FirmwareBanner(
             verticalAlignment = Alignment.CenterVertically,
         ) {
             Column(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(3.dp)) {
-                Text(title, color = Acab.onAccent, fontSize = 15.sp, fontWeight = FontWeight.SemiBold)
-                Text(kicker, color = Acab.onAccent.copy(alpha = 0.7f), fontSize = 10.sp,
+                Text(presentation.title, color = titleColor, fontSize = 15.sp,
+                    fontWeight = FontWeight.SemiBold)
+                Text(presentation.kicker, color = kickerColor, fontSize = 10.sp,
                     letterSpacing = 1.5.sp, fontWeight = FontWeight.Medium, fontFamily = Acab.mono)
             }
             Icon(if (expanded) Icons.Filled.ExpandLess else Icons.Filled.ExpandMore,
-                contentDescription = null, tint = Acab.onAccent, modifier = Modifier.size(20.dp))
+                contentDescription = null, tint = if (filled) Acab.onAccent else tone,
+                modifier = Modifier.size(20.dp))
         }
         AnimatedVisibility(visible = expanded) {
             Column(Modifier.fillMaxWidth().padding(start = Acab.padCard, end = Acab.padCard, bottom = Acab.padCard)) {
@@ -1498,12 +2281,32 @@ private fun Context.openUrl(url: String) {
 private fun hasNotifPermission(context: Context): Boolean =
     DetectionNotifier.hasPostPermission(context)
 
-/** Connected-device hero card. Honest in [demo]: says sample data, never "CONNECTED".
+/** Beacon hero card. [statusLine] comes from the connection presenter, so retained board data
+ * during a reconnect is labelled as last reported instead of being called connected.
  *  At large font scales the name/firmware column stacks UNDER the glyph+battery row instead of
- *  sharing it: at 2x text the firmware line was ellipsizing into uselessness beside the glyph. */
+ *  sharing it: at 2x text the firmware line was ellipsizing into uselessness beside the glyph.
+ *  It ALSO stacks when a battery read is present on a narrow phone. Inline, the name column is the
+ *  only flexible child (weight(1f)), so the fixed glyph, the battery percentage and the state dot
+ *  are all subtracted before it measures, and "All Cameras Are Beacons" wraps to two lines once
+ *  what is left drops under the ~188dp it needs at 16sp SemiBold. Battery-less boards never
+ *  subtract the percentage, which is why it reads as a battery-only bug. Stacking gives the name
+ *  the full card width. */
 @Composable
-private fun DeviceHero(name: String?, firmware: String?, battery: Int?, charging: Boolean, connected: Boolean, demo: Boolean) {
-    val stacked = LocalDensity.current.fontScale >= 1.5f
+private fun DeviceHero(
+    name: String?,
+    statusLine: String,
+    battery: Int?,
+    charging: Boolean,
+    connected: Boolean,
+) {
+    // 340dp is the inline floor, measured on a Pixel 2 driven through `wm density`. At a 340.6dp
+    // card the wordmark still sits on one line with room to spare, so the inline row never reaches
+    // its own wrap point. A 411dp card (Pixel 2 at stock density) has margin to burn and does NOT
+    // wrap: the case this guards is the 360dp phone class, where the glyph (52) + its 14 spacer +
+    // the battery read + the 7dp dot leave the name ~196dp, and the charging bolt's extra 16dp
+    // takes that under the wordmark's ~188dp. Only applied when a battery is actually reported, so
+    // battery-less boards keep the inline card they have always had.
+    val heroStackWidth = 340.dp
     val glyph: @Composable () -> Unit = {
         Box(
             Modifier
@@ -1522,28 +2325,31 @@ private fun DeviceHero(name: String?, firmware: String?, battery: Int?, charging
                 if (name?.contains("ACAB") == true || name?.contains("beacon") == true) "All Cameras Are Beacons" else (name ?: "ESP32 board"),
                 color = Acab.text, fontSize = 16.sp, fontWeight = FontWeight.SemiBold, maxLines = 2,
             )
-            Text(if (demo) "SAMPLE DATA · no live board" else "CONNECTED · ${firmware ?: "beacons"}",
-                color = Acab.dim, fontSize = 11.sp, fontFamily = Acab.mono)
+            Text(statusLine, color = Acab.dim, fontSize = 11.sp, fontFamily = Acab.mono)
         }
     }
-    if (stacked) {
-        Column(Modifier.fillMaxWidth().panel(strong = true), verticalArrangement = Arrangement.spacedBy(12.dp)) {
-            Row(verticalAlignment = Alignment.CenterVertically) {
+    BoxWithConstraints(Modifier.fillMaxWidth()) {
+        val stacked = LocalDensity.current.fontScale >= 1.5f ||
+            (battery != null && maxWidth < heroStackWidth)
+        if (stacked) {
+            Column(Modifier.fillMaxWidth().panel(strong = true), verticalArrangement = Arrangement.spacedBy(12.dp)) {
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    glyph()
+                    Spacer(Modifier.weight(1f))
+                    HeroBattery(battery, charging)
+                    Box(Modifier.size(7.dp).background(if (connected) Acab.accent else Acab.faint, CircleShape))
+                }
+                nameBlock(Modifier.fillMaxWidth())
+            }
+        } else {
+            Row(Modifier.fillMaxWidth().panel(strong = true), verticalAlignment = Alignment.CenterVertically) {
                 glyph()
-                Spacer(Modifier.weight(1f))
+                Spacer(Modifier.size(14.dp))
+                nameBlock(Modifier.weight(1f))
                 HeroBattery(battery, charging)
                 Box(Modifier.size(7.dp).background(if (connected) Acab.accent else Acab.faint, CircleShape))
             }
-            nameBlock(Modifier.fillMaxWidth())
         }
-        return
-    }
-    Row(Modifier.fillMaxWidth().panel(strong = true), verticalAlignment = Alignment.CenterVertically) {
-        glyph()
-        Spacer(Modifier.size(14.dp))
-        nameBlock(Modifier.weight(1f))
-        HeroBattery(battery, charging)
-        Box(Modifier.size(7.dp).background(if (connected) Acab.accent else Acab.faint, CircleShape))
     }
 }
 
@@ -1569,9 +2375,15 @@ private fun HeroBattery(battery: Int?, charging: Boolean) {
 
 /** Crimson banner shown only when a dual-radio board reports its nRF co-processor as faulted,
  *  meaning the BLE-detection half is dark. A tinted crimson card, not the filled accent, so it
- *  reads as a warning rather than an action. */
+ *  reads as a warning rather than an action.
+ *
+ *  The body sentence is BYTE-IDENTICAL to iOS SettingsView.swift `coprocFaultDetail`, as it was
+ *  before either side was reworked. One failure has to read the same on both phones, so reword
+ *  one and reword the other. Note the both-off case is its own sentence, not a suffix: when
+ *  nothing is scanning, the banner has to say so outright instead of leaving the reader to add
+ *  two facts together. */
 @Composable
-private fun NrfFaultBanner() {
+private fun NrfFaultBanner(wifiScanning: Boolean) {
     Row(
         Modifier
             .fillMaxWidth()
@@ -1587,7 +2399,13 @@ private fun NrfFaultBanner() {
         Column(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(3.dp)) {
             Text("nRF radio fault - bluetooth detection offline",
                 color = Acab.text, fontSize = 14.sp, fontWeight = FontWeight.SemiBold)
-            Text("the second radio stopped answering, so BLE gear won't be spotted. Wi-Fi detection still runs. try a power cycle, and reflash if it sticks.",
+            Text(
+                if (wifiScanning)
+                    "the second radio stopped answering, so Bluetooth gear won't be spotted. " +
+                        "Wi-Fi scanning is still active. try a power cycle, and reflash if it sticks."
+                else
+                    "the second radio stopped answering and Wi-Fi scanning is off, so the beacon " +
+                        "is not detecting nearby gear. try a power cycle, and reflash if it sticks.",
                 color = Acab.dim, fontSize = 11.sp, fontFamily = Acab.mono)
         }
     }
@@ -1595,9 +2413,15 @@ private fun NrfFaultBanner() {
 
 /** The calm twin of [NrfFaultBanner], shown when the board says its nRF is mid BLE DFU
  *  ("nrfup"). Same silence on the co-processor line, but expected: a neutral card with a
- *  spinner, so an update in progress never reads as a broken radio. */
+ *  spinner, so an update in progress never reads as a broken radio.
+ *
+ *  The true/false sentences are BYTE-IDENTICAL to iOS SettingsView.swift `nrfUpdateDetail` -
+ *  reword one and reword the other. The null arm has no iOS counterpart and needs none: this
+ *  banner also shows for a coordinator phase that has no current board frame (iOS's `nrfUpdating`
+ *  requires the board's own nrfup bit), and with no frame the Wi-Fi bit is not current enough to
+ *  claim coverage either way. */
 @Composable
-private fun NrfUpdatingBanner() {
+private fun NrfUpdatingBanner(wifiScanning: Boolean?) {
     Row(
         Modifier
             .fillMaxWidth()
@@ -1612,7 +2436,12 @@ private fun NrfUpdatingBanner() {
         Column(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(3.dp)) {
             Text("updating co-processor",
                 color = Acab.text, fontSize = 14.sp, fontWeight = FontWeight.SemiBold)
-            Text("the second radio is taking new firmware, so BLE gear won't be spotted until it comes back. Wi-Fi detection still runs. keep the board powered and stay close.",
+            Text("the second radio is taking new firmware, so Bluetooth gear won't be spotted until it comes back. " +
+                when (wifiScanning) {
+                    true -> "Wi-Fi scanning is still on. keep the board powered and stay close."
+                    false -> "Wi-Fi scanning is off. keep the board powered and stay close."
+                    null -> "Detection coverage may pause during this step. keep the board powered and stay close."
+                },
                 color = Acab.dim, fontSize = 11.sp, fontFamily = Acab.mono)
         }
     }
@@ -1638,6 +2467,11 @@ private fun FirmwareCard(
     /** The BOARD leg specifically is behind. [combinedStale] is the OR of both radios, so this is
      *  what lets the offer copy tell "board is behind" from "only the co-processor is behind". */
     s3Stale: Boolean,
+    canStartUpdate: Boolean,
+    revisionCompatible: Boolean,
+    /** Hoisted manual-check spinner state; the collapsed fold row reads it (see `fwChecking`). */
+    checkingForUpdate: Boolean,
+    onCheckingForUpdateChange: (Boolean) -> Unit,
     onCombinedUpdate: (FirmwareBuild) -> Unit,
     onCombinedCancel: () -> Unit,
     onCombinedDismiss: () -> Unit,
@@ -1646,7 +2480,7 @@ private fun FirmwareCard(
     // Manifest version is the source of truth for "latest"; fall back to the baked-in constant
     // only when the manifest has no entry for this board (offline cold start).
     val latest = entry?.version ?: LATEST
-    val outdated = installed != null && isFirmwareVersionOlder(installed, latest)
+    val outdated = revisionCompatible && installed != null && isFirmwareVersionOlder(installed, latest)
     val flasher = entry?.flasher?.takeIf { it.isNotEmpty() } ?: FALLBACK_FLASHER
 
     // The combined flow (running, or a done / failed / partial terminal) owns the action area.
@@ -1663,9 +2497,19 @@ private fun FirmwareCard(
             }
             Spacer(Modifier.weight(1f))
             Column(horizontalAlignment = Alignment.End, verticalArrangement = Arrangement.spacedBy(2.dp)) {
-                Text("v$latest", color = if (outdated) Acab.warn else Acab.dim,
+                // A listing we refuse to flash from has no "latest" to report, so name the
+                // refusal instead of printing a version the user cannot have.
+                //
+                // TWIN: this value/kicker pair must stay byte-identical with the firmware card
+                // in ios/Beacons/Views/SettingsView.swift. The healthy arm says "LATEST KNOWN",
+                // not "LATEST", because `latest` falls back to the baked-in `LATEST` constant
+                // when the manifest has no entry for this board: the number is the newest build
+                // this app knows of, not proof of global currency. Both platforms' firmware
+                // FOLD ROWS already say "LATEST KNOWN".
+                Text(if (revisionCompatible) "v$latest" else "-",
+                    color = if (outdated || !revisionCompatible) Acab.warn else Acab.dim,
                     fontSize = 20.sp, fontWeight = FontWeight.SemiBold)
-                Kicker("LATEST")
+                Kicker(if (revisionCompatible) "LATEST KNOWN" else "REVISION MISMATCH")
             }
         }
         HorizontalDivider(color = Acab.line)
@@ -1673,7 +2517,22 @@ private fun FirmwareCard(
         when {
             // Running, or a terminal we keep on screen: one merged progress view for both legs.
             combined.isRunning || combinedTerminal ->
-                CombinedStatus(combined, entry, onCombinedUpdate, onCombinedCancel, onCombinedDismiss)
+                CombinedStatus(
+                    combined,
+                    entry,
+                    canStartUpdate,
+                    onCombinedUpdate,
+                    onCombinedCancel,
+                    onCombinedDismiss,
+                )
+
+            // Byte-identical to the `revisionCompatible` arm of iOS
+            // beaconFirmwareStatusPresentation, and ABOVE `outdated` on purpose: no browser
+            // flasher button follows, because that link goes to the disagreeing listing's page.
+            !revisionCompatible -> Text(
+                "Update unavailable: this firmware listing does not match the beacon's reported board revision. No update will be offered from this listing.",
+                color = Acab.warn, fontSize = 11.sp, fontFamily = Acab.mono,
+            )
 
             // Either radio behind and self-updatable: offer the single one-click update. This is
             // the ONLY update button (no per-leg firmware/co-processor buttons anymore).
@@ -1687,7 +2546,13 @@ private fun FirmwareCard(
                     else "Co-processor update available. The board firmware is already current; this updates the second radio, over Bluetooth.",
                     color = Acab.warn, fontSize = 11.sp, fontFamily = Acab.mono,
                 )
-                CardButton("update", filled = true) { entry?.let { onCombinedUpdate(it) } }
+                CardButton("update", filled = true, enabled = canStartUpdate) {
+                    entry?.let { onCombinedUpdate(it) }
+                }
+                if (!canStartUpdate) {
+                    Text("Reconnect and wait for current board status before starting the update.",
+                        color = Acab.faint, fontSize = 11.sp, fontFamily = Acab.mono)
+                }
                 Text(
                     "Installs over Bluetooth and usually takes about 2-3 minutes. The board restarts on its own partway through. Keep this phone next to the beacon with the app open until it finishes.",
                     color = Acab.faint, fontSize = 11.sp, fontFamily = Acab.mono,
@@ -1703,8 +2568,18 @@ private fun FirmwareCard(
                 CardButton("Open the browser flasher") { onFlash(flasher) }
             }
 
+            installed == null -> Text(
+                "Waiting for board status before comparing firmware versions.",
+                color = Acab.dim, fontSize = 11.sp, fontFamily = Acab.mono,
+            )
+
+            entry == null -> Text(
+                "No current update listing is available for this beacon. Check again when online before treating its version as current.",
+                color = Acab.dim, fontSize = 11.sp, fontFamily = Acab.mono,
+            )
+
             else -> Text(
-                "You're on the latest firmware.",
+                "You're on the latest known firmware for this beacon.",
                 color = Acab.dim, fontSize = 11.sp, fontFamily = Acab.mono,
             )
         }
@@ -1713,7 +2588,10 @@ private fun FirmwareCard(
         // re-evaluates (entry/outdated recompute from the collected manifest flow). Mirrors iOS;
         // reachable in every state except mid-update.
         if (!combined.isRunning) {
-            CheckForUpdatesRow(updateAvailable = outdated || combinedStale)
+            CheckForUpdatesRow(
+                checking = checkingForUpdate,
+                onCheckingChange = onCheckingForUpdateChange,
+            )
         }
     }
 }
@@ -1726,6 +2604,7 @@ private fun FirmwareCard(
 private fun CombinedStatus(
     combined: CombinedUpdateProgress,
     entry: FirmwareBuild?,
+    canStartUpdate: Boolean,
     onUpdate: (FirmwareBuild) -> Unit,
     onCancel: () -> Unit,
     onDismiss: () -> Unit,
@@ -1792,7 +2671,13 @@ private fun CombinedStatus(
         combined.phase == CombinedUpdatePhase.PARTIAL -> {
             // S3 took; the second radio didn't finish. The same primary button re-offers just the
             // nRF leg (the S3 is current now, so a fresh run does the co-processor only).
-            CardButton("finish second radio", filled = true) { entry?.let { onUpdate(it) } }
+            CardButton("finish second radio", filled = true, enabled = canStartUpdate) {
+                entry?.let { onUpdate(it) }
+            }
+            if (!canStartUpdate) {
+                Text("Reconnect and wait for current board status before finishing the update.",
+                    color = Acab.faint, fontSize = 11.sp, fontFamily = Acab.mono)
+            }
             CardButton("Not now", tint = Acab.dim) { onDismiss() }
         }
         else -> CardButton("Done", tint = Acab.dim) { onDismiss() }
@@ -1800,15 +2685,15 @@ private fun CombinedStatus(
 }
 
 /** The manual "check for updates" control at the foot of the firmware card: forces a manifest
- *  refresh past the TTL, spins while it resolves, then flashes a brief confirmation. Don't claim
- *  "Up to date" if the refresh just revealed a newer version (the card above then offers an
- *  update); show a neutral "Checked" instead. The card's update state re-evaluates automatically
- *  off the refreshed manifest flow. Mirrors iOS. */
+ * refresh past the TTL, then reports only that the check finished. A fetch may legally preserve
+ * cached/fallback data, so completion alone is not proof that this beacon is up to date.
+ * [checking] is hoisted (DeviceScreen's `fwChecking`) so the collapsed Firmware fold row can
+ * name the running check; the `finally` clears it if this row leaves composition mid-check,
+ * because the scope's cancellation would otherwise strand the hoisted flag at true. */
 @Composable
-private fun CheckForUpdatesRow(updateAvailable: Boolean) {
+private fun CheckForUpdatesRow(checking: Boolean, onCheckingChange: (Boolean) -> Unit) {
     val context = LocalContext.current
     val scope = rememberCoroutineScope()
-    var checking by remember { mutableStateOf(false) }
     var justChecked by remember { mutableStateOf(false) }
     Row(
         Modifier
@@ -1818,10 +2703,13 @@ private fun CheckForUpdatesRow(updateAvailable: Boolean) {
             .border(1.dp, Acab.line, RoundedCornerShape(Acab.radiusSm))
             .clickable(enabled = !checking) {
                 scope.launch {
-                    checking = true
+                    onCheckingChange(true)
                     justChecked = false
-                    FirmwareManifest.getInstance(context).refreshNow()
-                    checking = false
+                    try {
+                        FirmwareManifest.getInstance(context).refreshNow()
+                    } finally {
+                        onCheckingChange(false)
+                    }
                     justChecked = true
                     delay(1800)
                     justChecked = false
@@ -1835,17 +2723,17 @@ private fun CheckForUpdatesRow(updateAvailable: Boolean) {
             CircularProgressIndicator(color = Acab.dim, strokeWidth = 2.dp, modifier = Modifier.size(14.dp))
         } else {
             Icon(
-                if (justChecked && !updateAvailable) Icons.Filled.Check else Icons.Filled.Refresh,
+                if (justChecked) Icons.Filled.Check else Icons.Filled.Refresh,
                 contentDescription = null,
-                tint = if (justChecked && !updateAvailable) Acab.accent else Acab.dim,
+                tint = Acab.dim,
                 modifier = Modifier.size(14.dp),
             )
         }
         Text(
             if (checking) "Checking…"
-            else if (justChecked) (if (updateAvailable) "Checked" else "Up to date")
+            else if (justChecked) "Check finished"
             else "Check for updates",
-            color = if (justChecked && !updateAvailable) Acab.accent else Acab.dim,
+            color = Acab.dim,
             fontSize = 11.sp, fontWeight = FontWeight.Bold, letterSpacing = 0.5.sp, fontFamily = Acab.mono,
         )
     }
@@ -1854,15 +2742,22 @@ private fun CheckForUpdatesRow(updateAvailable: Boolean) {
 /** A full-width action button in the card style (matches DisconnectButton). Outlined by
  *  default; [filled] is the primary-CTA treatment per spec: solid crimson, radius 12. */
 @Composable
-private fun CardButton(label: String, tint: Color = Acab.accent, filled: Boolean = false, onClick: () -> Unit) {
+private fun CardButton(
+    label: String,
+    tint: Color = Acab.accent,
+    filled: Boolean = false,
+    enabled: Boolean = true,
+    onClick: () -> Unit,
+) {
     val shape = RoundedCornerShape(if (filled) Acab.radiusSm else Acab.radius)
     Box(
         Modifier
             .fillMaxWidth()
             .minimumInteractiveComponentSize()
+            .alpha(if (enabled) 1f else 0.45f)
             .background(if (filled) Acab.accent else Acab.bg2, shape)
             .border(1.dp, if (filled) Color.Transparent else if (tint == Acab.accent) Acab.lineStrong else Acab.line, shape)
-            .clickable(onClick = onClick)
+            .clickable(enabled = enabled, onClick = onClick)
             .padding(vertical = 13.dp),
         contentAlignment = Alignment.Center,
     ) {
@@ -1934,7 +2829,7 @@ private fun NotifyCard(
             // toggle is on, so the card is not a wall of warnings.
             if (on && detectorOff(t)) {
                 Text(
-                    "the ${t.label.lowercase()} detector is off, so this won't fire. turn it on under Detectors.",
+                    notifyDetectorOffWarning(t),
                     color = Acab.warn, fontSize = 10.sp, fontFamily = Acab.mono, lineHeight = 14.sp,
                 )
             }
@@ -1945,6 +2840,14 @@ private fun NotifyCard(
         )
     }
 }
+
+/** The dead-switch warning under a notification toggle whose detector the board is not running.
+ *  DeviceType.inlineLabel, not `label.lowercase()`: the sentence voice is lowercase, and
+ *  lowercasing `label` flattened the ALPR initialism to "the alpr camera detector", the exact
+ *  defect inlineLabel exists to prevent. iOS SettingsView carries the twin sentence under its
+ *  notify card; keep the two in step. */
+internal fun notifyDetectorOffWarning(t: DeviceType): String =
+    "the ${t.inlineLabel} detector is off, so this won't fire. turn it on under Detectors."
 
 /** Mirrors iOS SettingsView.notifySubtitle word for word. */
 private fun notifySubtitle(t: DeviceType): String = when (t) {
@@ -1962,6 +2865,8 @@ private fun notifySubtitle(t: DeviceType): String = when (t) {
 private fun BuzzerCard(
     mode: AlertMode,
     master: Float,
+    restoreOffered: Boolean,
+    onRestore: () -> Unit,
     onMasterChange: (Float) -> Unit,
     onMode: (AlertMode) -> Unit,
     onVolumeCommit: (Int) -> Unit,
@@ -1994,6 +2899,8 @@ private fun BuzzerCard(
             color = Acab.faint, fontSize = 11.sp, fontFamily = Acab.mono,
         )
 
+        if (restoreOffered) AlertRestoreOffer(onRestore)
+
         // LIVE IN ALL THREE MODES. Vibrate and Silent turn detection beeps off, so the only
         // thing this level still governs there is the shutdown cue the caption above names - and
         // volume 0 is the ONLY thing that silences it (firmware alerts.cpp buzzerTone: a
@@ -2004,6 +2911,67 @@ private fun BuzzerCard(
             // Round, don't truncate: the status-echo check compares roundToInt(), so a truncated
             // send (49.7 -> 49) could never match and the 10s timeout would false-fire.
             onValueChange = onMasterChange, onCommit = { onVolumeCommit(master.roundToInt()) })
+    }
+}
+
+/** The one-tap way out of a silence the app imposed and never asked about. Rendered in FIVE places
+ *  (the Desert card's silence slot, the Alerts card, the panel that leads the Beacon tab while the
+ *  board is away, the panel that leads the pre-connect screen when there is no Beacon tab at all,
+ *  and the panel on the OTA wait screen, which is the pre-connect screen's twin for the reboot
+ *  window) from this single definition, so no surface can word or wire the offer differently. All
+ *  five pass the same AcabBleManager.takePendingAlertModeRestore, the only thing that takes it.
+ *
+ *  FIVE HERE, FOUR ON iOS, and the extra one is not drift: RootView keeps the tab shell mounted and
+ *  visible through an OTA reboot (mainIsUsable takes isRebootingForUpdate), so the Beacon screen's
+ *  detached panel already covers that window there, while AcabApp hands the reboot its own locked
+ *  screen and has to carry the offer onto it.
+ *
+ *  `internal`, not private: the pre-connect and wait screens live in AcabApp.kt and reach it
+ *  through [AlertRestorePanel] below, so a second copy of this markup never has to exist.
+ *
+ *  faint text, like the notice it replaces: this is a state report with a control attached, not an
+ *  alarm. The control is accent-toned and pill-shaped, the same anatomy as the ERASE pill.
+ *  iOS twin: AlertRestoreOffer in SettingsView.swift. */
+@Composable
+internal fun AlertRestoreOffer(onRestore: () -> Unit) {
+    Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+        Text(DESERT_RESTORE_OFFER,
+            color = Acab.faint, fontSize = 11.sp, fontFamily = Acab.mono)
+        Text(
+            DESERT_RESTORE_OFFER_ACTION,
+            color = Acab.accentText, fontSize = 10.sp, fontFamily = Acab.mono,
+            fontWeight = FontWeight.Bold, letterSpacing = 1.sp,
+            modifier = Modifier
+                .minimumInteractiveComponentSize()
+                .clip(CircleShape)
+                .border(1.dp, Acab.lineStrong, CircleShape)
+                .clickable(onClickLabel = "Puts back the alert mode you had before desert mode",
+                    onClick = onRestore)
+                .padding(horizontal = 10.dp, vertical = 6.dp),
+        )
+    }
+}
+
+/** The offer as a card of its own, for the three surfaces that are not inside another card: the
+ *  slot that LEADS the Beacon tab while the board is away, the slot that LEADS the pre-connect
+ *  screen in AcabApp when there is no Beacon tab, and the one on AcabApp's OTA wait screen, which
+ *  is the same pre-connect state with the reboot holding the link down. Same panel and same ALERTS
+ *  kicker on all three, so the owner meets the same card wherever the app has to hand it to them.
+ *
+ *  It takes the manager rather than a lambda so that all three of those surfaces reach the ONE take
+ *  call written here, and neither screen in AcabApp carries a take of its own.
+ *
+ *  It leads all three pages on purpose. A silence this app imposed is the one thing on any of them
+ *  the app owes the user, so it outranks the config panel, the stats, the scan panel and the update
+ *  spinner; and the offer arms in states where the rest of the page is collapsed, still searching,
+ *  or locked for an update.
+ *  iOS twin: AlertRestorePanel in SettingsView.swift, which has two callers rather than three: its
+ *  tab shell stays up through an OTA reboot, so the Beacon screen's copy covers that window. */
+@Composable
+internal fun AlertRestorePanel(ble: AcabBleManager) {
+    Column(Modifier.fillMaxWidth().panel(), verticalArrangement = Arrangement.spacedBy(14.dp)) {
+        Kicker("ALERTS")
+        AlertRestoreOffer { ble.takePendingAlertModeRestore() }
     }
 }
 
@@ -2213,7 +3181,7 @@ private fun IgnoredCard(
 @Composable
 private fun WatchedCard(
     watched: List<tech.acab.app.ble.WatchedDevice>,
-    boardCount: Int,
+    boardCount: Int?,
     onUnwatch: (String) -> Unit,
     onRename: (String, String) -> Unit,
 ) {
@@ -2222,7 +3190,8 @@ private fun WatchedCard(
         Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
             Kicker("WATCHING", color = Acab.watchTone)
             Spacer(Modifier.weight(1f))
-            if (boardCount > 0) Kicker("$boardCount ON BOARD", color = Acab.dim)
+            if (boardCount == null) Kicker("BOARD N/A", color = Acab.faint)
+            else if (boardCount > 0) Kicker("$boardCount ON BOARD", color = Acab.dim)
         }
         watched.forEachIndexed { i, dev ->
             Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
@@ -2554,19 +3523,20 @@ private fun ToggleRow(
 /** Small circular refresh control in the Device header: asks the board for a fresh status frame
  *  now instead of waiting for the next periodic poll. Mirrors iOS's header refresh button. */
 @Composable
-private fun StatusRefreshButton(onClick: () -> Unit) {
+private fun StatusRefreshButton(enabled: Boolean, onClick: () -> Unit) {
     Box(
         Modifier
             .minimumInteractiveComponentSize()
             .size(38.dp)
+            .alpha(if (enabled) 1f else 0.45f)
             .clip(CircleShape)
             .background(Acab.bg2)
             .border(1.dp, Acab.line, CircleShape)
-            .clickable(onClick = onClick),
+            .clickable(enabled = enabled, onClick = onClick),
         contentAlignment = Alignment.Center,
     ) {
         Icon(Icons.Filled.Refresh, contentDescription = "Refresh device status",
-            tint = Acab.dim, modifier = Modifier.size(16.dp))
+            tint = if (enabled) Acab.dim else Acab.faint, modifier = Modifier.size(16.dp))
     }
 }
 

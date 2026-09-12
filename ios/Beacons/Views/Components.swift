@@ -87,23 +87,30 @@ struct LinkChip: View {
     var version: String? = nil
     var connected: Bool
     var demo: Bool = false
+    var stateLabel: String? = nil
     var body: some View {
-        let tone = demo ? ACABTheme.warn : (connected ? ACABTheme.accent : ACABTheme.faint)
-        // dot + CONNECTED / OFFLINE / DEMO, matching the Android LinkChip. The firmware
-        // version lives on the Device screen's firmware row; repeating it in the header chip
-        // was noise on a pill the user reads as "is my board there or not".
-        let label = demo ? "DEMO" : connected ? "CONNECTED" : "OFFLINE"
+        // dot + CONNECTED / OFFLINE / DEMO, same labels and the SAME TINT RULE as the Android
+        // LinkChip (Components.kt `stateNeedsAttention`): DEMO and the three attention states
+        // (RECONNECTING / UPDATING / RADIO FAULT) draw the amber dot, label and border, so a
+        // radio fault never reads as a healthy connected pill. The firmware version lives on the
+        // Device screen's firmware row; repeating it in the header chip was noise on a pill the
+        // user reads as "is my board there or not".
+        let stateNeedsAttention = stateLabel == "RECONNECTING" || stateLabel == "UPDATING"
+            || stateLabel == "RADIO FAULT"
+        let amber = demo || stateNeedsAttention
+        let tone = amber ? ACABTheme.warn : (connected ? ACABTheme.accent : ACABTheme.faint)
+        let label = demo ? "DEMO" : stateLabel ?? (connected ? "CONNECTED" : "OFFLINE")
         return HStack(spacing: 6) {
             Circle().fill(tone)
                 .frame(width: 7, height: 7)
-                .shadow(color: demo ? ACABTheme.warn.opacity(0.6)
-                                    : (connected ? ACABTheme.accentGlow : .clear), radius: 4)
+                .shadow(color: amber ? ACABTheme.warn.opacity(0.6)
+                                     : (connected ? ACABTheme.accentGlow : .clear), radius: 4)
             Kicker(label,
-                   color: demo ? ACABTheme.warn : (connected ? ACABTheme.dim : ACABTheme.faint))
+                   color: amber ? ACABTheme.warn : (connected ? ACABTheme.dim : ACABTheme.faint))
         }
         .padding(.horizontal, 11).padding(.vertical, 7)
         .background(ACABTheme.bg2, in: Capsule())
-        .overlay(Capsule().strokeBorder(demo ? ACABTheme.warn.opacity(0.4) : ACABTheme.line, lineWidth: 1))
+        .overlay(Capsule().strokeBorder(amber ? ACABTheme.warn.opacity(0.4) : ACABTheme.line, lineWidth: 1))
     }
 }
 
@@ -183,6 +190,12 @@ struct RadarDot: Identifiable {
 struct RadarScope: View {
     let count: Int
     let dots: [RadarDot]
+    /// The caller's drawing limit, spoken in the accessibility summary below. Passed in rather
+    /// than written into that sentence: this view takes an arbitrary `dots` array and does not
+    /// own the cap, so a literal here would be a claim about somebody else's constant, and the
+    /// printed caption beside the scope (which does interpolate it) would silently disagree the
+    /// day the cap moved.
+    let cap: Int
     /// False parks the beam. A scope that keeps sweeping with the radios off (or the nRF
     /// dark) reads as scanning when nothing is.
     var sweeping: Bool = true
@@ -217,14 +230,16 @@ struct RadarScope: View {
                         .font(ACABTheme.display(62, weight: .bold))
                         .foregroundStyle(ACABTheme.text)
                         .monospacedDigit()
-                    // "ACTIVE" is load-bearing: this count is filtered to recently-seen
-                    // devices, so it reads lower than the Log's whole-session total. Saying
-                    // "active" tells the user why Status < Log instead of looking like a bug.
+                        .lineLimit(1)
+                        .minimumScaleFactor(0.25)
+                        .frame(maxWidth: s * 0.82)
+                    // Includes matched/watched and ambient devices, separated below the scope.
+                    // It is still a recent, not whole-Log, count.
                     // Fixed size, NOT ACABTheme.mono: the caption anchor roughly quadruples at
                     // accessibility sizes and this label lives inside the scope's fixed
                     // geometry, where it collided with the count. The count itself (real
                     // content) keeps scaling; the whole scope carries a spoken summary below.
-                    Text("ACTIVE NEARBY")
+                    Text("TOTAL NEARBY")
                         .font(Font.custom("JetBrainsMono-Medium", fixedSize: 10.5))
                         .tracking(1.6)
                         .foregroundStyle(ACABTheme.faint)
@@ -236,7 +251,7 @@ struct RadarScope: View {
         // One spoken element for the whole instrument: the dots and rings are positional
         // decoration a screen reader cannot use, so say what the scope actually knows.
         .accessibilityElement(children: .ignore)
-        .accessibilityLabel("\(count) active device\(count == 1 ? "" : "s") nearby. Radar shows signal strength only, not direction.")
+        .accessibilityLabel("\(count) recently heard device\(count == 1 ? "" : "s") nearby. \(dots.count) dot\(dots.count == 1 ? "" : "s") drawn, at most \(cap), with matches and stars first. Radar shows signal strength only, not direction.")
     }
 }
 
@@ -272,7 +287,7 @@ private struct SweepBeam: View {
     }
 }
 
-/// "they're watching - watch back."
+/// "they're watching. watch back." - rendered at the foot of the Status column.
 struct PunkLine: View {
     var body: some View {
         // Ornamental brand copy, so it is pinned at its design size: at accessibility text
@@ -335,18 +350,32 @@ extension Detection {
     var nodeName: String {
         String(mac.replacingOccurrences(of: ":", with: "").suffix(4)).uppercased()
     }
-    /// Friendly vendor guess for the detail screen.
+    /// Per-type vendor guess for the dossier subtitle (`maker ?? vendor`), so a row the board
+    /// could not name never repeats its type label there. Body cam reads the signature carried
+    /// in the wire detail string (it survives BLE address randomization, where there is no OUI
+    /// to look up); an unrecognized or missing signature names the category's makers rather
+    /// than picking one, because the category alone cannot name a maker: the Axon payload tag
+    /// and the broad Motorola proxy both arrive as t=3. Also one of the nine Log search fields
+    /// (DetectionLogQuery.foldedHaystack), which is why this table is BYTE-IDENTICAL to Android:
+    /// a vendor word on one platform only means the same query lenses different rows, and a
+    /// different CSV/GPX, on the two phones. Pinned by DetectionLogLensTests and
+    /// LogExportLensTest ("axon" finds an Axon signature and not a Motorola one; "unverified"
+    /// finds nothing).
+    /// TWIN: Android `Detection.vendor` in Models.kt, arm for arm, literal for literal.
     var vendor: String {
         switch type {
         case .flockCamera, .flockRaven: return "Flock Safety"
-        case .drone:                    return "UAS · Remote ID"
-        case .axonBodyCam:              return "Axon (unverified)"
+        case .axonBodyCam:              return bodyCamSignature?.vendor ?? "Axon / Utility / Motorola"
         case .tracker:                  return "Item tracker"
-        case .nearbyDevice:             return "Nearby device"
-        case .watched:                  return "Watched device"
-        case .recordingGlasses:         return "Camera glasses"
-        case .networkCamera:            return "Network camera"
-        case .unknown:                  return "Unknown device"   // future wire type this build can't name (Android's UNKNOWN parity)
+        case .drone:                    return "Drone maker"
+        case .recordingGlasses:         return "Smart glasses"
+        case .watched:                  return "Starred device"
+        // The dossier leads with `maker` (the "<vendor> on wifi" detail) when the board named
+        // the brand; this is the honest fallback when it did not.
+        case .networkCamera:            return "IP camera"
+        // Android's `else` arm: NEARBY_DEVICE, and UNKNOWN for a future wire type this build
+        // can't name.
+        case .nearbyDevice, .unknown:   return "Unknown vendor"
         }
     }
     /// Short category label for the badge pill.

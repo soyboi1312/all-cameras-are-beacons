@@ -1,5 +1,6 @@
 import XCTest
 import CoreLocation
+import MapKit
 @testable import Beacons
 
 /// A request that delivers response headers and a small prefix, then stays open until URLSession
@@ -373,6 +374,159 @@ final class ALPRDatasetTests: XCTestCase {
         XCTAssertNotEqual(
             ALPRStore.stableNodeID(index: 0, coordinate: coordinate, metadata: nil),
             ALPRStore.stableNodeID(index: 1, coordinate: coordinate, metadata: nil))
+    }
+
+    // MARK: Spatial index
+
+    func testLatitudeIndexPreservesDatasetOrderAndParallelArrayAlignment() {
+        let coordinates = [
+            CLLocationCoordinate2D(latitude: 10, longitude: 10),
+            CLLocationCoordinate2D(latitude: 0, longitude: 0),
+            CLLocationCoordinate2D(latitude: 5, longitude: 5),
+            CLLocationCoordinate2D(latitude: 5, longitude: 6),
+            CLLocationCoordinate2D(latitude: 20, longitude: 20),
+        ]
+        let makers = ["zero", "one", "two", "three", "four"]
+        let confirmed = [true, false, true, true, true]
+        let latitudeOrder = ALPRStore.makeLatitudeOrder(for: coordinates)
+        XCTAssertEqual(latitudeOrder, [1, 2, 3, 0, 4],
+                       "equal latitudes must use original index as their deterministic tie-breaker")
+
+        let result = ALPRStore.indexedNodeIndices(
+            coordinates: coordinates,
+            confirmed: confirmed,
+            latitudeOrder: latitudeOrder,
+            region: MKCoordinateRegion(
+                center: CLLocationCoordinate2D(latitude: 5, longitude: 3),
+                span: MKCoordinateSpan(latitudeDelta: 12, longitudeDelta: 14)
+            ),
+            includeUnverified: false,
+            cap: 10
+        )
+
+        XCTAssertFalse(result.exceededCap)
+        XCTAssertEqual(result.indices, [0, 2, 3],
+                       "a successful indexed query must retain the old source-array order")
+        XCTAssertEqual(result.indices.map { makers[$0] }, ["zero", "two", "three"],
+                       "query indices must still address every parallel node array")
+        XCTAssertTrue(ALPRStore.stableNodeID(
+            index: result.indices[1], coordinate: coordinates[result.indices[1]], metadata: nil
+        ).hasPrefix("legacy:2:"), "indexing must not renumber legacy identities")
+    }
+
+    func testParserBuildsLatitudeIndexAfterInvalidRowsAreCompacted() {
+        let source = [
+            Node(lat: 40, lon: -100, maker: 1, tier: 1, osmID: 10),
+            Node(lat: 91, lon: -101, maker: 2, tier: 0, osmID: 20),
+            Node(lat: 30, lon: -102, maker: 3, tier: 2, osmID: 30),
+        ]
+        guard let parsed = ALPRStore.parseDetailed(alp("ALP4", nodes: source)) else {
+            return XCTFail("valid ALP4 rows around one invalid coordinate were rejected")
+        }
+
+        XCTAssertEqual(parsed.latitudeOrder, [1, 0])
+        XCTAssertEqual(parsed.latitudeOrder.map { parsed.makers[$0] }, ["Neology", "Flock Safety"])
+        XCTAssertEqual(parsed.latitudeOrder.map { parsed.metadata[$0].osmID }, [30, 10])
+        XCTAssertEqual(parsed.latitudeOrder.map { parsed.metadata[$0].attributionTier }, [2, 1])
+    }
+
+    func testIndexedQueryCapCountsOnlyDisplayedTiersAndReturnsEmptyPastCap() {
+        let coordinates = (0..<4).map {
+            CLLocationCoordinate2D(latitude: Double($0), longitude: 0)
+        }
+        let confirmed = [true, false, true, true]
+        let latitudeOrder = ALPRStore.makeLatitudeOrder(for: coordinates)
+        let region = MKCoordinateRegion(
+            center: CLLocationCoordinate2D(latitude: 1.5, longitude: 0),
+            span: MKCoordinateSpan(latitudeDelta: 4, longitudeDelta: 2)
+        )
+
+        let exactCap = ALPRStore.indexedNodeIndices(
+            coordinates: coordinates,
+            confirmed: confirmed,
+            latitudeOrder: latitudeOrder,
+            region: region,
+            includeUnverified: false,
+            cap: 3
+        )
+        XCTAssertEqual(exactCap.indices, [0, 2, 3])
+        XCTAssertFalse(exactCap.exceededCap)
+
+        let pastCap = ALPRStore.indexedNodeIndices(
+            coordinates: coordinates,
+            confirmed: confirmed,
+            latitudeOrder: latitudeOrder,
+            region: region,
+            includeUnverified: false,
+            cap: 2
+        )
+        XCTAssertTrue(pastCap.indices.isEmpty)
+        XCTAssertTrue(pastCap.exceededCap)
+
+        let includingUnverified = ALPRStore.indexedNodeIndices(
+            coordinates: coordinates,
+            confirmed: confirmed,
+            latitudeOrder: latitudeOrder,
+            region: region,
+            includeUnverified: true,
+            cap: 3
+        )
+        XCTAssertTrue(includingUnverified.indices.isEmpty)
+        XCTAssertTrue(includingUnverified.exceededCap,
+                      "the same unverified row counts when that display tier is enabled")
+    }
+
+    func testNarrowLatitudeQueryInspectsOnlyItsIndexedCandidateSlice() {
+        let coordinates = (0..<10_000).map {
+            CLLocationCoordinate2D(latitude: Double($0) / 1_000, longitude: 0)
+        }
+        let latitudeOrder = ALPRStore.makeLatitudeOrder(for: coordinates)
+        let region = MKCoordinateRegion(
+            center: CLLocationCoordinate2D(latitude: 5, longitude: 0),
+            span: MKCoordinateSpan(latitudeDelta: 0.01, longitudeDelta: 1)
+        )
+        let minLatitude = region.center.latitude - region.span.latitudeDelta / 2
+        let maxLatitude = region.center.latitude + region.span.latitudeDelta / 2
+        let expected = coordinates.indices.filter {
+            coordinates[$0].latitude >= minLatitude && coordinates[$0].latitude <= maxLatitude
+        }
+
+        let result = ALPRStore.indexedNodeIndices(
+            coordinates: coordinates,
+            confirmed: Array(repeating: true, count: coordinates.count),
+            latitudeOrder: latitudeOrder,
+            region: region,
+            includeUnverified: true,
+            cap: 500
+        )
+
+        XCTAssertEqual(result.indices, expected)
+        XCTAssertEqual(result.inspectedCount, expected.count)
+        XCTAssertLessThan(result.inspectedCount, coordinates.count / 100,
+                          "the deterministic operation count must reflect the latitude slice, not all nodes")
+    }
+
+    func testIndexedQueryRetainsExistingNonWrappingAntimeridianBounds() {
+        let coordinates = [
+            CLLocationCoordinate2D(latitude: 0, longitude: 179),
+            CLLocationCoordinate2D(latitude: 0, longitude: -179),
+            CLLocationCoordinate2D(latitude: 1, longitude: 180),
+            CLLocationCoordinate2D(latitude: -1, longitude: -180),
+        ]
+        let result = ALPRStore.indexedNodeIndices(
+            coordinates: coordinates,
+            confirmed: Array(repeating: true, count: coordinates.count),
+            latitudeOrder: ALPRStore.makeLatitudeOrder(for: coordinates),
+            region: MKCoordinateRegion(
+                center: CLLocationCoordinate2D(latitude: 0, longitude: 179),
+                span: MKCoordinateSpan(latitudeDelta: 2, longitudeDelta: 4)
+            ),
+            includeUnverified: true,
+            cap: 10
+        )
+
+        XCTAssertEqual(result.indices, [0, 2],
+                       "the index must preserve the prior inclusive, non-wrapping longitude comparison")
     }
 
     func testValidALP3RoundTrip() {

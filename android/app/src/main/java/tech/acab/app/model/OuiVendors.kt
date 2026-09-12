@@ -142,6 +142,12 @@ val Detection.isOuiMatch: Boolean get() = method == 1
  *  Keys are ALWAYS lowercased MACs, matching how both lists store them. Mirrors iOS DeviceNames. */
 object DeviceNames {
     @Volatile private var byMac: Map<String, String> = emptyMap()
+    /** Bumped on every [rebuild]. A cache that derived something from [label] keys on this
+     *  instead of re-resolving every MAC per pass: LogSearchIndex (LogScreen.kt) reuses a row's
+     *  folded haystack while the revision it was built under still stands. TWIN: iOS
+     *  `DeviceNames.revision` in BLEManager.swift. */
+    @Volatile var revision: Int = 0
+        private set
     fun label(mac: String): String? = byMac[mac.lowercase()]?.takeIf { it.isNotEmpty() }
     /** Watched wins over ignored if a MAC somehow lands on both list files. */
     fun rebuild(watchedPairs: List<Pair<String, String>>, ignoredPairs: List<Pair<String, String>>) {
@@ -149,6 +155,7 @@ object DeviceNames {
         ignoredPairs.forEach { (mac, l) -> if (l.isNotEmpty()) m[mac.lowercase()] = l }
         watchedPairs.forEach { (mac, l) -> if (l.isNotEmpty()) m[mac.lowercase()] = l }
         byMac = m
+        revision++
     }
 }
 

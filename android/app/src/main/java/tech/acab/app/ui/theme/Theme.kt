@@ -30,9 +30,10 @@ val JetBrainsMono = FontFamily(
  *  Crimson cyber-noir look, ported from the iOS ACABTheme) and [High] (what a request for more
  *  contrast resolves to). [Acab] exposes whichever is in force; nothing else reads these directly.
  *
- *  iOS twin: ACABPalette in Theme.swift. Shared hex values are identical; the alpha tint for
- *  `faint` differs per platform and each side documents its own measurement. The ratios quoted
- *  below are composited onto the surface named and are locked in by AcabPaletteTest. */
+ *  iOS twin: ACABPalette in Theme.swift. Every token both sides declare is the same colour to
+ *  8-bit precision at both contrast levels, `faint` included (0x8A normal / 0xBF high on both;
+ *  the `faint` comment below says why it must stay that way). The ratios quoted below are
+ *  composited onto the surface named and are locked in by AcabPaletteTest. */
 data class AcabPalette(
     val bg: Color, val bg2: Color, val bg3: Color,
     val line: Color, val lineStrong: Color,
@@ -55,6 +56,12 @@ data class AcabPalette(
             // real instructions and privacy copy, not just ornament; 54% lands 4.98:1 on bg, 4.95:1
             // on bg2, 4.80:1 on bg3 (WCAG AA for body text on every surface it sits on) while
             // staying a visible step quieter than dim. Same base tint, so the palette reads unchanged.
+            // 0x8A is 0.54 x 255 = 138, so this is the same colour iOS declares as inkAt(0.54).
+            // TWIN: THREE declarations, one derivation - iOS `faint` in Views/Theme.swift and
+            // soyboi.tech css/styles.css `--text-faint` (rgba(240,224,226,0.54)), which copies
+            // the apps and had already lagged once at 0.52. iOS was 0.52 until 2026-09-05; there
+            // is nothing platform-derived here (same ink, same surfaces, same target), so the
+            // three must not diverge again - change all three or none.
             faint = Color(0x8AF0E0E2),       // @ 54%
             accent = Color(0xFFEE4034),      // crimson
             // Crimson AS TEXT. The fill accent measures 4.42:1 on bg3, under AA for text, and it

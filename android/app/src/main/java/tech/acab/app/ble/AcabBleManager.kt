@@ -53,9 +53,9 @@ import kotlinx.coroutines.flow.combine
 import kotlinx.coroutines.flow.onEach
 import kotlinx.coroutines.flow.launchIn
 import kotlinx.coroutines.flow.sample
+import kotlinx.coroutines.flow.update
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicLong
-import kotlin.math.roundToInt
 import org.json.JSONArray
 import org.json.JSONObject
 import tech.acab.app.model.Detection
@@ -88,6 +88,40 @@ import javax.crypto.SecretKey
 import tech.acab.app.model.maker
 
 enum class ConnState { DISCONNECTED, SCANNING, CONNECTING, BONDING, READY, POWERED_OFF }
+
+/** Board-backed switches that the sample Beacon screen can preview across tabs. These updates
+ * modify only the synthetic in-memory [DeviceStatus]; the real config writer and preferences are
+ * never involved. Keeping this typed prevents a sample UI callback from accidentally targeting an
+ * unrelated status field. */
+internal enum class DemoStatusToggle {
+    BLE,
+    WIFI,
+    FLOCK,
+    DRONE,
+    DRONE_OUI,
+    BODY_CAM,
+    MOTOROLA,
+    TRACKER,
+    GLASSES,
+    NETWORK_CAMERA,
+}
+
+/** Pure half of the sample-status echo, kept independently testable from Android's BLE stack. */
+internal fun DeviceStatus.withDemoStatusToggle(
+    toggle: DemoStatusToggle,
+    on: Boolean,
+): DeviceStatus = when (toggle) {
+    DemoStatusToggle.BLE -> copy(ble = on)
+    DemoStatusToggle.WIFI -> copy(wifi = on)
+    DemoStatusToggle.FLOCK -> copy(flock = on)
+    DemoStatusToggle.DRONE -> copy(drone = on)
+    DemoStatusToggle.DRONE_OUI -> copy(droui = on)
+    DemoStatusToggle.BODY_CAM -> copy(bodyCam = on)
+    DemoStatusToggle.MOTOROLA -> copy(moto = on)
+    DemoStatusToggle.TRACKER -> copy(tracker = on)
+    DemoStatusToggle.GLASSES -> copy(glasses = on)
+    DemoStatusToggle.NETWORK_CAMERA -> copy(ncam = on)
+}
 
 /** Outcome for one replay end sentinel. A bounded retry stops radio churn for this connection,
  * but DEFER_INCOMPLETE deliberately does not authorize advancing past a sequence gap. */
@@ -269,6 +303,160 @@ internal fun scanStartFailureHint(featureUnsupported: Boolean): String =
  *  SILENT  = board muted, no phone feedback either. */
 enum class AlertMode { BUZZER, VIBRATE, SILENT }
 
+/** WHO asked for an alert mode. The whole Desert restore rests on this one distinction, so it is a
+ *  REQUIRED parameter of [AcabBleManager.setAlertMode] with no default value: a caller that has not
+ *  thought about it does not compile. That is the loud failure we want. The quiet alternatives are
+ *  both worse - a default of USER silently discards a restore the app still owes, and a default of
+ *  APP lets a hand-picked mode be overwritten later, which is a beacon making noise its owner did
+ *  not ask for.
+ *
+ *  A NEW CALLER must answer one question: did a human tap something to cause this call? If yes,
+ *  USER, and the pending Desert restore and the saved pre-Desert mode are both dropped, because the
+ *  mode on screen is now the mode they chose. If the app decided (Desert's forced mute, either
+ *  restore path), APP, and both stay exactly as they were.
+ *
+ *  iOS twin: AlertModeOrigin in BLEManager.swift, same two cases and the same rule. */
+enum class AlertModeOrigin {
+    USER,   // a tap on the Alerts picker, or on the restore offer
+    APP,    // Desert's forced mute, or a restore the app is carrying out
+}
+
+/** The alert-mode state a Desert run owns, as ONE value.
+ *
+ *  [saved] is the mode captured on the way into Desert (AcabBleManager's alertModeBeforeDesert).
+ *  [offered] is a mode being held out for the user to take (AcabBleManager's
+ *  pendingAlertModeRestore). Never both at once: arming the offer MOVES the value out of [saved].
+ *  BOTH HALVES ARE PERSISTED. See pendingAlertModeRestore for why the offer had to become durable
+ *  and why that does not carry the stale-value hazard the saved mode does.
+ *  iOS twin: DesertAlertModeState in BLEManager.swift. */
+internal data class DesertAlertModeState(
+    val saved: AlertMode? = null,
+    val offered: AlertMode? = null,
+) {
+    companion object { val EMPTY = DesertAlertModeState() }
+}
+
+/** The same two halves as the raw strings a preference store holds.
+ *  iOS twin: DesertAlertModeStorage in BLEManager.swift. */
+internal data class DesertAlertModeStorage(
+    val saved: String? = null,
+    val offered: String? = null,
+) {
+    companion object { val EMPTY = DesertAlertModeStorage() }
+}
+
+/** State -> storage. null means "remove the key", not "write an empty string", so a cleared half
+ *  leaves nothing behind for a later launch to read.
+ *
+ *  This pair is PURE and sits on the manager's real read and write path, which is what lets this
+ *  side drive a whole relaunch - arm the offer, take what the store would then hold, reload from
+ *  it, then take or decline the offer - with no preference store at all. THIS side is the one that
+ *  needs it: AcabBleManager wants a Context, so a plain JUnit test cannot build one, while iOS
+ *  covers the same round trip against a real manager with an injected defaults suite.
+ *  iOS twin: desertAlertModeStorage in BLEManager.swift. */
+internal fun desertAlertModeStorage(state: DesertAlertModeState): DesertAlertModeStorage =
+    DesertAlertModeStorage(saved = state.saved?.name, offered = state.offered?.name)
+
+/** Storage -> state. A missing key, or a string no mode answers to (a downgrade, a hand-edited
+ *  prefs file), reads as "nothing held", which is what a fresh install has.
+ *  iOS twin: desertAlertModeStateFromStorage in BLEManager.swift. */
+internal fun desertAlertModeStateFromStorage(storage: DesertAlertModeStorage): DesertAlertModeState {
+    fun parse(raw: String?) = raw?.let { v -> AlertMode.entries.firstOrNull { it.name == v } }
+    return DesertAlertModeState(saved = parse(storage.saved), offered = parse(storage.offered))
+}
+
+/** The two SharedPreferences keys those halves live under, named once so the read path, the write
+ *  path and the launch republish cannot drift onto three spellings. The saved half keeps the key it
+ *  already shipped with; an installed app must not lose a restore it is holding on upgrade.
+ *  iOS twins: alertModeBeforeDesertKey / pendingAlertModeRestoreKey in BLEManager.swift. */
+internal const val PREF_ALERT_MODE_BEFORE_DESERT = "alert_mode_before_desert"
+internal const val PREF_PENDING_ALERT_MODE_RESTORE = "pending_alert_mode_restore"
+
+/** Everything that can move that state. iOS twin: DesertAlertModeEvent in BLEManager.swift. */
+internal enum class DesertAlertModeEvent {
+    USER_PICKED_MODE,        // the Alerts picker, or the restore offer being taken
+    APP_SET_MODE,            // Desert's forced mute, or a restore the app is carrying out
+    USER_ENABLED_DESERT,     // the Desert toggle on THIS phone, on
+    USER_ENDED_DESERT,       // the Desert toggle on THIS phone, off
+    BOARD_REPORTS_DESERT_ON, // a status frame says Desert is running
+    BOARD_ENDED_DESERT,      // a status frame says Desert stopped and we are not who stopped it
+}
+
+/** What the caller must do to the alert mode after applying the new state.
+ *  iOS twin: DesertAlertModeEffect in BLEManager.swift. */
+internal enum class DesertAlertModeEffect {
+    KEEP_MODE,       // leave the alert mode exactly where it is
+    MUTE_TO_SILENT,  // Desert is starting: drop to SILENT
+    RESTORE,         // put restoreTo back, because the USER ended Desert
+}
+
+/** iOS twin: DesertAlertModeOutcome in BLEManager.swift. */
+internal data class DesertAlertModeOutcome(
+    val state: DesertAlertModeState,
+    val effect: DesertAlertModeEffect,
+    val restoreTo: AlertMode? = null,
+)
+
+/** THE RULE, in one pure function both platforms run: only the user changes whether the detector
+ *  makes sound.
+ *
+ *  Two things it encodes that comments alone used to enforce, and got wrong:
+ *   - [DesertAlertModeEvent.USER_PICKED_MODE] empties the state WHATEVER MODE was picked, SILENT
+ *     included. A hand-picked SILENT used to leave the saved mode in place, so ending Desert
+ *     overrode the user and made the board audible. Nothing else clears the state, so a caller that
+ *     mislabels a user tap as APP_SET_MODE is the one way back to that bug; see [AlertModeOrigin]
+ *     for why the label cannot be forgotten.
+ *   - [DesertAlertModeEvent.BOARD_ENDED_DESERT] CANNOT return RESTORE. A board-reported Desert-off
+ *     (factory reset, an older board, a second paired phone) only ever moves the saved mode into
+ *     [DesertAlertModeState.offered], and the alert mode stays where it is until the user takes the
+ *     offer. USER_ENDED_DESERT is the one ending with a tap behind it, and the only one that
+ *     restores.
+ *
+ *  [current] is the alert mode right now. Where it is read, it guards the same invariant on both
+ *  endings: the saved mode is only ever acted on while the SILENT this app forced is still in
+ *  force. */
+internal fun desertAlertModeTransition(
+    state: DesertAlertModeState,
+    event: DesertAlertModeEvent,
+    current: AlertMode,
+): DesertAlertModeOutcome = when (event) {
+    // The mode on screen is now the mode they chose, so the app is holding nothing for them.
+    DesertAlertModeEvent.USER_PICKED_MODE ->
+        DesertAlertModeOutcome(DesertAlertModeState.EMPTY, DesertAlertModeEffect.KEEP_MODE)
+    // The app moved the mode as part of a decision already recorded here. Change nothing.
+    DesertAlertModeEvent.APP_SET_MODE ->
+        DesertAlertModeOutcome(state, DesertAlertModeEffect.KEEP_MODE)
+    // Capture only when we are the ones forcing a change. Already SILENT means there is nothing to
+    // give back, and keeping an arbitrarily old mode would un-mute someone who chose quiet. Either
+    // way any offer from the last run is closed: they picked a new mute over it.
+    DesertAlertModeEvent.USER_ENABLED_DESERT ->
+        if (current == AlertMode.SILENT) {
+            DesertAlertModeOutcome(DesertAlertModeState.EMPTY, DesertAlertModeEffect.KEEP_MODE)
+        } else {
+            DesertAlertModeOutcome(
+                DesertAlertModeState(saved = current), DesertAlertModeEffect.MUTE_TO_SILENT)
+        }
+    DesertAlertModeEvent.USER_ENDED_DESERT ->
+        if (state.saved != null && current == AlertMode.SILENT) {
+            DesertAlertModeOutcome(
+                DesertAlertModeState.EMPTY, DesertAlertModeEffect.RESTORE, state.saved)
+        } else {
+            DesertAlertModeOutcome(DesertAlertModeState.EMPTY, DesertAlertModeEffect.KEEP_MODE)
+        }
+    // Desert is running again, so an offer from the previous run is answered. The saved mode is left
+    // alone: if one is held, this run's own Desert-off still owes it back.
+    DesertAlertModeEvent.BOARD_REPORTS_DESERT_ON ->
+        DesertAlertModeOutcome(
+            DesertAlertModeState(saved = state.saved), DesertAlertModeEffect.KEEP_MODE)
+    DesertAlertModeEvent.BOARD_ENDED_DESERT ->
+        if (state.saved != null && current == AlertMode.SILENT) {
+            DesertAlertModeOutcome(
+                DesertAlertModeState(offered = state.saved), DesertAlertModeEffect.KEEP_MODE)
+        } else {
+            DesertAlertModeOutcome(DesertAlertModeState.EMPTY, DesertAlertModeEffect.KEEP_MODE)
+        }
+}
+
 /** How long a scanned board stays in the picker after its last advert. See FoundBoard.seenAt.
  *
  *  A board advertises many times a second, so a few seconds of silence means gone, not quiet. */
@@ -345,6 +533,311 @@ internal data class NearbySnapshot(
     val detections: List<Detection>,
     val newestByCategory: Map<String, NewestLive>,
 )
+
+/** An observer coordinate and the RSSI sample it arrived with are one evidence unit. */
+internal data class LocatedPinSample(val coord: Pair<Double, Double>, val rssi: Int)
+
+/** One lock-consistent slice of the active map projection. [lastSeenAt] is null when the only
+ * available value is the board's approximate replay ordering key, so UI history lenses cannot
+ * accidentally present that key as a recent clock time. */
+internal data class MapDetectionEvidence(
+    val detection: Detection,
+    val coordinate: Pair<Double, Double>?,
+    val lastSeenAt: Long?,
+)
+
+/** The only map geometry intentionally driven by hot signal updates: a drone without broadcast
+ * aircraft GPS uses RSSI to size an uncertainty ring around the observer. Kept as a tiny flow so
+ * MapScreen never scans/associates the full feed (up to FEED_CAP rows) on every radio
+ * publication. */
+internal data class MapDynamicRing(val id: String, val rssi: Int)
+
+/** Order-independent fingerprint of the ACTIVE projection's membership, which is the set of device
+ * ids the map and the dossier are currently allowed to see. Accumulated in the same walk that
+ * builds the projection, so deciding whether map geometry went stale costs three primitive
+ * comparisons instead of a HashSet of up to FEED_CAP ids allocated and compared on every publish,
+ * at about 3 Hz, to answer a question whose answer is usually no.
+ *
+ * Order-independent ON PURPOSE. A routine sighting re-adds its row at the front of the
+ * insertion-ordered store without changing who is on the map, and that reorder must not invalidate
+ * the geometry; the set compare this replaces ignored order for the same reason.
+ *
+ * Count, xor and sum together are what a count alone or a sum alone is not. Dropping an id moves
+ * the count; swapping one id for another at the same count moves both accumulators. So every
+ * membership change the set compare caught still moves the revision: a first sighting, a re-add
+ * that is a genuinely new id, an eviction, a clear, a replay filing, a mute or watch list edit, a
+ * mute expiring, the demo seed and leaving demo.
+ *
+ * What it can fail to invalidate on: a ONE-ROW swap at an unchanged count whose leaving id and
+ * arriving id fold to the same 64-bit [membershipHash64]. That is ONE collision, not two: the xor
+ * moves by h(gone) xor h(arrived) and the sum by h(arrived) - h(gone), and both are zero on
+ * exactly the same equality, so for a single swap these two accumulators are one test. They are
+ * independent only for a count-preserving change of MORE than one row, where a set that collides
+ * has to match the xor and the sum at once. A wrong yes hides BOTH sides of the swap: the
+ * arriving row gets no pin, and the row that LEFT keeps the pin and the marker it already had,
+ * because MapScreen's marker rebuild resolves its rows as `currentById[it.id] ?: it` and so
+ * redraws the cached plan's copy of a row the store has already dropped. The row that leaves is
+ * usually the one the user acted on: ignoreDevice, ignoreDevices, unignore and pruneExpiredMutes
+ * all end in publishNow() and bump nothing themselves, so mute, unmute and mute expiry reach the
+ * map through this signature alone. The state clears at the next membership change.
+ * [membershipHash64] is a real mix and not String.hashCode precisely so near-identical ids,
+ * which is what these ids are, cannot land near each other. */
+internal class MembershipSignature {
+    private var count = 0
+    private var xorAcc = 0L
+    private var sumAcc = 0L
+
+    /** The store is keyed by detection id, so one walk cannot present the same id twice and this
+     *  multiset fold is exactly a set compare here. */
+    fun add(id: String) {
+        val h = membershipHash64(id)
+        count++
+        xorAcc = xorAcc xor h
+        sumAcc += h
+    }
+
+    /** True when [other] covers the same ids, in any order. */
+    fun sameAs(other: MembershipSignature): Boolean =
+        count == other.count && xorAcc == other.xorAcc && sumAcc == other.sumAcc
+
+    companion object {
+        /** The whole set at once, for tests and for reasoning about a clear: a signature with
+         *  nothing added is the empty projection, which is the state every teardown resets to. */
+        fun of(ids: Iterable<String>): MembershipSignature =
+            MembershipSignature().apply { for (id in ids) add(id) }
+    }
+}
+
+/** 64-bit fold of one detection id for [MembershipSignature]: FNV-1a over the characters, then the
+ * murmur3 finalizer so that ids differing by one hex digit, which is what a MAC set looks like,
+ * land far apart in both accumulators instead of a few units apart. */
+internal fun membershipHash64(id: String): Long {
+    var h = -0x340d631b7bdddcdbL          // 0xcbf29ce484222325, the FNV-1a 64 offset basis
+    for (c in id) {
+        h = h xor c.code.toLong()
+        h *= 0x100000001b3L               // the FNV-1a 64 prime
+    }
+    h = h xor (h ushr 33)
+    h *= -0xae502812aa7333L               // 0xff51afd7ed558ccd
+    h = h xor (h ushr 29)
+    h *= -0x3b314601e57a13adL             // 0xc4ceb9fe1a85ec53
+    return h xor (h ushr 32)
+}
+
+/** Everything the DOSSIER's own map thumbnail reads out of the per-device side maps for ONE row.
+ * A value, not a revision, so the dossier can key its coordinate and trail on its own device
+ * instead of on [AcabBleManager.spatialEvidenceRev], which moves whenever ANY device's pin moves
+ * or the active membership changes at all. Under Desert density that is most publishes, and an
+ * open dossier was rebuilding its map data because an unrelated device entered the feed.
+ *
+ * [crumbCount] alone would NOT be enough, which is why [lastCrumbAt] is here: the trail caps at
+ * 120 crumbs and trims from the FRONT, so a long follow holds the count at 120 while the path
+ * keeps moving. [demo] is here because the sample tour changes what [mapWireFallbackAllowed]
+ * permits. The row's own lat, lon, gpsAgeSec, offline and type are Detection fields and are keys
+ * at the call site, so they are deliberately not repeated in here. */
+internal data class RowMapEvidence(
+    val pin: Pair<Double, Double>?,
+    val crumbCount: Int,
+    val lastCrumbAt: Long?,
+    val demo: Boolean,
+)
+
+/** A map pin is evidence from the strongest LOCATED sample, not merely the strongest radio
+ * sample. A detection heard without a usable coordinate cannot raise this bar and prevent a later
+ * located sample from establishing the pin. Equal RSSI keeps the earlier coordinate stable. */
+internal fun selectStrongestLocatedSample(
+    current: LocatedPinSample?,
+    candidateCoord: Pair<Double, Double>?,
+    candidateRssi: Int,
+): LocatedPinSample? {
+    if (candidateCoord == null || !validCoord(candidateCoord.first, candidateCoord.second)) {
+        return current
+    }
+    return if (current == null || candidateRssi > current.rssi) {
+        LocatedPinSample(candidateCoord, candidateRssi)
+    } else current
+}
+
+/** How stale a phone fix may be, in seconds, before it stops describing where the phone IS. One
+ * number for both Android gates: the app's own fix (FIX_MAX_AGE_NANOS, which stamps detections and
+ * anchors HERE mutes) and the board-relayed fix in [liveWireCoordinateIsFresh]. 2 min is ~1 mile at
+ * freeway speed: past that the coordinate is not "roughly where you were", it is a specific wrong
+ * place, and a blank cell beats a confident lie in an evidence export. TWIN: iOS
+ * `currentLocationFixMaxAge` in BLEManager.swift, the single value behind `locationFixIsCurrent`
+ * and `liveWireObserverFixIsCurrent` there. Pinned by LocationOwnershipTest at the 120/121 edge. */
+internal const val FIX_MAX_AGE_SEC = 120
+
+/** A live wire coordinate is a usable phone-fix fallback only while it is within the same
+ * [FIX_MAX_AGE_SEC] freshness window as freshSelfCoord. A missing age is the legacy/sub-second
+ * encoding and remains usable; negative ages are malformed, not magically fresh. A replayed
+ * coordinate is never REJECTED by this gate - it is capture-era evidence and is often the only
+ * position a deploy-and-leave capture has - but fileHistory does ask it which replayed fixes may
+ * outrank a live observer sample; see [STALE_FIX_PIN_RSSI].
+ * TWIN: iOS `liveWireObserverFixIsCurrent` in BLEManager.swift - same 120 s window, same
+ * nil-is-legacy and negative-is-malformed answers. Callers here: the live pin in fileLive
+ * (`wireObserver`), the replay split in fileHistory and the checkpoint load in
+ * [checkpointObserverPin] (both through [replayPinContest]), and the "where this was heard"
+ * wire-fallback gate [mapWireFallbackAllowed], which feeds mapCoord and mapEvidenceSnapshot. iOS
+ * asks the same questions from its live ingest, ingestHistory, its checkpoint restore, and the
+ * MapTabView `mapCoord(for:)` / DetectionDetailView `mapCoordinate` gate. */
+internal fun liveWireCoordinateIsFresh(gpsAgeSec: Int?): Boolean =
+    gpsAgeSec == null || gpsAgeSec in 0..FIX_MAX_AGE_SEC
+
+/** Peak stored beside a pin whose coordinate is a capture-era fix that was ALREADY STALE when the
+ * board recorded it (`gage` past [liveWireCoordinateIsFresh]'s window - up to about 18h12m; see
+ * the replay trim ladder in docs/ble-protocol.md). Such a coordinate is where the
+ * PHONE last was, not where the device was heard, and the only thing that says so is the `gage`
+ * on the replayed row - which vanishes the moment a live row wins the store instead. So it is
+ * recorded below every real BLE RSSI: it still supplies a pin when nothing better exists, and any
+ * later located sample at a real RSSI, however weak, takes the pin back through the ordinary
+ * [selectStrongestLocatedSample] rule. Riding in the existing `_crssi` half of the persisted
+ * coordinate pair, it also survives a relaunch without a second key. */
+// TWIN: iOS `staleFixPinRSSI` in BLEManager.swift - same value, same meaning.
+internal const val STALE_FIX_PIN_RSSI = -32768   // Short.MIN_VALUE: the persisted clamp floor
+
+/** Which contest a REPLAYED coordinate enters. RANKED: the fix was still inside the live
+ *  freshness window when the board recorded it, so it is an ordinary observer sample and competes
+ *  on raw RSSI. FLOOR: it was already stale at capture, so it may only fill an empty pin, parked
+ *  at [STALE_FIX_PIN_RSSI]. Both keep the coordinate; only the ranking differs. */
+internal enum class ReplayPinContest { RANKED, FLOOR }
+
+/** The replay routing decision, pure, so a test can pin it: a missing `gage` (legacy / sub-second
+ *  encoding) and any age inside the window rank; a stale or malformed age floors. fileHistory
+ *  routes through this and nothing else; swapping its arms, or feeding a stale fix to the ranked
+ *  half with the row's own RSSI, is exactly the pre-fix bug in which a sighting buffered while the
+ *  phone sat at home pinned the HOME coordinate above a later live sighting.
+ *  TWIN: iOS `replayPinContest(gpsAgeSec:)` in BLEManager.swift - same two answers, same edge, pinned
+ *  by LocationOwnershipTest here and MuteAndNearbyPolicyTests there at nil/0/120 -> RANKED and
+ *  121/-1 -> FLOOR. */
+internal fun replayPinContest(gpsAgeSec: Int?): ReplayPinContest =
+    if (liveWireCoordinateIsFresh(gpsAgeSec)) ReplayPinContest.RANKED else ReplayPinContest.FLOOR
+
+/** The FILL half of the floor rule, pure: the sample to record for a stale replayed coordinate,
+ *  or null when nothing is to be written. It fills an EMPTY pin only - a pin any sample already
+ *  won (ranked or floor) is never overwritten - and it refuses an unmappable coordinate the way
+ *  [selectStrongestLocatedSample] does. considerStaleLocatedSample writes exactly what this
+ *  returns. TWIN: iOS `staleObserverPinFill(existingCoordinate:candidate:)` in BLEManager.swift -
+ *  same guard, same floor, and the two REJECT THE SAME COORDINATES as composed - but the null
+ *  island (0,0) refusal sits at a different depth on each side, so the two helpers are NOT
+ *  interchangeable in a test. Here it is [validCoord], both in fileHistory's call gate and again
+ *  in this function, so the pure helper is safe for any caller. On iOS the only thing that can
+ *  hand ingestHistory a candidate is `Detection.coordinate`, which drops 0,0 itself, so the fill
+ *  helper there takes plain `CLLocationCoordinate2DIsValid` and a 0,0 assertion against it would
+ *  fail while the app is correct. Keep this guard rather than "matching" iOS by dropping it. */
+internal fun staleLocatedPinFill(
+    existing: Pair<Double, Double>?,
+    candidate: Pair<Double, Double>,
+): LocatedPinSample? {
+    if (existing != null) return null
+    if (!validCoord(candidate.first, candidate.second)) return null
+    return LocatedPinSample(candidate, STALE_FIX_PIN_RSSI)
+}
+
+/** The observer pin a checkpoint row restores on load, or null when it restores none. Pure, so
+ *  both arms are pinned by LocationOwnershipTest; loadPersistedDetections writes exactly what
+ *  this returns. No arm replaces a pin already held for the id unless it outranks it (the rule
+ *  considerLocatedSample applies), so the load can never trade a held pin for a weaker one.
+ *
+ *  PAIRED ARM. A saved observer coordinate (`_clat`/`_clon`) restores ONLY together with its saved
+ *  peak (`_crssi`), and it competes on that peak like any located sample
+ *  ([selectStrongestLocatedSample]). The peak records the contest the pair was written from: a
+ *  floor-parked pin carries [STALE_FIX_PIN_RSSI], a ranked one the RSSI it won with.
+ *  persistDetections writes the three keys together or not at all.
+ *
+ *  WIRE ARM. Every row without a usable pair: one that had no pin at checkpoint time, or one an
+ *  earlier build wrote (no earlier Android build saved the pair). It decides from the row's own
+ *  wire coordinate, `gage` and replay flag, through [replayPinContest], as the ingest did:
+ *  - a missing or in-window age competes on the row's RSSI, like fileLive's `wireObserver` and
+ *    fileHistory's RANKED arm;
+ *  - a stale or malformed age on a REPLAYED row only fills an empty pin at [STALE_FIX_PIN_RSSI]
+ *    ([staleLocatedPinFill]), like fileHistory, so a later located sighting at any real RSSI
+ *    takes it back;
+ *  - a stale or malformed age on a LIVE row seeds NOTHING. fileLive refused that fix
+ *    (`wireObserver`) and [mapWireFallbackAllowed] refuses it for the map and dossier as well, so
+ *    after a relaunch the row shows what it showed before, not the phone's old position as a pin.
+ *  A drone row never seeds from the wire: its wire coordinate is the aircraft.
+ *  [replayed] is [Detection.offline]: fileHistory sets it and detectionToJson persists it as
+ *  "offline". The wire `hist` flag is not persisted.
+ *  TWIN: iOS `checkpointObserverPin(type:pairLat:pairLon:peak:wire:rssi:gpsAgeSec:replayed:
+ *  existingCoordinate:existingRSSI:)` in BLEManager.swift: same arms, same answers, same Int16
+ *  peak clamp, and 0,0 is no pair on either side. iOS passes `Detection.isHistory` as its replay
+ *  flag, and its wire arm is handed `Detection.coordinate`, which has already dropped 0,0.
+ *  ONE iOS-ONLY STEP follows the helper there, for legacy data Android does not have: every
+ *  shipped iOS build wrote its pair with no peak, and iOS keeps that pair
+ *  (`legacyObserverPairToKeep`) WHETHER OR NOT this rule pins the row, because dropping it would
+ *  erase at the next checkpoint what a shipped build recorded. A row that also wins a pin carries
+ *  the pair beside it in the checkpoint's kept fields (`checkpointObserverPairToStore`). It feeds
+ *  that write-back and the standard export only, never a pin. No Android build has persisted an
+ *  observer pair AT ALL: `_clat`, `_clon` and `_crssi` arrive in this cut and persistDetections
+ *  writes the three together or not at all. So a log written by an earlier Android build carries
+ *  no pair to keep and every one of its rows re-runs the wire arm on reload, which for a live row
+ *  whose fix was already stale seeds nothing. Nothing to keep here, and no step to mirror. */
+internal fun checkpointObserverPin(
+    type: DeviceType,
+    pairLat: Double?,
+    pairLon: Double?,
+    pairPeak: Int?,
+    lat: Double?,
+    lon: Double?,
+    rssi: Int,
+    gpsAgeSec: Int?,
+    replayed: Boolean,
+    existingCoord: Pair<Double, Double>?,
+    existingRssi: Int?,
+): LocatedPinSample? {
+    val current = if (existingCoord != null && existingRssi != null) {
+        LocatedPinSample(existingCoord, existingRssi)
+    } else null
+    if (pairPeak != null && validCoord(pairLat, pairLon)) {
+        // The persisted clamp, which iOS applies too, so a corrupt peak ranks alike on both.
+        val peak = pairPeak.coerceIn(Short.MIN_VALUE.toInt(), Short.MAX_VALUE.toInt())
+        return selectStrongestLocatedSample(current, pairLat!! to pairLon!!, peak)
+            .takeIf { it !== current }
+    }
+    if (type == DeviceType.DRONE || !validCoord(lat, lon)) return null
+    val coord = lat!! to lon!!
+    return when (replayPinContest(gpsAgeSec)) {
+        ReplayPinContest.RANKED -> selectStrongestLocatedSample(current, coord, rssi)
+            .takeIf { it !== current }
+        ReplayPinContest.FLOOR -> if (replayed) staleLocatedPinFill(existingCoord, coord) else null
+    }
+}
+
+/** Prefer authoritative aircraft coordinates only for Remote ID rows. Every other pin represents
+ * where the observer phone heard the device most strongly; a wire coordinate remains a legacy /
+ * replay fallback when no paired observer coordinate has been retained.
+ *
+ * [allowNonDroneWireFallback] gates ONLY that last fallback. TWIN: iOS
+ * `resolvedDetectionMapCoordinate` in MapTabView.swift, same parameter, same default, same three
+ * branches - one rule, one owner, keep them together. Pass [mapWireFallbackAllowed] wherever the
+ * answer is presented as "where this was heard": the shipped q-pin FAQ, byte-identical on both
+ * platforms, reserves the last-shared-fix fallback for offline records, and a live board keeps
+ * stamping its last phone fix at ANY age (docs/ble-protocol.md), so an ungated fallback pins an
+ * ALPR camera at a driveway the phone left an hour ago. The default stays `true` because the
+ * ordinary Log export must keep carrying the coordinate either way - see [mapCoordForExport] and
+ * the same allowDetectionCoordinateFallback default on iOS. */
+internal fun mapCoordinateForDetection(
+    type: DeviceType,
+    detectedLat: Double?,
+    detectedLon: Double?,
+    observerCoord: Pair<Double, Double>?,
+    allowNonDroneWireFallback: Boolean = true,
+): Pair<Double, Double>? = when {
+    type == DeviceType.DRONE && validCoord(detectedLat, detectedLon) ->
+        detectedLat!! to detectedLon!!
+    observerCoord != null && validCoord(observerCoord.first, observerCoord.second) -> observerCoord
+    allowNonDroneWireFallback && type != DeviceType.DRONE && validCoord(detectedLat, detectedLon) ->
+        detectedLat!! to detectedLon!!
+    else -> null
+}
+
+/** May a presented pin fall back to the row's own wire coordinate? A replayed/offline row and the
+ * sample tour always may; a LIVE row may only while the board's fix is still inside
+ * [liveWireCoordinateIsFresh]'s window, which is the same test fileLive already applies before it
+ * will adopt that fix as an observer sample. TWIN: the iOS map and dossier call sites, which pass
+ * `d.isHistory || ble.demoMode || liveWireObserverFixIsCurrent(gpsAgeSec:)`. */
+internal fun mapWireFallbackAllowed(offline: Boolean, demo: Boolean, gpsAgeSec: Int?): Boolean =
+    offline || demo || liveWireCoordinateIsFresh(gpsAgeSec)
 
 /** One indivisible Stop result for the contribution composer. [capturedAtById] and [csv]
  *  are derived while holding the same store snapshot, so a live update or eviction cannot land
@@ -431,6 +924,17 @@ internal class HistTime(val basis: TimeBasis, val sortKey: Long)
 
 /** One unanchored record held back until the drain closes and the boot bounds are known. */
 private class PendingBracket(val id: String, val boot: Long, val ms: Long, val seq: Long)
+
+/** One lock-consistent row captured for the sealed detection-store write. Closest-approach
+ * coordinate and RSSI are one pair: persisting either alone can move the pin on a weaker sample
+ * after relaunch. */
+private data class PersistedDetectionRow(
+    val detection: Detection,
+    val firstSeen: Long?,
+    val histTime: HistTime?,
+    val observerCoord: Pair<Double, Double>?,
+    val bestRssi: Int?,
+)
 
 /** Where an in-app firmware update is in its run. Drives the FirmwareCard's button copy. */
 enum class OtaPhase {
@@ -614,8 +1118,42 @@ enum class MuteRuleStatus {
     INVALID_PLACE,
 }
 
-/** Status and Live Mode use one definition of "nearby now". Kept pure for policy tests. */
+/** "Heard recently enough to count as nearby now": the ONE Android owner of that window. It is the
+ *  default for [lastSeenIsNearby] (Live Mode's ongoing notification, through
+ *  [AcabBleManager.nearbySnapshot]), [lastSeenIsStale], [AcabBleManager.freshIdSet] (the Status
+ *  counts) and [AcabBleManager.isStale] (the dossier's SIGNAL LIVE/STALE kicker in DetailScreen),
+ *  so those cannot drift apart, and StatusScreen builds its "SEEN < 45s"
+ *  STATUS_SEEN_WINDOW_KICKER from it. Kept pure for policy tests. TWIN: iOS
+ *  `activeNearbyInterval` in BLEManager.swift (45 s), the default for its lastSeenIsNearby (Live
+ *  Mode), lastSeenIsStale (Status) and BLEManager.isStale(for:olderThan:asOf:) (its dossier
+ *  kicker), and the source of DashboardSnapshot.seenWindowKicker. check-signature-drift.py
+ *  ("active nearby window") compares the pair, seconds times 1000 against milliseconds, so a
+ *  retune on one phone fails it. */
 internal const val ACTIVE_NEARBY_WINDOW_MS = 45_000L
+/** Default Map history lens. A row must have a trustworthy wall-clock last-seen inside this
+ * window to appear in Recent; approximate replay ordering keys belong to All history only.
+ *
+ * SHARED WITH iOS - this one IS the same number: MapHistoryScope.recentSeconds in MapTabView.swift.
+ * Both suites pin the literal rather than the constant, because the map chip and
+ * docs/map-performance.md promise "15 minutes" in hardcoded copy a constant edit would not touch. */
+internal const val MAP_RECENT_WINDOW_MS = 15 * 60_000L
+
+/** A map age is actionable only when it names a point in time. Bracketed/unknown replay rows use
+ * a real-looking sort slot internally, but that slot must never make the Recent map. A row heard
+ * live after replay is no longer offline and its current lastSeen is this phone's exact clock,
+ * even though the retained first-seen basis remains historical. */
+internal fun trustworthyMapLastSeen(
+    stamp: Long?,
+    basis: TimeBasis?,
+    rowOffline: Boolean,
+): Long? {
+    if (stamp == null || stamp <= AcabBleManager.HIST_PSEUDO_BASE) return null
+    if (!rowOffline) return stamp
+    return when (basis) {
+        is TimeBasis.Bracketed, TimeBasis.Unknown -> null
+        null, TimeBasis.Exact, is TimeBasis.Reconstructed -> stamp
+    }
+}
 internal const val DEFAULT_HERE_RADIUS_METERS = 50.0
 
 internal fun lastSeenIsNearby(
@@ -1081,6 +1619,8 @@ class AcabBleManager(private val context: Context) {
 
     private val _detections = MutableStateFlow<List<Detection>>(emptyList())
     val detections: StateFlow<List<Detection>> = _detections.asStateFlow()
+    private val _mapDynamicRings = MutableStateFlow<List<MapDynamicRing>>(emptyList())
+    internal val mapDynamicRings: StateFlow<List<MapDynamicRing>> = _mapDynamicRings.asStateFlow()
     /** Evidence/log projection. Unlike [detections], active mute rules do not remove prior rows. */
     private val _logDetections = MutableStateFlow<List<Detection>>(emptyList())
     val logDetections: StateFlow<List<Detection>> = _logDetections.asStateFlow()
@@ -1249,6 +1789,16 @@ class AcabBleManager(private val context: Context) {
     // earlier and their content doesn't change when the basis is resolved.
     private val _timeBasisRev = MutableStateFlow(0)
     val timeBasisRev: StateFlow<Int> = _timeBasisRev.asStateFlow()
+
+    // Side-map equivalent of timeBasisRev. A stronger located history sample can move capturedLoc
+    // without replacing the visible Detection row, and StateFlow correctly conflates an equal row
+    // list. Breadcrumbs have the same shape. Screens key their coordinate/trail reads on this
+    // revision so side evidence cannot change invisibly. Writers bump the private generation;
+    // publishFeeds emits it through the existing ~3 Hz pump so packet cadence cannot recompose Map.
+    // spatialEvidenceGeneration is guarded by storeLock (declared with the store below).
+    private val _spatialEvidenceRev = MutableStateFlow(0L)
+    val spatialEvidenceRev: StateFlow<Long> = _spatialEvidenceRev.asStateFlow()
+    private var spatialEvidenceGeneration = 0L
 
     private val _alertMode = MutableStateFlow(AlertMode.BUZZER)
     val alertMode: StateFlow<AlertMode> = _alertMode.asStateFlow()
@@ -1601,15 +2151,22 @@ class AcabBleManager(private val context: Context) {
     private var gatt: BluetoothGatt? = null
     private var target: BluetoothDevice? = null
     private val store = LinkedHashMap<String, Detection>()
+    // Order-independent (see MembershipSignature) because routine sightings reorder the
+    // insertion-ordered store. Only actual active membership changes should invalidate the cached
+    // Map geometry projection. Guarded by storeLock, like the generation it decides. The instance
+    // stored here is the one the last publish built and nothing mutates it afterwards, so holding
+    // the accumulator itself is safe and costs one small object per membership change instead of
+    // a HashSet of up to FEED_CAP ids per publish.
+    private var lastPublishedMembership = MembershipSignature()
     private val firstSeenAt = HashMap<String, Long>()
     private val lastSeenAt = HashMap<String, Long>()
     private val rssiHistory = HashMap<String, MutableList<Int>>()
     private val capturedLoc = HashMap<String, Pair<Double, Double>>()
     private val contributionCapture = ContributionCaptureLedger()
-    // Best (strongest) RSSI seen for each capturedLoc pin. RSSI is a distance proxy, so a
-    // stronger later sighting is a better position estimate than the first: the pin migrates to
-    // closest approach and this is the bar it has to beat (with hysteresis). Keyed/locked like
-    // capturedLoc, and torn down wherever capturedLoc is.
+    // Best (strongest) RSSI that arrived WITH each capturedLoc pin. RSSI is a distance proxy, so a
+    // stronger later located sighting is a better position estimate than the first. The value and
+    // coordinate are always written/persisted as a pair; an unlocated sample never raises the bar.
+    // Keyed/locked like capturedLoc, and torn down wherever capturedLoc is.
     private val bestRssi = HashMap<String, Int>()
     private val trackHistory = HashMap<String, MutableList<Pair<Double, Double>>>()   // drone flight paths
     // Per-tracker breadcrumb of the PHONE's own path while a tracker stayed with us ("it followed
@@ -4007,6 +4564,51 @@ class AcabBleManager(private val context: Context) {
         else        -> "The board reported an error ($code). Try again."
     }
 
+    /** Consider one RSSI sample that carries a genuine observer coordinate. Coordinate and peak
+     * are one atomic pair under storeLock: samples without a fix never call this, and equal/weaker
+     * samples leave both values untouched. This is intentionally independent of which Detection
+     * row wins the store's timestamp/content selection. CALL UNDER storeLock. */
+    private fun considerLocatedSample(id: String, coord: Pair<Double, Double>, rssi: Int) {
+        val currentCoord = capturedLoc[id]
+        val currentRssi = bestRssi[id]
+        val current = if (currentCoord != null && currentRssi != null) {
+            LocatedPinSample(currentCoord, currentRssi)
+        } else null
+        val selected = selectStrongestLocatedSample(current, coord, rssi)
+        if (selected == null || selected === current) return
+        capturedLoc[id] = selected.coord
+        bestRssi[id] = selected.rssi
+        // A stronger packet at the SAME fix still advances the persisted peak, but it does not
+        // move any pixel. Keep the geometry revision independent of RSSI-only improvements.
+        if (currentCoord != selected.coord) noteSpatialEvidenceChanged()
+    }
+
+    /** A replayed coordinate whose own fix was already stale when the board stored it. It fills an
+     * EMPTY pin - that is real evidence and often the only position an unattended capture has -
+     * but it never competes on RSSI, because RSSI measures how close the device was and this
+     * coordinate is where the phone stood hours earlier. Recording it at [STALE_FIX_PIN_RSSI]
+     * settles both orderings of the same drive: a pin already won by a live sighting is not
+     * overwritten, and a live sighting arriving after the drain takes the pin back however weakly
+     * it was heard. Without that, the map pin, the detail LOCATION panel and the exported
+     * approx_lat/lon showed the phone's old position with nothing left on the row to qualify it.
+     * CALL UNDER storeLock. The decision itself is the pure [staleLocatedPinFill], so the
+     * empty-pin guard and the floor are pinned by LocationOwnershipTest without a manager.
+     * TWIN: iOS `considerStaleObserverPin` in BLEManager.swift - same empty-pin guard, same floor. */
+    private fun considerStaleLocatedSample(id: String, coord: Pair<Double, Double>) {
+        val fill = staleLocatedPinFill(capturedLoc[id], coord) ?: return
+        capturedLoc[id] = fill.coord
+        bestRssi[id] = fill.rssi
+        noteSpatialEvidenceChanged()
+    }
+
+    /** Mark side-map evidence dirty under storeLock, but publish only through the same coalesced
+     * pump as Detection rows. considerLocatedSample and considerStaleLocatedSample can both change
+     * a pin even when history row selection rejects its Detection, so they arm the pump themselves. */
+    private fun noteSpatialEvidenceChanged() {
+        spatialEvidenceGeneration++
+        schedulePublish()
+    }
+
     /** A live detection: timestamp is now, and a fresh sighting may buzz the phone. */
     private fun fileLive(d: Detection) {
         synchronized(storeLock) {
@@ -4017,52 +4619,40 @@ class AcabBleManager(private val context: Context) {
             // One observer read and one wall-clock instant describe this exact sighting. The
             // capture-local sample is independent of capturedLoc's session-global closest pin.
             val observer = freshSelfCoord()
+            val previousLastSeen = lastSeenAt[d.id]
             val first = !firstSeenAt.containsKey(d.id)
             if (first) {
                 firstSeenAt[d.id] = observedAt
-                // Stamp the hit with the phone's position only when the phone's fix is actually
-                // fresh. lastLat/lastLon are a LAST-SEEN value with no expiry: once the platform
-                // stops delivering (activity gone, permission revoked mid-drive) they hold their
-                // final value forever, and a frozen coordinate is not a missing coordinate - it
-                // pins the rest of the drive on the driveway, in the map and in the CSV both.
-                // validCoord can't catch this: a two-hour-old coordinate is a valid coordinate.
-                val self = observer
-                if (self != null) {
-                    // capturedLoc is always the OBSERVER PHONE's position. A drone's d.lat/d.lon
-                    // is its aircraft position, but the contribution export has independent
-                    // approx_lat/lon and drone_lat/lon columns and must be able to populate both.
-                    capturedLoc[d.id] = self
-                    if (d.lat == null) {
-                        bestRssi[d.id] = d.rssi   // the bar a later, closer sighting has to beat
-                    }
-                }
             }
             lastSeenAt[d.id] = observedAt
-            file(d, observedAt)   // appends this sample to rssiHistory, so smoothing sees it
+            // Re-entering the default Recent map lens is a projection change even when the row,
+            // coordinate and RSSI happen to be identical. A packet already inside the window is
+            // intentionally free: it must not invalidate geometry at radio cadence.
+            if (previousLastSeen == null || isApproxTime(previousLastSeen) ||
+                observedAt - previousLastSeen > MAP_RECENT_WINDOW_MS) {
+                noteSpatialEvidenceChanged()
+            }
+            file(d, observedAt)   // appends this sample to the RSSI trend
             // Record only after the live row is filed. History uses fileHistory and can never
             // enter this ledger, so a replay-only bracketed row cannot be relabeled `exact` by a
             // capture merely because it arrived between Start and Stop.
             contributionCapture.record(d, observedAt, observer)
-            // Seed a missing observer fix on any later sighting, INCLUDING a drone: its own
-            // aircraft coordinate does not fill the separate observer columns. For devices
-            // without an authoritative broadcast coordinate, later sightings also migrate the
-            // phone pin at a >= 4 dB stronger closest approach (hysteresis vs RSSI wobble).
-            if (!first) {
-                val smoothed = rssiHistory[d.id]?.takeLast(3)?.average()?.roundToInt() ?: d.rssi
+            // A valid Remote ID aircraft coordinate always owns the map pin and flight path. Its
+            // observer coordinate is still captured separately for evidence export, but it does
+            // not migrate with RSSI (preserving the existing RID policy). Every other live pin
+            // pairs the raw sample RSSI with the freshest phone fix; if this callback lacks one,
+            // a valid non-drone wire coordinate is the board's capture-time phone fix fallback.
+            val aircraftLocated = d.type == DeviceType.DRONE && validCoord(d.lat, d.lon)
+            if (aircraftLocated) {
                 if (capturedLoc[d.id] == null) {
-                    observer?.let { self ->
-                        capturedLoc[d.id] = self
-                        if (d.lat == null) bestRssi[d.id] = smoothed
-                    }
-                } else if (d.lat == null) {
-                    val prevBest = bestRssi[d.id]
-                    if (prevBest == null || smoothed - prevBest >= 4) {
-                        observer?.let { self ->
-                            capturedLoc[d.id] = self
-                            bestRssi[d.id] = smoothed
-                        }
-                    }
+                    observer?.let { considerLocatedSample(d.id, it, d.rssi) }
                 }
+            } else {
+                val wireObserver = if (d.type != DeviceType.DRONE &&
+                    liveWireCoordinateIsFresh(d.gpsAgeSec) && validCoord(d.lat, d.lon)) {
+                    d.lat!! to d.lon!!
+                } else null
+                (observer ?: wireObserver)?.let { considerLocatedSample(d.id, it, d.rssi) }
             }
             // Tracker breadcrumb trail: while a TRACKER stays with us, drop a crumb of the PHONE's
             // position, gated by time AND distance so a stationary stakeout doesn't stack crumbs
@@ -4086,6 +4676,7 @@ class AcabBleManager(private val context: Context) {
                         if (!firstCrumbAt.containsKey(d.id)) firstCrumbAt[d.id] = observedAt
                         lastCrumbAt[d.id] = observedAt
                         if (crumbs.size > 120) crumbs.subList(0, crumbs.size - 120).clear()
+                        noteSpatialEvidenceChanged()
                     }
                 }
             }
@@ -4171,6 +4762,23 @@ class AcabBleManager(private val context: Context) {
             if (!dropIgnored && d.at > 0L && d.boot > 0L) {
                 bootMinAt[d.boot] = minOf(bootMinAt[d.boot] ?: d.at, d.at)
                 bootMaxAt[d.boot] = maxOf(bootMaxAt[d.boot] ?: d.at, d.at)
+            }
+            // Replay coordinates are capture-time phone fixes for every non-drone type. Let a
+            // stronger located history sample improve the pin even when the content/timestamp
+            // guard below keeps an existing live row. Never substitute the phone's CURRENT fix
+            // here, and never treat a drone's Remote ID aircraft position as observer location.
+            // The `gage` that came with the coordinate decides WHICH contest it enters, through
+            // the pure replayPinContest so the split is pinned by LocationOwnershipTest: a fix
+            // still inside the live freshness window is an ordinary observer sample, while one
+            // already stale at capture is only a floor-ranked fallback (considerStaleLocatedSample
+            // says why). Both keep the coordinate; only the ranking differs. TWIN: the same
+            // `switch replayPinContest(gpsAgeSec:)` in iOS ingestHistory.
+            if (!dropIgnored && d.type != DeviceType.DRONE && validCoord(d.lat, d.lon)) {
+                val replayCoord = d.lat!! to d.lon!!
+                when (replayPinContest(d.gpsAgeSec)) {
+                    ReplayPinContest.RANKED -> considerLocatedSample(d.id, replayCoord, d.rssi)
+                    ReplayPinContest.FLOOR -> considerStaleLocatedSample(d.id, replayCoord)
+                }
             }
             if (!downgradesLiveRow && !dropIgnored) {
                 file(d, ts)
@@ -4363,17 +4971,30 @@ class AcabBleManager(private val context: Context) {
      *  suppressed at projection time (see ignoreDevice).
      *  CALL UNDER storeLock (the monitor is reentrant, so a guarded caller is fine). */
     private fun evictKey(k: String) = synchronized(storeLock) {
+        val hadSpatialEvidence = capturedLoc.containsKey(k) || trackHistory.containsKey(k) ||
+            crumbHistory.containsKey(k)
         for (m in perDeviceMaps) m.remove(k)
+        if (hadSpatialEvidence) noteSpatialEvidenceChanged()
     }
 
     /** Shared filing path: dedup-by-id into the store, keep the RSSI trend and (for drones)
      *  the flight path, and republish. Does not vibrate. */
     private fun file(d: Detection, ts: Long) = synchronized(storeLock) {
+        val previous = store[d.id]
         val hist = rssiHistory.getOrPut(d.id) { mutableListOf() }
         hist.add(d.rssi)
         if (hist.size > 48) hist.subList(0, hist.size - 48).clear()
         store.remove(d.id)            // re-add so it sorts as the most recent
         store[d.id] = d
+        // Detection values contain hot fields (RSSI/count) and spatial fields together. Bump only
+        // when the latter can change a marker or Remote ID operator representation. New unlocated
+        // noise is deliberately ignored; it never enters the map projection.
+        val hasRepresentation = validCoord(d.lat, d.lon) ||
+            (d.type == DeviceType.DRONE && validCoord(d.pilotLat, d.pilotLon))
+        val mapFieldsChanged = (previous == null && hasRepresentation) || (previous != null && (
+            previous.type != d.type || previous.lat != d.lat || previous.lon != d.lon ||
+                previous.pilotLat != d.pilotLat || previous.pilotLon != d.pilotLon))
+        if (mapFieldsChanged) noteSpatialEvidenceChanged()
         // Bound memory over a long drive. Priority-aware: an airport-density flood of
         // confidence-0 "nearby device" rows must never push a real flag (tracker, body cam,
         // drone, glasses, or a starred/watched device) out of the store. Evict the oldest
@@ -4391,12 +5012,18 @@ class AcabBleManager(private val context: Context) {
             if (path.lastOrNull() != (dla to dlo)) {
                 path.add(dla to dlo)
                 if (path.size > 60) path.subList(0, path.size - 60).clear()
+                noteSpatialEvidenceChanged()
             }
         }
         schedulePublish()
     }
 
-    private data class FeedSnapshots(val active: List<Detection>, val log: List<Detection>)
+    private data class FeedSnapshots(
+        val active: List<Detection>,
+        val log: List<Detection>,
+        val dynamicRings: List<MapDynamicRing>,
+        val spatialEvidenceRevision: Long,
+    )
 
     /** Build the active and evidence projections from one store snapshot. Both are newest-first
      * and capped; only the active projection applies current mute rules. */
@@ -4408,13 +5035,44 @@ class AcabBleManager(private val context: Context) {
         val indexes = managedListIndexes
         val muted = activeIgnoredMacs(now, indexes)
         val watched = indexes.watchedMacs
-        val all = synchronized(storeLock) { store.values.toList() }.asReversed()
+        val storedRows = synchronized(storeLock) { store.values.toList() }
+        val all = storedRows.asReversed()
         val log = if (all.size > FEED_CAP) all.take(FEED_CAP) else all
-        val active = all.asSequence()
-            .filter { d -> activeProjectionIncludes(d.mac, d.mac.lowercase() in watched, muted) }
-            .take(FEED_CAP)
-            .toList()
-        return FeedSnapshots(active = active, log = log)
+        // ONE walk for all three products of the active projection: the rows, the membership
+        // signature that decides whether map geometry is stale, and the no-fix drone rings. This
+        // was a filtering sequence, then a HashSet of up to FEED_CAP ids, then a third pass for
+        // the rings, all of it per publish at about 3 Hz. The early exit is kept: take(FEED_CAP)
+        // stopped walking at the cap and so does the break.
+        val active = ArrayList<Detection>(minOf(all.size, FEED_CAP))
+        val membership = MembershipSignature()
+        var rings: ArrayList<MapDynamicRing>? = null
+        for (d in all) {
+            if (active.size >= FEED_CAP) break
+            if (!activeProjectionIncludes(d.mac, d.mac.lowercase() in watched, muted)) continue
+            active.add(d)
+            membership.add(d.id)
+            if (d.type == DeviceType.DRONE && !validCoord(d.lat, d.lon)) {
+                val list = rings ?: ArrayList<MapDynamicRing>(4)
+                list.add(MapDynamicRing(d.id, d.rssi))
+                rings = list
+            }
+        }
+        val spatialRevision = synchronized(storeLock) {
+            // Deliberately a SECOND short section rather than folding the walk above into the copy
+            // that precedes it. storeLock is the monitor the BLE ingest thread takes for every
+            // advert, and holding it across an O(active) projection would stall ingest to save one
+            // uncontended acquire. What it guards is now three primitive comparisons instead of a
+            // set equality over up to FEED_CAP ids.
+            if (!membership.sameAs(lastPublishedMembership)) {
+                lastPublishedMembership = membership
+                spatialEvidenceGeneration++
+            }
+            spatialEvidenceGeneration
+        }
+        // No drone without a fix is the ordinary case, so the rings list is allocated only when
+        // there is one to report. StateFlow conflates equal values, and two empty lists are equal.
+        return FeedSnapshots(active = active, log = log, dynamicRings = rings ?: emptyList(),
+            spatialEvidenceRevision = spatialRevision)
     }
 
     /** Publish both projections from the same immutable snapshot. StateFlow assignments are
@@ -4422,6 +5080,8 @@ class AcabBleManager(private val context: Context) {
     private fun publishFeeds(snapshot: FeedSnapshots = feedSnapshots()) {
         _logDetections.value = snapshot.log
         _detections.value = snapshot.active
+        _mapDynamicRings.value = snapshot.dynamicRings
+        _spatialEvidenceRev.value = snapshot.spatialEvidenceRevision
     }
 
     /** Full-store Live Mode snapshot, restricted to live rows heard in the Status freshness
@@ -4724,16 +5384,101 @@ class AcabBleManager(private val context: Context) {
      *  BOTH prefs and the board's NVS (buzz=false). So relaunching the app while Desert was on
      *  lost the restore target, and turning Desert off afterwards left the board permanently mute
      *  with no way back except hand-picking the mode again. A user in that state reports "my
-     *  starred device never beeps", which reads as a detection bug and is not one. Mirrors iOS. */
-    private var alertModeBeforeDesert: AlertMode?
-        get() = prefs.getString("alert_mode_before_desert", null)
-            ?.let { v -> AlertMode.entries.firstOrNull { it.name == v } }
+     *  starred device never beeps", which reads as a detection bug and is not one. Mirrors iOS.
+     *
+     *  READ-ONLY here. Every write to either half goes through [desertAlertModeState] below, which
+     *  is the one place that can keep the stored copy and the published mirror agreeing. */
+    private val alertModeBeforeDesert: AlertMode?
+        get() = desertAlertModeStateFromStorage(
+            DesertAlertModeStorage(saved = prefs.getString(PREF_ALERT_MODE_BEFORE_DESERT, null)),
+        ).saved
+
+    /** Both durable halves as the raw strings prefs holds. Read at launch only: everything after
+     *  that reads [alertModeBeforeDesert] and the published mirror instead, so no status frame
+     *  pays two string lookups. */
+    private fun storedDesertAlertModeState(): DesertAlertModeStorage = DesertAlertModeStorage(
+        saved = prefs.getString(PREF_ALERT_MODE_BEFORE_DESERT, null),
+        offered = prefs.getString(PREF_PENDING_ALERT_MODE_RESTORE, null),
+    )
+
+    /** An alert mode the app is HOLDING OUT, not one it has applied. Non-null means: Desert ended
+     *  without the user ending it, we still had a mode saved from the way in, and we are offering
+     *  it back instead of taking it back.
+     *
+     *  WHY AN OFFER AND NOT A RESTORE. [reconcileDesert] runs off a status frame, so the Desert-off
+     *  it reacts to can come from a factory reset, an older board that does not persist Desert, or
+     *  a second paired phone. Restoring there put the board back on sound with nobody in the loop
+     *  and nothing on screen saying it had happened - the one thing this product must never do.
+     *
+     *  PERSISTED, like [alertModeBeforeDesert], and republished right here at construction so every
+     *  surface that carries the offer comes back (five of them on this side: the Desert card's
+     *  silence slot, the Alerts row, the panel that leads the Beacon tab while the board is away,
+     *  the panel that leads the pre-connect screen, and the panel on the OTA wait screen; iOS has
+     *  four, because its tab shell stays visible through a reboot). It was in memory for one release and that was the hole this offer was
+     *  built to close, reopened one step further along: the board ends Desert, the offer arms, the
+     *  user quits the app, and on relaunch there was no offer, no notice, and no saved mode either
+     *  (arming CONSUMES the saved half), leaving alerts silent with nothing on screen saying why or
+     *  how to undo it. A silence this app imposed with no way back is the one failure this product
+     *  must never ship.
+     *
+     *  WHY THE TWO DIFFER, since the in-memory version was argued for on "an arbitrarily old value
+     *  should not sit around". That hazard belongs to a mode the app APPLIES BY ITSELF: the saved
+     *  half is what setDesert(false) writes straight into the alert mode with no tap in between, so
+     *  an old one un-mutes someone who chose quiet months ago, and that is why setDesert's
+     *  already-SILENT branch throws it away. This half is never applied by anything. It only ever
+     *  draws a sentence and a control, and it moves the alert mode when, and only when, a finger
+     *  lands on that control ([takePendingAlertModeRestore]). An old offer costs a stale sentence
+     *  the user can decline; an old saved mode costs a beacon making noise. The value still MOVES
+     *  out of the saved token when the offer arms, so exactly one of the two holds a mode at any
+     *  moment, and neither can outlive the other's clearing.
+     *
+     *  Cleared in three places, all of them "the question stopped being open", and all three now
+     *  clear the stored copy in the same write: the user picked any mode by hand (setAlertMode with
+     *  origin USER, which is also how the offer is taken), the user turned Desert back on here, and
+     *  the board reported Desert back on from anywhere.
+     *  iOS twin: pendingAlertModeRestore in BLEManager. */
+    private val _pendingAlertModeRestore = MutableStateFlow(
+        desertAlertModeStateFromStorage(storedDesertAlertModeState()).offered,
+    )
+    val pendingAlertModeRestore: StateFlow<AlertMode?> = _pendingAlertModeRestore.asStateFlow()
+
+    /** The two halves above as the one value [desertAlertModeTransition] reasons about.
+     *
+     *  The getter reads the OFFER FROM MEMORY, not from prefs: it runs from the status path
+     *  ([reconcileDesert]), and a SharedPreferences read per frame for a value that changes at most
+     *  once per Desert cycle is cost for nothing. The StateFlow mirror and the stored copy are
+     *  written together below, so the two can never disagree.
+     *
+     *  The setter COMPARES BEFORE WRITING, both halves: both live in SharedPreferences now, and one
+     *  of the events below is fed from the status path, which must cost nothing per frame. An
+     *  unchanged state must not touch the disk at all, so the whole body is behind one equality
+     *  check, and the two halves are written in ONE edit rather than two. */
+    private var desertAlertModeState: DesertAlertModeState
+        get() = DesertAlertModeState(alertModeBeforeDesert, _pendingAlertModeRestore.value)
         set(value) {
+            val current = desertAlertModeState
+            if (value == current) return
+            val raw = desertAlertModeStorage(value)
             prefs.edit().apply {
-                if (value == null) remove("alert_mode_before_desert")
-                else putString("alert_mode_before_desert", value.name)
+                if (value.saved != current.saved) {
+                    if (raw.saved == null) remove(PREF_ALERT_MODE_BEFORE_DESERT)
+                    else putString(PREF_ALERT_MODE_BEFORE_DESERT, raw.saved)
+                }
+                if (value.offered != current.offered) {
+                    if (raw.offered == null) remove(PREF_PENDING_ALERT_MODE_RESTORE)
+                    else putString(PREF_PENDING_ALERT_MODE_RESTORE, raw.offered)
+                }
             }.apply()
+            _pendingAlertModeRestore.value = value.offered
         }
+
+    /** Run one event through the rule and store the result. The caller performs the effect, which is
+     *  always a call to [setAlertMode]; this function never touches the alert mode itself. */
+    private fun applyDesertAlertModeEvent(event: DesertAlertModeEvent): DesertAlertModeOutcome {
+        val outcome = desertAlertModeTransition(desertAlertModeState, event, _alertMode.value)
+        desertAlertModeState = outcome.state
+        return outcome
+    }
 
     /** Desert mode: the board reports EVERY device in range (not just signatures).
      *  Enabling it drops alerts to SILENT; with everything reporting in, the buzzer and
@@ -4742,24 +5487,26 @@ class AcabBleManager(private val context: Context) {
     fun setDesert(on: Boolean) {
         writeConfig(JSONObject().put("desert", on))
         if (on) {
-            // Remember the mode we're muting so it can come back, then drop to SILENT.
-            if (_alertMode.value != AlertMode.SILENT) {
-                alertModeBeforeDesert = _alertMode.value
-                setAlertMode(AlertMode.SILENT)
-            } else {
-                // Already Silent, so there is nothing to restore. CLEAR the token rather than
-                // leaving it: now that it is persisted it would otherwise be an arbitrarily old
-                // mode, and a later Desert-off would un-mute a user who deliberately chose Silent.
-                alertModeBeforeDesert = null
+            // Capture the mode we are about to mute, and close any offer left over from the last
+            // run: the user picked a new mute over a mode they were being offered back, so one tap
+            // must not undo the mute they just asked for. desertAlertModeTransition owns both
+            // decisions, including "already SILENT means nothing to give back". Mirrors iOS.
+            if (applyDesertAlertModeEvent(DesertAlertModeEvent.USER_ENABLED_DESERT).effect ==
+                DesertAlertModeEffect.MUTE_TO_SILENT
+            ) {
+                setAlertMode(AlertMode.SILENT, AlertModeOrigin.APP)
             }
             desertSeenOn = false   // wait for the board to confirm before arming the reconciler
         } else {
-            // Restore the pre-Desert mode, but only if the user hasn't already picked one by
-            // hand while Desert ran (in which case we're no longer SILENT and leave it alone).
-            alertModeBeforeDesert?.let { prior ->
-                if (_alertMode.value == AlertMode.SILENT) setAlertMode(prior)
+            // THE USER ended Desert, right here, so the mode is restored rather than offered: the
+            // tap that turned Desert off is the consent, and the mode coming back is the one this
+            // app took away on the way in. reconcileDesert is the other ending and cannot say that,
+            // which is why it offers instead. Origin APP, because nobody picked this mode now - they
+            // picked it before Desert started. Mirrors iOS.
+            val outcome = applyDesertAlertModeEvent(DesertAlertModeEvent.USER_ENDED_DESERT)
+            if (outcome.effect == DesertAlertModeEffect.RESTORE && outcome.restoreTo != null) {
+                setAlertMode(outcome.restoreTo, AlertModeOrigin.APP)
             }
-            alertModeBeforeDesert = null
         }
     }
 
@@ -4899,18 +5646,67 @@ class AcabBleManager(private val context: Context) {
 
     /** Pick how sightings get announced. VIBRATE and SILENT both mute the board's buzzer, for when
      *  a chirp would give you away; VIBRATE buzzes this phone instead. */
-    fun setAlertMode(mode: AlertMode) {
+    fun setAlertMode(mode: AlertMode, origin: AlertModeOrigin) {
         _alertMode.value = mode
         prefs.edit().putString("alertMode", mode.name).apply()
-        // A mode picked while Desert is running is an explicit choice and outranks whatever we
-        // captured on the way in, so drop the token. Mirrors iOS.
-        if (mode != AlertMode.SILENT) alertModeBeforeDesert = null
+        // A user pick drops everything the app was holding on their behalf: the mode captured on the
+        // way into Desert AND an offer still on screen. SILENT IS INCLUDED, which is the whole point
+        // - choosing silence by hand is a choice, not a mute to undo later. This used to key off
+        // `mode != SILENT`, which made a hand-picked SILENT indistinguishable from Desert's own
+        // mute, so leaving Desert overrode the user and made the board audible, the opposite of what
+        // the shipped FAQ promises. An app-set mode leaves both alone. Taking the restore offer
+        // arrives here as USER too ([takePendingAlertModeRestore]), so that is also what clears the
+        // offer; there is no second clearing site. The arms live in desertAlertModeTransition.
+        applyDesertAlertModeEvent(
+            if (origin == AlertModeOrigin.USER) DesertAlertModeEvent.USER_PICKED_MODE
+            else DesertAlertModeEvent.APP_SET_MODE,
+        )
         setBuzzer(mode == AlertMode.BUZZER)
+    }
+
+    /** Take the alert mode the app is offering back after a Desert run it did not end. This is the
+     *  ONE action behind all five surfaces that carry the offer (the Desert card's silence slot, the
+     *  Alerts row, and the panel that leads the Beacon tab, the pre-connect screen and the OTA wait
+     *  screen), so they cannot drift into doing different things. Origin USER, because a tap is what got
+     *  here, and that is also what clears the offer. A no-op when nothing is pending, so a stale tap
+     *  on a surface that has not recomposed yet cannot invent a mode.
+     *  iOS twin: takePendingAlertModeRestore in BLEManager. */
+    fun takePendingAlertModeRestore() {
+        val prior = _pendingAlertModeRestore.value ?: return
+        setAlertMode(prior, AlertModeOrigin.USER)
     }
 
     /** Latched view of the board's Desert state, so a `desert:false` frame can be told apart from
      *  "our enable write has not landed yet". Only flips true once the BOARD confirms Desert on. */
     private var desertSeenOn = false
+
+    /** Did the board report Desert ON at least once in THIS app run? Drives the Desert card's
+     *  still-silent notice (shouldShowDesertSilenceNotice in DeviceScreen.kt).
+     *
+     *  A SEPARATE flag from [desertSeenOn] on purpose, and not a change to that latch, which guards
+     *  the restore. desertSeenOn is cleared the instant Desert ends (reconcileDesert) and again by
+     *  setDesert(true) while the enable write is in flight, so it is false in exactly the moment
+     *  the notice has to be shown. This one only ever goes true, and it is in-memory (no prefs), so
+     *  the notice belongs to this run and is never inherited by a later launch.
+     *
+     *  DELIBERATELY STILL PER-RUN NOW THAT pendingAlertModeRestore IS DURABLE, which is not an
+     *  oversight and is the one place the two are allowed to differ. The offer is a mode the app is
+     *  holding for one named person to take back, so persisting it costs a stale sentence at worst
+     *  and it dies the moment it is answered. This flag has no holder and no answer: nothing clears
+     *  it, so a durable version would grow into "Desert ran here once, ever", and the notice would
+     *  then blame Desert for a silence the user chose by hand weeks later. On a relaunch the offer
+     *  still draws, because desertSilenceSlot ranks it above the notice and it never consults this
+     *  flag - the offer's own sentence names the cause and carries the way out, so it needs nothing
+     *  under it. The one behaviour that differs across a relaunch: a user who DECLINES the restored
+     *  offer by hand-picking SILENT gets the notice in the run the board ended Desert in, and gets
+     *  nothing after a relaunch. That is the notice's weakest arm either way (the cause of that
+     *  silence is their own tap, not Desert), and the launch with no in-run evidence is the one
+     *  where the app has the least right to claim otherwise.
+     *
+     *  Set only from reconcileDesert, which runs off a real status frame, so the sample tour never
+     *  arms it on either platform. iOS twin: desertRanThisRun in BLEManager. */
+    private val _desertRanThisRun = MutableStateFlow(false)
+    val desertRanThisRun: StateFlow<Boolean> = _desertRanThisRun.asStateFlow()
 
     /** Restore the pre-Desert alert mode when Desert ends WITHOUT going through setDesert(false).
      *
@@ -4930,15 +5726,37 @@ class AcabBleManager(private val context: Context) {
      *  "Desert stopped and we are not the ones who stopped it", is unchanged; only how often it
      *  fires changed. Mirrors iOS reconcileDesert(). */
     private fun reconcileDesert(s: DeviceStatus) {
-        if (s.desertMode) { desertSeenOn = true; return }
-        if (!desertSeenOn) return              // never saw it on: nothing to restore
-        desertSeenOn = false
-        // Same conditions as the manual path: only un-mute if we are still on the Silent that
-        // Desert forced, so a mode the user hand-picked while Desert ran survives.
-        alertModeBeforeDesert?.let { prior ->
-            if (_alertMode.value == AlertMode.SILENT) setAlertMode(prior)
+        if (s.desertMode) {
+            desertSeenOn = true
+            // Unguarded: a StateFlow drops an equal value, so this emits once and not once per
+            // status frame. The iOS twin needs an explicit guard because a @Published assignment
+            // publishes either way.
+            _desertRanThisRun.value = true
+            // Desert is running again, so an offer from the previous run is answered: the board is
+            // muted either way, and putting a mode back now would be undone by the very next line
+            // of the Desert card. The in-memory null check comes FIRST because this runs on every
+            // status frame while Desert is on and the transition reads the persisted half.
+            if (_pendingAlertModeRestore.value != null) {
+                applyDesertAlertModeEvent(DesertAlertModeEvent.BOARD_REPORTS_DESERT_ON)
+            }
+            return
         }
-        alertModeBeforeDesert = null
+        if (!desertSeenOn) return              // never saw it on: nothing to offer
+        desertSeenOn = false
+        // THIS FUNCTION MUST NEVER CHANGE THE ALERT MODE. It used to call setAlertMode(prior) here,
+        // which meant a factory reset, an older board that does not persist Desert, or a second
+        // paired phone ending Desert could put the board back on sound with nobody in the loop and
+        // no surface saying it had happened. On a counter-surveillance detector that is the worst
+        // failure we have: a device that makes noise while its owner believes it is silent.
+        //
+        // So the saved mode becomes an OFFER instead. Alerts stay exactly where they are, the five
+        // surfaces that carry the offer grow a one-tap control (DESERT_RESTORE_OFFER in
+        // DeviceScreen.kt: the Desert card's silence slot, the Alerts row, and the panel that leads
+        // the Beacon tab, the pre-connect screen and the OTA wait screen when neither card is
+        // reachable), and the mode only moves when the user takes it. desertAlertModeTransition
+        // is what makes that structural: BOARD_ENDED_DESERT has no arm that can return RESTORE.
+        // Mirrors iOS reconcileDesert().
+        applyDesertAlertModeEvent(DesertAlertModeEvent.BOARD_ENDED_DESERT)
     }
 
     /**
@@ -4989,6 +5807,23 @@ class AcabBleManager(private val context: Context) {
     // side-map reads take storeLock: the BLE thread writes these under it (see file()/fileLive)
     fun firstSeen(id: String): Long? = synchronized(storeLock) { firstSeenAt[id] }
     fun lastSeen(id: String): Long? = synchronized(storeLock) { lastSeenAt[id] }
+    /** Trustworthy last-seen stamps for a render batch in one lock acquisition. Approximate replay
+     * ordering keys are omitted because neither pin age nor a Recent lens may date them. */
+    internal fun mapLastSeenSnapshot(dets: List<Detection>): Map<String, Long> =
+        synchronized(storeLock) {
+            val out = HashMap<String, Long>(dets.size)
+            for (d in dets) {
+                // The geometry caller may intentionally hold an older Detection value while
+                // ordinary live fields stay hot. In particular, a replay row can be heard live
+                // without moving its pin; consult the store's current offline flag so its exact
+                // new lastSeen is not rejected under the retained historical firstSeen basis.
+                val current = store[d.id] ?: d
+                trustworthyMapLastSeen(
+                    lastSeenAt[d.id], histTime[d.id]?.basis, current.offline,
+                )?.let { out[d.id] = it }
+            }
+            out
+        }
     fun rssiTrend(id: String): List<Int> = synchronized(storeLock) { rssiHistory[id]?.toList() } ?: emptyList()
 
     /** True when [stamp] is fileHistory's seq-derived ordering key rather than a clock reading.
@@ -5001,10 +5836,16 @@ class AcabBleManager(private val context: Context) {
 
     /** True when we haven't heard from this id lately (probably gone). One row's worth: fine for a
      *  dossier, wrong for a feed - see [freshIdSet]. The one-sided comparison lives in the
-     *  top-level [lastSeenIsStale] so both readers answer identically. */
-    fun isStale(id: String, olderThanMs: Long = ACTIVE_NEARBY_WINDOW_MS): Boolean {
+     *  top-level [lastSeenIsStale] so both readers answer identically. Staleness moves with the
+     *  clock, not with any StateFlow, so a screen that must re-evaluate it on a timer passes its own
+     *  tick as [nowMs] to make that dependency explicit (iOS isStale(for:olderThan:asOf:)). */
+    fun isStale(
+        id: String,
+        olderThanMs: Long = ACTIVE_NEARBY_WINDOW_MS,
+        nowMs: Long = System.currentTimeMillis(),
+    ): Boolean {
         val ls = synchronized(storeLock) { lastSeenAt[id] }
-        return lastSeenIsStale(ls, System.currentTimeMillis(), olderThanMs)
+        return lastSeenIsStale(ls, nowMs, olderThanMs)
     }
 
     /** Which of [dets] were heard inside the staleness window, in ONE storeLock take and against
@@ -5022,25 +5863,78 @@ class AcabBleManager(private val context: Context) {
         }
     }
 
-    /** Where to drop the map pin: the detection's own coords (drones), or the phone's
-     *  position from when we first heard it. */
+    /** Where to drop the map pin: a drone's authoritative Remote ID aircraft coordinate, or the
+     * phone position paired with this device's strongest located RSSI sample. A live row with no
+     * retained observer sample falls back to its own wire coordinate only while that board fix is
+     * still fresh ([mapWireFallbackAllowed]). */
     fun mapCoord(d: Detection): Pair<Double, Double>? {
-        val la = d.lat; val lo = d.lon
-        // Only trust the detection's own coords when finite + in range + not null-island: a garbled
-        // drone Remote ID decodes to ~214 deg, and a bad GeoPoint wedges the osmdroid map thread.
-        return if (validCoord(la, lo)) la!! to lo!! else synchronized(storeLock) { capturedLoc[d.id] }
+        val observer = synchronized(storeLock) { capturedLoc[d.id] }
+        // mapCoordinateForDetection performs every validity check before osmdroid sees a point: a
+        // garbled Remote ID can decode to ~214 degrees, and a bad GeoPoint wedges its map thread.
+        return mapCoordinateForDetection(
+            d.type, d.lat, d.lon, observer,
+            mapWireFallbackAllowed(d.offline, _demoMode.value, d.gpsAgeSec))
+    }
+
+    /** What the dossier's map thumbnail reads out of the side maps for ONE row, in one storeLock
+     *  take and with no list copied. See [RowMapEvidence] for why the dossier keys its coordinate
+     *  and trail on this rather than on [spatialEvidenceRev], and for what it deliberately leaves
+     *  to the caller. The dossier still COLLECTS spatialEvidenceRev, because a pin or a crumb can
+     *  change while every visible Detection row stays equal and StateFlow conflates that away;
+     *  the revision is what wakes the screen, and this value is what decides whether the two
+     *  expensive reads (the crumb list copy and mapCoord) have to run again. */
+    internal fun rowMapEvidence(id: String): RowMapEvidence = synchronized(storeLock) {
+        RowMapEvidence(
+            pin = capturedLoc[id],
+            crumbCount = crumbHistory[id]?.size ?: 0,
+            lastCrumbAt = lastCrumbAt[id],
+            demo = _demoMode.value,
+        )
+    }
+
+    /** Active map rows with coordinate and trustworthy last-seen metadata from ONE storeLock pass.
+     * The caller keys this read on [spatialEvidenceRev], so routine RSSI/count feed emissions reuse
+     * the same immutable snapshot instead of taking this lock once per row. */
+    internal fun mapEvidenceSnapshot(): List<MapDetectionEvidence> {
+        val active = _detections.value
+        // Read once, outside the row loop: this runs per projection over the whole retained feed.
+        val demo = _demoMode.value
+        return synchronized(storeLock) {
+            active.map { d ->
+                val coordinate = mapCoordinateForDetection(
+                    d.type, d.lat, d.lon, capturedLoc[d.id],
+                    mapWireFallbackAllowed(d.offline, demo, d.gpsAgeSec))
+                val seen = trustworthyMapLastSeen(
+                    lastSeenAt[d.id], histTime[d.id]?.basis, d.offline)
+                MapDetectionEvidence(d, coordinate, seen)
+            }
+        }
     }
 
     /** Where the PHONE was when it heard [d], or null when that is genuinely unknown.
      *
-     *  Deliberately NOT mapCoord(): that prefers the detection's own wire lat/lon, which for a
-     *  DRONE is the aircraft's Remote ID broadcast rather than the observer. mapCoord is right for
-     *  the map (a drone pin belongs at the aircraft); it is wrong for approx_lat/lon and for the
-     *  GPX "Heard:" waypoint, both of which promise an observer position. A replayed drone has no
-     *  known observer position, and null is the honest answer. Mirrors iOS, where capturedLoc is
-     *  left nil for drones on history ingest. */
-    private fun mapCoordForExport(d: Detection): Pair<Double, Double>? =
-        if (d.type == DeviceType.DRONE) synchronized(storeLock) { capturedLoc[d.id] } else mapCoord(d)
+     *  Deliberately NOT mapCoord(), for TWO reasons. First, for a DRONE mapCoord answers with the
+     *  detection's own wire lat/lon, which is the aircraft's Remote ID broadcast rather than the
+     *  observer; mapCoord is right for the map (a drone pin belongs at the aircraft) and wrong for
+     *  approx_lat/lon and the GPX "Heard:" waypoint, both of which promise an observer position. A
+     *  replayed drone has no known observer position, and null is the honest answer. Mirrors iOS,
+     *  where capturedLoc is left nil for drones on history ingest. Second, mapCoord withholds a
+     *  stale live wire fix so the MAP does not pin a camera where the phone no longer is; an
+     *  export must still carry it - see the note in the body. */
+    private fun mapCoordForExport(d: Detection): Pair<Double, Double>? {
+        val observer = synchronized(storeLock) { capturedLoc[d.id] }
+        if (d.type == DeviceType.DRONE) return observer
+        // Deliberately UNGATED, unlike mapCoord: a stale board fix is still the best answer this
+        // app has to "roughly where was the phone", and an export must never carry LESS than the
+        // Log already shows. The exported row cannot qualify it: [DETECTION_CSV_COLUMNS] carries no
+        // fix-age column. iOS's ordinary export makes the same choice
+        // (allowDetectionCoordinateFallback defaults true; only the contribution composer sets it
+        // false), and one step ahead of this fallback it also uses a kept legacy pair, which is
+        // iOS-only: no Android build ever persisted a peakless pair. What the freshness gate
+        // withholds is a PIN the map would otherwise draw at a place the phone had already left.
+        return mapCoordinateForDetection(d.type, d.lat, d.lon, observer,
+            allowNonDroneWireFallback = true)
+    }
 
     /** A drone's accumulated flight path (empty for anything else). */
     fun track(id: String): List<Pair<Double, Double>> = synchronized(storeLock) { trackHistory[id]?.toList() } ?: emptyList()
@@ -5401,7 +6295,7 @@ class AcabBleManager(private val context: Context) {
     private fun resetInMemoryLog(invalidatePersistedSnapshots: Boolean = false) {
         notifier.reset()   // a new session may alert on the same devices again (iOS parity)
         // Called from main, unlike the rest of the store's mutations. See storeLock.
-        synchronized(storeLock) {
+        val spatialRevision = synchronized(storeLock) {
             // Clear bumps once before its durable boundary and again with the visible reset. The
             // second bump invalidates a snapshot captured from the old rows while that boundary
             // was being established; a post-reset snapshot receives the new generation.
@@ -5409,6 +6303,7 @@ class AcabBleManager(private val context: Context) {
             // The store and every per-device side map, off the one list, so a map added later
             // is cleared here too (see perDeviceMaps).
             for (m in perDeviceMaps) m.clear()
+            lastPublishedMembership = MembershipSignature()
             // The boot bounds go with the rows they were derived from: keeping them would let a
             // cleared log's anchors bracket records the user can no longer see the basis for.
             // Keyed by boot counter, not detection id, so they're not in perDeviceMaps.
@@ -5419,10 +6314,14 @@ class AcabBleManager(private val context: Context) {
             // the NEXT drain's boot bounds, bracketing rows the user just erased against anchors
             // from a different session.
             pendingBracket.clear()
+            spatialEvidenceGeneration++
+            spatialEvidenceGeneration
         }
         publishDirty.set(false)
         _logDetections.value = emptyList()
         _detections.value = emptyList()
+        _mapDynamicRings.value = emptyList()
+        _spatialEvidenceRev.value = spatialRevision
     }
 
     /** Erase the board's offline buffer (the detections it recorded while the phone was away),
@@ -6513,6 +7412,16 @@ class AcabBleManager(private val context: Context) {
 
     // ---- demo mode (explore the UI with sample data, no board) ----
 
+    /** Echo a sample radio/detector switch into the shared synthetic status so Status and Beacon
+     * tell the same story. The demo gate is checked inside StateFlow's atomic update: an Exit racing
+     * this callback cannot apply a preview to a real retained status frame. No config write or
+     * preference path is reachable from here. */
+    internal fun previewDemoStatusToggle(toggle: DemoStatusToggle, on: Boolean) {
+        _status.update { current ->
+            if (_demoMode.value) current?.withDemoStatusToggle(toggle, on) else current
+        }
+    }
+
     /** Seed sample detections so the whole UI works without a board.
      *  Behind the connect screen's "Continue without pairing" button. */
     fun seedDemoData() {
@@ -6528,7 +7437,7 @@ class AcabBleManager(private val context: Context) {
             // "moto" is present so the tour shows the Motorola sub-toggle. Omitting it would make
             // the demo board look like pre-split firmware and hide the control the tour exists to
             // introduce. "axon":true so the parent category is on and the sub-row is not dimmed.
-            """{"fw":"beacon board 2.0.7","up":4920,"total":6,"ble":true,"wifi":true,"axon":true,"moto":true,"tracker":true,"glasses":true,"ncam":true,"buzzer":true,"vol":70,"gps":true,"bat":82}"""))
+            """{"fw":"beacon board 2.0.8","up":4920,"total":6,"ble":true,"wifi":true,"axon":true,"moto":true,"tracker":true,"glasses":true,"ncam":true,"buzzer":true,"vol":70,"gps":true,"bat":82}"""))
         _state.value = ConnState.READY
         syncLocationOwnership()
         // placeDemoDetections clears + repopulates the same maps the async startup reload fills, so
@@ -6553,7 +7462,17 @@ class AcabBleManager(private val context: Context) {
         // DRONE, BODY CAM, TRACKER, GLASSES, and Network camera. Exactly six, so the demo status
         // "total" matches the seed count and lines up with the iOS tour's seed set.
         val samples = listOf(
-            """{"t":1,"s":1,"meth":1,"c":95,"mac":"AC:AB:00:7F:2A:10","rssi":-54,"name":"FlockSafety","lat":37.7799,"lon":-122.4202,"n":12,"new":true}""",
+            // Wire values are the firmware's own, to the same standard as the netcam row below.
+            // A BLE advert whose name trips the loose "Flock" prefix (flock_signatures.h's
+            // FLOCK_NAME_PREFIX entry) AND carries mfg 0x09C8 lands on flock_detect.cpp's
+            // `(nm == NM_LITERAL || mfgHit) ? 80 : 70` arm, so: s=0 SRC_BLE, meth=2 M_NAME,
+            // c=80, cid=0x09C8 (the only ID in FLOCK_MFG_IDS, and what earns the 80 over 70).
+            // This row used to read meth=1/c=95, which no board can put on the wire three times
+            // over: 95 is above the ALPR ceiling of 88 (the WiFi SSID arm), both OUI arms ride
+            // at 65 (BLE) and 68 (WiFi), and the name arm returns BEFORE the OUI arm, so a
+            // device broadcasting "FlockSafety" can never be reported as an OUI hit at all.
+            // The twin row in iOS BLEManager.seedDemoData carries the same values.
+            """{"t":1,"s":0,"meth":2,"c":80,"mac":"AC:AB:00:7F:2A:10","rssi":-54,"name":"FlockSafety","cid":2504,"lat":37.7799,"lon":-122.4202,"n":12,"new":true}""",
             """{"t":4,"s":2,"meth":7,"c":99,"mac":"DA:7E:E0:44:21:09","rssi":-61,"id":"1581F4FED0A2B7","lat":37.7816,"lon":-122.4169,"plat":37.7821,"plon":-122.4151,"alt":84,"n":1,"new":true}""",
             """{"t":3,"s":0,"meth":3,"c":45,"mac":"A0:0F:11:BA:7C:33","rssi":-88,"n":1}""",
             """{"t":5,"s":0,"meth":3,"c":85,"mac":"4C:00:12:19:AA:BB","rssi":-72,"det":"Apple Find My (offline)","cid":76,"lat":37.7791,"lon":-122.4196,"n":3}""",
@@ -6561,7 +7480,12 @@ class AcabBleManager(private val context: Context) {
             // strings, not a prettified paraphrase: `maker` parses them, so a paraphrase would
             // demo the OLD behaviour (a row reading "Recording glasses") while real hardware
             // shows the new one. This one resolves to "Meta".
-            """{"t":9,"s":0,"meth":3,"c":60,"mac":"5A:2E:7C:41:08:D3","rssi":-69,"det":"Meta: possible recording glasses or Quest","cid":1422,"lat":37.7804,"lon":-122.4181,"n":2,"new":true}""",
+            // MAC/rssi/lat/lon are the iOS row's, verbatim: the two tours must seed the SAME six
+            // devices, and this row was the only one that had drifted (a different MAC, so a
+            // different Detection id, plus its own rssi and its own spot on the map). iOS also
+            // carries "rnd": true here; Android has no `rnd` wire field and derives randomization
+            // from the LAA bit instead (Models.kt), and 0x1A has it set, so both read randomized.
+            """{"t":9,"s":0,"meth":3,"c":60,"mac":"1A:2B:3C:4D:5E:6F","rssi":-71,"det":"Meta: possible recording glasses or Quest","cid":1422,"lat":37.7795,"lon":-122.4193,"n":2,"new":true}""",
             // Branded IP-camera OUI seen on the host WiFi (matched by source MAC), so the NETCAM
             // tile and NETWORK CAM map chip both show up on the tour. The MAC is a real Hikvision
             // block, so this row demonstrates the maker-led title end to end. Wire values are the
@@ -6579,6 +7503,7 @@ class AcabBleManager(private val context: Context) {
             // row's pin, closest-approach RSSI or breadcrumbs left in a side map would outlive
             // the row it belonged to.
             for (m in perDeviceMaps) m.clear()
+            lastPublishedMembership = MembershipSignature()
             for (s in samples) {
                 val o = JSONObject(s)
                 if (baseLat != null && baseLon != null && o.has("lat") && o.has("lon")) {
@@ -6592,6 +7517,7 @@ class AcabBleManager(private val context: Context) {
                 firstSeenAt[d.id] = now; lastSeenAt[d.id] = now
                 rssiHistory[d.id] = wobble.map { (d.rssi + it).coerceIn(-99, -30) }.toMutableList()
             }
+            spatialEvidenceGeneration++
         }
         publishNow()
     }
@@ -6988,11 +7914,19 @@ class AcabBleManager(private val context: Context) {
         // already guards its own callers; this covers the direct replay-path calls too, and a
         // refusal is not a landed write.
         if (_demoMode.value) { completion?.invoke(false); return }
-        val snapshot: List<Triple<Detection, Long?, HistTime?>>
+        val snapshot: List<PersistedDetectionRow>
         val seq: Long
         val snapshotGeneration: Long
         synchronized(storeLock) {
-            snapshot = store.values.map { Triple(it, firstSeenAt[it.id], histTime[it.id]) }
+            snapshot = store.values.map { d ->
+                PersistedDetectionRow(
+                    detection = d,
+                    firstSeen = firstSeenAt[d.id],
+                    histTime = histTime[d.id],
+                    observerCoord = capturedLoc[d.id],
+                    bestRssi = bestRssi[d.id],
+                )
+            }
             seq = persistSnapSeq.incrementAndGet()
             snapshotGeneration = persistedDetectionWriteGeneration.get()
         }
@@ -7015,7 +7949,7 @@ class AcabBleManager(private val context: Context) {
                 if (seq < persistSeqWritten) return@withLock true
                 val text = runCatching {
                     val arr = JSONArray()
-                    for ((d, fs, ht) in snapshot) {
+                    for ((d, fs, ht, coord, peak) in snapshot) {
                         val o = detectionToJson(d)
                         fs?.let { o.put("_fs", it) }
                         // Time quality is derived from the whole batch a record arrived in, and
@@ -7023,6 +7957,18 @@ class AcabBleManager(private val context: Context) {
                         // row. Without it a bracketed record reloads as "time unknown" and the
                         // work of bounding it is quietly lost.
                         ht?.let { o.put("_sk", it.sortKey); basisToJson(it.basis)?.let { b -> o.put("_tq", b) } }
+                        // Closest-observer evidence is one pair. A coordinate without its peak
+                        // cannot reject a weaker sample after relaunch; a peak without its
+                        // coordinate can block the first located sample entirely. No Android
+                        // build has persisted a pair at all: these three keys arrive in this cut
+                        // and only ever go out together, so there is no peakless legacy pair to
+                        // carry forward. The iOS write-back of one
+                        // (checkpointObserverPairToStore) is iOS-only legacy handling.
+                        if (coord != null && peak != null && validCoord(coord.first, coord.second)) {
+                            o.put("_clat", coord.first)
+                            o.put("_clon", coord.second)
+                            o.put("_crssi", peak)
+                        }
                         arr.put(o)
                     }
                     arr.toString()
@@ -7102,6 +8048,31 @@ class AcabBleManager(private val context: Context) {
                     lastSeenAt[d.id] = fs
                     rssiHistory.getOrPut(d.id) { mutableListOf() }.add(d.rssi)
                     store[d.id] = d
+                    // The observer pin. The whole decision (a saved pair only with its saved peak,
+                    // otherwise the row's own wire coordinate, gage and offline flag) is the pure
+                    // checkpointObserverPin; this only writes its result, so a live row whose stale
+                    // fix fileLive refused comes back pinless, as it was before the relaunch.
+                    // TWIN: iOS restoreObserverPin(from:), which then keeps a shipped peakless
+                    // pair whether or not the row ends up pinned, for its checkpoint write-back
+                    // and its standard export only, never as a pin. That is iOS-only legacy data
+                    // (no Android build has persisted a pair at all), so nothing follows the
+                    // pin here.
+                    checkpointObserverPin(
+                        d.type,
+                        pairLat = o.optDouble("_clat", Double.NaN),
+                        pairLon = o.optDouble("_clon", Double.NaN),
+                        pairPeak = if (o.has("_crssi")) o.optInt("_crssi") else null,
+                        lat = d.lat,
+                        lon = d.lon,
+                        rssi = d.rssi,
+                        gpsAgeSec = d.gpsAgeSec,
+                        replayed = d.offline,
+                        existingCoord = capturedLoc[d.id],
+                        existingRssi = bestRssi[d.id],
+                    )?.let {
+                        capturedLoc[d.id] = it.coord
+                        bestRssi[d.id] = it.rssi
+                    }
                     // A row written before "_tq" existed has no recorded basis, and falling through
                     // to timeBasis()'s Exact default would label a buffered record as a live clock
                     // reading, which is the one claim this whole model exists to prevent. But only
@@ -7130,6 +8101,9 @@ class AcabBleManager(private val context: Context) {
                         }
                     }
                 }
+                // Restored closest-observer pairs live in side maps, so invalidate consumers even
+                // when StateFlow considers the restored Detection rows equal to their prior value.
+                if (accepted && entries.isNotEmpty()) spatialEvidenceGeneration++
             }
             // Count only, never row contents: this is a detection log and the app is the only
             // place live detections are ever recorded. Fully-qualified to match the one other
@@ -7263,10 +8237,12 @@ class AcabBleManager(private val context: Context) {
         // a Desert-mode flood to two whole-log re-seals a minute while keeping the most a crash can
         // cost to half a minute of driving.
         private const val CHECKPOINT_MIN_MS = 30_000L
-        // How stale the phone's own fix may be before we stop stamping detections with it. 2 min is
-        // ~1 mile at freeway speed: past that the coordinate is not "roughly where you were", it is
-        // a specific wrong place, and a blank cell beats a confident lie in an evidence export.
-        private const val FIX_MAX_AGE_NANOS = 120_000L * 1_000_000L
+        // How stale the phone's own fix may be before we stop stamping detections with it. The
+        // number and its reasoning live on FIX_MAX_AGE_SEC (top level), shared with the wire-fix
+        // gate so the two windows cannot drift apart; this is the same value in elapsedRealtime
+        // nanoseconds for the three age checks in this class (ownedLocationListener,
+        // freshMuteCoord, readFreshFix).
+        private const val FIX_MAX_AGE_NANOS = FIX_MAX_AGE_SEC * 1_000_000_000L
         // How long a last-known-fix read is reused (see freshSelfCoord).
         private const val FIX_CACHE_NANOS = 1_000L * 1_000_000L
         // Process-owned location cadence. Same values the old Activity listener used.

@@ -77,6 +77,11 @@ final class ALPRStore: ObservableObject {
     private var nodeConfirmed: [Bool] = []
     /// Stable provenance parallel to nodes. Legacy ALP1-3 caches contain nil provenance.
     private var nodeMetadata: [NodeMetadata] = []
+    /// Original node indices ordered by latitude, with the original index as the tie-breaker.
+    /// Viewport and nearest-node lookups binary-search this immutable order instead of walking the
+    /// six-figure coordinate array. It is built off the main actor as part of parsing and installed
+    /// before the published `nodes` assignment, alongside the other parallel arrays.
+    private var nodeLatitudeOrder: [Int] = []
     /// Wire format of the loaded cache. This prevents an ALP3 cache from satisfying an ALP4
     /// manifest that happens to carry the same calendar-date version during a channel rollout.
     private var loadedFormat = ""
@@ -138,7 +143,17 @@ final class ALPRStore: ObservableObject {
         let makers: [String]
         let confirmed: [Bool]
         let metadata: [NodeMetadata]
+        let latitudeOrder: [Int]
         let rawCount: Int
+    }
+
+    /// Pure query result used by `nodes(in:)` and by correctness tests. `inspectedCount` is a
+    /// deterministic operation-count seam: it records latitude candidates examined, without
+    /// making timing claims that depend on a particular device or build configuration.
+    struct IndexedNodeQuery: Equatable, Sendable {
+        let indices: [Int]
+        let inspectedCount: Int
+        let exceededCap: Bool
     }
 
     /// The V4 manifest is separate from the immutable V3 channel used by installed builds.
@@ -227,6 +242,37 @@ final class ALPRStore: ObservableObject {
         (stored as? Bool) ?? true
     }
 
+    /// Commit one parsed generation as a unit. `nodes` is the only published member, so assigning
+    /// it last ensures every observer sees the matching labels, tiers, metadata, and spatial index.
+    @discardableResult
+    private func install(_ parsed: ParsedDataset) -> Bool {
+        guard parsed.coords.count == parsed.makers.count,
+              parsed.coords.count == parsed.confirmed.count,
+              parsed.coords.count == parsed.metadata.count,
+              parsed.coords.count == parsed.latitudeOrder.count else {
+            assertionFailure("ALPR parsed arrays or latitude index lost alignment")
+            return false
+        }
+        nodeMakers = parsed.makers
+        nodeConfirmed = parsed.confirmed
+        nodeMetadata = parsed.metadata
+        nodeLatitudeOrder = parsed.latitudeOrder
+        unverifiedCount = parsed.confirmed.reduce(0) { $0 + ($1 ? 0 : 1) }
+        nodes = parsed.coords
+        return true
+    }
+
+    /// Clear the parallel state before publishing the empty coordinate array, for the same reason
+    /// `install(_:)` publishes its coordinate array last.
+    private func clearInstalledNodes() {
+        nodeMakers = []
+        nodeConfirmed = []
+        nodeMetadata = []
+        nodeLatitudeOrder = []
+        unverifiedCount = 0
+        nodes = []
+    }
+
     /// Turn the layer on (loads cache + refreshes, downloading on first enable) or off
     /// (clears the in-memory points; the cache is kept so re-enabling is instant).
     func setEnabled(_ on: Bool) {
@@ -248,13 +294,9 @@ final class ALPRStore: ObservableObject {
             // The slot retires the old completion before cancelling, so re-enable can launch a new
             // generation even if URLSession takes a moment to deliver its cancellation error.
             fetchSlot.cancel()
-            nodes = []
-            nodeMakers = []
-            nodeConfirmed = []
-            nodeMetadata = []
+            clearInstalledNodes()
             loadedFormat = ""
             loadedSHA256 = ""
-            unverifiedCount = 0
             loading = false
             downloading = false
             restartWanted = false
@@ -271,29 +313,139 @@ final class ALPRStore: ObservableObject {
 
     // MARK: viewport query
 
+    /// Build a deterministic latitude order without disturbing the source arrays. The original
+    /// index tie-breaker makes equal-latitude rows stable even though Swift's sort is not stable.
+    nonisolated static func makeLatitudeOrder(
+        for coordinates: [CLLocationCoordinate2D]
+    ) -> [Int] {
+        Array(coordinates.indices).sorted { lhs, rhs in
+            let lhsLatitude = coordinates[lhs].latitude
+            let rhsLatitude = coordinates[rhs].latitude
+            return lhsLatitude == rhsLatitude ? lhs < rhs : lhsLatitude < rhsLatitude
+        }
+    }
+
+    /// Half-open positions in `latitudeOrder` whose node latitude is inside the inclusive bounds.
+    /// Invalid/reversed bounds deliberately produce no candidates, matching the old comparisons.
+    nonisolated static func latitudeCandidateRange(
+        coordinates: [CLLocationCoordinate2D],
+        latitudeOrder: [Int],
+        minLatitude: Double,
+        maxLatitude: Double
+    ) -> Range<Int> {
+        guard !coordinates.isEmpty,
+              latitudeOrder.count == coordinates.count,
+              !minLatitude.isNaN, !maxLatitude.isNaN,
+              minLatitude <= maxLatitude else { return 0..<0 }
+
+        var low = 0
+        var high = latitudeOrder.count
+        while low < high {
+            let middle = low + (high - low) / 2
+            if coordinates[latitudeOrder[middle]].latitude < minLatitude {
+                low = middle + 1
+            } else {
+                high = middle
+            }
+        }
+        let first = low
+
+        low = first
+        high = latitudeOrder.count
+        while low < high {
+            let middle = low + (high - low) / 2
+            if coordinates[latitudeOrder[middle]].latitude <= maxLatitude {
+                low = middle + 1
+            } else {
+                high = middle
+            }
+        }
+        return first..<low
+    }
+
+    /// Resolve visible source-array indices through the latitude index. Successful results are
+    /// sorted back into original dataset order, preserving the previous render order and legacy
+    /// `legacy:<index>:...` identities. Longitude bounds intentionally retain the existing simple,
+    /// non-wrapping comparison at the antimeridian.
+    nonisolated static func indexedNodeIndices(
+        coordinates: [CLLocationCoordinate2D],
+        confirmed: [Bool],
+        latitudeOrder: [Int],
+        region: MKCoordinateRegion,
+        includeUnverified: Bool,
+        cap: Int
+    ) -> IndexedNodeQuery {
+        guard cap >= 0 else {
+            return IndexedNodeQuery(indices: [], inspectedCount: 0, exceededCap: false)
+        }
+        let minLatitude = region.center.latitude - region.span.latitudeDelta / 2
+        let maxLatitude = region.center.latitude + region.span.latitudeDelta / 2
+        let minLongitude = region.center.longitude - region.span.longitudeDelta / 2
+        let maxLongitude = region.center.longitude + region.span.longitudeDelta / 2
+        guard !minLongitude.isNaN, !maxLongitude.isNaN else {
+            return IndexedNodeQuery(indices: [], inspectedCount: 0, exceededCap: false)
+        }
+        let candidateRange = latitudeCandidateRange(
+            coordinates: coordinates,
+            latitudeOrder: latitudeOrder,
+            minLatitude: minLatitude,
+            maxLatitude: maxLatitude
+        )
+        var matches: [Int] = []
+        matches.reserveCapacity(min(cap, 64))
+        var inspectedCount = 0
+        for position in candidateRange {
+            inspectedCount += 1
+            let index = latitudeOrder[position]
+            let coordinate = coordinates[index]
+            guard coordinate.longitude >= minLongitude,
+                  coordinate.longitude <= maxLongitude else { continue }
+            let isConfirmed = index < confirmed.count ? confirmed[index] : true
+            if !includeUnverified && !isConfirmed { continue }
+            matches.append(index)
+            if matches.count > cap {
+                return IndexedNodeQuery(
+                    indices: [],
+                    inspectedCount: inspectedCount,
+                    exceededCap: true
+                )
+            }
+        }
+        matches.sort()
+        return IndexedNodeQuery(
+            indices: matches,
+            inspectedCount: inspectedCount,
+            exceededCap: false
+        )
+    }
+
     /// The camera points inside `region`, capped so a zoomed-out view never tries to draw the
     /// whole set. Returns [] past the cap (caller shows a "zoom in" hint instead).
     func nodes(in region: MKCoordinateRegion, cap: Int = 500) -> [(id: String, coord: CLLocationCoordinate2D, maker: String, tier: UInt8, confirmed: Bool)] {
         guard !nodes.isEmpty else { return [] }
-        let minLat = region.center.latitude - region.span.latitudeDelta / 2
-        let maxLat = region.center.latitude + region.span.latitudeDelta / 2
-        let minLon = region.center.longitude - region.span.longitudeDelta / 2
-        let maxLon = region.center.longitude + region.span.longitudeDelta / 2
-        var out: [(id: String, coord: CLLocationCoordinate2D, maker: String, tier: UInt8, confirmed: Bool)] = []
-        out.reserveCapacity(min(cap, 64))
-        for i in nodes.indices {
-            let c = nodes[i]
-            if c.latitude >= minLat && c.latitude <= maxLat && c.longitude >= minLon && c.longitude <= maxLon {
-                let ok = i < nodeConfirmed.count ? nodeConfirmed[i] : true
-                if !ok && !showUnverified { continue }   // hidden by default, see showUnverified
-                let meta = i < nodeMetadata.count ? nodeMetadata[i] : nil
-                let tier = meta?.attributionTier ?? (ok ? 1 : 0)
-                let id = Self.stableNodeID(index: i, coordinate: c, metadata: meta)
-                out.append((id, c, i < nodeMakers.count ? nodeMakers[i] : "", tier, ok))
-                if out.count > cap { return [] }     // too many in view: signal "zoom in"
-            }
+        let query = Self.indexedNodeIndices(
+            coordinates: nodes,
+            confirmed: nodeConfirmed,
+            latitudeOrder: nodeLatitudeOrder,
+            region: region,
+            includeUnverified: showUnverified,
+            cap: cap
+        )
+        guard !query.exceededCap else { return [] }
+        return query.indices.map { index in
+            let coordinate = nodes[index]
+            let isConfirmed = index < nodeConfirmed.count ? nodeConfirmed[index] : true
+            let metadata = index < nodeMetadata.count ? nodeMetadata[index] : nil
+            let tier = metadata?.attributionTier ?? (isConfirmed ? 1 : 0)
+            let id = Self.stableNodeID(index: index, coordinate: coordinate, metadata: metadata)
+            return (
+                id: id,
+                coord: coordinate,
+                maker: index < nodeMakers.count ? nodeMakers[index] : "",
+                tier: tier,
+                confirmed: isConfirmed
+            )
         }
-        return out
     }
 
     /// Nearest mapped camera to `coord`, for the detection detail's "matches a mapped camera" line.
@@ -313,7 +465,15 @@ final class ALPRStore: ObservableObject {
         var bestMaker = ""
         var bestConfirmed = true
         var bestTier: UInt8 = 1
-        for i in nodes.indices {
+        var bestIndex = Int.max
+        let candidateRange = Self.latitudeCandidateRange(
+            coordinates: nodes,
+            latitudeOrder: nodeLatitudeOrder,
+            minLatitude: coord.latitude - box,
+            maxLatitude: coord.latitude + box
+        )
+        for position in candidateRange {
+            let i = nodeLatitudeOrder[position]
             let c = nodes[i]
             if abs(c.latitude - coord.latitude) > box || abs(c.longitude - coord.longitude) > box { continue }
             // Never corroborate a detection against a node the user cannot see on the map. Vouching
@@ -322,8 +482,11 @@ final class ALPRStore: ObservableObject {
             let dLat = (c.latitude - coord.latitude) * 111_320
             let dLon = (c.longitude - coord.longitude) * 111_320 * cosLat
             let m = (dLat * dLat + dLon * dLon).squareRoot()
-            if m < bestM {
+            // The old full scan kept the lowest original index when distances were exactly equal.
+            // Latitude order differs, so spell out that tie-breaker to preserve its result.
+            if m < bestM || (m == bestM && i < bestIndex) {
                 bestM = m
+                bestIndex = i
                 bestMaker = i < nodeMakers.count ? nodeMakers[i] : ""
                 bestConfirmed = i < nodeConfirmed.count ? nodeConfirmed[i] : true
                 bestTier = i < nodeMetadata.count ? nodeMetadata[i].attributionTier
@@ -497,13 +660,9 @@ final class ALPRStore: ObservableObject {
             }
         }.value
         guard cached, !Task.isCancelled, gen == enableGen, enabled else { return }
-        nodes = parsed.coords
-        nodeMakers = parsed.makers
-        nodeConfirmed = parsed.confirmed
-        nodeMetadata = parsed.metadata
+        guard install(parsed) else { return }
         loadedFormat = parsed.wireFormat
         loadedSHA256 = expectedHash
-        unverifiedCount = parsed.confirmed.reduce(0) { $0 + ($1 ? 0 : 1) }
         updated = manifest.updated
         outcome = .updated(count: parsed.coords.count)
         UserDefaults.standard.set(manifest.updated, forKey: versionKey)
@@ -518,13 +677,9 @@ final class ALPRStore: ObservableObject {
             return (parsed, Self.sha256(bin))
         })
         guard let (parsed, hash) = await task.value, enabled else { return }
-        nodes = parsed.coords
-        nodeMakers = parsed.makers
-        nodeConfirmed = parsed.confirmed
-        nodeMetadata = parsed.metadata
+        guard install(parsed) else { return }
         loadedFormat = parsed.wireFormat
         loadedSHA256 = hash
-        unverifiedCount = parsed.confirmed.reduce(0) { $0 + ($1 ? 0 : 1) }
         // The cache IS the version `versionKey` recorded, so a cold start can caption its
         // dataset date before (or without) the next successful manifest round-trip.
         if updated == nil { updated = UserDefaults.standard.string(forKey: versionKey) }
@@ -659,8 +814,9 @@ final class ALPRStore: ObservableObject {
             metadata.append(rowMetadata)
         }
         let wireFormat = isV4 ? "ALP4" : (isV3 ? "ALP3" : (isV2 ? "ALP2" : "ALP1"))
+        let latitudeOrder = makeLatitudeOrder(for: coords)
         return ParsedDataset(wireFormat: wireFormat, coords: coords, makers: makers, confirmed: confirmed,
-                             metadata: metadata, rawCount: count)
+                             metadata: metadata, latitudeOrder: latitudeOrder, rawCount: count)
     }
 
     /// A matching date alone is insufficient during a wire-format channel migration. Old

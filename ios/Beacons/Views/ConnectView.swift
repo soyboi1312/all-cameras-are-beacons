@@ -28,6 +28,11 @@ struct ConnectView: View {
     @EnvironmentObject var ble: BLEManager
     @Environment(\.dynamicTypeSize) private var dynamicTypeSize
     @State private var showSavedLog = false   // read-only path into the persisted log, no beacon needed
+    /// Does this screen have to carry the desert restore offer? Decided by RootView through
+    /// desertRestoreNeedsPreConnectSurface, which is the negation of the gate that draws the tab
+    /// shell. It is passed in rather than read here because this view only exists when the shell
+    /// is gone, so deciding it here would be deciding it against a constant.
+    var showAlertRestore = false
     var onOpenSetupHelp: () -> Void = {}
     // Scan-outcome bookkeeping: BLEManager's 45s scan window closes by silently settling back
     // to .idle, which looked like a spinner that just gave up. Track when the window closed
@@ -58,6 +63,22 @@ struct ConnectView: View {
 
             ScrollView {
                 VStack(spacing: 16) {
+                    // A SILENCE THIS APP IMPOSED LEADS EVEN THIS SCREEN. Every other home of the
+                    // offer is on the Beacon screen, which RootView either has not mounted yet or
+                    // keeps mounted with its opacity at zero, its hit testing off and its
+                    // accessibility hidden while this one draws over it, so this is the only
+                    // reachable copy right now - and the state that arms the offer (a board reboot,
+                    // a factory reset) is exactly the state that lands the owner here. It goes
+                    // above setup because setup is about the next beacon; this is about the phone
+                    // in their hand still being silent.
+                    //
+                    // Nothing about taking it needs a board: the alert mode is a phone preference.
+                    // The board write it also makes is dropped while there is no link; the next
+                    // connect re-sends the wanted mode, and reconcileBuzzer re-asserts it from the
+                    // first status frame if the board still disagrees. That is the same path as any
+                    // other mode picked while offline. Same panel and same strings as the Beacon
+                    // screen's copy, from the one AlertRestorePanel definition.
+                    if showAlertRestore { AlertRestorePanel() }
                     // Setup comes before the capability catalog. A first-time owner needs the next
                     // physical action before learning every category the beacon can recognize.
                     setupIntro

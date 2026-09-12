@@ -31,6 +31,46 @@ private enum FollowPanelState: Equatable {
     case noFix
 }
 
+/// The dossier's short age text: "now", "12s ago", "4m ago", "1h ago", "3d ago", or a dash when
+/// there is no time. `now` has no default on purpose: the dossier hands in its 1 s tick, so every
+/// clock reading on that screen measures against the same instant and its body keeps a real
+/// dependency on the tick (see DetectionDetailView `now`). Taking it as a parameter is also what
+/// lets DetectionDetailTimeTests prove the text follows the `now` it is given, not the wall clock.
+/// TWIN: android DetailScreen.kt `relativeAgo(ms, nowMs)`, same buckets and edges, pinned there by
+/// DetailTimeLabelsTest; check-signature-drift.py's "dossier time labels" rule pins the same
+/// buckets in both bodies.
+func dossierRelativeAgo(_ date: Date?, now: Date) -> String {
+    guard let date else { return "-" }
+    // Non-trapping: a poisoned Date from an old checkpoint must degrade, not crash the view.
+    let secs = max(0, Int(exactly: now.timeIntervalSince(date).rounded(.down)) ?? Int.max)
+    switch secs {
+    case ..<5:        return "now"
+    case ..<60:       return "\(secs)s ago"
+    case ..<3600:     return "\(secs / 60)m ago"
+    case ..<86_400:   return "\(secs / 3600)h ago"
+    default:          return "\(secs / 86_400)d ago"
+    }
+}
+
+/// Compact duration since the first sighting, for CONFIRM IT's "over 18m so far": "45s", "18m",
+/// "2h", "3d". Floored at 1 s, so a fresh row reads "over 1s", never "over 0s". `now` is required
+/// for the same reasons as `dossierRelativeAgo`, and DetectionDetailTimeTests pins it the same way.
+/// TWIN: android DetailScreen.kt `seenSpan(ms, nowMs)`, same buckets and floor, pinned there by
+/// DetailTimeLabelsTest; check-signature-drift.py's "dossier time labels" rule pins the same
+/// buckets in both bodies. The twin returns null for a missing stamp; here the view's
+/// `sightingSpan` makes that call.
+func dossierSightingSpan(since first: Date, now: Date) -> String {
+    // Non-trapping: a poisoned first-seen Date from an old checkpoint must not crash the detail
+    // view every time it opens (the decode clamp stops new ones at ingest).
+    let secs = max(1, Int(exactly: now.timeIntervalSince(first).rounded(.down)) ?? Int.max)
+    switch secs {
+    case ..<60:      return "\(secs)s"
+    case ..<3600:    return "\(secs / 60)m"
+    case ..<86_400:  return "\(secs / 3600)h"
+    default:         return "\(secs / 86_400)d"
+    }
+}
+
 /// Full detection detail, pushed from the dashboard and logbook, shown as a sheet
 /// from the map. Custom top bar, a live RSSI signal panel, stat grid, identity, and
 /// location.
@@ -52,6 +92,9 @@ struct DetectionDetailView: View {
     @State private var showRssiInfo = false          // tap the info dot next to SIGNAL to explain the RSSI graph
     @State private var showMuteOptions = false
     @State private var muteError: String?
+    @State private var identityExpanded = false
+    @State private var helpExpanded = false
+    @Environment(\.dynamicTypeSize) private var dynamicTypeSize
 
     // Follow evidence (trackers only). Cached in @State and refreshed on a slow tick rather than
     // derived inside `body`, because this dossier re-renders at the coalesced publish cadence (a
@@ -63,6 +106,20 @@ struct DetectionDetailView: View {
     /// would be rebuilt on every body evaluation, and onReceive would cancel and resubscribe each
     /// time, so under a fast feed the timer would never live long enough to fire once.
     @State private var followTick = Timer.publish(every: 5, on: .main, in: .common).autoconnect()
+
+    /// The clock every time-derived reading on this screen is measured against: the LIVE/STALE
+    /// kicker and the sparkline dim, First seen and Last seen, the SIGHTINGS age, and CONFIRM IT's
+    /// "over 2m". Staleness moves with the clock, not with @Published state, so once this device
+    /// stops being heard and nothing else publishes, nothing invalidates the view: the kicker held
+    /// SIGNAL · LIVE and Last seen held its last age indefinitely, at exactly the moment someone
+    /// checks whether a device really went quiet. followTick cannot stand in for it, because its
+    /// refreshes assign Equatable state that is unchanged in the usual case, and SwiftUI skips those.
+    /// 1 s, and held in @State for the same reason as DashboardView's `staleTick`. TWIN: Android
+    /// DetailScreen `nowMs` drives the same readings at the same cadence. Every clock reading below
+    /// measures against `now` instead of calling Date(), so the body keeps a real dependency on it.
+    /// The Technical details rows are built during this body pass, so they move only when it re-runs.
+    @State private var now = Date()
+    @State private var staleTick = Timer.publish(every: 1, on: .main, in: .common).autoconnect()
 
     /// Mapped-camera corroboration for the LOCATION panel, cached for the same reason followState
     /// is. `ALPRStore.nearest(to:)` walks the node array end to end, and its inputs (this
@@ -81,6 +138,12 @@ struct DetectionDetailView: View {
         let confirmed: Bool
     }
 
+    /// Camera for the LOCATION thumbnail, fitted in `mapThumbnail` whenever its pin or trail moves.
+    /// A binding rather than `initialPosition`, which a map reads once: with it, the only way to
+    /// bring the camera to a moved pin was to build a whole new map. `.automatic` is only the value
+    /// before the first fit, which runs as the thumbnail appears.
+    @State private var thumbnailCamera: MapCameraPosition = .automatic
+
     /// Always re-read the live row: the captured `detection` is a value type with let fields,
     /// so it can never update, and this screen sits next to id-keyed lookups that do (the
     /// LIVE/STALE kicker, the sparkline). A frozen copy means the dBm readout never moves
@@ -89,6 +152,14 @@ struct DetectionDetailView: View {
     /// the captured copy once the row is evicted, so the dossier doesn't blank out.
     private var d: Detection { ble.detection(for: detection.id) ?? detection }
     private var trend: [Int] { ble.rssiTrend(for: d.id) }
+    /// Exactly the same subject-vs-observer resolution as the full Map tab. Non-drone dossiers
+    /// show the strongest located sighting; Remote ID dossiers keep the aircraft coordinate.
+    private var mapCoordinate: CLLocationCoordinate2D? {
+        resolvedDetectionMapCoordinate(type: d.type, wireCoordinate: d.coordinate,
+                                       strongestObserverCoordinate: ble.capturedLocation(for: d.id),
+                                       allowNonDroneWireFallback: d.isHistory || ble.demoMode
+                                           || liveWireObserverFixIsCurrent(gpsAgeSec: d.gpsAgeSec))
+    }
     private var muteRule: IgnoredDevice? {
         ble.ignored.first { $0.mac == d.mac.lowercased() }
     }
@@ -101,29 +172,37 @@ struct DetectionDetailView: View {
             ACABTheme.bg.ignoresSafeArea()
             ScrollView {
                 VStack(alignment: .leading, spacing: 16) {
+                    // THE CANONICAL DOSSIER ORDER. android DetailScreen.kt's dossier Column runs
+                    // the same panels in the same SEQUENCE, so an instruction that names a panel
+                    // ("expand Technical details", "tap COPY MAC ADDRESS") is true on both phones.
+                    // Sequence, NOT cell for cell: the two primary actions are one child here in
+                    // either layout (watch beside mute, stacked only for an existing mute rule or
+                    // accessibility text), and two full-width children on android, so every panel
+                    // below sits one child later there. Moving one of those actions is a two-file
+                    // edit for that reason. Until this was settled, android carried a CAPTURE NOTE
+                    // panel of its own, ran CONFIRM IT above the map, and kept COPY MAC ADDRESS
+                    // inside the collapsed disclosure. Keep the two in step when either one moves.
                     titleBlock
+                    primaryActions
                     matchQualityPanel
-                    relatedHelpPanel
                     if d.type.isExperimental { experimentalNote }
-                    signalPanel
-                    statGrid
-                    if showConfirmIt { confirmItPanel }
-                    identityPanel
-                    // A drone's own broadcast fix when it has one, else the phone's captured
-                    // position at the sighting - the SAME resolution the Map tab pins with
-                    // (MapTabView.mapCoord), so fixed installs (ALPR / body cam / tracker)
-                    // get the LOCATION panel + OPEN IN MAP too, not just drones. Broadcast-GPS
-                    // rows keep their richer readout in the identity panel above.
-                    if let coord = d.coordinate ?? ble.capturedLocation(for: d.id) { locationPanel(coord) }
+                    relatedHelpPanel
+                    // The SAME resolution the Map tab pins with: Remote ID aircraft coordinates
+                    // win for drones; fixed installs use the phone position paired with their
+                    // strongest located RSSI sample. Broadcast-GPS rows keep their richer readout
+                    // in the expandable technical details below.
+                    if let coord = mapCoordinate { locationPanel(coord) }
                     // Tracker rows only, and only here. Nothing about this judgement is allowed to
                     // reach a notification, a haptic, the buzzer, the log row, the dashboard
                     // counters, the Live Activity, the map, or the CSV export. The export in
                     // particular: it is a record of raw sightings that gets handed over as
                     // evidence, and a derived opinion in a column reads as fact.
                     followPanel
+                    signalPanel
+                    statGrid
+                    if showConfirmIt { confirmItPanel }
+                    identityDisclosure
                     copyButton
-                    watchButton
-                    ignoreButton
                     Spacer(minLength: 8)
                 }
                 .padding(.horizontal, ACABTheme.pad)
@@ -140,10 +219,9 @@ struct DetectionDetailView: View {
         // the ingest or publish paths. Crumbs need 60 s and 25 m to move at all, so a 5 s refresh
         // is already far faster than the underlying data can change. The mapped-camera
         // corroboration rides the same three hooks, but do NOT read ITS input as equally still.
-        // The panel resolves `d.coordinate ?? capturedLocation(for:)` and both halves move: on a
-        // non-drone row `lat`/`lon` is the DETECTOR's GPS as of the newest frame, and where that is
-        // absent, ingestDetection migrates the captured observer fix at closest approach (>= 4 dB
-        // over the row's best RSSI, with none of the 60 s / 25 m floors the crumb gate has). So the
+        // The panel resolves the aircraft coordinate for Remote ID and the captured strongest-
+        // RSSI observer coordinate for other rows. Both can move, with none of the 60 s / 25 m
+        // floors the tracker crumb gate has. So the
         // distance in the corroboration line can trail the coordinate printed at the top of the
         // same panel by up to one tick. Bounded and accepted: nearest(to:) walks the whole node
         // array, so hanging it off every coordinate change would put that walk back on the render
@@ -151,8 +229,12 @@ struct DetectionDetailView: View {
         .onAppear { refreshFollow(); refreshALPRMatch() }
         // The iPad two-pane keeps ONE detail view mounted and swaps the row into it, so without
         // this the panel would keep showing the previously selected tag's score.
-        .onChange(of: d.id) { refreshFollow(); refreshALPRMatch() }
+        .onChange(of: d.id) {
+            identityExpanded = false; helpExpanded = false
+            refreshFollow(); refreshALPRMatch()
+        }
         .onReceive(followTick) { _ in refreshFollow(); refreshALPRMatch() }
+        .onReceive(staleTick) { now = $0 }
         // A star refused at the firmware's 256-entry cap sets this on the manager; surface it here
         // instead of the WATCH tap silently doing nothing.
         .alert("Watchlist full", isPresented: $ble.watchlistFull) {
@@ -197,24 +279,46 @@ struct DetectionDetailView: View {
 
     // MARK: Title
 
+    /// The two common decisions are available before the technical dossier. An existing mute
+    /// has an explanatory state panel, so it keeps a full row; large text also stacks the actions.
+    private var primaryActions: some View {
+        let layout = dynamicTypeSize.isAccessibilitySize || muteRule != nil
+            ? AnyLayout(VStackLayout(spacing: 10)) : AnyLayout(HStackLayout(spacing: 10))
+        return layout {
+            watchButton
+            ignoreButton
+        }
+    }
+
     private var titleBlock: some View {
         HStack(alignment: .top, spacing: 14) {
             CatGlyph(type: d.type, size: 54, filled: true)
             VStack(alignment: .leading, spacing: 7) {
                 badgePill
-                Text("NODE \(d.nodeName)")
+                // The headline is the same user/device name the Log row and the Status hero
+                // lead with (custom label, else advertised name, else UAS serial, else maker,
+                // else the class); the node handle moves into the subtitle. TWIN: android
+                // DetailScreen.kt title block - `Text(d.displayName, 26.sp)` over
+                // `"NODE ${nodeName(d.mac)} · ${d.maker ?: d.vendor}"`, one dossier header on
+                // both phones.
+                Text(d.displayName)
                     .font(ACABTheme.display(26, weight: .semibold)).foregroundStyle(ACABTheme.text)
-                // Subtitle is the vendor, not the type label (F15), the badge pill
-                // above already names the category. NEITHER branch may consult the OUI
-                // lookup: for a Flock Falcon it resolves to the Liteon WiFi module and
+                    .fixedSize(horizontal: false, vertical: true)
+                // Subtitle is the node handle and the vendor, not the type label (F15), the
+                // badge pill above already names the category. NEITHER branch may consult
+                // the OUI lookup: for a Flock Falcon it resolves to the Liteon WiFi module and
                 // would head the ALPR dossier with "Liteon" instead of "Flock Safety".
                 // The OUI reading still shows in the identity panel below, labelled as such.
                 //
-                // `maker` first fixes a real mislabel: d.vendor answers the body-cam
-                // category with a fixed guess, so a Motorola-proxy or Utility hit headed
-                // this dossier with Axon's name outright. maker is nil for Flock, so the
-                // ALPR case above is unaffected.
-                Text(d.maker ?? d.vendor).font(ACABTheme.mono(11)).foregroundStyle(ACABTheme.dim)
+                // `maker` leads because it is the name the device's own payload carried;
+                // `vendor` is the per-type fallback. For a body cam both read the same
+                // signature, so a recognized Motorola or Utility hit names its own maker.
+                // With no signature it recognizes (a replayed row carries no detail),
+                // `vendor` names all three makers together, Axon first, so a body-cam row
+                // names Axon alone only when an Axon signature fired. maker is nil for
+                // Flock, so the ALPR case above is unaffected.
+                Text("NODE \(d.nodeName) · \(d.maker ?? d.vendor)")
+                    .font(ACABTheme.mono(11)).foregroundStyle(ACABTheme.dim)
             }
             Spacer(minLength: 0)
         }
@@ -222,7 +326,7 @@ struct DetectionDetailView: View {
 
     private var badgePill: some View {
         HStack(spacing: 5) {
-            Text(d.type.category.lowercased())
+            Text(d.type.inlineCategory)
             Text("\u{00B7}").opacity(0.5)
             Text(d.classLabel)
         }
@@ -249,23 +353,25 @@ struct DetectionDetailView: View {
     /// categories only, never for confidence.
     private var isWeakMatch: Bool { d.confidence < 50 }
 
-    /// RELATED HELP: the one or two FAQ answers that speak to THIS category, deep-linked.
+    /// RELATED HELP: the FAQ answers that speak to THIS category, deep-linked.
     ///
-    /// It sits directly under match quality because that is where the doubt lands. Someone looking
-    /// at a 45% Motorola hit, or an ALPR pin with nothing detected, is already asking a question,
-    /// and the answer was previously only on the website. A reporter using the device hit exactly
-    /// that and concluded the hardware was broken.
+    /// Collapsed, but placed where the doubt lands: directly under match quality and the
+    /// category's own experimental note. Someone looking at a 45% body cam hit, or an ALPR pin
+    /// with nothing detected, is already asking a question, and the answer was previously only on
+    /// the website. A reporter using the device hit exactly that and concluded the hardware was
+    /// broken. It is collapsed so a second block of prose does not stack under that warning and
+    /// read as a second hedge, but the header stays on the FIRST screen. Do not demote it again:
+    /// this panel is the only route from a dossier into HelpView, the top bar carries no help
+    /// control, and a collapsed row further down the scroll is reachable only by someone who
+    /// already knows to look. That is not the reader it exists for.
     ///
     /// Renders nothing for categories with no mapped questions (nearby device and unknown, whose
-    /// faqKey is ""). Every real category has entries now, glasses and body cam included, and the
-    /// drift check enforces that; the panel sits above each category's own experimental note where
-    /// one exists.
+    /// faqKey is ""). Every real category has entries, and the drift check enforces that.
     @ViewBuilder
     private var relatedHelpPanel: some View {
         let qs = FAQContent.shared.related(for: d.type)
         if !qs.isEmpty {
-            VStack(alignment: .leading, spacing: 12) {
-                Kicker("RELATED HELP")
+            DisclosureGroup(isExpanded: $helpExpanded) {
                 VStack(alignment: .leading, spacing: 0) {
                     ForEach(Array(qs.enumerated()), id: \.element.id) { idx, q in
                         NavigationLink {
@@ -295,7 +401,22 @@ struct DetectionDetailView: View {
                         }
                     }
                 }
+            } label: {
+                // Same anatomy as identityDisclosure below, and the summary is BYTE-IDENTICAL to
+                // android DetailScreen.kt's RelatedHelpPanel `summary`. Collapsed content leaves
+                // the accessibility tree entirely, so without this line VoiceOver reached a
+                // control that named nothing about what it holds while Technical details, sitting
+                // right under it, said what was inside.
+                VStack(alignment: .leading, spacing: 3) {
+                    Label("Related help", systemImage: "questionmark.circle")
+                        .font(ACABTheme.display(15, weight: .semibold)).foregroundStyle(ACABTheme.text)
+                    Text("\(qs.count) answer\(qs.count == 1 ? "" : "s") for \(d.type.inlineLabel)")
+                        .font(ACABTheme.mono(11)).foregroundStyle(ACABTheme.dim)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+                .frame(minHeight: 44)
             }
+            .tint(ACABTheme.dim)
             .panel()
         }
     }
@@ -318,6 +439,15 @@ struct DetectionDetailView: View {
             matchExplainer
                 .font(ACABTheme.mono(11)).foregroundStyle(ACABTheme.dim)
                 .fixedSize(horizontal: false, vertical: true)
+            // Keep the broadcast's qualifications visible when technical identity is collapsed:
+            // strings such as "or Quest" / "gear, no Remote ID" must never turn into certainty.
+            // TWIN: android DetailScreen.kt's MatchQualityPanel closes with the same string in
+            // this same slot, verbatim and with no kicker of its own.
+            if let detail = d.detail, !detail.isEmpty {
+                Text(detail)
+                    .font(ACABTheme.mono(12)).foregroundStyle(ACABTheme.text)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
         }
         .frame(maxWidth: .infinity, alignment: .leading)
         .padding(16)
@@ -518,15 +648,7 @@ struct DetectionDetailView: View {
     private var sightingSpan: String? {
         let first = ble.firstSeenDate(for: d.id)
         guard let first, !ble.timeBasis(for: d.id, stamp: first).hidesInstant else { return nil }
-        // Non-trapping: a poisoned first-seen Date from an old checkpoint must not crash the
-        // detail view every time it opens (the decode clamp stops new ones at ingest).
-        let secs = max(1, Int(exactly: Date().timeIntervalSince(first).rounded(.down)) ?? Int.max)
-        switch secs {
-        case ..<60:      return "\(secs)s"
-        case ..<3600:    return "\(secs / 60)m"
-        case ..<86_400:  return "\(secs / 3600)h"
-        default:         return "\(secs / 86_400)d"
-        }
+        return dossierSightingSpan(since: first, now: now)
     }
 
     private var starRow: some View {
@@ -542,7 +664,9 @@ struct DetectionDetailView: View {
             Button {
                 toggleWatch()   // shared guard: this used to star directly, skipping the confirm
             } label: {
-                Text(on ? "WATCHING" : "WATCH")
+                // Same pair as the primary watchButton below and Android's WatchButton: the
+                // action verb, so the sighted label and the spoken one agree.
+                Text(on ? "STOP WATCHING" : "WATCH")
                     .font(ACABTheme.mono(9.5, weight: .bold)).tracking(1)
                     .foregroundStyle(on ? ACABTheme.onAccent : ACABTheme.watchTone)
                     .padding(.horizontal, 10).padding(.vertical, 5)
@@ -561,7 +685,7 @@ struct DetectionDetailView: View {
     // MARK: Signal
 
     private var signalPanel: some View {
-        let stale = ble.isStale(for: d.id)
+        let stale = ble.isStale(for: d.id, asOf: now)
         return VStack(alignment: .leading, spacing: 12) {
             HStack {
                 if stale {
@@ -711,6 +835,24 @@ struct DetectionDetailView: View {
             if let st = d.ridStatusLabel { idRow("Status", st) }
             whyFlagged
         }
+    }
+
+    /// Title and subtitle are BYTE-IDENTICAL to android DetailScreen.kt's identity
+    /// DisclosureSection, and docs/app-guide.md names this control for readers of both apps.
+    private var identityDisclosure: some View {
+        DisclosureGroup(isExpanded: $identityExpanded) {
+            identityPanel
+        } label: {
+            VStack(alignment: .leading, spacing: 3) {
+                Label("Technical details", systemImage: "info.circle")
+                    .font(ACABTheme.display(15, weight: .semibold)).foregroundStyle(ACABTheme.text)
+                Text("Identifiers, capture times and broadcast fields")
+                    .font(ACABTheme.mono(11)).foregroundStyle(ACABTheme.dim)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            .frame(minHeight: 44)
+        }
+        .tint(ACABTheme.dim)
         .panel()
     }
 
@@ -725,20 +867,9 @@ struct DetectionDetailView: View {
         .overlay(alignment: .bottom) { Rectangle().fill(ACABTheme.line).frame(height: 1) }
     }
 
-    /// Short "ago" string for a sighting: "now", "12s ago", "4m ago", "1h ago",
-    /// "3d ago", or a dash if we don't know the time.
-    private func relativeAgo(_ date: Date?) -> String {
-        guard let date else { return "-" }
-        // Non-trapping: a poisoned Date from an old checkpoint must degrade, not crash the view.
-        let secs = max(0, Int(exactly: Date().timeIntervalSince(date).rounded(.down)) ?? Int.max)
-        switch secs {
-        case ..<5:        return "now"
-        case ..<60:       return "\(secs)s ago"
-        case ..<3600:     return "\(secs / 60)m ago"
-        case ..<86_400:   return "\(secs / 3600)h ago"
-        default:          return "\(secs / 86_400)d ago"
-        }
-    }
+    /// Short "ago" string for a sighting, measured to `now`, the 1 Hz tick, so an age keeps
+    /// advancing while no frame arrives. The buckets live in `dossierRelativeAgo`.
+    private func relativeAgo(_ date: Date?) -> String { dossierRelativeAgo(date, now: now) }
 
     /// A sighting time and, whenever it was not read off the phone's own clock, how it was
     /// arrived at. The qualifier sits in the row rather than in a footnote because a derived
@@ -788,14 +919,19 @@ struct DetectionDetailView: View {
     // MARK: Location
 
     private func locationPanel(_ coord: CLLocationCoordinate2D) -> some View {
-        VStack(alignment: .leading, spacing: 10) {
+        let hasTrackerTrail = d.type == .tracker && ble.crumbTrail(for: d.id).count >= 2
+        return VStack(alignment: .leading, spacing: 10) {
             HStack {
                 Kicker("LOCATION")
                 Spacer()
                 Text(String(format: "%.5f, %.5f", coord.latitude, coord.longitude))
                     .font(ACABTheme.mono(10)).foregroundStyle(ACABTheme.dim)
             }
-            if let age = d.locationAgeDetail {
+            // gpsAgeSec describes the wire coordinate on THIS row. Once a different strongest
+            // sample owns the observer pin, applying this row's age to it would be false.
+            if let wire = d.coordinate,
+               wire.latitude == coord.latitude, wire.longitude == coord.longitude,
+               let age = d.locationAgeDetail {
                 // The board stamped this fix from a stale phone position (offline /
                 // Desert mode), so flag how old it is.
                 HStack(spacing: 7) {
@@ -858,12 +994,21 @@ struct DetectionDetailView: View {
                             .strokeBorder(ACABTheme.line, lineWidth: 1))
                 }
                 .buttonStyle(.plain)
-                .accessibilityLabel("Open in map")
+                .accessibilityLabel(hasTrackerTrail
+                                    ? "Open in map. Phone breadcrumb trail, this session."
+                                    : "Open in map")
             } else {
                 mapThumbnail(coord)
                     .clipShape(RoundedRectangle(cornerRadius: ACABTheme.radiusSm, style: .continuous))
                     .overlay(RoundedRectangle(cornerRadius: ACABTheme.radiusSm, style: .continuous)
                         .strokeBorder(ACABTheme.line, lineWidth: 1))
+            }
+            if hasTrackerTrail {
+                Label("Phone breadcrumb trail · this session",
+                      systemImage: "point.topleft.down.curvedto.point.bottomright.up")
+                    .font(ACABTheme.mono(9.5))
+                    .foregroundStyle(ACABTheme.faint)
+                    .accessibilityLabel("Phone breadcrumb trail, this session only")
             }
         }
         .panel()
@@ -871,17 +1016,87 @@ struct DetectionDetailView: View {
 
     /// The static mini-map itself, shared by both presentations of the panel above.
     private func mapThumbnail(_ coord: CLLocationCoordinate2D) -> some View {
-        Map(initialPosition: .region(MKCoordinateRegion(
-            center: coord, span: MKCoordinateSpan(latitudeDelta: 0.008, longitudeDelta: 0.008)))) {
+        let crumbs = d.type == .tracker ? ble.crumbTrail(for: d.id) : []
+        return Map(position: $thumbnailCamera) {
+            // The same accumulated, session-only phone trail the full Map draws for a tracker.
+            // It is intentionally independent of the Map tab's display toggle: this dossier is
+            // the evidence view the user explicitly opened for this one row.
+            if crumbs.count >= 2 {
+                MapPolyline(coordinates: crumbs)
+                    .stroke(ACABTheme.trackerTone.opacity(0.85),
+                            style: StrokeStyle(lineWidth: 3, dash: [6, 6]))
+            }
             Annotation(d.type.shortTag, coordinate: coord) { miniPin }
             if let pilot = d.pilotCoordinate {
                 Marker("Operator", systemImage: "person.fill", coordinate: pilot).tint(ACABTheme.dim)
             }
         }
+        // The map's identity carries NO pin. The pin moves whenever a strictly stronger packet
+        // arrives with a new phone fix, and a Remote ID aircraft's pin moves with every position
+        // it broadcasts, so on an approach it moves again and again while this dossier is open.
+        // Keyed on the pin, each of those moves built a fresh MKMapView and fetched its tiles
+        // again. A crumb landing or the trail dropping still rebuilds: that cost is bounded
+        // (tracker rows only, and crumbs land at least 60 s apart), and it draws the trail on a
+        // fresh map, so this evidence view never depends on an overlay being swapped in place.
+        // Selecting a different row in the iPad two-pane rebuilds too.
+        .id(ThumbnailMapKey(detectionID: d.id, trail: CrumbTrailStamp(crumbs)))
+        // A pin move keeps the map: the annotation above moves in place, as the operator marker
+        // always has, and this re-fits the camera to the new pin, the same thing android
+        // DetailScreen.kt LocationPanel's `update` block does to its retained MapView (re-center,
+        // or re-fit a trail). It sits outside the `.id` on purpose, so a rebuild never resets what
+        // it compares against and a crumb change re-fits the rebuilt map as well. The region is
+        // computed only here, when the key changes, never in the body pass, so the trail sort
+        // stays off the render path.
+        //
+        // What this key does not see: the operator coordinate, which was never part of the fit
+        // (its marker still moves), and a trail edit that keeps both its count and its last crumb
+        // (see CrumbTrailStamp). Neither can strand the pin: the pin is in the key, so the camera
+        // always frames the final pin, and the annotation is re-declared on every pass, so the
+        // final pin always renders.
+        .onChange(of: ThumbnailFit(pin: coord, trail: crumbs), initial: true) { _, fit in
+            thumbnailCamera = .region(detectionDetailMapRegion(pin: fit.pin, trail: fit.trail))
+        }
         .mapStyle(.standard(elevation: .flat, pointsOfInterest: .excludingAll))
         .preferredColorScheme(.dark)
         .frame(height: 168)
         .allowsHitTesting(false)   // just a thumbnail; never pans, any wrapping button takes the tap
+    }
+
+    /// Identity of the thumbnail's Map. No pin, on purpose: see mapThumbnail.
+    private struct ThumbnailMapKey: Hashable {
+        let detectionID: String
+        let trail: CrumbTrailStamp
+    }
+
+    /// What the thumbnail camera is fitted to. Equality reads the pin and the trail's stamp, not
+    /// every crumb, so the comparison made on each body pass stays O(1). `trail` rides along so
+    /// the fit uses the trail from the pass that changed rather than one captured earlier.
+    private struct ThumbnailFit: Equatable {
+        let pin: CLLocationCoordinate2D
+        let trail: [CLLocationCoordinate2D]
+
+        static func == (a: ThumbnailFit, b: ThumbnailFit) -> Bool {
+            a.pin.latitude == b.pin.latitude && a.pin.longitude == b.pin.longitude
+                && CrumbTrailStamp(a.trail) == CrumbTrailStamp(b.trail)
+        }
+    }
+
+    /// Stands in for a whole crumb trail in both keys above. BLEManager's crumb writer appends a
+    /// crumb at least 25 m from the previous one, trims the oldest past 120, or drops the whole
+    /// trail, so an append always moves the count or the last crumb and a drop always moves the
+    /// count. The one edit this cannot see is a trail dropped and rebuilt to the same count, ending
+    /// on a bit-identical coordinate; for the two or more crumbs the thumbnail draws, that needs
+    /// at least a minute of crumbs and the phone reporting the exact same fix again.
+    private struct CrumbTrailStamp: Hashable {
+        let count: Int
+        let lastLat: Double?
+        let lastLon: Double?
+
+        init(_ trail: [CLLocationCoordinate2D]) {
+            count = trail.count
+            lastLat = trail.last?.latitude
+            lastLon = trail.last?.longitude
+        }
     }
 
     /// Corner chip on the map thumbnail so the tap is discoverable. Styled like the map
@@ -955,7 +1170,7 @@ struct DetectionDetailView: View {
     /// costs nothing downstream.
     private func refreshALPRMatch() {
         guard d.type == .flockCamera || d.type == .flockRaven,
-              let coord = d.coordinate ?? ble.capturedLocation(for: d.id) else {
+              let coord = mapCoordinate else {
             if alprMatch != nil { alprMatch = nil }
             return
         }
@@ -1028,6 +1243,9 @@ struct DetectionDetailView: View {
 
     // MARK: Action
 
+    /// Always visible, below the Technical details disclosure and never inside it: an address is
+    /// what someone hands to a reporter or a records request, so it cannot sit behind a collapsed
+    /// section. TWIN: android DetailScreen.kt calls CopyMacButton in this same position.
     private var copyButton: some View {
         Button {
             // localOnly keeps the MAC off Universal Clipboard (no sync to other devices) and the
@@ -1091,7 +1309,10 @@ struct DetectionDetailView: View {
         } label: {
             HStack(spacing: 7) {
                 Image(systemName: on ? "star.fill" : "star").font(.system(size: 13, weight: .bold))
-                Text(on ? "STOP WATCHING" : "WATCH THIS DEVICE")
+                // "WATCH" / "STOP WATCHING": the action verb, not a state word, so the sighted
+                // label and the VoiceOver label below say the same thing. TWIN: android
+                // DetailScreen.kt `WatchButton`, same pair, byte for byte.
+                Text(on ? "STOP WATCHING" : "WATCH")
                     .font(ACABTheme.mono(12, weight: .bold)).tracking(0.5)
             }
             .foregroundStyle(on ? ACABTheme.onAccent : ACABTheme.watchTone)
@@ -1102,6 +1323,8 @@ struct DetectionDetailView: View {
                 .strokeBorder(on ? Color.clear : ACABTheme.watchTone.opacity(0.4), lineWidth: 1))
         }
         .buttonStyle(.plain)
+        .accessibilityLabel(on ? "Stop watching this device" : "Watch this device")
+        .accessibilityAddTraits(on ? .isSelected : [])
         // A randomized address rotates, so confirm before starring it. ONE dialog with a
         // type-selected body, never two in a row: a tracker is almost always randomized too, so
         // firing a generic prompt and then a tracker prompt would double up on the same tap.

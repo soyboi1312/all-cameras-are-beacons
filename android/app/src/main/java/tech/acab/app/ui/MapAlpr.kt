@@ -1,8 +1,13 @@
 package tech.acab.app.ui
 
 import android.graphics.drawable.BitmapDrawable
+import android.graphics.drawable.GradientDrawable
 import android.os.Handler
 import android.os.Looper
+import android.view.View
+import android.widget.TextView
+import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.toArgb
 import org.osmdroid.events.MapListener
 import org.osmdroid.events.ScrollEvent
 import org.osmdroid.events.ZoomEvent
@@ -10,7 +15,73 @@ import org.osmdroid.util.GeoPoint
 import org.osmdroid.views.MapView
 import org.osmdroid.views.overlay.FolderOverlay
 import org.osmdroid.views.overlay.Marker
+import org.osmdroid.views.overlay.infowindow.MarkerInfoWindow
+import tech.acab.app.R
 import tech.acab.app.net.ALPR_TIER_LEGACY_FORMAT
+import tech.acab.app.ui.theme.Acab
+import tech.acab.app.ui.theme.AcabPalette
+import kotlin.math.roundToInt
+
+/** Shared palette contract for text floating over map tiles. The surface is deliberately opaque:
+ * contrast must not change with a pale road tile, satellite imagery, or the dark tile filter. */
+internal data class MapInfoColors(
+    val surface: Color,
+    val primaryText: Color,
+    val secondaryText: Color,
+    val border: Color,
+)
+
+internal fun mapInfoColors(palette: AcabPalette): MapInfoColors = MapInfoColors(
+    surface = palette.bg2,
+    primaryText = palette.text,
+    secondaryText = palette.dim,
+    border = palette.lineStrong,
+)
+
+/** Dark replacement for osmdroid's bundled light-grey bubble and hardcoded black type. Shared by
+ * ALPR reference rings and Remote-ID operator explanations on the main map. */
+internal class DarkMapInfoWindow(mapView: MapView) :
+    MarkerInfoWindow(R.layout.map_info_window, mapView) {
+    private var applied: MapInfoColors? = null
+
+    init {
+        applyColors(mapInfoColors(Acab.palette))
+    }
+
+    fun applyColors(colors: MapInfoColors) {
+        if (colors == applied) return
+        applied = colors
+        val density = mView.resources.displayMetrics.density
+        mView.background = GradientDrawable().apply {
+            shape = GradientDrawable.RECTANGLE
+            setColor(colors.surface.toArgb())
+            cornerRadius = 12f * density
+            setStroke((1f * density).roundToInt().coerceAtLeast(1), colors.border.toArgb())
+        }
+        mView.findViewById<TextView>(R.id.bubble_title)?.setTextColor(colors.primaryText.toArgb())
+        mView.findViewById<TextView>(R.id.bubble_description)
+            ?.setTextColor(colors.secondaryText.toArgb())
+        mView.findViewById<TextView>(R.id.bubble_subdescription)
+            ?.setTextColor(colors.secondaryText.toArgb())
+        mView.elevation = 8f * density
+    }
+
+    override fun onOpen(item: Any?) {
+        super.onOpen(item)
+        val marker = item as? Marker ?: return
+        mView.contentDescription = listOfNotNull(
+            marker.title?.takeIf(String::isNotBlank),
+            marker.snippet?.takeIf(String::isNotBlank),
+            marker.subDescription?.takeIf(String::isNotBlank),
+        ).joinToString(". ")
+        mView.importantForAccessibility = View.IMPORTANT_FOR_ACCESSIBILITY_YES
+    }
+
+    override fun onClose() {
+        mView.contentDescription = null
+        super.onClose()
+    }
+}
 
 /** Source credit, one copy, tail of every reference-ring snippet. */
 private const val ALPR_CREDIT = "DeFlock / OSM ODbL"
@@ -166,6 +237,7 @@ class AlprOverlayHolder {
     private val handler = Handler(Looper.getMainLooper())
     private var attachedTo: MapView? = null
     private var mapListener: MapListener? = null   // kept so detach() can remove it (no post-detach rebuilds)
+    private var infoWindow: DarkMapInfoWindow? = null
 
     // Latest inputs, pushed from the Compose update pass.
     private var nodes: IntArray = IntArray(0)   // interleaved latE7, lonE7
@@ -211,7 +283,8 @@ class AlprOverlayHolder {
     }
 
     /** Add our folder to the map (once) and start listening for pan/zoom. */
-    fun attach(map: MapView) {
+    internal fun attach(map: MapView, infoWindow: DarkMapInfoWindow) {
+        this.infoWindow = infoWindow
         if (attachedTo === map) return
         attachedTo = map
         if (!map.overlays.contains(folder)) map.overlays.add(folder)
@@ -258,7 +331,9 @@ class AlprOverlayHolder {
      *  drawn.
      *
      *  Identity, not contents: the caller keeps the SAME array instance while the pins it drew are
-     *  unchanged, so the ~3 Hz publishes and the 1 Hz staleness rebuilds cost nothing at all. */
+     *  unchanged, so the ~3 Hz publishes, which the caller's rebuild gate absorbs, and the rebuilds
+     *  that redraw every pin in the same place (a tracker crumb lands, the age minute rolls over,
+     *  a label toggle) cost nothing at all. */
     fun setPeekPins(map: MapView, pins: DoubleArray) {
         if (pins === peekPins) return
         peekPins = pins
@@ -328,6 +403,7 @@ class AlprOverlayHolder {
                         title = markerTitle
                         snippet = markerSnippet
                     }
+                    this@AlprOverlayHolder.infoWindow?.let(::setInfoWindow)
                     setOnMarkerClickListener { m, _ -> m.showInfoWindow(); true }
                 }
                 folder.add(marker)
@@ -406,6 +482,7 @@ class AlprOverlayHolder {
         enabled = false
         showUnverified = false
         icons = null
+        infoWindow = null
         peekPins = DoubleArray(0)
         peekBands = AlprPeekBands(DoubleArray(0))
         // Nothing is drawn any more, so say so before the callback goes: a legend row left

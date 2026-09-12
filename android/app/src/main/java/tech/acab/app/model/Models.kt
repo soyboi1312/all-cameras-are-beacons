@@ -55,6 +55,55 @@ enum class DeviceType(val raw: Int) {
             UNKNOWN      -> "Unknown"
         }
 
+    /** `label` as it reads INSIDE a lowercase sentence, e.g. the Related help disclosure's
+     *  "3 answers for ALPR camera". Hand-written per case rather than `label.lowercase()`,
+     *  which flattened the proper nouns: Flock Raven became "flock raven" and the ALPR
+     *  initialism became "alpr". faq-content.json states the rule this obeys, "lowercase-plain,
+     *  honest about limits; proper nouns keep their casing". No single transform derives it,
+     *  because `label` itself mixes title case ("ALPR Camera", "Body Camera") with sentence
+     *  case ("Recording glasses", "Network camera").
+     *
+     *  BYTE-IDENTICAL to iOS DeviceType.inlineLabel, case for case. NEARBY_DEVICE and UNKNOWN
+     *  carry an empty faqKey so no help panel renders for them, but the values are defined so
+     *  any future caller reads the same rule. */
+    val inlineLabel: String
+        get() = when (this) {
+            FLOCK_CAMERA -> "ALPR camera"
+            FLOCK_RAVEN  -> "Flock Raven"
+            BODY_CAM     -> "body camera"
+            DRONE        -> "drone"
+            TRACKER      -> "tracker"
+            NEARBY_DEVICE-> "nearby device"
+            WATCHED      -> "watched device"
+            GLASSES      -> "recording glasses"
+            NETWORK_CAMERA -> "network camera"
+            UNKNOWN      -> "unknown"
+        }
+
+    /** `category` as it reads in DISPLAY text, where the surrounding voice is lowercase: the
+     *  dossier badge pill ("ALPR · PLATE READER") and the Status nearest card ("ALPR · NODE
+     *  2A10"). Same rule and same reason as `inlineLabel` above: `category.lowercase()` turned
+     *  the ALPR initialism into "alpr".
+     *
+     *  This is DISPLAY ONLY and is never a key. `category` itself is unchanged and stays the
+     *  identifier the Log/Map filters, the category counts, the widget rows and the drive
+     *  surface all match on, so nothing that compares strings is touched by this.
+     *
+     *  BYTE-IDENTICAL to iOS DeviceType.inlineCategory, case for case. */
+    val inlineCategory: String
+        get() = when (this) {
+            FLOCK_CAMERA -> "ALPR"
+            FLOCK_RAVEN  -> "ALPR"
+            BODY_CAM     -> "body cam"
+            DRONE        -> "drone"
+            TRACKER      -> "tracker"
+            NEARBY_DEVICE-> "nearby"
+            WATCHED      -> "watched"
+            GLASSES      -> "glasses"
+            NETWORK_CAMERA -> "camera"
+            UNKNOWN      -> "unknown"
+        }
+
     /** True for the buckets the drive-mode notification speaks: the six counters, and only those.
      *
      *  NETWORK_CAMERA joined 2026-07-31. It was excluded because the surface listed a fixed five
@@ -335,12 +384,15 @@ data class Detection(
             confidence = o.optInt("c", 0),
             mac = o.optString("mac", ""),
             // Clamped to the int16 wire type (the firmware sends an int16 dBm), the same rule as
-            // the rssi min/max in iOS Detection.init(from:). The clamp keeps the value inside the
-            // range the 3-sample smoothing average and the >= 4 dB closest-approach comparison in
-            // AcabBleManager are written for. Raw BLE uses exactInt16ClampedOrAbsent and
-            // stored/demo objects use int16Clamped; neither narrows through optInt/optLong before
-            // checking type and integrality, because that would test a number the wire never
-            // carried.
+            // the rssi min/max in iOS Detection.init(from:), so both apps hold the same number for
+            // the same packet. The pin rule ranks that number raw: AcabBleManager's
+            // selectStrongestLocatedSample moves a map pin only for a strictly greater RSSI, with
+            // no smoothing and no hysteresis, the same comparison as iOS
+            // strongestLocatedSampleShouldReplace. The int16 floor is also STALE_FIX_PIN_RSSI, the
+            // peak parked beside a stale replayed coordinate, so a decoded reading never ranks
+            // below that peak. Raw BLE uses exactInt16ClampedOrAbsent and stored/demo objects use
+            // int16Clamped; neither narrows through optInt/optLong before checking type and
+            // integrality, because that would test a number the wire never carried.
             rssi = wireFields?.rssi ?: o.int16Clamped("rssi"),
             name = o.stringOrNull("name"),
             rid = o.stringOrNull("id"),
@@ -443,11 +495,17 @@ sealed class TimeBasis {
     }
 }
 
-/** Friendly per-type vendor guess for when the OUI is unknown, so the detail screen
- *  never falls back to repeating the type label. Mirrors iOS Detection.displayVendor's
- *  fallback steps: body cam consults the signature carried in the wire detail string
- *  first (it survives BLE address randomization, where there is no OUI to look up), and
- *  only an unrecognized signature names the category's makers rather than picking one. */
+/** Per-type vendor guess for the dossier subtitle (`maker ?: vendor`), so a row the board could
+ *  not name never repeats its type label there. Body cam reads the signature carried in the wire
+ *  detail string (it survives BLE address randomization, where there is no OUI to look up); an
+ *  unrecognized or missing signature names the category's makers rather than picking one,
+ *  because the category alone cannot name a maker: the Axon payload tag and the broad Motorola
+ *  proxy both arrive as t=3. Also one of the nine Log search fields (LogSearchIndex.foldRow in
+ *  LogScreen.kt), which is why this table is BYTE-IDENTICAL to iOS: a vendor word on one
+ *  platform only means the same query lenses different rows, and a different CSV/GPX, on the
+ *  two phones. Pinned by LogExportLensTest and iOS DetectionLogLensTests ("axon" finds an Axon
+ *  signature and not a Motorola one; "unverified" finds nothing).
+ *  TWIN: iOS `Detection.vendor` in Components.swift, arm for arm, literal for literal. */
 val Detection.vendor: String
     get() = when (type) {
         DeviceType.FLOCK_CAMERA, DeviceType.FLOCK_RAVEN -> "Flock Safety"
@@ -456,8 +514,8 @@ val Detection.vendor: String
         DeviceType.DRONE    -> "Drone maker"
         DeviceType.GLASSES  -> "Smart glasses"
         DeviceType.WATCHED  -> "Starred device"
-        // Named the specific brand (Hikvision/Dahua/...) off the OUI when known; this is the
-        // honest fallback when the exact block isn't in the vendor table.
+        // The dossier leads with `maker` (the "<vendor> on wifi" detail) when the board named
+        // the brand; this is the honest fallback when it did not.
         DeviceType.NETWORK_CAMERA -> "IP camera"
         else -> "Unknown vendor"
     }

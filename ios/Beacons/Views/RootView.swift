@@ -94,44 +94,48 @@ struct RootView: View {
         // falling to ConnectView's scan panel mid-update would invite a racing second connect.
         hasUsableSession || (hasMountedMain && (ble.isReconnecting || ble.isRebootingForUpdate))
     }
+    /// THE LAST HOME THE RESTORE OFFER WAS MISSING. Every other surface that carries it lives on
+    /// the Beacon screen, and `mainIsUsable` false means the tab shell was never mounted or is
+    /// mounted with its opacity at zero, its hit testing off and its accessibility hidden, so
+    /// DeviceView is not reachable: the board ended Desert, the user came back with the board off
+    /// or gone, and alerts stayed silent with nothing on screen and no way out of it. RootView is
+    /// the only view composed in BOTH states, which is why the decision is taken here and handed
+    /// down rather than made inside ConnectView (where the shell is false by construction).
+    ///
+    /// ONE screen reads it here, where Android has two: `mainIsUsable` stays true through an OTA
+    /// reboot (it takes `isRebootingForUpdate`), so the shell keeps carrying the offer for that
+    /// whole window, while AcabApp parks its shell behind a locked wait screen and draws the panel
+    /// on that screen as well. Android twin: the same call in AcabApp.kt, above its early returns.
+    private var connectScreenCarriesRestore: Bool {
+        desertRestoreNeedsPreConnectSurface(
+            restoreOffered: alertRestoreIsOffered(isDemoMode: ble.demoMode,
+                                                  pending: ble.pendingAlertModeRestore),
+            mainShellVisible: mainIsUsable)
+    }
 
     var body: some View {
         ZStack {
             ACABTheme.bg.ignoresSafeArea()
-            if hasMountedMain || hasUsableSession {
-                connectedContent
-                    .opacity(mainIsUsable ? 1 : 0)
-                    .allowsHitTesting(mainIsUsable)
-                    .accessibilityHidden(!mainIsUsable)
-            }
-            if !mainIsUsable {
-                ConnectView(onOpenSetupHelp: {
-                    guard !showFirstRunTour, !showFinishSetup else { return }
-                    showSetupHelp = true
-                })
-                    .background(ACABTheme.bg.ignoresSafeArea())
-                    .zIndex(1)
-            }
-        }
-        // Reconnect "black box" count banner. Lives on RootView (always mounted) so it's
-        // seen no matter which tab is up when the board finishes replaying its buffer.
-        .safeAreaInset(edge: .top, spacing: 0) {
-            VStack(spacing: 8) {
-                if hasMountedMain, ble.isReconnecting {
-                    LinkRecoveryBannerView()
-                        .transition(.move(edge: .top).combined(with: .opacity))
-                }
-                if hasMountedMain, ble.demoMode {
-                    SampleDataBannerView()
-                        .transition(.move(edge: .top).combined(with: .opacity))
-                }
-                if let summary = ble.offlineSyncBanner {
-                    OfflineSyncBannerView(summary: summary)
-                        .transition(.move(edge: .top).combined(with: .opacity))
+            VStack(spacing: 0) {
+                topBanners
+                ZStack {
+                    if hasMountedMain || hasUsableSession {
+                        connectedContent
+                            .opacity(mainIsUsable ? 1 : 0)
+                            .allowsHitTesting(mainIsUsable)
+                            .accessibilityHidden(!mainIsUsable)
+                    }
+                    if !mainIsUsable {
+                        ConnectView(showAlertRestore: connectScreenCarriesRestore,
+                                    onOpenSetupHelp: {
+                            guard !showFirstRunTour, !showFinishSetup else { return }
+                            showSetupHelp = true
+                        })
+                            .background(ACABTheme.bg.ignoresSafeArea())
+                            .zIndex(1)
+                    }
                 }
             }
-            .padding(.horizontal, 14)
-            .padding(.bottom, (hasMountedMain && (ble.isReconnecting || ble.demoMode)) || ble.offlineSyncBanner != nil ? 8 : 0)
         }
         .animation(.easeInOut, value: ble.offlineSyncBanner)
         .onChange(of: legibilityWeight, initial: true) { _, w in
@@ -302,6 +306,44 @@ struct RootView: View {
                 isDemoMode: ble.demoMode,
                 isAppActive: UIApplication.shared.applicationState == .active) else { return }
             ble.requestLocationAccessIfNeeded()
+        }
+    }
+
+    /// Reconnect / sample / replay banners. Lives on RootView (always mounted) so a banner is
+    /// seen no matter which tab is up when the board finishes replaying its buffer. They STACK
+    /// rather than replace each other: a reconnect must not swallow "N detections replayed while
+    /// you were away".
+    ///
+    /// Real layout space above the shell, NOT the `.safeAreaInset(edge: .top)` this used to be.
+    /// The tab shell is a UIKit-backed TabView, and it re-derives its pages' safe area from the
+    /// window, so an ancestor's additional inset never reached a tab: the banner drew straight
+    /// over every screen's title, and over the back chevron of a pushed dossier (whose own top
+    /// bar sits at the same height), which left sample data with no visible way back out of a
+    /// detection. TWIN: android MainScreen.kt, whose banner stack is now the first child of a
+    /// Column above the shell AND above the full-screen dossier, for the same reason and after
+    /// the same bug (a reconnect banner swallowing the dossier's back control). There the top
+    /// banner carries the status-bar inset and the content below consumes it; here the VStack
+    /// is simply outside the shell's safe area, so no inset bookkeeping is needed.
+    @ViewBuilder private var topBanners: some View {
+        let reconnecting = hasMountedMain && ble.isReconnecting
+        let sampleData = hasMountedMain && ble.demoMode
+        if reconnecting || sampleData || ble.offlineSyncBanner != nil {
+            VStack(spacing: 8) {
+                if reconnecting {
+                    LinkRecoveryBannerView()
+                        .transition(.move(edge: .top).combined(with: .opacity))
+                }
+                if sampleData {
+                    SampleDataBannerView()
+                        .transition(.move(edge: .top).combined(with: .opacity))
+                }
+                if let summary = ble.offlineSyncBanner {
+                    OfflineSyncBannerView(summary: summary)
+                        .transition(.move(edge: .top).combined(with: .opacity))
+                }
+            }
+            .padding(.horizontal, 14)
+            .padding(.bottom, 8)
         }
     }
 

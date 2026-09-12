@@ -12,12 +12,9 @@ import android.graphics.Canvas
 import android.graphics.DashPathEffect
 import android.graphics.Paint
 import android.graphics.drawable.BitmapDrawable
-import android.os.SystemClock
-import androidx.activity.compose.BackHandler
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
-import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.selection.toggleable
 import androidx.compose.foundation.layout.Arrangement
@@ -33,6 +30,7 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.shape.CircleShape
@@ -45,9 +43,9 @@ import androidx.compose.material.icons.filled.Refresh
 import androidx.compose.material.icons.automirrored.outlined.ListAlt
 import androidx.compose.material.icons.outlined.Info
 import androidx.compose.material.icons.outlined.Layers
-import androidx.compose.material.icons.outlined.Settings
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.ExperimentalMaterial3Api
+import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
 import androidx.compose.material3.ModalBottomSheet
 import androidx.compose.material3.Switch
@@ -59,6 +57,7 @@ import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableIntStateOf
+import androidx.compose.runtime.mutableLongStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.saveable.rememberSaveable
@@ -66,14 +65,13 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.draw.clipToBounds
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.toArgb
-import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.Role
-import androidx.compose.ui.semantics.clearAndSetSemantics
 import androidx.compose.ui.semantics.selected
 import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.semantics.stateDescription
@@ -112,11 +110,29 @@ import tech.acab.app.model.displayName
  *  can't rebuild thousands of markers on every ~3 Hz emission. */
 private const val MAP_MARKER_CAP = 600
 
-/** How long a skipped overlay rebuild may coast before one is forced anyway. The rebuild gate
- *  keys on visible membership + zoom bucket, but drone flight paths grow, no-GPS RSSI rings
- *  breathe with signal, and cluster composition shifts within a bucket, so this bounded
- *  staleness is the correctness backstop that lets those refresh at ~1 Hz. */
-private const val MAP_REBUILD_MAX_STALE_MS = 1_000L
+/** Cheap overlay rebuild key. [plan] is intentionally compared by identity: its nested groups can
+ * contain the entire retained feed (up to FEED_CAP rows, AcabBleManager), and walking those IDs
+ * just to discover a projection-cache hit would put a feed-sized allocation back on every RSSI
+ * publication. Identity loses nothing: MapRenderPlanCache hands back the prior instance for a
+ * structurally equal plan, so a new instance is always a changed plan. No RSSI field at all: the
+ * one overlay RSSI can move, the no-GPS drone ring, is resized in place by the pass under the
+ * rebuild gate (see [DrawnRing]), so a signal change never tears the other overlays down.
+ * Internal rather than private only so MapProjectionTest can pin that every field moves the key. */
+internal class MapOverlaySignature(
+    private val plan: MapRenderPlan,
+    private val zoomBucket: Int,
+    private val showBreadcrumbs: Boolean,
+    private val showLabels: Boolean,
+    private val spatialRevision: Long,
+    private val ageMinute: Long,
+) {
+    override fun equals(other: Any?): Boolean = other is MapOverlaySignature &&
+        plan === other.plan && zoomBucket == other.zoomBucket &&
+        showBreadcrumbs == other.showBreadcrumbs && showLabels == other.showLabels &&
+        spatialRevision == other.spatialRevision && ageMinute == other.ageMinute
+
+    override fun hashCode(): Int = System.identityHashCode(plan)
+}
 
 /** A row belongs in the map feed when it can produce at least one honest overlay. Operator
  * coordinates are Remote ID telemetry and therefore only meaningful on a drone row. Keeping an
@@ -194,8 +210,18 @@ internal fun configureOsmdroid(context: Context) {
 
 /** Mirrors iOS clusterable(_:): the types that arrive in volume (ambient nearby devices,
  *  trackers, consumer glasses, network cams) collapse into grid bubbles so a dense area
- *  can't spray hundreds of individual pins; fixed surveillance infrastructure (Flock ALPR,
- *  Raven, body cam) and drones always pin individually. */
+ *  can't spray hundreds of individual pins.
+ *
+ *  This predicate is NOT the whole clustering gate on Android, so do not read it as one. At
+ *  street zoom it is: fixed surveillance infrastructure (Flock ALPR, Raven, body cam) and drones
+ *  pin individually, exactly as on iOS. Below MAP_FAR_ZOOM, [buildMapRenderPlan] additionally
+ *  folds every non-RID row into the adaptive grid - see its KDoc for why, MapProjectionTest's
+ *  farZoomCombinesInfrastructureAndPreservesMembersAndCategoryCounts for the pinned behaviour,
+ *  and the "far zooms combine dense points" line in the Map options sheet for what the user is
+ *  told. iOS has no far-zoom clause: it keeps individual infra artwork at every span and narrows
+ *  its annotation budget instead (MapTabView.swift mapInfrastructurePinCap), which drops the
+ *  lowest-priority infra pins outright rather than bucketing them. Drones are exempt on both
+ *  sides. */
 internal fun clusterable(type: DeviceType): Boolean =
     type == DeviceType.NEARBY_DEVICE || type == DeviceType.TRACKER ||
         type == DeviceType.GLASSES || type == DeviceType.NETWORK_CAMERA
@@ -209,9 +235,19 @@ internal fun clusterable(type: DeviceType): Boolean =
 // newest-first, so the last one added was the OLDEST sighting. One pin per spot settles the
 // draw order, the tap and the missing count cue at once.
 //
+// WHERE IT LIVES: buildMapRenderPlan (MapProjection.kt). At street zoom it drops every row that
+// does not grid-cluster onto a PIN_GROUP_EPSILON_DEG cell and SymbolBucket.finish orders each
+// cell with sameSpotOrder; the draw loop in the update block below re-applies that order through
+// orderSameSpotMembers on the live last-seen read it takes per rebuild. A group of ONE keeps its
+// member's own coordinate, so a lone pin renders exactly where it always has; a group of several
+// takes the lead's coordinate rather than an average, because the members are the same spot by
+// construction and averaging would move the pin off the position the lead was stamped with. The
+// pure inputs stay here beside clusterable: the tolerance and the priority table.
+//
 // EVERY individually-pinned type takes part, drones included: the set is exactly the rows that
-// do not grid-cluster, so the filter is !clusterable(type) and there is no second list to keep in
-// step. A drone PIN anchors nothing. Its flight path, operator tether, launch glyph, no-GPS ring
+// do not grid-cluster, so at street zoom the split is !clusterable(type) (below MAP_FAR_ZOOM only
+// drones stay off the grid, see clusterable) and there is no second list to keep in step. A
+// drone PIN anchors nothing. Its flight path, operator tether, launch glyph, no-GPS ring
 // and operator marker are each emitted by a pass over `droneRows` in the update block below, and
 // none of those passes asks whether that row's pin won its group, so an absorbed drone keeps
 // every piece of its artwork. What grouping buys the drone is reachability: at a shared spot only
@@ -237,11 +273,12 @@ internal const val PIN_GROUP_EPSILON_DEG = 1e-5
  *  see: their own watchlist hit first, then the fixed surveillance kinds in the order the app
  *  lists them everywhere else, then anything left over. Shared with iOS.
  *
- *  DRONE ranks here and reaches the grouper like every other individually-pinned type, so this
- *  rank decides real leads: a body cam sharing a drone's spot draws the pin, and the drone is a
- *  member of that pin's sheet. The table is also the cross-platform contract and both suites
- *  assert it, so a type quietly dropping out of one copy is exactly the drift this pairing exists
- *  to catch. */
+ *  DRONE ranks here and reaches same-spot grouping (buildMapRenderPlan, MapProjection.kt) like
+ *  every other individually-pinned type, so this rank decides real leads: a body cam sharing a
+ *  drone's spot draws the pin, and the drone is a member of that pin's sheet. The order is
+ *  applied through sameSpotOrder, the one copy for the projection and the draw loop. The table
+ *  is also the cross-platform contract and both suites assert it, so a type quietly dropping out
+ *  of one copy is exactly the drift this pairing exists to catch. */
 internal fun infraPinPriority(type: DeviceType): Int = when (type) {
     DeviceType.WATCHED -> 0
     DeviceType.FLOCK_CAMERA -> 1
@@ -249,56 +286,6 @@ internal fun infraPinPriority(type: DeviceType): Int = when (type) {
     DeviceType.BODY_CAM -> 3
     DeviceType.DRONE -> 4
     else -> 5
-}
-
-/** Detections sharing one spot, collapsed into the single pin that will be drawn for them. */
-internal data class PinGroup(
-    val lat: Double,
-    val lon: Double,
-    /** Highest priority first ([infraPinPriority]), ties broken most-recently-seen first. */
-    val members: List<Detection>,
-) {
-    /** The member whose pin actually draws, and whose detail opens for a group of one. */
-    val lead: Detection get() = members.first()
-}
-
-/**
- * Group individually-pinned detections by spot (see [PIN_GROUP_EPSILON_DEG]).
- *
- * A group of ONE keeps its member's own coordinate untouched, so a lone pin renders exactly where
- * it renders today. A group of several takes the lead's coordinate rather than an average of the
- * members', for the same reason: the members are the same spot by construction, and averaging
- * would move the pin off the position the lead was actually stamped with.
- *
- * [lastSeenOf] resolves the tie between two members of equal priority. Resolved ONCE per member
- * before the sort, not from inside the comparator, because the caller reads those stamps behind
- * the detection store's lock. A member with no usable stamp sorts last inside its priority band:
- * an undated row never outranks one we can actually date. Ties all the way down keep the caller's
- * order, which is the feed's newest-first.
- */
-internal fun groupPinsBySpot(
-    items: List<Detection>,
-    coordOf: (Detection) -> Pair<Double, Double>?,
-    lastSeenOf: (Detection) -> Long?,
-): List<PinGroup> {
-    if (items.isEmpty()) return emptyList()
-    class Entry(val d: Detection, val lat: Double, val lon: Double, val seen: Long)
-    val buckets = LinkedHashMap<Long, MutableList<Entry>>()
-    for (d in items) {
-        val (lat, lon) = coordOf(d) ?: continue
-        val gx = Math.floor(lon / PIN_GROUP_EPSILON_DEG).toLong()
-        val gy = Math.floor(lat / PIN_GROUP_EPSILON_DEG).toLong()
-        val key = (gx shl 32) xor (gy and 0xFFFFFFFFL)
-        buckets.getOrPut(key) { mutableListOf() }
-            .add(Entry(d, lat, lon, lastSeenOf(d) ?: Long.MIN_VALUE))
-    }
-    return buckets.values.map { bucket ->
-        // A single-member bucket is the overwhelmingly common case; skip the sort for it entirely.
-        val ordered = if (bucket.size == 1) bucket else bucket.sortedWith(
-            compareBy<Entry> { infraPinPriority(it.d.type) }.thenByDescending { it.seen })
-        val lead = ordered.first()
-        PinGroup(lead.lat, lead.lon, ordered.map { it.d })
-    }
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -368,6 +355,16 @@ internal fun pinTitle(category: String, groupSize: Int): String =
 private fun rssiRadiusMeters(rssi: Int): Double =
     Math.pow(10.0, (-50.0 - rssi) / 25.0).coerceIn(5.0, 600.0)   // TxPower -50 dBm, n ~ 2.5
 
+/** A no-GPS drone ring as the last rebuild drew it: the Polygon osmdroid holds, the observer
+ *  coordinate it is centred on, and the RSSI its radius was built from. The rebuild registers one
+ *  per ring it draws; the pass under the rebuild gate resizes it when the RSSI moves, so a signal
+ *  change redraws one polygon instead of tearing every overlay down. The radius stays the raw
+ *  reading, as on iOS (`MapCircle(center: me, radius: rssiRadiusMeters(d.rssi))` in
+ *  MapTabView.swift, where DroneOverlay.rendersSame puts that reading in the render key instead):
+ *  a bars bucket would either leave the drawn radius outside the key or step it away from the iOS
+ *  circle. */
+private class DrawnRing(val polygon: Polygon, val center: GeoPoint, var rssi: Int)
+
 /** Mutable camera memory for the osmdroid MapView, which is torn down whenever the Map tab
  *  leaves composition. A plain holder (not Compose state) so the per-gesture scroll/zoom events
  *  never recompose the screen; rememberSaveable snapshots it via [MapCameraSaver] at save time,
@@ -389,54 +386,8 @@ private val MapCameraSaver = androidx.compose.runtime.saveable.listSaver<MapCame
     },
 )
 
-/** The rows the map can draw at all, plus the valid map coordinate each of them resolved to,
- *  keyed by row id. Resolving one takes the detection store's lock, so the pass that already
- *  pays for it hands the answer to every later pass in the same publish. */
-private class LocatedRows(
-    val rows: List<Detection>,
-    val coords: Map<String, Pair<Double, Double>>,
-)
-
-/** A group of nearby detections collapsed into one map bubble. */
-private data class Cluster(
-    val lat: Double,
-    val lon: Double,
-    val members: List<Detection>,
-    val dominantCategory: String,
-)
-
-/** Grid-cluster detections into bubbles. The cell size shrinks as you zoom in, so the
- *  same world spot splits apart at higher zoom (tap a bubble to zoom in and break it up).
- *  Each cell is roughly a fixed on-screen size regardless of zoom. */
-private fun clusterDetections(
-    items: List<Detection>,
-    zoom: Double,
-    coordOf: (Detection) -> Pair<Double, Double>?,
-): List<Cluster> {
-    if (items.isEmpty()) return emptyList()
-    // osmdroid: ~360 / 2^zoom degrees span the whole tile width. Pick a cell of ~64 of those
-    // pixels' worth of degrees so cells stay a steady screen size; clamp so it never degenerates.
-    val cell = (360.0 / Math.pow(2.0, zoom + 2.0)).coerceIn(1e-6, 5.0)
-    val buckets = LinkedHashMap<Long, MutableList<Pair<Detection, Pair<Double, Double>>>>()
-    for (d in items) {
-        val (lat, lon) = coordOf(d) ?: continue
-        val gx = Math.floor(lon / cell).toLong()
-        val gy = Math.floor(lat / cell).toLong()
-        val key = (gx shl 32) xor (gy and 0xFFFFFFFFL)
-        buckets.getOrPut(key) { mutableListOf() }.add(d to (lat to lon))
-    }
-    return buckets.values.map { bucket ->
-        val members = bucket.map { it.first }
-        val avgLat = bucket.sumOf { it.second.first } / bucket.size
-        val avgLon = bucket.sumOf { it.second.second } / bucket.size
-        val dominant = members.groupingBy { it.type.category }.eachCount()
-            .maxByOrNull { it.value }?.key ?: members.first().type.category
-        Cluster(avgLat, avgLon, members, dominant)
-    }
-}
-
-/** Located detections dropped on a dark map, filterable by category. Fixed installs
- *  use the phone's position from when first heard; drones use their own broadcast coords.
+/** Located detections dropped on a dark map, filterable by category. Non-RID pins use the phone
+ *  position paired with their strongest located RSSI sample; drones use their broadcast coords.
  *  [focus] is a one-shot "open in map" jump from the dossier's location thumbnail: center
  *  close-in on that coordinate, then call [onFocusConsumed] so it never re-applies. */
 @Composable
@@ -448,9 +399,27 @@ fun MapScreen(
     onFocusConsumed: () -> Unit = {},
 ) {
     val context = LocalContext.current
-    val detections by ble.detections.collectAsState()
-    val status by ble.status.collectAsState()
-    val demo by ble.demoMode.collectAsState()
+    val floatingInfoColors = mapInfoColors(Acab.palette)
+    val dynamicRings by ble.mapDynamicRings.collectAsState()
+    // The spatial revision this screen has INSTALLED, not the manager's live one. The live flow is
+    // followed by coalesceDetectionRevisions (MapProjection.kt) under the row-count ceiling that
+    // iOS applies through mapDetectionRefreshInterval: 0.3 s under 500 retained rows, up to 1.0 s
+    // at 4,000. A burst of revisions lands as one snapshot per interval and its LAST revision
+    // always lands (trailing edge). Pan, zoom, filter, scope, toggle and focus rebuilds never wait
+    // on it: they run on the installed snapshot at once. Seeded from the live value so a tab return
+    // starts from the current store rather than owing a wait to a coroutine that was cancelled.
+    var mapEvidenceRev by remember { mutableLongStateOf(ble.spatialEvidenceRev.value) }
+    LaunchedEffect(ble) {
+        coalesceDetectionRevisions(
+            revisions = ble.spatialEvidenceRev,
+            installedRevision = mapEvidenceRev,
+            rowCount = { ble.detections.value.size },
+        ) { mapEvidenceRev = it }
+    }
+    val watchedList by ble.watched.collectAsState()
+    val watchedMacs = remember(watchedList) {
+        watchedList.mapTo(HashSet(watchedList.size)) { it.mac.lowercase() }
+    }
     // Saveable (under the tab shell's SaveableStateProvider): a tab switch must not clear a lens.
     var filter by rememberSaveable { mutableStateOf<String?>(null) }   // category key (null = all)
     // Where the user last left the camera; re-applied when the MapView is rebuilt after a tab
@@ -464,6 +433,7 @@ fun MapScreen(
     // not a lifecycle pause.
     val myLocation = remember { mutableStateOf<MyLocationNewOverlay?>(null) }
     val liveMap = remember { mutableStateOf<MapView?>(null) }
+    val mapInfoWindow = remember { arrayOfNulls<DarkMapInfoWindow>(1) }
     val mapResumed = remember { booleanArrayOf(false) }
     val lifecycleOwner = androidx.lifecycle.compose.LocalLifecycleOwner.current
     androidx.compose.runtime.DisposableEffect(lifecycleOwner) {
@@ -504,15 +474,40 @@ fun MapScreen(
     var visibleDetectionIds by remember { mutableStateOf<List<String>>(emptyList()) }
     // F18: the legend rests as a small info chip; expands on tap, auto-shows while ALPR loads
     var legendExpanded by remember { mutableStateOf(false) }
-    // The LAYERS sheet (known-ALPR dataset toggle lives there; it is a layer, not a filter).
-    var layersOpen by remember { mutableStateOf(false) }
-    // Map settings "gear" menu. Two toggles persisted in SharedPreferences (same mechanism as
-    // the ALPR layer toggle) so they survive relaunch: breadcrumb trails default ON, icon labels OFF.
+    // One readable options sheet owns history scope, display choices and reference layers. Keeping
+    // those controls together avoids two tiny floating menus that overlap the map and each other.
+    var optionsOpen by remember { mutableStateOf(false) }
     val mapPrefs = remember { context.getSharedPreferences("acab.map", Context.MODE_PRIVATE) }
     var showBreadcrumbs by remember { mutableStateOf(mapPrefs.getBoolean("show_breadcrumbs", true)) }
     var showLabels by remember { mutableStateOf(mapPrefs.getBoolean("show_labels", false)) }
-    var mapSettingsOpen by remember { mutableStateOf(false) }
-    BackHandler(enabled = mapSettingsOpen) { mapSettingsOpen = false }
+    var historyScope by remember {
+        mutableStateOf(
+            runCatching {
+                MapHistoryScope.valueOf(mapPrefs.getString("history_scope", null) ?: "Recent")
+            }.getOrDefault(MapHistoryScope.Recent),
+        )
+    }
+    // A Recent row can age out while the radio is quiet. Thirty seconds is plenty for a 15-minute
+    // lens and avoids a permanent per-second recomposition. This is the invalidation tick ONLY;
+    // the comparison clock is recentScopeClock in MapProjection.kt (see scopedIds below).
+    var historyNow by remember { mutableLongStateOf(System.currentTimeMillis()) }
+    LaunchedEffect(historyScope) {
+        historyNow = System.currentTimeMillis()
+        while (true) {
+            delay(30_000L)
+            historyNow = System.currentTimeMillis()
+        }
+    }
+    // A dossier can open an old/undated row from the full Logbook. Clear an unrelated category
+    // and reveal all history before centering, while leaving the manager's mute projection intact.
+    LaunchedEffect(focus) {
+        if (focus != null) {
+            filter = null
+            historyScope = MapHistoryScope.All
+            mapPrefs.edit().putString("history_scope", historyScope.name).apply()
+            historyNow = System.currentTimeMillis()
+        }
+    }
     // one-shot pre-fix centering flag; a plain holder (not Compose state) so setting it
     // inside the update pass doesn't schedule another pass
     val centeredOnce = remember { booleanArrayOf(false) }
@@ -521,10 +516,20 @@ fun MapScreen(
     // full teardown/realloc of up to ~1200 overlays per pass is the map's biggest main-thread
     // cost. Plain holders, not Compose state, same reason as centeredOnce.
     val rebuildSig = remember { arrayOfNulls<Any>(1) }
-    val rebuildAt = remember { longArrayOf(0L) }
+    val projectionCache = remember { MapRenderPlanCache() }
+    // The no-GPS drone rings the last rebuild drew, by drone id. Plain holder, same reason: it is
+    // written from the update pass. Cleared and refilled by every rebuild, resized in place
+    // between rebuilds (see DrawnRing).
+    val drawnRings = remember { HashMap<String, DrawnRing>() }
+    var renderStats by remember {
+        mutableStateOf(MapRenderPlan(emptyList(), emptyList(), emptyList(), 0, 0, 0, 0, 0))
+    }
     // osmdroid gestures do not inherently re-run AndroidView.update. Incremented once after a
     // short quiet period so viewport culling and zoom-dependent clustering also refresh when the
     // detection feed itself is quiet. The pending Runnable is removed when the MapView releases.
+    // READ inside the update block below, and that read is the whole mechanism: AndroidView runs
+    // update under a snapshot observer, so without it this counter invalidates nothing and a pan
+    // into a culled region draws no pins until something else recomposes the screen.
     var viewportRevision by remember { mutableIntStateOf(0) }
     val viewportRefresh = remember { arrayOfNulls<Runnable>(1) }
     val markers = rememberCategoryMarkers()   // category pins, built once
@@ -607,45 +612,76 @@ fun MapScreen(
     }
     var emptyDismissed by remember { mutableStateOf(false) }   // R12: matches iOS dismissible empty banner
 
-    // One pass per publish, not per recomposition: mapCoord takes storeLock per row, so the
-    // up-to-FEED_CAP filter must not re-run for every chip tap or legend toggle. Counts are a
-    // single grouped pass instead of one O(n) scan per category chip.
-    //
-    // The pass also KEEPS the coordinate it resolved, keyed by row id, so every later pass in the
-    // update lambda below reads it instead of asking mapCoord again per row: the viewport cull,
-    // the drone no-GPS RSSI ring, groupPinsBySpot's coordOf, and clusterDetections' bucketing.
-    // That matters because mapCoord falls through to the detection store's lock for every row
-    // without its own broadcast coordinates - nearly the whole log - and that is the same lock
-    // the BLE thread holds while filing a detection, so the redundant lookups contended with
-    // ingest during exactly the dense moments a drive test cares about. Freshness holds: this memo
-    // re-runs on every publish that moves the feed, and a row whose coordinate only just arrived
-    // does not pass the filter below until that same publish either. It also makes the four passes
-    // AGREE - a closest-approach coordinate migration used to land in the cull one publish before
-    // the pin that drew from it, which could briefly place a pin outside the box that let it in.
-    val locatedRows = remember(detections) {
-        // Sized for the pass up front: the feed is capped, and growing a map this pass fills
-        // once per publish would rehash it several times for nothing.
-        val coords = HashMap<String, Pair<Double, Double>>(detections.size)
-        val rows = detections.filter { d ->
-            val c = ble.mapCoord(d)
-            // Only VALID pairs are kept, so a reader downstream can take a present entry at face
-            // value; an out-of-range one is exactly what mapRepresentationCoord already refuses.
-            if (c != null && validCoord(c.first, c.second)) coords[d.id] = c
-            hasMapRepresentation(d.type, c, d.pilotLat, d.pilotLon)
+    // Spatial evidence and active membership share one coalesced revision in the manager, and this
+    // screen installs it on the ceiling above. Routine RSSI/count packets still refresh the no-GPS
+    // ring and tapped rows, but reuse this immutable coordinate projection and never retake
+    // storeLock per row. Keyed on the installed revision: the snapshot reads the store as it stands
+    // when it runs, so every revision the ceiling skipped is already inside it.
+    val locatedEvidence = remember(mapEvidenceRev) {
+        ble.mapEvidenceSnapshot().filter { row ->
+            val d = row.detection
+            hasMapRepresentation(d.type, row.coordinate, d.pilotLat, d.pilotLon)
         }
-        LocatedRows(rows, coords)
     }
-    val located = locatedRows.rows
-    val mapCoords = locatedRows.coords
-    val shown = remember(located, filter) {
-        filter?.let { f -> located.filter { it.type.category == f } } ?: located
+    val located = remember(locatedEvidence) { locatedEvidence.map { it.detection } }
+    // The geometry snapshot intentionally ignores ordinary RSSI/count publishes, but Recent
+    // membership cannot reuse the last-seen values captured with it forever: a stationary device
+    // heard continuously would otherwise age out after 15 minutes. Refresh timing in one lock on
+    // the slow scope tick. `scopedIds` has structural equality, so an unchanged membership keeps
+    // the same scopedEvidence identity and does not invalidate the projection cache.
+    val latestMapLastSeen = remember(locatedEvidence, historyScope, historyNow) {
+        if (historyScope == MapHistoryScope.Recent) ble.mapLastSeenSnapshot(located)
+        else emptyMap()
     }
-    val visibleDetections = remember(shown, visibleDetectionIds) {
-        val byId = shown.associateBy { it.id }
-        visibleDetectionIds.mapNotNull(byId::get)
+    val scopedIds = remember(locatedEvidence, historyScope, latestMapLastSeen, historyNow) {
+        // historyNow is ONLY the invalidation tick in the keys above; the comparison clock is a
+        // wall-clock read inside recentScopeIds (recentScopeClock in MapProjection.kt, pinned by
+        // MapProjectionTest). A row heard since the last tick carries a stamp NEWER than
+        // historyNow, and mapHistoryIncludes rejects a stamp ahead of `now`, so a tick-based
+        // comparison would drop exactly the freshest sightings out of the default Recent lens for
+        // up to 30 seconds. recentScopeIds takes no `now` so the tick cannot be handed in.
+        recentScopeIds(locatedEvidence, historyScope, latestMapLastSeen)
     }
-    val catCounts = remember(located) { located.groupingBy { it.type.category }.eachCount() }
+    val scopedEvidence = remember(locatedEvidence, historyScope, scopedIds) {
+        if (historyScope == MapHistoryScope.All) locatedEvidence
+        else {
+            val allowed = scopedIds.toHashSet()
+            locatedEvidence.filter { it.detection.id in allowed }
+        }
+    }
+    val shownEvidence = remember(scopedEvidence, filter, watchedMacs) {
+        filter?.let { f ->
+            scopedEvidence.filter { it.detection.matchesCategoryFilter(f, watchedMacs) }
+        } ?: scopedEvidence
+    }
+    val shown = remember(shownEvidence) { shownEvidence.map { it.detection } }
+    val mapCoords = remember(locatedEvidence) {
+        locatedEvidence.mapNotNull { row -> row.coordinate?.let { row.detection.id to it } }.toMap()
+    }
+    val shownById = remember(shownEvidence) {
+        shownEvidence.associate { it.detection.id to it.detection }
+    }
+    val visibleDetections = remember(shownById, visibleDetectionIds) {
+        visibleDetectionIds.mapNotNull(shownById::get)
+    }
+    val catCounts = remember(scopedEvidence, watchedMacs) {
+        val scoped = scopedEvidence.map { it.detection }
+        scoped.groupingBy { it.type.category }.eachCount().toMutableMap().apply {
+            // WATCHED is an overlapping lens: a currently starred tracker/camera stays in its
+            // real category and appears here too; a historical t=8 row is counted once.
+            put(WATCHED_FILTER_KEY, watchedDetectionCount(scoped, watchedMacs))
+        }
+    }
     fun count(cat: String) = catCounts[cat] ?: 0
+
+    // A current star can disappear without the detection feed changing. Do not strand the map
+    // behind an invisible zero-count WATCHED lens; historical WATCHED rows keep it alive.
+    LaunchedEffect(filter, watchedMacs, locatedEvidence) {
+        if (filter == WATCHED_FILTER_KEY &&
+            watchedDetectionCount(scopedEvidence.map { it.detection }, watchedMacs) == 0) {
+            filter = null
+        }
+    }
 
     // Markers outlive skipped rebuild passes, so a tap resolves the live row by id instead of
     // handing the dossier the snapshot captured whenever the marker was last built.
@@ -659,22 +695,43 @@ fun MapScreen(
     val mapDescription = when {
         !hasLocationPermission -> buildString {
             append("Map. Phone location is off. ")
-            if (located.isNotEmpty()) append("${located.size} existing or broadcast-located detection")
-            if (located.size > 1) append('s')
-            if (located.isNotEmpty()) append(" shown. ")
+            if (shown.isNotEmpty()) {
+                append("${shown.size} displayed of ${located.size} retained detection")
+                if (located.size != 1) append('s')
+                append(". ")
+            }
             append("New phone-positioned detections cannot be added; drones broadcasting their own coordinates can still appear.")
         }
         located.isEmpty() -> "Map. No located detections yet."
-        else -> "Map. ${located.size} located detection${if (located.size == 1) "" else "s"}."
+        else -> buildString {
+            append("Map. ${shown.size} displayed of ${located.size} retained detections")
+            filter?.let { append(", filter $it") }
+            append(if (historyScope == MapHistoryScope.Recent) ", recent fifteen minutes." else ", all history.")
+            if (renderStats.simplifiedRows > 0 || renderStats.omittedRows > 0) {
+                append(" ${renderStats.symbols.size} map symbols; ${renderStats.simplifiedRows} rows simplified")
+                if (renderStats.omittedRows > 0) append(", ${renderStats.omittedRows} omitted at this zoom")
+                append('.')
+            }
+        }
     }
 
     Box(Modifier.fillMaxSize()) {
         Box(
-            Modifier.fillMaxSize().then(
-                if (mapSettingsOpen) Modifier.clearAndSetSemantics { } else Modifier),
+            Modifier.fillMaxSize(),
         ) {
         AndroidView(
-            modifier = Modifier.fillMaxSize().semantics { contentDescription = mapDescription },
+            // clipToBounds because Compose does NOT clip an AndroidView's own drawing to its
+            // layout slot, and osmdroid's MapView paints its tile canvas from the WINDOW origin
+            // at window size rather than from the slot it was measured into. On the compact
+            // branch the slot already is the full width, so the spill has nothing to cover and
+            // the bug is invisible; on the >= 840.dp branch the slot is inset by the
+            // NavigationRail and the SampleDataBanner, and the tiles painted straight over both,
+            // leaving a tablet user on the Map tab with no visible navigation at all (the rail
+            // still took touches, so it read as the app losing its own chrome). Compose's own
+            // layout was never wrong here - the rail and banner keep their correct semantics
+            // bounds throughout - so clip the spill rather than move anything.
+            modifier = Modifier.fillMaxSize().clipToBounds()
+                .semantics { contentDescription = mapDescription },
             factory = { ctx ->
                 // osmdroid setup (user agent + bounded tile cache) MUST land before the first tile
                 // fetch, and the factory is the last point before MapView is constructed. It used
@@ -723,7 +780,11 @@ fun MapScreen(
                     }
                     overlays.add(self)
                     myLocation.value = self
-                    alprHolder.attach(this)   // known-ALPR folder overlay + pan/zoom re-cull
+                    val darkInfo = DarkMapInfoWindow(this).also {
+                        it.applyColors(floatingInfoColors)
+                    }
+                    mapInfoWindow[0] = darkInfo
+                    alprHolder.attach(this, darkInfo)   // known-ALPR layer + shared dark callout
                     // Only fires when the count changes, so a pan that leaves the number alone
                     // costs no recomposition; the pass it recomposes into early-outs of both the
                     // marker rebuild and the ALPR update, so this cannot feed itself.
@@ -752,72 +813,64 @@ fun MapScreen(
                 }
             },
             update = { map ->
-                // AND-PERF-1: cull to the current viewport (mirrors MapAlpr.rebuild) and cap the
-                // count, so panning over a big log doesn't rebuild thousands of overlays each frame.
-                // A detection stays if its own pin OR its operator pin falls inside the box.
-                //
-                // The cap is on ROWS taken, and it is taken here, from the mixed newest-first set,
-                // BEFORE anything splits infrastructure from the clusterable mass. Same-spot pin
-                // grouping happens further down and only reduces how many MARKERS those surviving
-                // rows produce, so it does not widen this cap and does not change which rows an
-                // ambient-noise flood evicts. Cap policy is deliberately left exactly as it was.
+                // The InfoWindow is a native Android view, outside Compose's color propagation.
+                // Reapply when the app/system contrast preference swaps Acab palettes.
+                mapInfoWindow[0]?.applyColors(floatingInfoColors)
+                // The gesture revision, read for its SNAPSHOT SUBSCRIPTION and nothing else. This
+                // block runs under a snapshot observer, so reading the counter here is what lets
+                // the 140 ms debounced increment in the map listener re-invoke the pass after a
+                // pan or zoom; without the read a gesture refreshes the cull only when something
+                // else happens to recompose. The value is deliberately unused: the plan cache and
+                // the overlay signature below still decide whether overlays are rebuilt, so a pan
+                // that lands on the same cells costs one cached projection and no teardown.
+                @Suppress("UNUSED_VARIABLE")
+                val gestureRevision = viewportRevision
+                // Cached one-pass cull + clustering. Hot RSSI/count publishes still enter this
+                // update lambda, but MapRenderPlanCache returns by identity until geometry, lens,
+                // viewport, zoom or breadcrumb availability actually changes.
                 val box = map.boundingBox
-                fun inBox(lat: Double, lon: Double) =
-                    lat in box.latSouth..box.latNorth && lon in box.lonWest..box.lonEast
+                val viewport = MapViewport(box.latNorth, box.lonEast, box.latSouth, box.lonWest)
                 // One crumb read per tracker per PASS. crumbs() copies the whole trail under the
                 // detection store's lock, and the trail pass further down wants the same list, so
                 // the two share one read instead of copying it twice on a rebuild.
                 val trails = HashMap<String, List<Pair<Double, Double>>>()
                 fun trail(id: String): List<Pair<Double, Double>> =
                     trails.getOrPut(id) { ble.crumbs(id) }
-                // Which of the scanned rows are actually INSIDE the box, collected as the cull
-                // walks them so the in-view set below reads the answer instead of re-deciding it.
-                val inBoxIds = HashSet<String>()
-                val visible = shown.asSequence().filter { d ->
-                    // The coordinate comes from `located`'s pass, so this is pure arithmetic and
-                    // takes no lock (see mapCoords above).
-                    val c = mapCoords[d.id]
-                    val pla = d.pilotLat; val plo = d.pilotLon
-                    val onScreen = (c != null && inBox(c.first, c.second)) ||
-                        (d.type == DeviceType.DRONE && pla != null && plo != null &&
-                            validCoord(pla, plo) && inBox(pla, plo))
-                    if (onScreen) {
-                        inBoxIds.add(d.id)
-                        return@filter true
-                    }
-                    // Drones and trailed trackers are exempt from the box cull (mirrors iOS):
-                    // a flight path or breadcrumb trail can cross the viewport while the pin
-                    // itself sits outside it, and both sets are tiny. Asked only AFTER the box
-                    // test now, so a tracker already on screen needs no trail read to survive.
-                    if (d.type == DeviceType.DRONE) return@filter true
-                    if (showBreadcrumbs && d.type == DeviceType.TRACKER &&
-                        trail(d.id).size >= 2) return@filter true
-                    false
-                }.take(MAP_MARKER_CAP).toList()
-                // The two exemptions above are deliberately stripped back out here: the in-view
-                // chip and its sheet speak for what is in the box, not for the off-screen rows
-                // kept only so their path or trail can cross it.
-                val inViewport = visible.mapNotNull { d -> d.id.takeIf { it in inBoxIds } }
-                if (inViewport != visibleDetectionIds) visibleDetectionIds = inViewport
-                // AND-PERF-3: skip the teardown/realloc when visible membership and the zoom
-                // bucket are unchanged since the last pass. Membership alone is NOT enough
-                // (clusters depend on zoom, drone paths grow, rings track RSSI), so the bounded
-                // staleness override is the correctness backstop.
-                // toggles fold into the signature so flipping a map-setting forces a rebuild even
-                // when the visible set and zoom bucket are unchanged.
-                val signature = Triple(
-                    visible.map { it.id },
-                    (map.zoomLevelDouble * 4).toInt(),
-                    Triple(showBreadcrumbs, showLabels, viewportRevision),
+                val plan = projectionCache.get(
+                    shownEvidence, viewport, map.zoomLevelDouble, MAP_MARKER_CAP,
+                    showBreadcrumbs, hasTrackerTrail = { trail(it).size >= 2 },
                 )
-                val now = SystemClock.uptimeMillis()
-                if (signature != rebuildSig[0] || now - rebuildAt[0] >= MAP_REBUILD_MAX_STALE_MS) {
+                if (plan.inViewportIds != visibleDetectionIds) {
+                    visibleDetectionIds = plan.inViewportIds
+                }
+                if (plan != renderStats) renderStats = plan
+                // AND-PERF-3: skip the teardown/realloc when nothing an overlay draws has moved
+                // since the last pass. Visible membership alone is NOT enough (clusters depend on
+                // zoom, drone paths grow, pin tiers age), so every one of those is a field of the
+                // signature below: the plan identity, the zoom bucket, the two display toggles,
+                // the installed spatial revision and the Recent age minute. The one geometry hot
+                // RSSI moves, the no-GPS drone ring's radius, is deliberately NOT here: it is
+                // resized in place after this gate, so ordinary count/signal changes skip both
+                // projection and overlay churn.
+                val signature = MapOverlaySignature(
+                    plan = plan,
+                    zoomBucket = (map.zoomLevelDouble * 4).toInt(),
+                    showBreadcrumbs = showBreadcrumbs,
+                    showLabels = showLabels,
+                    spatialRevision = mapEvidenceRev,
+                    ageMinute = historyNow / 60_000L,
+                )
+                if (signature != rebuildSig[0]) {
                     rebuildSig[0] = signature
-                    rebuildAt[0] = now
+                    // Current hot fields are resolved only after the cheap signature says actual
+                    // overlays will change. Taps independently resolve the latest row by id.
+                    val currentById = ble.detections.value.associateBy { it.id }
+                    val visible = plan.overlayRows.map { currentById[it.id] ?: it }
                     // rebuild just the detection markers; leave the location dot alone. Overlays
                     // are a CopyOnWriteArrayList, so the pass collects into a plain list and lands
                     // in ONE addAll instead of copying the backing array per marker.
                     map.overlays.removeAll { it is Marker || it is Polyline || it is Polygon }
+                    drawnRings.clear()   // every ring it named went with the Polygons above
                     val fresh = ArrayList<Overlay>()
                     // RING-PEEK: every PIN this pass draws, interleaved lat/lon. Count bubbles are
                     // deliberately absent - a bubble already says "several things here", and
@@ -826,7 +879,7 @@ fun MapScreen(
                     // pin) so the collect never reallocates; same-spot grouping only ever draws
                     // fewer pins than rows, and its members shared a coordinate anyway, so the set
                     // of PLACES a ring can be asked about is exactly what it was before grouping.
-                    val pinPts = DoubleArray(visible.size * 2)
+                    val pinPts = DoubleArray(plan.symbols.size * 2)
                     var pinN = 0
                     // One last-seen read per visible row, taken once for the whole pass. Both new
                     // pin rules want it (a same-spot group breaks its priority ties on it, and
@@ -838,11 +891,7 @@ fun MapScreen(
                     // A pseudo-stamp from the board's buffered replay is an ordering key, not a
                     // clock reading, so it is dropped here and the row is left undated. pinAge
                     // answers RECENT for that, which is the honest tier for a time we do not know.
-                    val seenAt = HashMap<String, Long>(visible.size)
-                    for (d in visible) {
-                        val ls = ble.lastSeen(d.id)
-                        if (ls != null && !ble.isApproxTime(ls)) seenAt[d.id] = ls
-                    }
+                    val seenAt = ble.mapLastSeenSnapshot(visible)
                     val nowMs = System.currentTimeMillis()
                     fun ageOf(d: Detection): PinAge = pinAge(seenAt[d.id], nowMs)
                     // The drone rows, split out ONCE and read by the two DRONE OVERLAY passes:
@@ -893,19 +942,24 @@ fun MapScreen(
                             // From the publish pass, like the cull: no storeLock, and no second
                             // validCoord test because only valid pairs were ever stored.
                             mapCoords[d.id]?.let { (lat, lon) ->
-                                fresh.add(Polygon(map).apply {
-                                    points = Polygon.pointsAsCircle(GeoPoint(lat, lon), rssiRadiusMeters(d.rssi))
+                                val center = GeoPoint(lat, lon)
+                                val ring = Polygon(map).apply {
+                                    points = Polygon.pointsAsCircle(center, rssiRadiusMeters(d.rssi))
                                     fillPaint.color = Acab.droneTone.copy(alpha = 0.08f).toArgb()
                                     outlinePaint.color = Acab.droneTone.copy(alpha = 0.5f).toArgb()
                                     outlinePaint.strokeWidth = 3f
-                                })
+                                }
+                                fresh.add(ring)
+                                // Registered at the RSSI it was built from, so the pass under
+                                // the gate can tell a moved radius from a repeat.
+                                drawnRings[d.id] = DrawnRing(ring, center, d.rssi)
                             }
                         }
                     }
                     // tracker breadcrumb trails, under the markers: the phone's own path while a
                     // tracker stayed with us, drawn DASHED in the tracker tone so it reads as
                     // "this followed me" and stays distinct from the SOLID drone flight paths.
-                    // Gated by the "breadcrumb trail" map setting.
+                    // Gated by the "phone breadcrumb trails" map setting.
                     if (showBreadcrumbs) {
                         visible.filter { it.type == DeviceType.TRACKER }.forEach { d ->
                             // Whatever the cull above already read for this tracker, not a
@@ -921,99 +975,52 @@ fun MapScreen(
                             }
                         }
                     }
-                    // Fixed surveillance infrastructure (Flock ALPR, Raven, body cam), drones and
-                    // anything unclassified always pin individually, so a camera is never lost
-                    // inside a clump. The noisy mass (nearby devices, trackers, glasses, network
-                    // cams) grid-clusters, below, mirroring iOS. (A tracker later flagged as
-                    // "following" will promote back to an individual marker.)
-                    //
-                    // Individually does not mean one pin per row when several rows share a spot:
-                    // groupPinsBySpot collapses those onto the highest-priority member with a
-                    // count badge, so the stack stops swallowing taps and every member stays
-                    // reachable through the badged pin's sheet. Drones are in here with everyone
-                    // else; their overlays come from droneRows above and below and do not care
-                    // which row won. Runs inside the rebuild gate with everything else on this
-                    // path, never per arrival.
-                    val pinGroups = groupPinsBySpot(
-                        visible.filterNot { clusterable(it.type) },
-                        // Publish-pass coordinate, same as the cull: mapCoords already holds the
-                        // validCoord-filtered answer for every row that got this far.
-                        coordOf = { d -> mapCoords[d.id] },
-                        lastSeenOf = { d -> seenAt[d.id] },
-                    )
-                    for (g in pinGroups) {
-                        val d = g.lead
-                        val n = g.members.size
-                        pinPts[pinN++] = g.lat; pinPts[pinN++] = g.lon
-                        fresh.add(Marker(map).apply {
-                            position = GeoPoint(g.lat, g.lon)
-                            val age = ageOf(d)
-                            pinIcon(d.type, age, showLabels, pinArt, pinBadges, n)
-                            // osmdroid's InfoWindow text, and nothing more: this marker consumes
-                            // its own tap so that window never opens, and osmdroid publishes the
-                            // map as ONE opaque surface with no per-marker accessibility node, so
-                            // the title is not a cue on Android (see pinTitle). What the user
-                            // gets instead: the badge in the pin bitmap for the count, the dimmed
-                            // artwork for the STALE tier, the LIST chip's sheet as the
-                            // screen-reader companion (every member of every group is its own
-                            // focusable row there), and, for the age in words, the dossier - which
-                            // this tap opens directly for a lone pin, and which a grouped pin
-                            // reaches one row further on, through the member sheet below.
-                            title = pinTitle(d.type.category, n)
-                            setOnMarkerClickListener { _, _ ->
-                                // One member keeps today's behaviour exactly: straight to the
-                                // dossier. Several open the member sheet, which is the only way
-                                // the ones under the lead are reachable at all.
-                                if (n == 1) {
-                                    selectFresh(d)
-                                } else {
-                                    memberSheetIsViewport = false
-                                    clusterMembers = g.members
-                                }
-                                true
-                            }
-                        })
-                    }
-                    val clusters = clusterDetections(
-                        visible.filter { clusterable(it.type) },
-                        map.zoomLevelDouble,
-                    ) {
-                        // Publish-pass coordinate again, for the same reason as the two passes
-                        // above: bucketing up to MAP_MARKER_CAP rows must not take storeLock once
-                        // per row while the BLE thread is filing detections into it.
-                        mapCoords[it.id]
-                    }
-                    for (c in clusters) {
-                        if (c.members.size == 1) {
-                            val d = c.members.first()
-                            pinPts[pinN++] = c.lat; pinPts[pinN++] = c.lon
+                    // The projection already performed culling, adaptive clustering and exact-pin
+                    // grouping in one pass. Drawing only materializes its bounded symbol list.
+                    for (group in plan.symbols) {
+                        val members = group.members.map { currentById[it.id] ?: it }
+                        if (!group.cluster) {
+                            // Re-ordered on the live last-seen read above, not the snapshot's:
+                            // the snapshot lands on a ceiling and a member may have been heard
+                            // since. Same rule as the projection (sameSpotOrder), one owner.
+                            val ordered = orderSameSpotMembers(members) { seenAt[it] }
+                            val d = ordered.first()
+                            val n = ordered.size
+                            val point = mapCoords[d.id] ?: (group.lat to group.lon)
+                            pinPts[pinN++] = point.first; pinPts[pinN++] = point.second
                             fresh.add(Marker(map).apply {
-                                position = GeoPoint(c.lat, c.lon)
-                                // A lone clusterable row draws a real pin, so it carries the
-                                // recency tier like every other pin. The BUBBLE below never
-                                // does: one tier cannot describe a whole cell's worth of rows,
-                                // and dimming a bubble would date members it does not speak for.
+                                position = GeoPoint(point.first, point.second)
                                 val age = ageOf(d)
-                                pinIcon(d.type, age, showLabels, pinArt, pinBadges, 1)
+                                pinIcon(d.type, age, showLabels, pinArt, pinBadges, n)
+                                title = pinTitle(d.type.category, n)
+                                setOnMarkerClickListener { _, _ ->
+                                    if (n == 1) selectFresh(d) else {
+                                        memberSheetIsViewport = false
+                                        clusterMembers = ordered
+                                    }
+                                    true
+                                }
+                            })
+                        } else if (members.size == 1) {
+                            val d = members.first()
+                            pinPts[pinN++] = group.lat; pinPts[pinN++] = group.lon
+                            fresh.add(Marker(map).apply {
+                                position = GeoPoint(group.lat, group.lon)
+                                pinIcon(d.type, ageOf(d), showLabels, pinArt, pinBadges, 1)
                                 title = pinTitle(d.type.category, 1)
                                 setOnMarkerClickListener { _, _ -> selectFresh(d); true }
                             })
                         } else {
-                            // iOS parity: keep the category tint only when every member shares
-                            // one category; a mixed clump goes neutral instead of masquerading
-                            // as a uniform clump of its dominant type.
-                            val cats = c.members.mapTo(HashSet()) { it.type.category }
-                            val tone = if (cats.size == 1) catTone(c.dominantCategory) else Acab.text
+                            val tone = if (group.homogeneousCategory)
+                                catTone(group.dominantCategory) else Acab.text
                             fresh.add(Marker(map).apply {
-                                position = GeoPoint(c.lat, c.lon)
-                                icon = clusterFactory.marker(c.members.size, tone)
+                                position = GeoPoint(group.lat, group.lon)
+                                icon = clusterFactory.marker(members.size, tone)
                                 setAnchor(Marker.ANCHOR_CENTER, Marker.ANCHOR_CENTER)
-                                title = "${c.members.size} detections"
-                                // F19: tapping a bubble opens the member-list sheet; zoom-stepping
-                                // can never split a same-coordinate clump
+                                title = "${members.size} detections"
                                 setOnMarkerClickListener { _, _ ->
                                     memberSheetIsViewport = false
-                                    clusterMembers = c.members
+                                    clusterMembers = members
                                     true
                                 }
                             })
@@ -1029,6 +1036,7 @@ fun MapScreen(
                                 setAnchor(Marker.ANCHOR_CENTER, Marker.ANCHOR_CENTER)
                                 title = "Operator"
                                 snippet = "operator. this drone broadcasts its pilot's location in its remote ID, so this pin is roughly where it's being flown from."
+                                mapInfoWindow[0]?.let(::setInfoWindow)
                                 // tap explains what OP is, rather than opening the drone's detail
                                 setOnMarkerClickListener { m, _ -> m.showInfoWindow(); true }
                             })
@@ -1037,12 +1045,41 @@ fun MapScreen(
                     map.overlays.addAll(fresh)
                     map.invalidate()
                     // Keep the PREVIOUS array whenever the pins landed in the same places. The
-                    // ALPR layer early-outs on identity, and this pass re-runs once a second even
-                    // when nothing moved (the staleness backstop), so swapping in an equal-but-new
-                    // instance would re-scan the whole node set every second for nothing.
+                    // ALPR layer early-outs on identity, and this rebuild also runs when the
+                    // signature moves without a pin moving (a tracker crumb lands, the 30 s scope
+                    // tick rolls ageMinute over, a label toggle), so swapping in an equal-but-new
+                    // instance would re-index the pins and re-test every drawn ring for nothing.
                     val nextPins = pinPts.copyOf(pinN)
                     if (!nextPins.contentEquals(peekPins[0])) peekPins[0] = nextPins
                 }
+                // The no-GPS drone ring is resized IN PLACE, rebuild or not. Its radius is the one
+                // geometry hot RSSI moves, and a signature field keyed on the ring's RSSI would
+                // redraw every overlay to move one polygon. Everything else about the ring is still
+                // under the gate: its CENTRE comes from mapCoords, so it is covered by the
+                // installed spatial revision, and whether it exists at all follows the drone's own
+                // coordinate, which file() in AcabBleManager bumps the spatial revision for on any
+                // lat/lon change, so a first fix retires the ring through the ordinary rebuild.
+                // What this pass does not invalidate on: a ring whose RSSI is unchanged. What it
+                // can never leave stale: a drawn ring's radius, compared with the latest ring
+                // publish on every pass, so a burst's trailing value is always the one on screen.
+                // A published ring the rebuild did not draw has nothing to resize and is skipped;
+                // it gains a polygon only through a rebuild. That is a drone outside the filter or
+                // the history scope, one the installed revision does not hold yet, one with no
+                // observer coordinate to centre on, or one whose latitude is present but whose
+                // coordinate is invalid (feedSnapshots lists a ring on validCoord, while the
+                // rebuild draws one only for a null latitude). Drones skip the viewport cull, so
+                // an offscreen drone's ring is drawn and resized like any other. Cost on the ~3 Hz
+                // path: one walk of the tiny ring list, and a circle only for a ring that moved.
+                var ringsResized = false
+                for (ring in dynamicRings) {
+                    val drawn = drawnRings[ring.id] ?: continue
+                    if (drawn.rssi == ring.rssi) continue
+                    drawn.rssi = ring.rssi
+                    drawn.polygon.points =
+                        Polygon.pointsAsCircle(drawn.center, rssiRadiusMeters(ring.rssi))
+                    ringsResized = true
+                }
+                if (ringsResized) map.invalidate()
                 // "open in map" jump from a dossier thumbnail: one close-in hop to the sighting,
                 // consumed exactly once so recompositions and tab revisits never re-center.
                 // Follow mode would snap back to the phone on the next fix, so drop it first
@@ -1064,7 +1101,7 @@ fun MapScreen(
                 if (!centeredOnce[0] && myLocation.value?.myLocation == null) {
                     val pts = shown.mapNotNull { d ->
                         mapRepresentationCoord(
-                            d.type, ble.mapCoord(d), d.pilotLat, d.pilotLon)
+                            d.type, mapCoords[d.id], d.pilotLat, d.pilotLon)
                     }
                     if (pts.isNotEmpty()) {
                         centeredOnce[0] = true
@@ -1129,13 +1166,15 @@ fun MapScreen(
                 mapResumed[0] = false
                 if (liveMap.value === map) liveMap.value = null
                 alprHolder.detach()
+                mapInfoWindow[0]?.close()
+                mapInfoWindow[0] = null
                 map.onDetach()
             },
         )
 
         // F17: iOS-style top scrim so the floating header/chips read over the tiles
         Box(
-            Modifier.align(Alignment.TopCenter).fillMaxWidth().height(120.dp)
+            Modifier.align(Alignment.TopCenter).fillMaxWidth().height(176.dp)
                 .background(Brush.verticalGradient(listOf(Acab.bg, Color.Transparent))),
         )
 
@@ -1145,45 +1184,53 @@ fun MapScreen(
                 .fillMaxSize()
                 .padding(horizontal = Acab.pad)
                 .padding(top = 8.dp),
-            verticalArrangement = Arrangement.spacedBy(12.dp),
+            verticalArrangement = Arrangement.spacedBy(8.dp),
         ) {
-            // F19: link chip on the header row, right-aligned like Status
-            Row(verticalAlignment = Alignment.CenterVertically) {
-                Column(verticalArrangement = Arrangement.spacedBy(3.dp)) {
-                    Text("Map", color = Acab.text, fontSize = 26.sp, fontWeight = FontWeight.SemiBold)
-                    Kicker("${located.size} SIGHTING${if (located.size == 1) "" else "S"}")
-                }
-                Spacer(Modifier.weight(1f))
-                LinkChip(version = status?.version, demo = demo)
+            // NO LINK CHIP HERE, deliberately. The connection pill lives on Status and Beacon,
+            // which are where a user goes to ask "is my board there". On the Map it competed with
+            // the counts line for a narrow header: on a Pixel 2 (411dp) the row measured this
+            // Column first, left the pill too little, and "CONNECTED" wrapped mid-word across
+            // three lines. Dropping it also gives the counts the full width. TWIN: iOS
+            // MapTabView.header, which drops it for the same reason - iOS never wrapped (its
+            // Kicker pins one line at default type) but the pill is redundant on both.
+            Column(verticalArrangement = Arrangement.spacedBy(3.dp)) {
+                Text("Map", color = Acab.text, fontSize = 26.sp, fontWeight = FontWeight.SemiBold)
+                val simplified = renderStats.simplifiedRows + renderStats.omittedRows
+                Kicker(buildString {
+                    append("${shown.size} DISPLAYED · ${located.size} RETAINED")
+                    if (simplified > 0) append(" · $simplified SIMPLIFIED")
+                })
             }
             Row(
                 Modifier.horizontalScroll(rememberScrollState()),
                 horizontalArrangement = Arrangement.spacedBy(8.dp),
             ) {
-                // ALL chip, the LAYERS control, and divider are ALWAYS present (they are not
-                // category filters); only the category chips after the divider are dynamic.
-                CatChip(null, "ALL", located.size, filter == null) { filter = null }
-                // LAYERS opens a small sheet holding the known-ALPR dataset toggle. It used to
-                // be an "ALPR MAP" chip inline with the filters, which read as one more filter
-                // when it actually enables an offline dataset download; the sheet has room to
-                // say what turning it on does.
-                LayersChip(alprEnabled, alprLoading) { layersOpen = true }
+                // The active lens is FIRST and fixed outside the category carousel, so it can
+                // never scroll offscreen while continuing to hide points.
+                val activeLabel = filter?.let { "FILTER · $it" } ?: "ALL"
+                CatChip(filter, activeLabel, shown.size, true) { filter = null }
+                OptionsChip(historyScope, alprEnabled, alprLoading) { optionsOpen = true }
                 if (visibleDetections.isNotEmpty()) {
                     MapListChip(visibleDetections.size) {
                         memberSheetIsViewport = true
                         clusterMembers = visibleDetections
                     }
                 }
-                Box(Modifier.widthIn(1.dp, 1.dp).height(18.dp).align(Alignment.CenterVertically).background(Acab.line))   // divider: layer control vs category filters
+            }
+            Row(
+                Modifier.horizontalScroll(rememberScrollState()),
+                horizontalArrangement = Arrangement.spacedBy(8.dp),
+            ) {
                 // Category chips are dynamic: a chip appears only once that category has a
                 // sighting this session, so a zero-count filter never clutters the row.
-                MAP_CATEGORIES.forEach { c ->
+                MAP_CATEGORIES.sortedByDescending { it.key == filter }.forEach { c ->
                     val active = filter == c.key
                     // Active-filter exception: keep the chip while it is the current filter even
                     // if its live count drops to 0 (eviction/staleness). Without this the chip
                     // would vanish out from under the user, leaving the map filtered with no chip
                     // left to tap and no way to clear back to ALL.
-                    if (count(c.key) > 0 || active) {
+                    val visible = count(c.key) > 0 || active
+                    if (visible) {
                         CatChip(c.key, c.label, count(c.key), active) { filter = c.key }
                     }
                 }
@@ -1208,13 +1255,19 @@ fun MapScreen(
         if (alprHint != null) {
             Text(
                 alprHint,
-                color = Acab.dim, fontSize = 10.sp, fontFamily = Acab.mono,
+                color = floatingInfoColors.primaryText,
+                fontSize = 13.sp,
+                lineHeight = 18.sp,
+                fontWeight = FontWeight.Medium,
+                fontFamily = Acab.display,
+                textAlign = TextAlign.Center,
                 modifier = Modifier
                     .align(Alignment.BottomCenter)
                     .padding(bottom = 22.dp)
-                    .background(Acab.bg2.copy(alpha = 0.9f), RoundedCornerShape(Acab.radiusSm))
-                    .border(1.dp, Acab.line, RoundedCornerShape(Acab.radiusSm))
-                    .padding(horizontal = 12.dp, vertical = 7.dp),
+                    .widthIn(max = 320.dp)
+                    .background(floatingInfoColors.surface, RoundedCornerShape(Acab.radiusSm))
+                    .border(1.dp, floatingInfoColors.border, RoundedCornerShape(Acab.radiusSm))
+                    .padding(horizontal = 14.dp, vertical = 9.dp),
             )
         }
 
@@ -1247,11 +1300,11 @@ fun MapScreen(
             // tile credit required by the OSM tile policy / ODbL
             Text(
                 "© OpenStreetMap contributors",
-                color = Acab.dim,
-                fontSize = 9.sp,
+                color = floatingInfoColors.secondaryText,
+                fontSize = 10.sp,
                 fontFamily = Acab.mono,
                 modifier = Modifier
-                    .background(Acab.bg2.copy(alpha = 0.85f), RoundedCornerShape(Acab.radiusSm))
+                    .background(floatingInfoColors.surface, RoundedCornerShape(Acab.radiusSm))
                     .padding(horizontal = 8.dp, vertical = 4.dp),
             )
         }
@@ -1262,27 +1315,37 @@ fun MapScreen(
         // exceptions and offers the fix. With location fine, the empty case explains what appears.
         // Dismissible (R12, matches iOS), and it never eats map gestures: the card has no gesture
         // modifier, so a pan falls through to the map; only the controls consume touch.
-        if ((!hasLocationPermission || located.isEmpty()) && !emptyDismissed) {
+        if ((!hasLocationPermission || scopedEvidence.isEmpty()) && !emptyDismissed) {
             Box(Modifier.align(Alignment.Center).padding(Acab.pad)) {
                 Column(
                     Modifier
-                        .background(Acab.bg2.copy(alpha = 0.92f), RoundedCornerShape(Acab.radius))
-                        .border(1.dp, Acab.line, RoundedCornerShape(Acab.radius))
+                        .background(floatingInfoColors.surface, RoundedCornerShape(Acab.radius))
+                        .border(1.dp, floatingInfoColors.border, RoundedCornerShape(Acab.radius))
                         .padding(20.dp),
                     horizontalAlignment = Alignment.CenterHorizontally,
                     verticalArrangement = Arrangement.spacedBy(8.dp),
                 ) {
                     if (!hasLocationPermission) {
-                        Text("Location permission is off", color = Acab.dim,
-                            fontSize = 14.sp, fontWeight = FontWeight.Medium)
+                        Text(
+                            "Location permission is off",
+                            color = floatingInfoColors.primaryText,
+                            fontSize = 14.sp,
+                            fontWeight = FontWeight.Medium,
+                            modifier = Modifier.padding(end = 28.dp),
+                        )
                         Text("Phone location is off. New non-drone detections cannot be positioned. " +
                             "Drones that broadcast coordinates can still appear, and existing " +
                             "phone-positioned detections stay on the map.",
-                            color = Acab.faint, fontSize = 11.sp, fontFamily = Acab.mono,
+                            color = floatingInfoColors.secondaryText, fontSize = 11.sp,
+                            fontFamily = Acab.mono,
                             textAlign = TextAlign.Center, modifier = Modifier.widthIn(max = 250.dp))
                         Text(
                             "OPEN SETTINGS",
-                            color = Acab.accent, fontSize = 11.sp, fontFamily = Acab.mono,
+                            // accentText, not accent: same bg2 floating-info surface as the
+                            // SHOW ALL HISTORY sibling below, where the fill tone is under AA as
+                            // text (Theme.kt). Twin rule: iOS uses ACABTheme.accentText for crimson
+                            // words on this surface.
+                            color = Acab.accentText, fontSize = 11.sp, fontFamily = Acab.mono,
                             fontWeight = FontWeight.Bold, letterSpacing = 1.sp,
                             modifier = Modifier
                                 .minimumInteractiveComponentSize()
@@ -1296,14 +1359,63 @@ fun MapScreen(
                                 }
                                 .padding(horizontal = 14.dp, vertical = 8.dp),
                         )
-                    } else {
-                        Text("No located detections yet", color = Acab.dim,
-                            fontSize = 14.sp, fontWeight = FontWeight.Medium)
-                        Text("Detections appear here once they're heard with location available.",
-                            color = Acab.faint, fontSize = 11.sp, fontFamily = Acab.mono,
+                    } else if (located.isNotEmpty() && historyScope == MapHistoryScope.Recent) {
+                        // The rows here DO have locations; they are simply older than the lens.
+                        // Copy is byte-identical to iOS MapTabView's emptyBecauseHistoryScope
+                        // branch, down to the one-tap scope switch, so the same state reads the
+                        // same on both phones. The "uses your phone's position" line below
+                        // deliberately does NOT render here: nothing about location is the reason,
+                        // and offering it as one sends the reader to the wrong setting.
+                        Text(
+                            "No recent located detections",
+                            color = floatingInfoColors.primaryText,
+                            fontSize = 14.sp,
+                            fontWeight = FontWeight.Medium,
+                            modifier = Modifier.padding(end = 28.dp),
+                        )
+                        Text(
+                            "The Recent map covers the previous 15 minutes. Older located " +
+                                "detections are still retained in the Log.",
+                            color = floatingInfoColors.secondaryText, fontSize = 11.sp,
+                            fontFamily = Acab.mono,
                             textAlign = TextAlign.Center, modifier = Modifier.widthIn(max = 250.dp))
+                        // accentText, not accent: a crimson WORD on the bg2 info surface, where
+                        // the fill tone is under AA as text (Theme.kt). Same cut as the iOS twin
+                        // (`.foregroundStyle(ACABTheme.accentText)` on its SHOW ALL HISTORY).
+                        Text(
+                            "SHOW ALL HISTORY",
+                            color = Acab.accentText, fontSize = 11.sp, fontFamily = Acab.mono,
+                            fontWeight = FontWeight.Bold, letterSpacing = 1.sp,
+                            modifier = Modifier
+                                .minimumInteractiveComponentSize()
+                                .clip(CircleShape)
+                                .border(1.dp, Acab.lineStrong, CircleShape)
+                                .clickable {
+                                    historyScope = MapHistoryScope.All
+                                    mapPrefs.edit()
+                                        .putString("history_scope", historyScope.name).apply()
+                                }
+                                .padding(horizontal = 14.dp, vertical = 8.dp),
+                        )
+                    } else {
+                        Text(
+                            "No located detections yet",
+                            color = floatingInfoColors.primaryText,
+                            fontSize = 14.sp,
+                            fontWeight = FontWeight.Medium,
+                            modifier = Modifier.padding(end = 28.dp),
+                        )
+                        Text(
+                            "Detections appear here once they're heard with location available.",
+                            color = floatingInfoColors.secondaryText, fontSize = 11.sp,
+                            fontFamily = Acab.mono,
+                            textAlign = TextAlign.Center, modifier = Modifier.widthIn(max = 250.dp))
+                        // Scoped to THIS branch only, exactly as iOS scopes it: it explains why a
+                        // detection has no location at all, which is untrue of the recent-scope
+                        // branch above.
                         Text("ALPR, body cam, glasses, network camera and tracker hits use your phone's position; drones report their own.",
-                            color = Acab.faint, fontSize = 11.sp, fontFamily = Acab.mono,
+                            color = floatingInfoColors.secondaryText, fontSize = 11.sp,
+                            fontFamily = Acab.mono,
                             textAlign = TextAlign.Center, modifier = Modifier.widthIn(max = 250.dp))
                     }
                 }
@@ -1311,97 +1423,35 @@ fun MapScreen(
                     Modifier.align(Alignment.TopEnd)
                         .minimumInteractiveComponentSize()
                         .size(26.dp)
-                        .background(Acab.bg2, CircleShape)
-                        .border(1.dp, Acab.line, CircleShape)
+                        .background(floatingInfoColors.surface, CircleShape)
+                        .border(1.dp, floatingInfoColors.border, CircleShape)
                         .clickable { emptyDismissed = true },
                     contentAlignment = Alignment.Center,
                 ) {
                     Icon(Icons.Filled.Close, contentDescription = "dismiss",
-                        tint = Acab.dim, modifier = Modifier.size(13.dp))
+                        tint = floatingInfoColors.primaryText, modifier = Modifier.size(13.dp))
                 }
             }
         }
         }
 
-        // Bottom-left stack: the map-settings gear (with its dropdown) sits above the legend.
-        // Composed last so the settings menu's full-screen tap-away scrim floats over the map
-        // and the other overlays; the scrim only exists while the menu is open.
+        // Bottom-left legend. Display/history/layer controls moved to the single Options sheet.
         // F18 legend: DERIVED, not latched - auto-expands only while the ALPR dataset actually
         // downloads (keyed to `downloading`, not `loading`, so the per-enable manifest freshness
         // check never force-opens it and overrides the user's collapsed state).
         val legendOpen = legendExpanded || alprDownloading
-        if (mapSettingsOpen) {
-            Box(
-                // Pointer-only tap-away layer: the visible gear/menu controls are the accessible
-                // actions. Publishing this full-screen scrim as an unlabeled clickable made
-                // TalkBack land on a giant mystery button.
-                Modifier.fillMaxSize().pointerInput(Unit) {
-                    detectTapGestures { mapSettingsOpen = false }
-                },
-            )
-        }
         Column(
             Modifier.align(Alignment.BottomStart).padding(Acab.pad),
             verticalArrangement = Arrangement.spacedBy(8.dp),
         ) {
-            // settings dropdown card, above the gear, matching the legend card styling
-            if (mapSettingsOpen) {
-                Column(
-                    // Capped, not just floored: the breadcrumb caption below is a full sentence and
-                    // an uncapped min-width card would stretch it edge to edge across a tablet.
-                    Modifier
-                        .widthIn(min = 196.dp, max = 264.dp)
-                        .background(Acab.bg2.copy(alpha = 0.95f), RoundedCornerShape(Acab.radiusSm))
-                        .border(1.dp, Acab.line, RoundedCornerShape(Acab.radiusSm))
-                        .padding(horizontal = 12.dp, vertical = 8.dp),
-                    verticalArrangement = Arrangement.spacedBy(2.dp),
-                ) {
-                    // The trail is the other tracker-only surface a user will assume is universal
-                    // (it draws nothing for a body cam, and that silence reads as "nothing to
-                    // draw"), so it carries the SAME scope sentence as the detail-screen follow
-                    // panel that scores the same crumbs. One sentence, one place it is authored.
-                    MapSettingRow("breadcrumb trail", showBreadcrumbs,
-                        note = FollowEvidence.SCOPE_TEXT) {
-                        showBreadcrumbs = it
-                        mapPrefs.edit().putBoolean("show_breadcrumbs", it).apply()
-                    }
-                    MapSettingRow("icon labels", showLabels) {
-                        showLabels = it
-                        mapPrefs.edit().putBoolean("show_labels", it).apply()
-                    }
-                    // known-ALPR layer: the same toggle the chip row flips (one store, always
-                    // in sync), repeated here so the layer controls live with the map settings.
-                    MapSettingRow("known ALPR", alprEnabled) { alpr.setEnabled(it) }
-                    if (alprEnabled) {
-                        AlprDatasetRows(alpr, alprNodes, alprLoading, alprShowUnverified,
-                                        alprUnverifiedCount, alpr.rawTier)
-                    }
-                }
-            }
-            // gear chip, mirroring the legend info chip. stateDescription: the accent border is
-            // the only sighted cue that the menu is open, so TalkBack needs the same fact.
-            Box(
-                Modifier
-                    .minimumInteractiveComponentSize()   // 34dp chip, 48dp touch target
-                    .size(34.dp)
-                    .background(Acab.bg2.copy(alpha = 0.85f), CircleShape)
-                    .border(1.dp, if (mapSettingsOpen) Acab.accent else Acab.line, CircleShape)
-                    .clickable { mapSettingsOpen = !mapSettingsOpen }
-                    .semantics { stateDescription = if (mapSettingsOpen) "expanded" else "collapsed" },
-                contentAlignment = Alignment.Center,
-            ) {
-                Icon(Icons.Outlined.Settings, contentDescription = "Map settings",
-                    tint = if (mapSettingsOpen) Acab.accent else Acab.dim,
-                    modifier = Modifier.size(16.dp))
-            }
             // legend: expanded card, or the small info chip
             if (legendOpen) {
                 // stateDescription on both legend states: the chip and the card are the same
                 // control to TalkBack (tap = toggle), so each names which side it is on.
                 Column(
                     Modifier
-                        .background(Acab.bg2.copy(alpha = 0.85f), RoundedCornerShape(Acab.radiusSm))
-                        .border(1.dp, Acab.line, RoundedCornerShape(Acab.radiusSm))
+                        .background(floatingInfoColors.surface, RoundedCornerShape(Acab.radiusSm))
+                        .border(1.dp, floatingInfoColors.border, RoundedCornerShape(Acab.radiusSm))
                         .clickable { legendExpanded = false }
                         .semantics { stateDescription = "expanded" }
                         .padding(11.dp),
@@ -1462,8 +1512,9 @@ fun MapScreen(
                             hollow = true,
                             wide = true,
                         )
-                        Text("cameras: OpenStreetMap ODbL · DeFlock", color = Acab.faint,
-                            fontSize = 8.5.sp, fontFamily = Acab.mono)
+                        Text("cameras: OpenStreetMap ODbL · DeFlock",
+                            color = floatingInfoColors.secondaryText,
+                            fontSize = 11.sp, fontFamily = Acab.mono)
                     }
                 }
             } else {
@@ -1471,32 +1522,71 @@ fun MapScreen(
                     Modifier
                         .minimumInteractiveComponentSize()   // 34dp chip, 48dp touch target
                         .size(34.dp)
-                        .background(Acab.bg2.copy(alpha = 0.85f), CircleShape)
-                        .border(1.dp, Acab.line, CircleShape)
+                        .background(floatingInfoColors.surface, CircleShape)
+                        .border(1.dp, floatingInfoColors.border, CircleShape)
                         .clickable { legendExpanded = true }
                         .semantics { stateDescription = "collapsed" },
                     contentAlignment = Alignment.Center,
                 ) {
-                    Icon(Icons.Outlined.Info, contentDescription = "Map legend", tint = Acab.dim,
+                    Icon(Icons.Outlined.Info, contentDescription = "Map legend",
+                        tint = floatingInfoColors.primaryText,
                         modifier = Modifier.size(16.dp))
                 }
             }
         }
     }
 
-    // LAYERS sheet: the known-ALPR reference layer's toggle, out of the filter row so a layer
-    // that carries a dataset download (now on by default) can explain itself.
-    if (layersOpen) {
+    // One sheet, three plainly-labelled sections. History scope changes only Map; the retained
+    // Logbook remains complete. Display settings and downloaded reference data no longer hide in
+    // separate floating controls.
+    if (optionsOpen) {
         ModalBottomSheet(
-            onDismissRequest = { layersOpen = false },
+            onDismissRequest = { optionsOpen = false },
             containerColor = Acab.bg3,
             shape = RoundedCornerShape(topStart = 24.dp, topEnd = 24.dp),
         ) {
             Column(
-                Modifier.padding(horizontal = Acab.pad).padding(bottom = 28.dp),
+                Modifier
+                    .fillMaxWidth()
+                    .verticalScroll(rememberScrollState())
+                    .padding(horizontal = Acab.pad)
+                    .padding(bottom = 28.dp),
                 verticalArrangement = Arrangement.spacedBy(10.dp),
             ) {
-                Text("Map layers", color = Acab.text, fontSize = 20.sp, fontWeight = FontWeight.SemiBold)
+                Text("Map options", color = Acab.text, fontSize = 20.sp, fontWeight = FontWeight.SemiBold)
+                Kicker("HISTORY")
+                MapScopeRow(
+                    label = "Recent · 15 minutes",
+                    note = "Keeps the live map readable. Older evidence stays in Logbook.",
+                    selected = historyScope == MapHistoryScope.Recent,
+                ) {
+                    historyScope = MapHistoryScope.Recent
+                    mapPrefs.edit().putString("history_scope", historyScope.name).apply()
+                }
+                MapScopeRow(
+                    label = "All history",
+                    note = "Shows every retained located sighting; far zooms combine dense points.",
+                    selected = historyScope == MapHistoryScope.All,
+                ) {
+                    historyScope = MapHistoryScope.All
+                    mapPrefs.edit().putString("history_scope", historyScope.name).apply()
+                }
+                HorizontalDivider(color = Acab.line)
+                Kicker("DISPLAY")
+                MapSettingRow("phone breadcrumb trails", showBreadcrumbs,
+                    note = FollowEvidence.SCOPE_TEXT) {
+                    showBreadcrumbs = it
+                    mapPrefs.edit().putBoolean("show_breadcrumbs", it).apply()
+                }
+                MapSettingRow("icon labels", showLabels) {
+                    showLabels = it
+                    mapPrefs.edit().putBoolean("show_labels", it).apply()
+                }
+                HorizontalDivider(color = Acab.line)
+                // BYTE-IDENTICAL to iOS MapTabView's `mapOptionsSection("REFERENCE OVERLAYS · NOT
+                // FILTERS")`, header and the ALPR note below alike: the toggles here draw
+                // reference data over the map and never hide a detection, and the two sheets
+                // must say so in the same words.
                 Kicker("REFERENCE OVERLAYS · NOT FILTERS")
                 Row(
                     Modifier.fillMaxWidth().minimumInteractiveComponentSize()
@@ -1511,7 +1601,9 @@ fun MapScreen(
                     Column(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(2.dp)) {
                         Text("known ALPR cameras", color = Acab.text, fontSize = 14.sp,
                             fontWeight = FontWeight.Medium)
-                        Text("draws a fixed dataset of reported camera locations (OpenStreetMap · DeFlock). on by default. the dataset downloads once and works offline; turn it off to hide the pins.",
+                        // The source credit ("cameras: OpenStreetMap ODbL · DeFlock") is the map
+                        // legend's job on both phones; this note carries the privacy disclosure.
+                        Text("draws community-mapped camera locations, on by default. the dataset is one offline download; no location, viewport, or detection data is attached, and the site host sees an ordinary web request. pins are mapped locations, not live detections.",
                             color = Acab.faint, fontSize = 11.sp, fontFamily = Acab.mono)
                     }
                     Spacer(Modifier.size(12.dp))
@@ -1529,6 +1621,10 @@ fun MapScreen(
                             uncheckedBorderColor = Acab.line,
                         ),
                     )
+                }
+                if (alprEnabled) {
+                    AlprDatasetRows(alpr, alprNodes, alprLoading, alprShowUnverified,
+                        alprUnverifiedCount, alpr.rawTier)
                 }
             }
         }
@@ -1667,6 +1763,32 @@ private fun MapSettingRow(label: String, checked: Boolean, note: String? = null,
         note?.let {
             Text(it, color = Acab.faint, fontSize = 9.sp, fontFamily = Acab.mono, lineHeight = 12.sp,
                 modifier = Modifier.padding(end = 8.dp, bottom = 4.dp))
+        }
+    }
+}
+
+/** Large-text-safe history choice for the unified Options sheet. The full row is the radio target;
+ * the note is merged into its accessibility label. */
+@Composable
+private fun MapScopeRow(label: String, note: String, selected: Boolean, onSelect: () -> Unit) {
+    Row(
+        Modifier.fillMaxWidth().minimumInteractiveComponentSize()
+            .toggleable(value = selected, role = Role.RadioButton) { if (it) onSelect() }
+            .semantics(mergeDescendants = true) { this.selected = selected }
+            .padding(vertical = 5.dp),
+        verticalAlignment = Alignment.Top,
+        horizontalArrangement = Arrangement.spacedBy(10.dp),
+    ) {
+        Box(
+            Modifier.size(20.dp).border(1.dp, if (selected) Acab.accent else Acab.line, CircleShape),
+            contentAlignment = Alignment.Center,
+        ) {
+            if (selected) Box(Modifier.size(10.dp).background(Acab.accent, CircleShape))
+        }
+        Column(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(3.dp)) {
+            Text(label, color = Acab.text, fontSize = 14.sp, fontWeight = FontWeight.Medium)
+            Text(note, color = Acab.faint, fontSize = 11.sp, fontFamily = Acab.mono,
+                lineHeight = 15.sp)
         }
     }
 }
@@ -1825,27 +1947,33 @@ private fun LegendRow(color: Color, label: String, hollow: Boolean = false, wide
         val dot = if (hollow) Modifier.size(dotSize).border(1.5.dp, color, RoundedCornerShape(50))
                   else Modifier.size(dotSize).background(color, RoundedCornerShape(50))
         Box(Modifier.size(12.dp), contentAlignment = Alignment.Center) { Box(dot) }
-        Text(label, color = Acab.dim, fontSize = 11.sp, fontFamily = Acab.mono)
+        Text(label, color = Acab.text, fontSize = 12.sp, lineHeight = 16.sp,
+            fontFamily = Acab.mono)
     }
 }
 
-/** Opens the map-layers sheet. Same capsule anatomy as the filter chips, but labeled LAYERS so
- *  it stops masquerading as a filter: the known-ALPR toggle it fronts enables an offline dataset
- *  download, and that deserves a sheet with an explanation, not a bare chip flip. The chip fills
- *  with the flock tone while the layer is on so its state stays glanceable from the row. */
+/** Opens the unified history/display/reference-overlay sheet. The current time scope stays visible
+ * on the closed chip, which is the map's most consequential display choice. */
 @Composable
-private fun LayersChip(alprEnabled: Boolean, loading: Boolean, onClick: () -> Unit) {
-    val tone = Acab.flockTone
+private fun OptionsChip(
+    scope: MapHistoryScope,
+    alprEnabled: Boolean,
+    loading: Boolean,
+    onClick: () -> Unit,
+) {
     val shape = RoundedCornerShape(50)
     Row(
         Modifier
             .minimumInteractiveComponentSize()
-            .background(if (alprEnabled) tone else Acab.bg2, shape)
-            .border(1.dp, if (alprEnabled) Color.Transparent else Acab.line, shape)
+            .background(Acab.bg2, shape)
+            .border(1.dp, Acab.line, shape)
             .clickable(onClick = onClick)
-            // The fill tone is the only sighted cue that the known-ALPR layer is on; give
-            // TalkBack the same fact instead of a bare "LAYERS" with no state.
-            .semantics { stateDescription = if (alprEnabled) "on" else "off" }
+            .semantics {
+                stateDescription = buildString {
+                    append(if (scope == MapHistoryScope.Recent) "recent fifteen minutes" else "all history")
+                    append(if (alprEnabled) ", known ALPR layer on" else ", known ALPR layer off")
+                }
+            }
             .padding(horizontal = 11.dp, vertical = 7.dp),
         verticalAlignment = Alignment.CenterVertically,
         horizontalArrangement = Arrangement.spacedBy(5.dp),
@@ -1854,14 +1982,14 @@ private fun LayersChip(alprEnabled: Boolean, loading: Boolean, onClick: () -> Un
             CircularProgressIndicator(
                 Modifier.size(10.dp),
                 strokeWidth = 1.5.dp,
-                color = if (alprEnabled) Acab.onAccent else Acab.dim,
+                color = Acab.dim,
             )
         }
         Icon(Icons.Outlined.Layers, contentDescription = null,
-            tint = if (alprEnabled) Acab.onAccent else Acab.dim, modifier = Modifier.size(12.dp))
+            tint = Acab.dim, modifier = Modifier.size(12.dp))
         Text(
-            "LAYERS",
-            color = if (alprEnabled) Acab.onAccent else Acab.dim,
+            if (scope == MapHistoryScope.Recent) "OPTIONS · 15M" else "OPTIONS · ALL",
+            color = Acab.dim,
             fontSize = 10.5.sp,
             letterSpacing = 0.5.sp,
             fontWeight = FontWeight.Bold,
@@ -1902,6 +2030,7 @@ private fun catTone(cat: String?): Color = when (cat) {
     "TRACKER" -> Acab.trackerTone
     "GLASSES" -> Acab.glassesTone
     "CAMERA" -> Acab.netcamTone
+    WATCHED_FILTER_KEY -> Acab.watchTone
     else -> Acab.accent
 }
 
@@ -1918,6 +2047,7 @@ private val MAP_CATEGORIES = listOf(
     MapCategory("TRACKER", "TRACKER"),
     MapCategory("GLASSES", "GLASSES"),
     MapCategory("CAMERA", "NETWORK CAM"),
+    MapCategory(WATCHED_FILTER_KEY, "WATCHED"),
 )
 
 /** Pill chip that filters the pins to one category; active fills with its tone. */

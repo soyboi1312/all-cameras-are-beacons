@@ -1,0 +1,63 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  osmdroid's stock bubble hardcodes black text on a light-grey nine-patch. Map callouts live over
+  unpredictable tiles, so this view owns an opaque app-themed surface and explicit readable type.
+  The four bubble_* IDs are the contract consumed by MarkerInfoWindow.
+-->
+<LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    android:layout_width="wrap_content"
+    android:layout_height="wrap_content"
+    android:minWidth="176dp"
+    android:maxWidth="300dp"
+    android:orientation="vertical"
+    android:background="@drawable/map_info_window_bg"
+    android:paddingStart="14dp"
+    android:paddingTop="12dp"
+    android:paddingEnd="14dp"
+    android:paddingBottom="12dp"
+    android:elevation="8dp">
+
+    <ImageView
+        android:id="@+id/bubble_image"
+        android:layout_width="48dp"
+        android:layout_height="48dp"
+        android:layout_marginBottom="8dp"
+        android:contentDescription="@null"
+        android:scaleType="centerInside"
+        android:visibility="gone" />
+
+    <TextView
+        android:id="@+id/bubble_title"
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:maxWidth="272dp"
+        android:fontFamily="@font/space_grotesk_medium"
+        android:textColor="#FFF4EEF0"
+        android:textSize="14sp"
+        android:lineSpacingExtra="2dp"
+        android:textStyle="bold" />
+
+    <TextView
+        android:id="@+id/bubble_description"
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:layout_marginTop="5dp"
+        android:maxWidth="272dp"
+        android:fontFamily="@font/space_grotesk_regular"
+        android:textColor="#FFAA9FA2"
+        android:textSize="13sp"
+        android:lineSpacingExtra="3dp" />
+
+    <TextView
+        android:id="@+id/bubble_subdescription"
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:layout_marginTop="5dp"
+        android:maxWidth="272dp"
+        android:fontFamily="@font/jetbrains_mono_regular"
+        android:textColor="#FFAA9FA2"
+        android:textSize="11sp"
+        android:lineSpacingExtra="2dp"
+        android:visibility="gone" />
+
+</LinearLayout>

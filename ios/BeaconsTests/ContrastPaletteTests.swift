@@ -66,6 +66,39 @@ final class ContrastPaletteTests: XCTestCase {
         }
     }
 
+    /// Map callouts and legends float over arbitrary tiles. What keeps them readable is that
+    /// `mapInfoBackground` is OPAQUE: an opaque layer screens the tile off, so the composited
+    /// backdrop IS the surface and one measurement covers every tile. The real ink is therefore
+    /// measured once, not re-measured per tile for the same number.
+    ///
+    /// The opacity assertion is also the only reliable detector of a surface going translucent,
+    /// which is why it is asserted directly: a DARK tile bleeding through a sheer surface RAISES
+    /// contrast against pale ink, so a tile sweep alone could miss it.
+    ///
+    /// The sweep instead runs a deliberately sheer cut of the same surface, the one arrangement
+    /// in which a tile reaches the ink, and asserts every tile MOVES the measurement. That is the
+    /// compositing path this whole file rests on, kept live. It deliberately does not assert how
+    /// far the bleed hurts: that number is a fact about this palette being dark, not about the
+    /// invariant, and it would fire spuriously if the callout were ever restyled light-on-dark.
+    /// Android twin: `mapInformationSurfaceIsOpaqueAndItsTextStaysReadableOverAnyTile`.
+    func testMapInformationStaysOpaqueAndReadableOverAnyMapTile() {
+        let pale = ACABTone(0xFFFFFF), mid = ACABTone(0x808080), dark = ACABTone(0x000000)
+        for palette in [ACABPalette.normal, ACABPalette.high] {
+            XCTAssertEqual(palette.mapInfoBackground.a, 1)
+            XCTAssertEqual(palette.mapInfoText.a, 1)
+            let onSurface = ratio(palette.mapInfoText, on: palette.mapInfoBackground)
+            XCTAssertGreaterThanOrEqual(onSurface, 7)
+
+            let sheer = ACABTone(r: palette.mapInfoBackground.r,
+                                 g: palette.mapInfoBackground.g,
+                                 b: palette.mapInfoBackground.b, a: 0.5)
+            for tile in [pale, mid, dark] {
+                XCTAssertNotEqual(ratio(palette.mapInfoText, on: sheer.over(tile)), onSurface,
+                                  accuracy: 0.01, "a sheer surface must let the tile through")
+            }
+        }
+    }
+
     func testFaintStaysQuieterThanDimWhichStaysQuieterThanText() {
         for p in [ACABPalette.normal, ACABPalette.high] {
             for (_, s) in surfaces(p) {

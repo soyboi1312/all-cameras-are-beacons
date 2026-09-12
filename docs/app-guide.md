@@ -20,18 +20,30 @@ make the first pairing in trusted surroundings: an unowned board accepts its fir
 
 ## read the results
 
-- **Status** counts devices heard in roughly the last 45 seconds. tap a category for its filtered Log, or its detector setting when disabled.
-- **Log** keeps sightings on your phone while disconnected. filter rows, inspect match evidence and signal history, or export the rows you are viewing as CSV or GPX.
-- **Map** combines located sightings with an optional community-mapped camera layer.
+- **Status** counts devices heard in roughly the last 45 seconds, with matched/watched devices separated from Desert-mode ambient radios. an unfamiliar firmware category appears separately as **unclassified**, not as an ordinary nearby device. the radar draws at most 14 dots, prioritizing stars and recognized matches; its total still includes every recent, unmuted device. a detector switched off keeps its recent count and adds an **OFF** label. tap a nonzero category count for its Log, or an empty disabled category for its detector setting.
+- **Log** keeps sightings on your phone while disconnected. search names, vendors, or full/partial hardware addresses; combine the search with category and New/Offline filters; and sort by newest or strongest signal. CSV and GPX exports use the same matching rows and order, including when the Log is paused.
+- **Map** combines located sightings with an optional community-mapped camera layer. **Recent** shows devices with a known sighting in the last 15 minutes; choose **All history** in Map options to include older or undated retained sightings. this is a display filter: it does not stop recording or remove anything from the Log.
 - **Beacon** controls detector categories, alert behavior, radios, offline buffering, firmware updates, and setup readiness.
 
-most map pins show where your phone heard a signal, using its strongest sighting, rather than the device's exact location. Remote ID drones can supply aircraft coordinates and sometimes operator coordinates; vendor-only drone matches do not provide those positions. community-mapped cameras are a separate dataset. a missing pin does not prove that no camera exists.
+Status names the strongest recent match and shows when it was last heard; with no matched devices, it falls back to an explicitly labelled unclassified or ambient sighting. a user-assigned name takes precedence over the broadcast name. the radar shows signal strength, not bearing or an exact distance.
 
-the confidence percentage describes the specificity of the matching evidence, not signal strength. open a detection for identifiers, first and last sightings, location context, and why it matched. weak vendor matches need confirmation. tracker details can show **Seen with you** evidence from the current app session; a sighting or repeated nearby presence is not a stalking verdict.
+Beacon puts routine scan and alert controls first in its hardware group and separates phone notifications, Live Mode, and display preferences. connection labels distinguish reconnecting and secure setup from a ready link. radio labels wait for board status instead of assuming scanning is active. firmware summaries distinguish an available update, progress, completion, failure, and an unfinished second-radio update; open the summary for details or recovery actions.
+
+most map pins show where your phone heard a signal, using its strongest sighting with a recorded location, rather than the device's exact location. a stronger RSSI moves the pin to that sighting's location; equal or weaker signals leave it in place. Remote ID drones can supply aircraft coordinates and sometimes operator coordinates; vendor-only drone matches do not provide those positions. community-mapped cameras are a separate dataset. a missing pin does not prove that no camera exists.
+
+the Log and Map offer a **Watched** category when they contain watched/starred detections, including starred devices that also belong to another category.
+
+the Map groups nearby pins and can simplify marker symbols in crowded or zoomed-out views. iPhone also simplifies dense trail rendering; on either platform you can switch map trails off if you do not need them. zoom in for more detail. its counts distinguish the current display from retained located history; filtering and simplification do not discard saved evidence. Map options groups history, display, and reference-overlay controls in one sheet; the overlays are not filters, so switching one off never hides a detection.
+
+the confidence percentage describes the specificity of the matching evidence, not signal strength. open a detection for identifiers, first and last sightings, location context, and why it matched. weak vendor matches need confirmation. open a tracker in the Log to see its breadcrumb trail on the detail map: these are your phone's positions when it heard the tracker, not the tracker's exact route. breadcrumbs need a fresh phone location, at least 60 seconds and 25 meters between points, and keep up to 120 points in memory for the current app session. they are not restored after restarting the app. tracker details can also show **Seen with you** evidence; a sighting or repeated nearby presence is not a stalking verdict.
+
+Watch and Mute actions, match caveats, **Related help**, and the location map appear near the top of detection details. expand **Related help** for the questions that fit that kind of detection. **Technical details**, further down, holds identifiers, capture-time qualifiers, and broadcast fields. collapsing either section does not hide the match's uncertainty warning.
 
 ## watch or mute a device
 
-star a detection to watch that exact device. open a detection to mute it permanently, for 1 hour, for 24 hours, or within 50 meters of a saved place. manage names, stars, and mutes under **Beacon**. muted history remains in the Log with a **MUTED** label.
+star a detection to watch that exact device. open a detection to mute it permanently, for 1 hour, for 24 hours, or within 50 meters of a saved place. manage names, stars, and mutes under **Beacon**. retained history remains in the Log and shows a **MUTED** label while the rule is active. muting removes the star; starring a muted device unmutes it.
+
+muting an individual tracker stops new breadcrumbs while the mute is active and hides it from the main Map, but does not erase its existing session trail from Log details. unmuting allows new points to resume on the same trail; the muted interval is not filled in. **silent** alert mode and Focus/Do Not Disturb only suppress alerts; they do not stop breadcrumbs.
 
 permanent mutes are copied to the board and silence that device's alerts with the phone away. timed and place mutes depend on the connected phone; the board can still sound according to its alert setting. stars and mutes follow an exact hardware address, so a device that rotates addresses may appear again.
 
@@ -57,6 +69,8 @@ add the home-screen widget through your system's widget picker. it shows today's
 ## accessibility and your data
 
 key controls and status surfaces include VoiceOver or TalkBack descriptions, and layouts support larger text. the palette follows supported system contrast settings; **Beacon > Display > always use higher contrast** forces higher contrast on.
+
+ALPR map callouts and legends use solid dark backgrounds and bright, wrapping text so the map underneath cannot wash out their contrast. mapped-camera attribution and the distinction from live detections remain visible.
 
 offline buffering is optional and encrypted, but the enabled board stores its key too, so it is not protection against forensic access to a captured board. offline pins may use the phone's last shared fix; they do not track the board's movement. the board also advertises a fixed Bluetooth address, allowing observers to correlate it over time. see the [BLE privacy and buffer details](ble-protocol.md).
 

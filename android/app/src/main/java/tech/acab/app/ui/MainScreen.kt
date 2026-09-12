@@ -10,11 +10,13 @@ import androidx.compose.foundation.layout.BoxWithConstraints
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.consumeWindowInsets
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.layout.statusBars
 import androidx.compose.foundation.layout.statusBarsPadding
 import androidx.compose.foundation.layout.WindowInsets
 import androidx.compose.foundation.layout.safeDrawing
@@ -52,6 +54,7 @@ import androidx.compose.runtime.movableContentOf
 import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.runtime.saveable.SaveableStateHolder
 import androidx.compose.runtime.saveable.Saver
 import androidx.compose.runtime.saveable.listSaver
@@ -117,6 +120,18 @@ fun MainScreen(
     modifier: Modifier = Modifier,
 ) {
     val demoMode by ble.demoMode.collectAsState()
+    // movableContentOf below is remembered once (no keys, and a remember calculation cannot call
+    // composables), so every PLAIN value captured in it freezes at its first composition; the
+    // state-backed vars are read through their delegates and stay live. Carry the changing plain
+    // params through State holders instead. The permission flags matter most: MainActivity
+    // refreshes them from onResume (syncPermissionState), which is exactly when a runtime grant
+    // lands, and a grant does not recreate the activity - frozen, the map's allow-location banner
+    // would never clear and the readiness cards would keep reporting a permission off after the
+    // user turned it on. onRequestLocation is a bound reference to the activity and behaves the
+    // same whenever it was captured, so it needs no holder.
+    val reconnectingState = rememberUpdatedState(reconnecting)
+    val locationGrantedState = rememberUpdatedState(locationGranted)
+    val notificationsAvailableState = rememberUpdatedState(notificationsAvailable)
     // Saveable: no configChanges are declared, so a dark-theme flip or multi-window resize
     // recreates the activity; without this the shell would snap back to the Status tab
     // (iOS SwiftUI state survives the equivalent).
@@ -282,9 +297,10 @@ fun MainScreen(
                 openDetectorsToken = openDetectorsToken,
                 openHelpToken = openHelpToken,
                 openReadinessToken = openReadinessToken,
+                reconnecting = reconnectingState.value,
                 demoMode = demoMode,
-                locationGranted = locationGranted,
-                notificationsAvailable = notificationsAvailable,
+                locationGranted = locationGrantedState.value,
+                notificationsAvailable = notificationsAvailableState.value,
                 onRequestLocation = onRequestLocation,
                 onSelect = { setSelected(it) },
                 modifier = modifier,
@@ -308,114 +324,141 @@ fun MainScreen(
         // 840 breakpoint (minus the rail); the roomier 420 only where there is width to spare.
         val detailWidth: Dp = if (maxWidth >= 1100.dp) 420.dp else 380.dp
 
-        if (expanded) {
-            // targetSdk 36 enforces edge-to-edge, and unlike the compact branch (whose Scaffold
-            // insets its content) this Row had no inset handling at all: landscape content drew
-            // under the status bar, gesture bar and display cutout. background BEFORE the inset
-            // padding so bg still paints to the physical edges; windowInsetsPadding consumes
-            // what it applies, so the rail (which handles its own safe-drawing insets
-            // internally) doesn't double-pad.
-            Row(
-                Modifier.fillMaxSize().background(Acab.bg)
-                    .then(baseSemanticsModifier)
-                    .windowInsetsPadding(WindowInsets.safeDrawing),
+        // Reconnect and replay banners take REAL layout space above the shell AND above the
+        // full-screen dossier, so nothing they can cover is drawn underneath them. They used to
+        // be an overlay Column aligned TopCenter, composed AFTER the dossier: with a dossier open
+        // a link drop put the reconnect banner straight over the dossier's own top bar (same
+        // status-bar inset, same height) and swallowed its back control, leaving no visible way
+        // out of a detection. Suppressing the banner there (what the offline one below does)
+        // would have hidden a real transient status exactly where "your work stays open" is the
+        // most reassuring, so the layout gives way instead of the message.
+        // The banners STACK rather than replace each other: a reconnect must not swallow "N
+        // detections replayed while you were away", and on a board that keeps dropping the link
+        // that suppression would last indefinitely. Only the TOP banner carries the status-bar
+        // inset, and the content below CONSUMES it, so Scaffold's topBar, the wide Row and the
+        // dossier each apply zero there rather than double-padding.
+        // TWIN: iOS RootView.swift's `topBanners`, real layout space in a VStack above the tab
+        // shell (NOT the .safeAreaInset it used to be), changed for the same class of bug.
+        // "view" reuses the Live-Activity deep-link path (openLogNew) to land on the Log/NEW lens.
+        val offlineBannerShown = !fullScreenDetailOpen && !demoMode && offlineBanner != null
+        Column(Modifier.fillMaxSize()) {
+            if (reconnecting) {
+                ReconnectingBanner()
+            }
+            if (offlineBannerShown) offlineBanner?.let { n ->
+                OfflineSyncBanner(
+                    n = n,
+                    unreplayed = offlineUnreplayed,
+                    onView = {
+                        ble.clearOfflineSyncBanner()
+                        setSelected(null)             // an open dossier would cover the log
+                        MainActivity.openLogNew.value = true
+                    },
+                    onDismiss = { ble.clearOfflineSyncBanner() },
+                    includeStatusInset = !reconnecting,
+                )
+            }
+            Box(
+                Modifier.weight(1f).fillMaxSize().then(
+                    // A drawn banner already occupies the status-bar strip and pads for it, so
+                    // consume that inset for everything below; without this the shell and the
+                    // dossier would each push themselves down a second status bar's worth.
+                    if (reconnecting || offlineBannerShown) {
+                        Modifier.consumeWindowInsets(WindowInsets.statusBars)
+                    } else Modifier,
+                ),
             ) {
-                NavigationRail(containerColor = Acab.bg2) {
-                    Tab.entries.forEachIndexed { i, t ->
-                        NavigationRailItem(
-                            selected = tab == i,
-                            onClick = { logFilterSeed = initialLogFilter; tab = i },
-                            // The adjacent NavigationRailItem label names the destination; a
-                            // second description on the glyph makes TalkBack announce it twice.
-                            icon = { Icon(t.icon, contentDescription = null) },
-                            label = { Text(t.label) },
-                            colors = NavigationRailItemDefaults.colors(
-                                selectedIconColor = Acab.accent,
-                                selectedTextColor = Acab.accent,
-                                indicatorColor = Acab.bg3,
-                                unselectedIconColor = Acab.faint,
-                                unselectedTextColor = Acab.faint,
-                            ),
+                if (expanded) {
+                    // targetSdk 36 enforces edge-to-edge, and unlike the compact branch (whose Scaffold
+                    // insets its content) this Row had no inset handling at all: landscape content drew
+                    // under the status bar, gesture bar and display cutout. background BEFORE the inset
+                    // padding so bg still paints to the physical edges; windowInsetsPadding consumes
+                    // what it applies, so the rail (which handles its own safe-drawing insets
+                    // internally) doesn't double-pad.
+                    Row(
+                        Modifier.fillMaxSize().background(Acab.bg)
+                            .then(baseSemanticsModifier)
+                            .windowInsetsPadding(WindowInsets.safeDrawing),
+                    ) {
+                        NavigationRail(containerColor = Acab.bg2) {
+                            Tab.entries.forEachIndexed { i, t ->
+                                NavigationRailItem(
+                                    selected = tab == i,
+                                    onClick = { logFilterSeed = initialLogFilter; tab = i },
+                                    // The adjacent NavigationRailItem label names the destination; a
+                                    // second description on the glyph makes TalkBack announce it twice.
+                                    icon = { Icon(t.icon, contentDescription = null) },
+                                    label = { Text(t.label) },
+                                    colors = NavigationRailItemDefaults.colors(
+                                        selectedIconColor = Acab.accent,
+                                        selectedTextColor = Acab.accent,
+                                        indicatorColor = Acab.bg3,
+                                        unselectedIconColor = Acab.faint,
+                                        unselectedTextColor = Acab.faint,
+                                    ),
+                                )
+                            }
+                        }
+                        Column(Modifier.weight(1f).fillMaxSize()) {
+                            // Reserve real layout space for the sample escape hatch. The former overlay
+                            // sat directly on top of every screen's title and first controls.
+                            if (demoMode && !fullScreenDetailOpen) {
+                                SampleDataBanner(onExit = { ble.exitDemo() }, includeStatusInset = false)
+                            }
+                            tabBody(wide, detailWidth, Modifier.weight(1f).fillMaxSize())
+                        }
+                    }
+                } else {
+                    Scaffold(
+                        modifier = baseSemanticsModifier,
+                        containerColor = Acab.bg,
+                        topBar = {
+                            if (demoMode && !fullScreenDetailOpen) {
+                                SampleDataBanner(onExit = { ble.exitDemo() })
+                            }
+                        },
+                        bottomBar = {
+                            NavigationBar(containerColor = Acab.bg2) {
+                                Tab.entries.forEachIndexed { i, t ->
+                                    NavigationBarItem(
+                                        selected = tab == i,
+                                        onClick = { logFilterSeed = initialLogFilter; tab = i },
+                                        icon = { Icon(t.icon, contentDescription = null) },
+                                        label = { Text(t.label) },
+                                        colors = NavigationBarItemDefaults.colors(
+                                            selectedIconColor = Acab.accent,
+                                            selectedTextColor = Acab.accent,
+                                            indicatorColor = Acab.bg3,
+                                            unselectedIconColor = Acab.faint,
+                                            unselectedTextColor = Acab.faint,
+                                        ),
+                                    )
+                                }
+                            }
+                        },
+                    ) { inner ->
+                        tabBody(wide, detailWidth, Modifier.fillMaxSize().padding(inner))
+                    }
+                }
+
+                // dossier fills the shell area over the tabs (the banner stack above stays
+                // visible); system back closes it (not the app). At `wide` on LOG/MAP the dossier
+                // is already inline (drawn by TabBody), so the overlay only fires in compact, or
+                // on STATUS where there's no inline pane.
+                BackHandler(enabled = selected != null) { setSelected(null) }
+                if (fullScreenDetailOpen) {
+                    selected?.let { d ->
+                        DetailScreen(
+                            detection = d,
+                            ble = ble,
+                            onBack = { setSelected(null) },
+                            onOpenInMap = openInMap,
+                            locationGranted = locationGranted,
+                            onRequestLocation = onRequestLocation,
                         )
                     }
                 }
-                Column(Modifier.weight(1f).fillMaxSize()) {
-                    // Reserve real layout space for the sample escape hatch. The former overlay
-                    // sat directly on top of every screen's title and first controls.
-                    if (demoMode && !fullScreenDetailOpen) {
-                        SampleDataBanner(onExit = { ble.exitDemo() }, includeStatusInset = false)
-                    }
-                    tabBody(wide, detailWidth, Modifier.weight(1f).fillMaxSize())
-                }
             }
-        } else {
-            Scaffold(
-                modifier = baseSemanticsModifier,
-                containerColor = Acab.bg,
-                topBar = {
-                    if (demoMode && !fullScreenDetailOpen) {
-                        SampleDataBanner(onExit = { ble.exitDemo() })
-                    }
-                },
-                bottomBar = {
-                    NavigationBar(containerColor = Acab.bg2) {
-                        Tab.entries.forEachIndexed { i, t ->
-                            NavigationBarItem(
-                                selected = tab == i,
-                                onClick = { logFilterSeed = initialLogFilter; tab = i },
-                                icon = { Icon(t.icon, contentDescription = null) },
-                                label = { Text(t.label) },
-                                colors = NavigationBarItemDefaults.colors(
-                                    selectedIconColor = Acab.accent,
-                                    selectedTextColor = Acab.accent,
-                                    indicatorColor = Acab.bg3,
-                                    unselectedIconColor = Acab.faint,
-                                    unselectedTextColor = Acab.faint,
-                                ),
-                            )
-                        }
-                    }
-                },
-            ) { inner ->
-                tabBody(wide, detailWidth, Modifier.fillMaxSize().padding(inner))
-            }
-        }
-
-        // dossier sits full-screen over the tabs; system back closes it (not the app).
-        // At `wide` on LOG/MAP the dossier is already inline (drawn by TabBody), so the
-        // overlay only fires in compact, or on STATUS where there's no inline pane.
-        BackHandler(enabled = selected != null) { setSelected(null) }
-        if (fullScreenDetailOpen) {
-            selected?.let { d ->
-                DetailScreen(
-                    detection = d,
-                    ble = ble,
-                    onBack = { setSelected(null) },
-                    onOpenInMap = openInMap,
-                    locationGranted = locationGranted,
-                    onRequestLocation = onRequestLocation,
-                )
-            }
-        }
-
-        // Reconnect count banner, pinned near the top over whatever tab is showing. "view"
-        // reuses the Live-Activity deep-link path (openLogNew) to land on the Log/NEW lens.
-        if (!fullScreenDetailOpen && !demoMode) offlineBanner?.let { n ->
-            OfflineSyncBanner(
-                n = n,
-                unreplayed = offlineUnreplayed,
-                onView = {
-                    ble.clearOfflineSyncBanner()
-                    setSelected(null)             // an open dossier would cover the log
-                    MainActivity.openLogNew.value = true
-                },
-                onDismiss = { ble.clearOfflineSyncBanner() },
-                modifier = Modifier.align(Alignment.TopCenter),
-            )
-        }
-
-        if (reconnecting) {
-            ReconnectingBanner(Modifier.align(Alignment.TopCenter))
         }
     }
 }
@@ -498,13 +541,22 @@ private fun ReconnectingBanner(modifier: Modifier = Modifier) {
  *  buffered while the phone was away. "view" jumps to the Log's NEW lens; the x dismisses it.
  *  Copy voice: all-lowercase, a comma, no em-dash. Singular "1 detection" when n == 1. */
 @Composable
-private fun OfflineSyncBanner(n: Int, unreplayed: Int = 0, onView: () -> Unit, onDismiss: () -> Unit, modifier: Modifier = Modifier) {
+private fun OfflineSyncBanner(
+    n: Int,
+    unreplayed: Int = 0,
+    onView: () -> Unit,
+    onDismiss: () -> Unit,
+    modifier: Modifier = Modifier,
+    includeStatusInset: Boolean = true,
+) {
     // R9: match the iOS OfflineSyncBannerView anatomy (1e button/radius rules) - radiusSm corners,
     // a tray glyph in accent, mono 11.5 message, and a filled-capsule "view". Copy is unchanged.
     val shape = RoundedCornerShape(Acab.radiusSm)
     // TopCenter: the row is capped at 640dp, and the Box's default TopStart alignment left it
     // hugging the left edge on anything wider than the cap (tablet, landscape).
-    Box(modifier.fillMaxWidth().statusBarsPadding().padding(Acab.pad),
+    Box(modifier.fillMaxWidth()
+            .then(if (includeStatusInset) Modifier.statusBarsPadding() else Modifier)
+            .padding(Acab.pad),
         contentAlignment = Alignment.TopCenter) {
         Row(
             Modifier
@@ -585,6 +637,7 @@ private fun TabBody(
     openDetectorsToken: Int,
     openHelpToken: Int,
     openReadinessToken: Int,
+    reconnecting: Boolean,
     demoMode: Boolean,
     locationGranted: Boolean,
     notificationsAvailable: Boolean,
@@ -598,7 +651,7 @@ private fun TabBody(
         // with the composition, so a tab switch is no longer a silent reset.
         stateHolder.SaveableStateProvider(Tab.entries[tab].name) {
         when (Tab.entries[tab]) {
-            Tab.STATUS -> StatusScreen(ble, onSelect = { onSelect(it) },
+            Tab.STATUS -> StatusScreen(ble, reconnecting = reconnecting, onSelect = { onSelect(it) },
                 onOpenLogCategory = onOpenLogCategory,
                 onOpenDetectorSettings = onOpenDetectorSettings,
                 onOpenHelp = onOpenHelp,
@@ -685,6 +738,7 @@ private fun TabBody(
             }
             Tab.DEVICE -> DeviceScreen(
                 ble = ble,
+                reconnecting = reconnecting,
                 openDetectorsToken = openDetectorsToken,
                 openHelpToken = openHelpToken,
                 openReadinessToken = openReadinessToken,

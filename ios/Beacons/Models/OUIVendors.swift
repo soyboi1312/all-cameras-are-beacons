@@ -113,7 +113,7 @@ enum BodyCamSignature: String {
     case motorola    = "Motorola Solutions OUI"
 
     /// Who makes the device this signature fired on. Known exactly in every case, which
-    /// is the point: the category's guess would name Axon for all four.
+    /// is the point: the category's guess would name three makers for all four.
     var vendor: String {
         switch self {
         case .axonPayload, .axonOUI: return "Axon Enterprise"

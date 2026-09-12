@@ -279,14 +279,16 @@ class ClusterMarkerFactory(
     private val densityPx: Float,
 ) {
     private companion object {
-        /** The largest count drawn as digits; anything above it would render one shared "999+"
+        /** The largest count drawn as digits; anything above it renders one shared "999+"
          *  bubble instead of a bitmap apiece.
          *
-         *  UNREACHABLE today, and worth saying so rather than crediting it with a saving it never
-         *  makes: MapScreen truncates a pass at MAP_MARKER_CAP rows (600) before it clusters, so
-         *  a cluster cannot hold more members than that and `rendered` always equals `count`. The
-         *  clamp stays because it is what stops the cache KEY space from following the cap if the
-         *  cap ever rises. The bound that actually holds this cache down is [CACHE_MAX]. */
+         *  REACHABLE. buildMapRenderPlan (MapProjection.kt) buckets every retained row and then
+         *  admits the first MAP_MARKER_CAP BUCKETS, so the cap bounds how many bubbles a pass
+         *  draws, not how many members one of them holds; a bubble is bounded only by the
+         *  retained feed. So `rendered` is not always `count`, and the "999+" label is what a
+         *  far-zoom All-history pass draws over a dense drive. The clamp is also what stops the
+         *  cache KEY space from following the bucket size, and [CACHE_MAX] is the bound that
+         *  holds the cache itself down. */
         const val COUNT_MAX = 999
         /** How many bubbles are held at once. A pass wanting more rebuilds the surplus, at
          *  exactly what an uncached call costs, so the ceiling buys a bounded footprint for
@@ -437,12 +439,12 @@ class BadgedPin(
     val anchorV: Float,
 )
 
-/** Composites a small count badge onto a category pin, for a same-coordinate pin group (see
- *  PinGroup in MapScreen.kt). Deliberately NOT the cluster bubble: a bubble replaces the artwork
- *  with a tone-filled disc carrying dark digits, and it means "several things somewhere in this
- *  grid cell". This keeps the category pin exactly as it draws alone and hangs a dark pill with
- *  light digits off its shoulder, so the two read as different objects at a glance and by their
- *  inverted fill.
+/** Composites a small count badge onto a category pin, for a same-coordinate pin group (an
+ *  exact-pin MapSymbolGroup, cluster = false, from buildMapRenderPlan in MapProjection.kt).
+ *  Deliberately NOT the cluster bubble: a bubble replaces the artwork with a tone-filled disc
+ *  carrying dark digits, and it means "several things somewhere in this grid cell". This keeps
+ *  the category pin exactly as it draws alone and hangs a dark pill with light digits off its
+ *  shoulder, so the two read as different objects at a glance and by their inverted fill.
  *
  *  Built on demand from the map's update pass (the count varies), so it is a plain class rather
  *  than a @Composable.

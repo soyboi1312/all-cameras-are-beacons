@@ -6,6 +6,7 @@ import android.content.Context
 import android.content.pm.PackageManager
 import android.graphics.ColorMatrix
 import android.graphics.ColorMatrixColorFilter
+import android.graphics.DashPathEffect
 import androidx.core.content.ContextCompat
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
@@ -38,6 +39,8 @@ import androidx.compose.material.icons.filled.Check
 import androidx.compose.material.icons.filled.CheckBox
 import androidx.compose.material.icons.filled.CheckBoxOutlineBlank
 import androidx.compose.material.icons.filled.ContentCopy
+import androidx.compose.material.icons.filled.ExpandLess
+import androidx.compose.material.icons.filled.ExpandMore
 import androidx.compose.material.icons.filled.GpsFixed
 import androidx.compose.material.icons.filled.NotificationsOff
 import androidx.compose.material.icons.outlined.Info
@@ -52,6 +55,7 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableLongStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
@@ -61,6 +65,7 @@ import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.Path
+import androidx.compose.ui.graphics.toArgb
 import androidx.compose.ui.graphics.drawscope.DrawScope
 import androidx.compose.ui.input.pointer.PointerEventPass
 import androidx.compose.ui.input.pointer.pointerInput
@@ -69,6 +74,7 @@ import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.semantics.clearAndSetSemantics
 import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.semantics
+import androidx.compose.ui.semantics.stateDescription
 import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.text.SpanStyle
 import androidx.compose.ui.text.buildAnnotatedString
@@ -87,6 +93,7 @@ import org.osmdroid.util.GeoPoint
 import org.osmdroid.views.CustomZoomButtonsController
 import org.osmdroid.views.MapView
 import org.osmdroid.views.overlay.Marker
+import org.osmdroid.views.overlay.Polyline
 import tech.acab.app.ble.AcabBleManager
 import tech.acab.app.ble.ConnState
 import tech.acab.app.ble.MuteRuleStatus
@@ -102,6 +109,7 @@ import tech.acab.app.model.companyIdText
 import tech.acab.app.model.methodLabel
 import tech.acab.app.model.ouiVendor
 import tech.acab.app.model.sourceLabel
+import tech.acab.app.model.displayName
 import tech.acab.app.model.validCoord
 import tech.acab.app.model.vendor
 import tech.acab.app.ui.theme.Acab
@@ -131,10 +139,32 @@ fun DetailScreen(
     val detections by ble.detections.collectAsState()
     val targetId = remember(detection) { detection.id }
     val d = detections.firstOrNull { it.id == targetId } ?: detection
+    // Closest pins and tracker crumbs live in side maps and can change while the immutable row is
+    // equal (notably when a stronger history record loses timestamp-row selection). This revision
+    // is what wakes the dossier for that, independently of the Detection StateFlow. It is the
+    // wake-up and not the key: it moves for any device, so what it re-reads is the cheap per-row
+    // rowMapEvidence below, and that value decides whether the pin and the trail are read again.
+    val spatialEvidenceRev by ble.spatialEvidenceRev.collectAsState()
     val tone = d.type.tone()
     val textTone = d.type.textTone()   // crimson words use the text-safe cut; fills keep tone
     val trend = ble.rssiTrend(d.id)
-    val stale = ble.isStale(d.id)
+    // Staleness and every "ago" on this dossier move with the clock, not with any flow collected
+    // here, so once this device stops being heard and nothing else publishes, nothing recomposes:
+    // the kicker held SIGNAL · LIVE and Last seen held its last age indefinitely, at exactly the
+    // moment someone checks whether a device really went quiet. 1 s, the same cadence as
+    // StatusScreen's staleness `tick`. TWIN: iOS DetectionDetailView `staleTick` drives the same
+    // readings at the same cadence. nowMs is PASSED to every clock reading on this screen, not
+    // merely read here: a child composable is skipped while its parameters are unchanged, so a
+    // wall-clock read inside one (ConfirmItPanel's span did this) stayed at its last composition
+    // even when this scope recomposed.
+    var nowMs by remember { mutableLongStateOf(System.currentTimeMillis()) }
+    LaunchedEffect(Unit) {
+        while (true) {
+            delay(1_000)
+            nowMs = System.currentTimeMillis()
+        }
+    }
+    val stale = ble.isStale(d.id, nowMs = nowMs)
     // Buffered rows the board had no clock for carry an ordering key, not a time. Rendering that
     // as an age reads "24 years ago" with total confidence, so say what we actually know instead.
     val firstSeen = ble.firstSeen(d.id)
@@ -148,7 +178,7 @@ fun DetailScreen(
     // The reconstructed / bracketed / unknown line, or null when the stamp is a plain clock
     // reading and the existing relative age is the honest thing to show.
     val firstSeenText = timeBasis.primaryText()
-        ?: if (approxFirst) APPROX_TIME else relativeAgo(firstSeen)
+        ?: if (approxFirst) APPROX_TIME else relativeAgo(firstSeen, nowMs)
     val watchedList by ble.watched.collectAsState()
     val isWatched = watchedList.any { it.mac == d.mac.lowercase() }
     val ignoredList by ble.ignored.collectAsState()
@@ -179,6 +209,7 @@ fun DetailScreen(
         muteRule?.let { ble.muteRuleStatus(it) }
     }
     var showRssiInfo by remember { mutableStateOf(false) }   // info dot next to SIGNAL explains the RSSI graph
+    var identityExpanded by remember(d.id) { mutableStateOf(false) }
     // One watch/star toggle shared by the CONFIRM IT chip and the big button below.
     val toggleWatch: () -> Unit = {
         if (isWatched) {
@@ -190,6 +221,26 @@ fun DetailScreen(
         } else {
             ble.watchDevice(d)
         }
+    }
+    // What THIS row's map evidence is right now: its pin, how long its trail is and when its last
+    // crumb landed, and demo mode. Recomputed on every revision bump, which is one storeLock take
+    // and three lookups, and used as the key for the two expensive reads below so that they run
+    // when this device's own evidence moved rather than whenever the global revision moved. The
+    // revision moves on any device's pin and on every active-membership change, which under Desert
+    // density is most publishes, so the open dossier was copying a crumb list and retaking the
+    // lock because an unrelated device entered the feed. Reading spatialEvidenceRev HERE is also
+    // what subscribes this screen to it: a pin or crumb can change while every visible row stays
+    // equal, and StateFlow conflates that away, so the revision is the only thing that wakes us.
+    val rowMapEvidence = remember(d.id, spatialEvidenceRev) { ble.rowMapEvidence(d.id) }
+    val breadcrumbTrail = remember(d.id, d.type, rowMapEvidence) {
+        if (d.type == DeviceType.TRACKER) ble.crumbs(d.id) else emptyList()
+    }
+    // gpsAgeSec is a key because mapCoord's live-wire fallback is gated on it: a row whose board
+    // fix has aged past the freshness window stops resolving to a coordinate. offline is a key for
+    // the other half of the same gate, mapWireFallbackAllowed, which the revision did not reliably
+    // cover: file() bumps nothing when a row arrives again with the lat/lon it already had.
+    val mapCoordinate = remember(d.id, d.lat, d.lon, d.gpsAgeSec, d.offline, rowMapEvidence) {
+        ble.mapCoord(d)
     }
 
     // T2: cap the readable dossier width so tablets/landscape stop stretching one column edge to
@@ -220,27 +271,54 @@ fun DetailScreen(
                 Column(verticalArrangement = Arrangement.spacedBy(7.dp)) {
                     // Category lowercased like iOS: the caps in the pill belong to the class
                     // label, the category reads as content.
-                    BadgePill("${d.type.category.lowercase()} · ${d.type.classLabel}", tone, textTone)
-                    Text("NODE ${nodeName(d.mac)}", color = Acab.text,
+                    BadgePill("${d.type.inlineCategory} · ${d.type.classLabel}", tone, textTone)
+                    // The headline is the same user/device name the Log row and the Status hero
+                    // lead with; the node handle sits in the subtitle. TWIN: iOS
+                    // DetectionDetailView `titleBlock` - `Text(d.displayName)` at 26pt over
+                    // `"NODE \(d.nodeName) · \(d.maker ?? d.vendor)"`, one dossier header on both
+                    // phones.
+                    Text(d.displayName, color = Acab.text,
                         fontSize = 26.sp, fontWeight = FontWeight.SemiBold)
                     // NEITHER branch may consult the OUI lookup: the OUI resolves a Flock
                     // Falcon to its Liteon WiFi module and would head the ALPR dossier with
                     // "Liteon" instead of "Flock Safety". The OUI reading still shows in the
                     // identity panel below, where it is labelled as such. maker is null for
                     // Flock, so the ALPR case is unaffected by the new first branch.
-                    Text(d.maker ?: d.vendor, color = Acab.dim,
+                    Text("NODE ${nodeName(d.mac)} · ${d.maker ?: d.vendor}", color = Acab.dim,
                         fontSize = 11.sp, fontFamily = Acab.mono)
                 }
             }
 
-            // ---- how good the match is: verdict, meter, plain-language explainer ----
-            MatchQualityPanel(d)
+            // Primary decisions live directly under the identity instead of below every graph and
+            // raw field. Existing confirmation/cap/scoped-mute behavior remains unchanged.
+            // SEQUENCE MATCHES iOS, CELL COUNT DOES NOT, and the iOS twin comment above its own
+            // body says the same: DetectionDetailView draws these two as ONE child there (watch
+            // beside mute, stacked only for an accessibility text size or an existing mute rule),
+            // where this screen draws two full-width children, so every panel below sits one child
+            // later here. That is why moving either action is a two-file edit.
+            WatchButton(watched = isWatched, onToggle = toggleWatch)
+            MuteButton(
+                mutedScope = muteRule?.scopeLabel,
+                muteStatus = muteStatus,
+                onUnmute = { ble.unignore(d.mac) },
+                onOptions = { showMuteOptions = true },
+            )
 
-            // ---- the FAQ answers that speak to THIS category ----
-            RelatedHelpPanel(d) { helpDeepLink = it }
+            // ---- how good the match is: verdict, meter, plain-language explainer, and the
+            // firmware's own hedge string verbatim at the foot of the same panel ----
+            MatchQualityPanel(d)
 
             // ---- heads-up that THIS category's signatures aren't field-verified ----
             if (d.type.isExperimental) ExperimentalNote(d.type)
+
+            // ---- collapsed, but at the point of doubt: the header is visible without scrolling ----
+            RelatedHelpPanel(d) { helpDeepLink = it }
+
+            // ---- location and session trail stay close to the primary decisions ----
+            mapCoordinate?.let { (lat, lon) ->
+                LocationPanel(d, lat, lon, breadcrumbTrail, onOpenInMap)
+            }
+            if (d.type == DeviceType.TRACKER) FollowEvidencePanel(d.id, d.type, ble, timeBasis)
 
             // ---- signal: big RSSI + band + sparkline, dimmed if stale ----
             Column(Modifier.fillMaxWidth().panel(), verticalArrangement = Arrangement.spacedBy(12.dp)) {
@@ -297,26 +375,37 @@ fun DetailScreen(
                     // measured off a derived point, so it gets the "~" that marks it as one.
                     // A bracketed row has no point to measure from, so it says so.
                     "SIGHTINGS" to when {
-                        timeBasis is TimeBasis.Reconstructed -> "${d.count} · first ~${relativeAgo(firstSeen)}"
+                        timeBasis is TimeBasis.Reconstructed -> "${d.count} · first ~${relativeAgo(firstSeen, nowMs)}"
                         timeBasis is TimeBasis.Bracketed -> "${d.count} · time bounded"
                         approxFirst -> "${d.count} · time unknown"
-                        else -> "${d.count} · first ${relativeAgo(firstSeen)}"
+                        else -> "${d.count} · first ${relativeAgo(firstSeen, nowMs)}"
                     },
                 ),
             )
 
             // ---- weak / chipset-only hits get a field checklist instead of a shrug ----
+            // AFTER the stat grid, not above the map: the checklist's second question is
+            // whether the device is still here on a second pass, which is the count and span
+            // the grid just printed. iOS DetectionDetailView.body is the canonical dossier
+            // order and already ran CONFIRM IT in this slot; this screen used to run it above
+            // the location panel, and since 2026-09-11 both dossiers run the same panels in the
+            // same sequence, so an instruction that names one is true on either phone.
             if (d.isOuiMatch || d.confidence < 50) {
-                // null firstSeen on an approx row drops the "over 18m" clause rather than
-                // quoting a span measured off the ordering key.
-                ConfirmItPanel(d, firstSeen = if (approxFirst) null else firstSeen,
+                ConfirmItPanel(d, firstSeen = if (approxFirst) null else firstSeen, nowMs = nowMs,
                     watched = isWatched, onWatch = toggleWatch)
             }
 
-            // ---- identity ----
-            Column(Modifier.fillMaxWidth().panel()) {
-                Kicker("IDENTITY")
-                Spacer(Modifier.size(4.dp))
+            // Raw radio/firmware identity is available on demand without forcing the primary
+            // decisions, map and signal below the fold.
+            // Title and summary are BYTE-IDENTICAL to iOS DetectionDetailView.identityDisclosure,
+            // and docs/app-guide.md names this control for readers of both apps, so a support
+            // answer or the guide cannot be right on one phone and wrong on the other.
+            DisclosureSection(
+                title = "Technical details",
+                summary = "Identifiers, capture times and broadcast fields",
+                expanded = identityExpanded,
+                onToggle = { identityExpanded = !identityExpanded },
+            ) {
                 val rows = buildList {
                     // TWO ROWS, NOT ONE. The old single "Vendor" row rendered a union of a real
                     // IEEE registrant and a per-type constant, so it printed "Vendor: IP camera"
@@ -350,8 +439,8 @@ fun DetailScreen(
                     add("Last seen" to when {
                         ble.isApproxTime(lastSeen) -> APPROX_TIME
                         timeBasis is TimeBasis.Reconstructed && lastSeen == firstSeen ->
-                            "${relativeAgo(lastSeen)} · reconstructed"
-                        else -> relativeAgo(lastSeen)
+                            "${relativeAgo(lastSeen, nowMs)} · reconstructed"
+                        else -> relativeAgo(lastSeen, nowMs)
                     })
                     d.name?.takeIf { it.isNotEmpty() }?.let { add("Name" to it) }
                     d.rid?.takeIf { it.isNotEmpty() }?.let { add("UAS ID" to it) }
@@ -390,23 +479,12 @@ fun DetailScreen(
                 WhyFlagged(d, tone)
             }
 
-            // ---- location: static map thumbnail centered on the sighting ----
-            ble.mapCoord(d)?.let { (lat, lon) -> LocationPanel(d, lat, lon, onOpenInMap) }
-
-            // ---- has this tag been near you across more than one place? trackers only ----
-            // Deliberately BELOW the location panel and ABOVE the actions: it is the last thing
-            // read before deciding to star or ignore, and it is a reading of the map above it.
-            if (d.type == DeviceType.TRACKER) FollowEvidencePanel(d.id, d.type, ble, timeBasis)
-
-            // ---- actions ----
+            // OUTSIDE the disclosure, where iOS DetectionDetailView.body already put its
+            // `copyButton`. This was the last row INSIDE Technical details, so copying an
+            // address meant expanding a collapsed section first, and an instruction that
+            // named this button could not be true of both phones at once.
             CopyMacButton(d.mac)
-            WatchButton(watched = isWatched, onToggle = toggleWatch)
-            MuteButton(
-                mutedScope = muteRule?.scopeLabel,
-                muteStatus = muteStatus,
-                onUnmute = { ble.unignore(d.mac) },
-                onOptions = { showMuteOptions = true },
-            )
+
         }
 
         // Randomized-address confirm sheet: star it anyway, but say plainly why it may lapse.
@@ -555,25 +633,33 @@ private fun BadgePill(label: String, tone: Color, textTone: Color) {
 }
 
 /**
- * RELATED HELP: the one or two FAQ answers that speak to THIS category, deep-linked.
+ * RELATED HELP: the FAQ answers that speak to THIS category, deep-linked.
  *
- * Sits directly under match quality because that is where the doubt lands. Someone looking at a 45%
- * hit, or an ALPR pin with nothing detected next to it, is already asking a question, and until now
- * the answer only existed on the website. A reporter using the device hit exactly that and
- * concluded the hardware was broken.
+ * Collapsed, but placed where the doubt lands: directly under match quality and the category's own
+ * experimental note. Someone looking at a 45% hit, or an ALPR pin with nothing detected next to it,
+ * is already asking a question, and the answer was previously only on the website. A reporter using
+ * the device hit exactly that and concluded the hardware was broken. It is collapsed so a second
+ * block of prose does not stack under that warning and read as a second hedge, but the header stays
+ * on the FIRST screen. Do not demote it again: this panel is the only route from a dossier into the
+ * help screen, and a collapsed row further down the scroll is reachable only by someone who already
+ * knows to look. That is not the reader it exists for.
  *
  * Renders nothing for categories with no mapped questions (nearby device and unknown, whose
- * faqKey is ""). Every real category has entries now, glasses and body cam included, and the
- * drift check enforces that; the panel sits above each category's own experimental note where
- * one exists. Mirrors iOS relatedHelpPanel.
+ * faqKey is ""). Every real category has entries, glasses and body cam included, and the drift
+ * check enforces that. Mirrors iOS relatedHelpPanel, which sits in the same slot.
  */
 @Composable
 private fun RelatedHelpPanel(d: Detection, onOpen: (String) -> Unit) {
     val context = LocalContext.current
     val qs = remember(d.type) { FaqContent.get(context).related(d.type) }
     if (qs.isEmpty()) return
-    Column(Modifier.fillMaxWidth().panel(), verticalArrangement = Arrangement.spacedBy(2.dp)) {
-        Kicker("RELATED HELP")
+    var expanded by remember(d.type) { mutableStateOf(false) }
+    DisclosureSection(
+        title = "Related help",
+        summary = "${qs.size} answer${if (qs.size == 1) "" else "s"} for ${d.type.inlineLabel}",
+        expanded = expanded,
+        onToggle = { expanded = !expanded },
+    ) {
         qs.forEachIndexed { i, q ->
             Row(
                 Modifier.fillMaxWidth().minimumInteractiveComponentSize()
@@ -594,9 +680,47 @@ private fun RelatedHelpPanel(d: Detection, onOpen: (String) -> Unit) {
     }
 }
 
+/** Shared disclosure anatomy for long supporting material. Header is one merged 48dp target, and
+ * state is explicit for TalkBack rather than conveyed by the chevron alone. */
+@Composable
+private fun DisclosureSection(
+    title: String,
+    summary: String,
+    expanded: Boolean,
+    onToggle: () -> Unit,
+    content: @Composable () -> Unit,
+) {
+    Column(Modifier.fillMaxWidth().panel(), verticalArrangement = Arrangement.spacedBy(4.dp)) {
+        Row(
+            Modifier.fillMaxWidth().minimumInteractiveComponentSize()
+                .clickable(onClick = onToggle)
+                .semantics(mergeDescendants = true) {
+                    stateDescription = if (expanded) "expanded" else "collapsed"
+                }
+                .padding(vertical = 3.dp),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(10.dp),
+        ) {
+            Column(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(3.dp)) {
+                Text(title, color = Acab.text, fontSize = 14.sp, fontWeight = FontWeight.SemiBold)
+                Text(summary, color = Acab.faint, fontSize = 10.5.sp, fontFamily = Acab.mono)
+            }
+            Icon(
+                if (expanded) Icons.Filled.ExpandLess else Icons.Filled.ExpandMore,
+                contentDescription = null, tint = Acab.dim, modifier = Modifier.size(20.dp),
+            )
+        }
+        if (expanded) {
+            HorizontalDivider(color = Acab.line)
+            Spacer(Modifier.size(2.dp))
+            content()
+        }
+    }
+}
+
 /** MATCH QUALITY: verdict + 5-segment meter + a plain-language line about what actually
- *  matched. Weak matches go loud amber; strong ones stay calm white. Crimson is reserved
- *  for the category, never for certainty. */
+ *  matched, closing with the firmware's own caveat string verbatim. Weak matches go loud amber;
+ *  strong ones stay calm white. Crimson is reserved for the category, never for certainty. */
 @Composable
 private fun MatchQualityPanel(d: Detection) {
     val weak = d.confidence < 50
@@ -622,6 +746,16 @@ private fun MatchQualityPanel(d: Detection) {
         }
         MatchMeter(d.confidence, weak)
         Text(plainMatchLine(d), color = Acab.dim, fontSize = 11.sp, fontFamily = Acab.mono)
+        // Keep the broadcast's qualifications visible when technical identity is collapsed:
+        // strings such as "or Quest" / "gear, no Remote ID" must never turn into certainty.
+        // Firmware authors put those hedges only in this raw string, so it renders verbatim.
+        // TWIN: iOS DetectionDetailView.matchQualityPanel closes with the same string in this
+        // same slot. It used to be a separate CAPTURE NOTE panel of its own here, which is one
+        // panel iPhone never had and which pushed Related help a slot further down.
+        d.detail?.takeIf { it.isNotEmpty() }?.let {
+            Text(it, color = Acab.text, fontSize = 12.sp, fontFamily = Acab.mono,
+                lineHeight = 16.sp)
+        }
     }
 }
 
@@ -788,14 +922,16 @@ private fun AnnotatedString.Builder.appendSignatureExplainer(d: Detection, sig: 
 /** Field checklist for weak / chipset-only hits: what to look for, whether it sticks
  *  around, and a one-tap star. The checkboxes are scratch state, local to this screen. */
 @Composable
-private fun ConfirmItPanel(d: Detection, firstSeen: Long?, watched: Boolean, onWatch: () -> Unit) {
+private fun ConfirmItPanel(
+    d: Detection, firstSeen: Long?, nowMs: Long, watched: Boolean, onWatch: () -> Unit,
+) {
     var looked by remember(d.id) { mutableStateOf(false) }
     var secondPass by remember(d.id) { mutableStateOf(false) }
     Column(Modifier.fillMaxWidth().panel(), verticalArrangement = Arrangement.spacedBy(12.dp)) {
         Kicker("CONFIRM IT", color = Acab.warn)   // amber header, iOS parity: this is a to-do, not chrome
         CheckRow(d.type.confirmPrompt,
             checked = looked) { looked = !looked }
-        val span = seenSpan(firstSeen)
+        val span = seenSpan(firstSeen, nowMs)
         CheckRow(
             if (span != null) "Still here on a second pass? It's been seen ${d.count}× over $span so far."
             else "Still here on a second pass? It's been seen ${d.count}× so far.",
@@ -856,7 +992,8 @@ private fun WatchChip(watched: Boolean, onClick: () -> Unit) {
         Icon(if (watched) Icons.Filled.Star else Icons.Filled.StarBorder,
             contentDescription = null, tint = if (watched) Acab.onAccent else gold,
             modifier = Modifier.size(12.dp))
-        Text(if (watched) "WATCHING" else "WATCH", color = if (watched) Acab.onAccent else gold,
+        // Same pair as WatchButton below and iOS's star-card capsule: the action verb.
+        Text(if (watched) "STOP WATCHING" else "WATCH", color = if (watched) Acab.onAccent else gold,
             fontSize = 10.sp, letterSpacing = 1.sp, fontWeight = FontWeight.Bold, fontFamily = Acab.mono)
     }
 }
@@ -911,11 +1048,17 @@ internal val osmDarkTileFilter: ColorMatrixColorFilter by lazy {
     ColorMatrixColorFilter(adjust)
 }
 
-/** Static map thumbnail centered on the sighting, with the device pin and (for drones)
- *  a separate operator marker. Mirrors the iOS location panel. Tapping the thumbnail (it
- *  never pans or zooms itself) jumps to the full Map tab centered close-in on this spot. */
+/** Static map thumbnail centered on the sighting, with the device pin, a tracker's accumulated
+ * session breadcrumb, and (for drones) a separate operator marker. Tapping the thumbnail (it
+ * never pans or zooms itself) jumps to the full Map tab centered close-in on this spot. */
 @Composable
-private fun LocationPanel(d: Detection, lat: Double, lon: Double, onOpenInMap: (Double, Double) -> Unit) {
+private fun LocationPanel(
+    d: Detection,
+    lat: Double,
+    lon: Double,
+    breadcrumbTrail: List<Pair<Double, Double>>,
+    onOpenInMap: (Double, Double) -> Unit,
+) {
     val context = LocalContext.current
     val markers = rememberCategoryMarkers()
     val operatorMarker = rememberOperatorMarker()
@@ -962,11 +1105,17 @@ private fun LocationPanel(d: Detection, lat: Double, lon: Double, onOpenInMap: (
             Text(coordText(lat, lon),
                 color = Acab.dim, fontSize = 10.sp, fontFamily = Acab.mono)
         }
-        // When the board stamped this from a stale phone fix (offline / Desert mode), say how
-        // old the position is so it isn't read as a live "here, now". The v1.7 headline.
-        d.locationAgeDetail?.let { age ->
-            Text(age, color = Acab.warn,
-                fontSize = 11.sp, fontFamily = Acab.mono)
+        // gpsAgeSec describes the wire coordinate on THIS row. Once a different strongest
+        // sample owns the observer pin, applying this row's age to it would be false.
+        val wireLat = d.lat
+        val wireLon = d.lon
+        if (wireLat != null && wireLon != null && wireLat == lat && wireLon == lon) {
+            // The board stamped this fix from a stale phone position (offline / Desert mode),
+            // so flag how old it is.
+            d.locationAgeDetail?.let { age ->
+                Text(age, color = Acab.warn,
+                    fontSize = 11.sp, fontFamily = Acab.mono)
+            }
         }
         // CORROBORATION, positive-only (mirrors iOS). An ALPR-type hit within ~150m of a
         // community-mapped camera is strong confirmation, and names the mapped maker when known.
@@ -1009,7 +1158,15 @@ private fun LocationPanel(d: Detection, lat: Double, lon: Double, onOpenInMap: (
                 .clip(RoundedCornerShape(Acab.radiusSm))
                 .border(1.dp, Acab.line, RoundedCornerShape(Acab.radiusSm))
                 .clickable(role = Role.Button) { onOpenInMap(lat, lon) }
-                .semantics { contentDescription = "Open this location in the map" },
+                .semantics {
+                    contentDescription = if (breadcrumbTrail.count {
+                            validCoord(it.first, it.second)
+                        } >= 2) {
+                        "Open this location and phone breadcrumb trail from this session in the map"
+                    } else {
+                        "Open this location in the map"
+                    }
+                },
         ) {
             AndroidView(
                 modifier = Modifier.fillMaxSize(),
@@ -1046,6 +1203,20 @@ private fun LocationPanel(d: Detection, lat: Double, lon: Double, onOpenInMap: (
                         zoomController.setVisibility(CustomZoomButtonsController.Visibility.NEVER)
                         controller.setZoom(15.0)
                         controller.setCenter(GeoPoint(lat, lon))
+                        val validTrail = breadcrumbTrail.filter {
+                            validCoord(it.first, it.second)
+                        }
+                        if (validTrail.size >= 2) {
+                            overlays.add(
+                                Polyline(this).apply {
+                                    setPoints(validTrail.map { GeoPoint(it.first, it.second) })
+                                    outlinePaint.color = Acab.trackerTone.toArgb()
+                                    outlinePaint.strokeWidth = 4f
+                                    outlinePaint.pathEffect =
+                                        DashPathEffect(floatArrayOf(18f, 12f), 0f)
+                                }
+                            )
+                        }
                         overlays.add(
                             Marker(this).apply {
                                 position = GeoPoint(lat, lon)
@@ -1077,10 +1248,32 @@ private fun LocationPanel(d: Detection, lat: Double, lon: Double, onOpenInMap: (
                 // pins and the panel disagreed with itself. Signature-guarded so the 3 Hz feed
                 // doesn't churn osmdroid when nothing moved; zoom is deliberately untouched.
                 update = { map ->
-                    val sig = listOf(lat, lon, d.pilotLat, d.pilotLon)
+                    val sig = listOf(lat, lon, d.pilotLat, d.pilotLon, breadcrumbTrail)
                     if (map.tag != sig) {
                         map.tag = sig
-                        map.controller.setCenter(GeoPoint(lat, lon))
+                        val validTrail = breadcrumbTrail.filter { validCoord(it.first, it.second) }
+                        val trail = map.overlays.filterIsInstance<Polyline>().firstOrNull()
+                        if (validTrail.size >= 2) {
+                            val points = validTrail.map { GeoPoint(it.first, it.second) }
+                            if (trail != null) {
+                                trail.setPoints(points)
+                            } else {
+                                map.overlays.add(
+                                    0,
+                                    Polyline(map).apply {
+                                        setPoints(points)
+                                        outlinePaint.color = Acab.trackerTone.toArgb()
+                                        outlinePaint.strokeWidth = 4f
+                                        outlinePaint.pathEffect =
+                                            DashPathEffect(floatArrayOf(18f, 12f), 0f)
+                                    },
+                                )
+                            }
+                            fitDetailBreadcrumb(map, lat, lon, validTrail, sig)
+                        } else {
+                            if (trail != null) map.overlays.remove(trail)
+                            map.controller.setCenter(GeoPoint(lat, lon))
+                        }
                         val pins = map.overlays.filterIsInstance<Marker>()
                         pins.firstOrNull { it.title != "Operator" }?.position = GeoPoint(lat, lon)
                         val plat = d.pilotLat
@@ -1128,6 +1321,129 @@ private fun LocationPanel(d: Detection, lat: Double, lon: Double, onOpenInMap: (
                     fontWeight = FontWeight.Bold, fontFamily = Acab.mono)
             }
         }
+        // Captions the dashed line on the thumbnail above, so it reads under the map rather
+        // than over it, and the same trail gate decides both. Same placement as iOS
+        // DetectionDetailView.locationPanel, which renders this caption after its thumbnail.
+        if (breadcrumbTrail.count { validCoord(it.first, it.second) } >= 2) {
+            Text(
+                "Phone breadcrumb trail · this session",
+                color = Acab.dim,
+                fontSize = 10.sp,
+                fontFamily = Acab.mono,
+            )
+        }
+    }
+}
+
+internal data class DetailBreadcrumbBounds(
+    val north: Double,
+    val east: Double,
+    val south: Double,
+    val west: Double,
+)
+
+private const val DETAIL_MAP_MAX_LAT = 85.05112878 // Web Mercator's finite latitude limit
+
+/** Frame padding and the smallest box the dossier thumbnail will ask for.
+ *
+ *  SHARED WITH iOS - these two ARE the same numbers, applied in this same order (pad first, then
+ *  floor): detectionDetailMapRegion in MapTabView.swift computes `max(span * 1.35, 0.008)` on both
+ *  axes, so one pin and one trail get one frame on both phones. 0.008 deg of latitude is about
+ *  890 m, and it is the fixed span the iOS thumbnail used before either side gained a fit: it is
+ *  there so a lone pin, or a trail shorter than the 25 m crumb gate, still shows the neighbourhood
+ *  around the sighting instead of a rooftop with no context. Android's own previous behaviour was
+ *  a flat zoom 15 (roughly twice this box), so the floor also keeps the short-trail view from
+ *  tightening well past what this screen has ever shown.
+ *
+ *  A trail of FEWER THAN TWO valid crumbs is not folded in on either platform. One crumb draws
+ *  no polyline anywhere - both this screen's fit call sites and iOS's thumbnail gate the line at
+ *  two points - so widening the frame around it would trade real context near the pin for a point
+ *  nothing renders. The gate lives in `detailBreadcrumbBounds` and in `detectionDetailMapRegion`
+ *  itself, not only at the call sites, so the pure fit policy is the same on both phones.
+ *
+ *  Two platform-derived differences are left, both from the renderer rather than the policy: the
+ *  24 px border zoomToBoundingBox adds while fitting this box to the view, which MapKit needs no
+ *  equivalent for, and the latitude ceiling - osmdroid is Web Mercator, so this clamps to
+ *  DETAIL_MAP_MAX_LAT where MapKit keeps its region inside +/-90. */
+private const val DETAIL_MAP_MIN_SPAN_DEG = 0.008
+private const val DETAIL_MAP_FIT_SCALE = 1.35
+
+private fun normalizeLon360(lon: Double): Double = ((lon % 360.0) + 360.0) % 360.0
+
+private fun normalizeLon180(lon: Double): Double {
+    val out = ((lon + 180.0) % 360.0 + 360.0) % 360.0 - 180.0
+    // Keep +180 when that is the supplied edge; either spelling is the same meridian, but this
+    // avoids flipping a non-crossing interval merely because `% 360` chose -180.
+    return if (out == -180.0 && lon > 0.0) 180.0 else out
+}
+
+/** Pure fit policy for a detail breadcrumb. Longitudes use the smallest circular arc, so a trail
+ * crossing 179E -> 179W spans two degrees rather than almost the whole world. `west > east` is the
+ * ordinary osmdroid representation of an antimeridian-crossing box. Latitude is padded and
+ * clamped to Web Mercator before a BoundingBox is constructed. A trail of fewer than two valid
+ * crumbs frames the pin alone, which is what both call sites already asked for and what iOS does
+ * (see DETAIL_MAP_MIN_SPAN_DEG above). */
+internal fun detailBreadcrumbBounds(
+    pin: Pair<Double, Double>,
+    crumbs: List<Pair<Double, Double>>,
+): DetailBreadcrumbBounds? {
+    val validCrumbs = crumbs.filter { validCoord(it.first, it.second) }
+    val points = buildList {
+        if (validCoord(pin.first, pin.second)) add(pin)
+        // Two-point gate, shared with iOS detectionDetailMapRegion. A lone crumb is not a trail:
+        // no polyline is drawn for it here or there, so folding it in would zoom the thumbnail
+        // out around something invisible and push the pin's own surroundings off the frame.
+        if (validCrumbs.size >= 2) addAll(validCrumbs)
+    }
+    if (points.isEmpty()) return null
+
+    val lats = points.map { it.first.coerceIn(-DETAIL_MAP_MAX_LAT, DETAIL_MAP_MAX_LAT) }
+    var south = lats.min()
+    var north = lats.max()
+    val latCenter = (north + south) / 2.0
+    val latSpan = maxOf((north - south) * DETAIL_MAP_FIT_SCALE, DETAIL_MAP_MIN_SPAN_DEG)
+    south = (latCenter - latSpan / 2.0).coerceAtLeast(-DETAIL_MAP_MAX_LAT)
+    north = (latCenter + latSpan / 2.0).coerceAtMost(DETAIL_MAP_MAX_LAT)
+
+    val lons = points.map { normalizeLon360(it.second) }.sorted()
+    var gapAfter = 0
+    var largestGap = Double.NEGATIVE_INFINITY
+    for (i in lons.indices) {
+        val next = if (i == lons.lastIndex) lons.first() + 360.0 else lons[i + 1]
+        val gap = next - lons[i]
+        if (gap > largestGap) {
+            largestGap = gap
+            gapAfter = i
+        }
+    }
+    val west360 = if (gapAfter == lons.lastIndex) lons.first() else lons[gapAfter + 1]
+    val rawSpan = (360.0 - largestGap).coerceAtLeast(0.0)
+    val lonCenter = west360 + rawSpan / 2.0
+    val lonSpan = maxOf(rawSpan * DETAIL_MAP_FIT_SCALE, DETAIL_MAP_MIN_SPAN_DEG)
+        .coerceAtMost(359.999)
+    val west = normalizeLon180(lonCenter - lonSpan / 2.0)
+    val east = normalizeLon180(lonCenter + lonSpan / 2.0)
+    return DetailBreadcrumbBounds(north = north, east = east, south = south, west = west)
+}
+
+/** Frame the whole accumulated tracker breadcrumb plus its strongest-sighting pin. [tag] cancels
+ * a posted fit when a newer trail arrives before layout completes. */
+private fun fitDetailBreadcrumb(
+    map: MapView,
+    pinLat: Double,
+    pinLon: Double,
+    crumbs: List<Pair<Double, Double>>,
+    tag: Any,
+) {
+    val bounds = detailBreadcrumbBounds(pinLat to pinLon, crumbs) ?: return
+    val box = runCatching {
+        org.osmdroid.util.BoundingBox(
+            bounds.north, bounds.east, bounds.south, bounds.west,
+        )
+    }.getOrNull() ?: return
+    map.post {
+        if (map.tag != tag) return@post
+        runCatching { map.zoomToBoundingBox(box, false, 24) }
     }
 }
 
@@ -1423,7 +1739,11 @@ private fun ScopedMuteDialog(
                             .padding(vertical = 12.dp),
                     )
                     !locationPermissionGranted -> Text(
-                        "Enable location for a place mute", color = Acab.accent,
+                        // accentText, not accent: this is a crimson WORD on a bg2 sheet, and the
+                        // fill tone only reaches 4.79:1 there while accentText reaches 6.61:1
+                        // (Theme.kt: accent is for fills, accentText for words). Other sites in
+                        // both apps still draw text in the fill tone; this speaks for this one.
+                        "Enable location for a place mute", color = Acab.accentText,
                         modifier = Modifier.fillMaxWidth().clickable(onClick = onRequestLocation)
                             .padding(vertical = 12.dp),
                     )
@@ -1453,8 +1773,10 @@ private fun ScopedMuteDialog(
 @Composable
 private fun WatchButton(watched: Boolean, onToggle: () -> Unit) {
     val shape = RoundedCornerShape(Acab.radiusSm)
-    // R3: match iOS , watched fills gold with onAccent content ("STOP WATCHING"); unwatched
-    // is a gold-outlined bg2 button.
+    // Watched fills gold with onAccent content; unwatched is a gold-outlined bg2 button. The
+    // labels are "WATCH" / "STOP WATCHING": the action verb, not a state word, so the sighted
+    // label and the spoken one say the same thing. TWIN: iOS DetectionDetailView `watchButton`
+    // (and its star-card capsule), same pair, byte for byte.
     val content = if (watched) Acab.onAccent else Acab.watchTone
     Row(
         Modifier
@@ -1470,7 +1792,7 @@ private fun WatchButton(watched: Boolean, onToggle: () -> Unit) {
         Icon(if (watched) Icons.Filled.Star else Icons.Filled.StarBorder,
             contentDescription = null, tint = content, modifier = Modifier.size(15.dp))
         Spacer(Modifier.size(7.dp))
-        Text(if (watched) "STOP WATCHING" else "WATCH THIS DEVICE", color = content,
+        Text(if (watched) "STOP WATCHING" else "WATCH", color = content,
             fontSize = 12.sp, letterSpacing = 0.5.sp, fontWeight = FontWeight.Bold, fontFamily = Acab.mono)
     }
 }
@@ -1676,11 +1998,17 @@ private fun nodeName(mac: String): String {
  *  Components.kt now, shared with the log rows.) */
 private const val FIRST_SEEN_LABEL = "First seen"
 
-/** Short "ago" string like "now", "12s ago", "4m ago", "1h ago", "3d ago".
- *  A dash if we don't know the time. (internal: the map-settings ALPR caption reuses it.) */
-internal fun relativeAgo(ms: Long?): String {
+/** Short "ago" string like "now", "12s ago", "4m ago", "1h ago", "3d ago", or a dash if we don't
+ *  know the time. Pure in ([ms], [nowMs]): the body reads no clock. Every dossier call passes the
+ *  screen's 1 s tick as [nowMs], because a wall-clock reading taken inside a skipped child
+ *  composable stays at its last composition (see the nowMs tick comment in this file). The
+ *  wall-clock default is for the one caller outside the dossier, MapScreen checkedAgo. TWIN: iOS
+ *  `dossierRelativeAgo(_:now:)` in DetectionDetailView.swift, same buckets and edges. Pinned by
+ *  DetailTimeLabelsTest and iOS DetectionDetailTimeTests; check-signature-drift.py's "dossier
+ *  time labels" rule pins the same buckets in both bodies. */
+internal fun relativeAgo(ms: Long?, nowMs: Long = System.currentTimeMillis()): String {
     if (ms == null) return "-"
-    val secs = ((System.currentTimeMillis() - ms) / 1000).coerceAtLeast(0)
+    val secs = ((nowMs - ms) / 1000).coerceAtLeast(0)
     return when {
         secs < 5 -> "now"
         secs < 60 -> "${secs}s ago"
@@ -1691,11 +2019,18 @@ internal fun relativeAgo(ms: Long?): String {
 }
 
 /** Bare duration since a timestamp, for "seen 4× over 18m so far": "45s", "18m", "2h", "3d".
- *  null when the first sighting time is unknown, so the caller can drop the clause. */
-private fun seenSpan(ms: Long?): String? {
+ *  null when the first sighting time is unknown, so the caller can drop the clause. Pure in
+ *  ([ms], [nowMs]) with no default, so a caller has to pass a clock reading on purpose;
+ *  ConfirmItPanel passes the dossier's tick. TWIN: iOS `dossierSightingSpan(since:now:)` in
+ *  DetectionDetailView.swift, same buckets and floor; it takes no optional, so there the view's
+ *  `sightingSpan` makes the null call and feeds it the same `now` tick. Pinned by
+ *  DetailTimeLabelsTest and iOS DetectionDetailTimeTests; check-signature-drift.py's "dossier
+ *  time labels" rule pins the same buckets in both bodies. internal only so DetailTimeLabelsTest
+ *  can pin it. */
+internal fun seenSpan(ms: Long?, nowMs: Long): String? {
     if (ms == null) return null
     // Floor of 1, like iOS: a fresh detection reads "over 1s", never "over 0s".
-    val secs = ((System.currentTimeMillis() - ms) / 1000).coerceAtLeast(1)
+    val secs = ((nowMs - ms) / 1000).coerceAtLeast(1)
     return when {
         secs < 60 -> "${secs}s"
         secs < 3600 -> "${secs / 60}m"

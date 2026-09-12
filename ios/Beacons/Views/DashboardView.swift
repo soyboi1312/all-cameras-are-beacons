@@ -9,10 +9,12 @@ struct DashboardView: View {
     // bottom; read once here so every consumer keys off the same threshold.
     @Environment(\.dynamicTypeSize) private var dynamicTypeSize
     // SF Symbols have different intrinsic bounds (the wide tracker radio waves are taller than
-    // the glasses, for example), and lowercase "off" has a shorter optical height than a digit.
-    // Give every tile the same three scaled slots so neither glyph choice nor state changes the
-    // card's outer height. The value/caption metrics follow the same Dynamic Type curves as the
-    // matching ACABTheme fonts below.
+    // the glasses, for example), so the icon sits in a fixed frame. Under it every tile has the
+    // same three scaled lines: the count (always a digit; OFF never takes its place), the label,
+    // and the OFF line, which holds an empty string while the detector is on. The caption metric
+    // sizes both of the last two, so neither the glyph choice nor switching a detector off
+    // changes the card's outer height. The value/caption metrics follow the same Dynamic Type
+    // curves as the matching ACABTheme fonts below.
     @ScaledMetric(relativeTo: .title) private var categoryValueLineHeight: CGFloat = 22
     @ScaledMetric(relativeTo: .caption) private var categoryCaptionLineHeight: CGFloat = 10
 
@@ -32,34 +34,15 @@ struct DashboardView: View {
     /// has to age off instead of holding the radar at "SEEN < 45s".
     @State private var staleTick = Timer.publish(every: 1, on: .main, in: .common).autoconnect()
 
-    /// Only what we can still hear. The store is capped, never time-evicted, so an
-    /// unfiltered read hands "strongest signal" to a Flock heard at 9:00 and left fifteen
-    /// miles behind by 9:20. Replayed buffer rows are dropped too: ingest backdates their
-    /// lastSeen but they keep the RSSI they were recorded at, so a buffered body cam would
-    /// win the nearest comparison outright.
-    ///
-    /// The tour is exempt: its sample rows are a fixture stamped with one lastSeen at seed
-    /// time and never refreshed, so ageing them out empties the radar to "0 DEVICES NEARBY"
-    /// 45 s in. App Review takes the tour, so that reads as a broken app.
-    private var detections: [Detection] {
-        if ble.demoMode { return ble.detections }
-        return ble.detections.filter { !$0.isHistory && !ble.isStale(for: $0.id, asOf: tick) }
-    }
-
-    /// Per-category counts in ONE pass over the body's snapshot. The tiles used to call a
-    /// per-type filter each, so every body eval (~3 Hz while detections stream) re-filtered
-    /// the full store seven more times.
-    private func categoryCounts(_ live: [Detection]) -> [DeviceType: Int] {
-        var counts: [DeviceType: Int] = [:]
-        for d in live { counts[d.type, default: 0] += 1 }
-        return counts
-    }
-
-    private func dots(from live: [Detection]) -> [RadarDot] {
-        // cap at 14 so a busy scope stays readable
-        live.prefix(14).map { d in
-            RadarDot(id: d.id, angle: angle(for: d.mac),
-                     radius: ringRadius(bars: d.signalBars), tone: d.type.tint)
+    /// A starred row keeps its real category type, so the gold comes from the sighting's watched
+    /// flag and not from the type (Android StatusScreen.kt's RadarScope dot loop draws it the
+    /// same way, from StatusRadarDot.watched).
+    private func dots(from snapshot: DashboardSnapshot) -> [RadarDot] {
+        snapshot.dots.map { sighting in
+            let d = sighting.detection
+            return RadarDot(id: d.id, angle: angle(for: d.mac),
+                     radius: ringRadius(bars: d.signalBars),
+                     tone: sighting.watched ? DeviceType.watched.tint : d.type.tint)
         }
     }
 
@@ -71,10 +54,6 @@ struct DashboardView: View {
         case 3:  return 2.0 / 3.0
         default: return 1.0
         }
-    }
-
-    private func nearest(in live: [Detection]) -> Detection? {
-        live.max(by: { $0.rssi < $1.rssi })
     }
 
     // MARK: Live radio state
@@ -91,51 +70,34 @@ struct DashboardView: View {
     private var nrfUpdating: Bool { ble.status?.nrfUpdating == true }
     private var coprocFault: Bool { coprocDown && !nrfUpdating }
     /// The nRF is only worth shouting about when BLE is meant to be running.
-    private var bleFault: Bool { coprocFault && ble.status?.ble == true }
-    /// Same gate for the calm twin: a running update only matters if BLE was meant to be on.
-    private var bleUpdating: Bool { nrfUpdating && ble.status?.ble == true }
-    // No status frame yet (between connect and the first poll, and in demo) reads as
-    // scanning, mirroring the Log tab, so Status doesn't flash "RADIOS OFF" on every connect.
-    private var bleLive: Bool { ble.status.map { $0.ble && !coprocDown } ?? true }
-    private var wifiLive: Bool { ble.status?.wifi ?? true }
-    private var scanning: Bool { bleLive || wifiLive }
-
-    /// Kicker tracks radio state so the at-a-glance screen never claims to be scanning
-    /// with the radios off or the nRF dark. Wording is shared with Android.
-    private var scanKicker: String {
-        // The tour seeds a fake status with both radios up, so the ladder below would read
-        // "SCANNING · BLE · WI-FI" over fabricated rows. Name it, same as the Log tab's
-        // "Sample data mode." and the Android kicker.
-        if ble.demoMode { return "SAMPLE DATA" }
-        switch (bleLive, wifiLive) {
-        case (true, true):   return "SCANNING \u{00B7} BLE \u{00B7} WI-FI"
-        case (true, false):  return "SCANNING \u{00B7} BLE"
-        case (false, true):
-            if bleFault    { return "SCANNING \u{00B7} WI-FI ONLY \u{00B7} BLE RADIO FAULT" }
-            if bleUpdating { return "SCANNING \u{00B7} WI-FI ONLY \u{00B7} UPDATING CO-PROCESSOR" }
-            return "SCANNING \u{00B7} WI-FI"
-        case (false, false):
-            if bleFault    { return "BLE RADIO FAULT \u{00B7} NOT SCANNING" }
-            if bleUpdating { return "UPDATING CO-PROCESSOR \u{00B7} NOT SCANNING" }
-            return "RADIOS OFF \u{00B7} NOT SCANNING"
-        }
+    private var bleFault: Bool {
+        ble.connectionState == .connected && ble.sessionReady && !ble.isReconnecting
+            && !ble.combinedState.isRunning && coprocFault && ble.status?.ble == true
+    }
+    /// The board's update state is meaningful even if Bluetooth scanning was switched off.
+    private var bleUpdating: Bool {
+        ble.connectionState == .connected && ble.sessionReady && !ble.isReconnecting
+            && nrfUpdating
+    }
+    private var radioPresentation: BeaconRadioPresentation {
+        beaconRadioPresentation(connectionState: ble.connectionState, sessionReady: ble.sessionReady,
+            isReconnecting: ble.isReconnecting, isDemoMode: ble.demoMode, status: ble.status,
+            combinedUpdateRunning: ble.combinedState.isRunning,
+            isRebootingForUpdate: ble.isRebootingForUpdate)
+    }
+    private var scanning: Bool { radioPresentation.isScanning }
+    private var scanKickerColor: Color {
+        radioPresentation.tone == .warning ? ACABTheme.warn : ACABTheme.dim
     }
 
-    /// Amber for a fault, plain dim for radios the user turned off himself (and for an update,
-    /// which is a state to wait out, not a warning).
-    private var scanKickerColor: Color { bleFault ? ACABTheme.warn : ACABTheme.dim }
-
     var body: some View {
-        // Snapshot ONCE per body eval: `detections` is an O(store) filter with a dictionary
-        // lookup per row, and reading it through count/dots/nearest/the tiles re-ran it ~10x
-        // per eval. One filter pass + one counts pass, everything below derives from these.
-        let live = detections
-        let counts = categoryCounts(live)
+        let snapshot = dashboardSnapshot(ble.detections, now: tick, isDemoMode: ble.demoMode,
+            lastHeard: ble.lastSeenDate(for:), isWatched: { ble.isWatched($0) })
         NavigationStack {
             ZStack {
                 ACABTheme.bg.ignoresSafeArea()
                 ScrollView {
-                    VStack(alignment: .leading, spacing: 18) {
+                    VStack(alignment: .leading, spacing: 16) {
                         HStack {
                             BrandMark(size: 21)
                             Spacer()
@@ -152,7 +114,9 @@ struct DashboardView: View {
                             }
                             .buttonStyle(.plain)
                             .accessibilityLabel("help and support")
-                            LinkChip(version: ble.status?.version, connected: ble.connectionState == .connected, demo: ble.demoMode)
+                            LinkChip(version: ble.status?.version,
+                                     connected: ble.connectionState == .connected && ble.sessionReady && !ble.isReconnecting,
+                                     demo: ble.demoMode, stateLabel: radioPresentation.chipLabel)
                         }
                         HStack(spacing: 8) {
                             if scanning {
@@ -161,47 +125,61 @@ struct DashboardView: View {
                                 // A pulsing dot beside "NOT SCANNING" would still read as alive.
                                 Circle().fill(ACABTheme.faint).frame(width: 7, height: 7)
                             }
-                            Kicker(scanKicker, color: scanKickerColor)
+                            Kicker(radioPresentation.scanLabel, color: scanKickerColor)
+                                // The kicker is a clipped all-caps telegram ("SCANNING ·
+                                // WI-FI ONLY · BLE RADIO FAULT"). The presenter already carries
+                                // the plain sentence that abbreviation stands for, so speak it
+                                // after the label. Part of the LABEL, not a hint: hints are a
+                                // VoiceOver setting a user can switch off, and this is the only
+                                // place the sentence is read.
+                                .accessibilityLabel("\(radioPresentation.scanLabel). \(radioPresentation.detail)")
                             // Far-right recency note: the radar + counts only include devices heard
-                            // within the ~45s isStale window, so name it - only when something's up.
-                            if !ble.demoMode, !live.isEmpty {
+                            // within the activeNearbyInterval window (dashboardSnapshot's
+                            // lastSeenIsStale), so name it, but only when something is up.
+                            if !ble.demoMode, snapshot.total > 0 {
                                 Spacer()
-                                Kicker("SEEN < 45s", color: ACABTheme.faint)
+                                Kicker(DashboardSnapshot.seenWindowKicker, color: ACABTheme.faint)
                             }
                         }
 
                         if bleFault { coprocFaultPill } else if bleUpdating { coprocUpdatingPill }
                         if ble.syncingOfflineLog { syncingPill }
 
-                        RadarScope(count: live.count, dots: dots(from: live), sweeping: scanning)
-                            .frame(height: 250)
+                        // A square that fills the column up to 420, which is what Android's
+                        // RadarScope has always been: `widthIn(max = 420.dp)` outside,
+                        // `fillMaxWidth().aspectRatio(1f).padding(top = 4.dp)` inside
+                        // (StatusScreen.kt). This used to be a hard `.frame(height: 250)`, and
+                        // because RadarScope sizes on `min(width, height)` that height ALWAYS won:
+                        // the scope was 250pt on every phone AND every iPad, the shared 420 cap
+                        // below was unreachable, and the same screen read 250pt on iPhone against
+                        // 371dp on a 411dp Android. aspectRatio must stay INSIDE the 420 frame so
+                        // it squares the capped width rather than the full column.
+                        //
+                        // Unbounded height is what makes `.fit` resolve on width here: this sits
+                        // in a ScrollView. Do not add a fixed height back.
+                        RadarScope(count: snapshot.total, dots: dots(from: snapshot),
+                                   cap: DashboardSnapshot.dotLimit, sweeping: scanning)
+                            .aspectRatio(1, contentMode: .fit)
                             .overlay(ringLabels)
                             .frame(maxWidth: 420)
                             .frame(maxWidth: .infinity)   // center the capped radar in the (leading) column, matters on iPad
                             .padding(.top, 4)
 
-                        // Promoted from a 9pt afterthought to a standing element of the radar
-                        // presentation: a dial reads as bearing to everyone who has ever seen one,
-                        // and here the angle is a MAC hash. The one line that corrects that mental
-                        // model has to be legible and always on screen, not a caption you squint at.
-                        // Scales with Dynamic Type (it is content, not chrome).
-                        Text("SIGNAL STRENGTH ONLY \u{00B7} NO DIRECTION")
-                            .font(ACABTheme.mono(10.5, weight: .semibold))
-                            .tracking(1.2)
-                            .foregroundStyle(ACABTheme.dim)
-                            .multilineTextAlignment(.center)
-                            .fixedSize(horizontal: false, vertical: true)
-                            .padding(.horizontal, 14).padding(.vertical, 7)
-                            .background(ACABTheme.bg2, in: Capsule())
-                            .overlay(Capsule().strokeBorder(ACABTheme.line, lineWidth: 1))
-                            .frame(maxWidth: .infinity)
-
+                        // SECTION ORDER BELOW THE SCOPE IS SHARED with android StatusScreen.kt
+                        // (the Column in StatusScreen, RadarScope down to PunkLine): the strongest
+                        // card, the category tiles, the legend that explains the dial (count cards,
+                        // the two conditional lines, the captions, the no-direction pill), then the
+                        // brand line. The square scope already spends most of a 390pt phone's first
+                        // screen, so the verdict and the two taps it leads to (dossier, Log) come
+                        // before the legend, which can scroll. Reorder one side only and the other
+                        // side's comment becomes a lie.
+                        if let strongest = snapshot.strongest { nearestCard(strongest) }
+                        categoryTiles(snapshot)
+                        radarLegend(snapshot)
+                        // Brand ornament, last on both phones (PunkLine is the last child of the
+                        // Android Column too), so it spends nothing of the budget above the fold.
                         HStack { Spacer(); PunkLine(); Spacer() }
-                            .padding(.vertical, 2)
-
-                        categoryTiles(counts)
-
-                        if let nearest = nearest(in: live) { nearestCard(nearest) }
+                            .padding(.top, 2)
                         Spacer(minLength: 8)
                     }
                     .padding(.horizontal, ACABTheme.pad)
@@ -217,6 +195,110 @@ struct DashboardView: View {
             .navigationBarHidden(true)
         }
         .onReceive(staleTick) { tick = $0 }
+    }
+
+    /// Everything that explains the dial, one block in one order on both phones (android
+    /// StatusScreen.kt `RadarLegend`): the count cards that split TOTAL NEARBY, the two
+    /// conditional lines, the two caption lines, then the no-direction pill. Three siblings of
+    /// the column, so they keep its section spacing.
+    @ViewBuilder
+    private func radarLegend(_ snapshot: DashboardSnapshot) -> some View {
+        nearbyBreakdown(snapshot)
+
+        VStack(spacing: 3) {
+            // Both lines come from the presentation, where Android's
+            // StatusNearbySummary.radarCaption / STATUS_RADAR_CAPTION_DETAIL are
+            // the byte-identical twins and both suites pin the literals.
+            Text(snapshot.radarCaption)
+                .font(ACABTheme.mono(11, weight: .semibold))
+            Text(DashboardSnapshot.radarCaptionDetail)
+                .font(ACABTheme.mono(10))
+        }
+        .foregroundStyle(ACABTheme.dim)
+        .multilineTextAlignment(.center)
+        .fixedSize(horizontal: false, vertical: true)
+        .frame(maxWidth: .infinity)
+
+        // Promoted from a 9pt afterthought to a standing element of the radar presentation: a
+        // dial reads as bearing to everyone who has ever seen one, and here the angle is a MAC
+        // hash. The one line that corrects that mental model has to be legible and always
+        // rendered (the lines above it come and go), not a caption you squint at. Scales with
+        // Dynamic Type (it is content, not chrome).
+        Text("SIGNAL STRENGTH ONLY \u{00B7} NO DIRECTION")
+            .font(ACABTheme.mono(10.5, weight: .semibold))
+            .tracking(1.2)
+            .foregroundStyle(ACABTheme.dim)
+            .multilineTextAlignment(.center)
+            .fixedSize(horizontal: false, vertical: true)
+            .padding(.horizontal, 14).padding(.vertical, 7)
+            .background(ACABTheme.bg2, in: Capsule())
+            .overlay(Capsule().strokeBorder(ACABTheme.line, lineWidth: 1))
+            .frame(maxWidth: .infinity)
+    }
+
+    /// The two count cards and the two lines under them. Every drawn word is the presentation's
+    /// (DashboardSnapshot.matchedCardTitle and friends, unclassifiedLine, watchedLine), where the
+    /// Android twins are named. The one string worded here is the watched tap's VoiceOver hint,
+    /// which is iOS's own: Android's tap speaks its "show in log" click label instead. TWIN:
+    /// android StatusScreen.kt `RadarCountCards` + the two lines in `RadarLegend`, same order,
+    /// same tones: crimson (accentText) for the match card, dim for ambient and for the
+    /// unclassified line, the watched tint for the watched tap.
+    private func nearbyBreakdown(_ snapshot: DashboardSnapshot) -> some View {
+        VStack(spacing: 8) {
+            ViewThatFits(in: .horizontal) {
+                HStack(spacing: 10) {
+                    nearbyCount(snapshot.matched, title: DashboardSnapshot.matchedCardTitle,
+                                detail: DashboardSnapshot.matchedCardDetail, color: ACABTheme.accentText)
+                    nearbyCount(snapshot.ambient, title: DashboardSnapshot.ambientCardTitle,
+                                detail: DashboardSnapshot.ambientCardDetail, color: ACABTheme.dim)
+                }
+                VStack(spacing: 8) {
+                    nearbyCount(snapshot.matched, title: DashboardSnapshot.matchedCardTitle,
+                                detail: DashboardSnapshot.matchedCardDetail, color: ACABTheme.accentText)
+                    nearbyCount(snapshot.ambient, title: DashboardSnapshot.ambientCardTitle,
+                                detail: DashboardSnapshot.ambientCardDetail, color: ACABTheme.dim)
+                }
+            }
+            if let line = snapshot.unclassifiedLine {
+                // Dim on purpose: a wire type this build does not know is a fact to report, not
+                // an alert (the nearest card treats unclassified the same way).
+                Text(line)
+                    .font(ACABTheme.mono(10.5)).foregroundStyle(ACABTheme.dim)
+                    .multilineTextAlignment(.center)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            if let line = snapshot.watchedLine {
+                Button {
+                    LogFocus.pendingCategory = "WATCHED"
+                    NotificationCenter.default.post(name: LogFocus.notification, object: nil)
+                } label: {
+                    Label(line, systemImage: "star.fill")
+                        .font(ACABTheme.mono(11, weight: .medium))
+                        .foregroundStyle(DeviceType.watched.textTint)
+                        .padding(.horizontal, 12).padding(.vertical, 10)
+                        .frame(minHeight: 44)
+                }
+                .buttonStyle(.plain)
+                .accessibilityHint("opens the Log filtered to watched devices")
+            }
+        }
+    }
+
+    /// VoiceOver reads the three children in order (count, title, detail); the Android card
+    /// speaks the same three through its merged contentDescription.
+    private func nearbyCount(_ count: Int, title: String, detail: String, color: Color) -> some View {
+        VStack(spacing: 4) {
+            Text("\(count)").font(ACABTheme.display(24, weight: .bold)).monospacedDigit()
+            Text(title).font(ACABTheme.mono(10, weight: .semibold))
+            Text(detail).font(ACABTheme.mono(9)).foregroundStyle(ACABTheme.dim)
+        }
+        .foregroundStyle(color)
+        .multilineTextAlignment(.center)
+        .fixedSize(horizontal: false, vertical: true)
+        .frame(maxWidth: .infinity)
+        .padding(10)
+        .background(ACABTheme.bg2, in: RoundedRectangle(cornerRadius: ACABTheme.radiusSm))
+        .accessibilityElement(children: .combine)
     }
 
     /// The nRF fault is a whole half of the detection surface going dark, so it can't live
@@ -287,21 +369,30 @@ struct DashboardView: View {
         return "syncing offline log\u{2026}"
     }
 
-    /// NEAR / MID / FAR stacked up the vertical axis, naming the rings the
-    /// blips snap to. Lives in an overlay so RadarScope itself stays generic.
+    /// STRONG / GOOD / WEAK stacked up the vertical axis, naming the rings the blips snap to.
+    /// Lives in an overlay so RadarScope itself stays generic.
+    ///
+    /// THESE ARE STRENGTH WORDS, NOT DISTANCE WORDS. They were NEAR / MID / FAR until
+    /// 2026-09-08, which labelled a signal-strength quantity with distance, and the screen then
+    /// had to walk it back twice on itself: the pill says SIGNAL STRENGTH ONLY - NO DIRECTION and
+    /// radarCaptionDetail says the same again. RSSI is not distance, because transmit power is a
+    /// per-DEVICE choice (faq-content.json q-signal spells this out): a pole-mounted ALPR camera
+    /// reads strong from across a street while a tracking tag a few meters away reads weak. The
+    /// vocabulary is `beaconSignalDescription`'s, so the ring a blip sits on and the word
+    /// VoiceOver speaks for its bars cannot disagree. Do not put NEAR / MID / FAR back.
     private var ringLabels: some View {
         GeometryReader { geo in
             let s = min(geo.size.width, geo.size.height)
             let cx = geo.size.width / 2
             let cy = s / 2
             Group {
-                ringLabel("NEAR", opacity: 0.45).position(x: cx, y: cy - s / 6)
-                ringLabel("MID",  opacity: 0.38).position(x: cx, y: cy - s / 3)
-                ringLabel("FAR",  opacity: 0.30).position(x: cx, y: cy - s / 2 + 7)
+                ringLabel("STRONG", opacity: 0.45).position(x: cx, y: cy - s / 6)
+                ringLabel("GOOD",   opacity: 0.38).position(x: cx, y: cy - s / 3)
+                ringLabel("WEAK",   opacity: 0.30).position(x: cx, y: cy - s / 2 + 7)
             }
         }
         .allowsHitTesting(false)
-        // Decorative instrument chrome: VoiceOver otherwise reads NEAR/MID/FAR as three stray
+        // Decorative instrument chrome: VoiceOver otherwise reads the three ring words as stray
         // elements. The scope's own summary label already carries the meaning.
         .accessibilityHidden(true)
     }
@@ -323,51 +414,35 @@ struct DashboardView: View {
     /// At accessibility text sizes six-across leaves each tile ~55pt while its label quadruples,
     /// so the strip reflows into a 3x2 grid; the default layout is untouched.
     @ViewBuilder
-    private func categoryTiles(_ counts: [DeviceType: Int]) -> some View {
+    private func categoryTiles(_ snapshot: DashboardSnapshot) -> some View {
         if dynamicTypeSize.isAccessibilitySize {
             LazyVGrid(columns: Array(repeating: GridItem(.flexible(), spacing: 6), count: 3),
-                      spacing: 6) { tileSet(counts) }
+                      spacing: 6) { tileSet(snapshot) }
         } else {
-            HStack(spacing: 6) { tileSet(counts) }
+            HStack(spacing: 6) { tileSet(snapshot) }
         }
     }
 
-    /// The six tiles themselves, shared by both containers above. `spoken` is what VoiceOver
-    /// says: the drawn label is a width-budget abbreviation ("TRKR", "GLAS") that a screen
-    /// reader would speak as gibberish, so each tile carries its full-word name too.
+    /// The six tiles themselves, shared by both containers above. Which tiles, in what order,
+    /// drawn and spoken as what, and counting which types, is the presentation's
+    /// (DashboardSnapshot.stripTiles, where the Android twin is named); this only draws them.
     @ViewBuilder
-    private func tileSet(_ counts: [DeviceType: Int]) -> some View {
-        tile(.flockCamera, "ALPR",  spoken: "ALPR cameras", enabled: detectorEnabled(.flockCamera),
-             (counts[.flockCamera] ?? 0) + (counts[.flockRaven] ?? 0))
-        tile(.drone,       "DRONE", spoken: "Drones", enabled: detectorEnabled(.drone), counts[.drone] ?? 0)
-        tile(.axonBodyCam, "BODY",  spoken: "Body cameras", enabled: detectorEnabled(.axonBodyCam), counts[.axonBodyCam] ?? 0)
-        tile(.tracker,     "TRKR",  spoken: "Trackers", enabled: detectorEnabled(.tracker), counts[.tracker] ?? 0)
-        tile(.recordingGlasses, "GLAS", spoken: "Glasses", enabled: detectorEnabled(.recordingGlasses), counts[.recordingGlasses] ?? 0)
-        tile(.networkCamera, "NETCAM", spoken: "Network cameras", enabled: detectorEnabled(.networkCamera),
-             counts[.networkCamera] ?? 0)
-    }
-
-    private func detectorEnabled(_ type: DeviceType) -> Bool? {
-        guard let s = ble.status else { return nil }
-        switch type {
-        case .flockCamera, .flockRaven: return s.flock
-        case .drone: return s.drone
-        case .axonBodyCam: return s.axon
-        case .tracker: return s.tracker
-        case .recordingGlasses: return s.glasses
-        case .networkCamera: return s.ncam
-        default: return true
+    private func tileSet(_ snapshot: DashboardSnapshot) -> some View {
+        ForEach(DashboardSnapshot.stripTiles, id: \.type) { t in
+            // nil before the first frame: not off, not on, just unknown.
+            tile(t, enabled: ble.status.map { $0[keyPath: t.toggle] }, snapshot.stripCount(t))
         }
     }
 
     /// Each tile deep-links to the Log tab with its category filter armed (LogFocus is the
     /// same one-shot static-slot pattern MapFocus uses, session-only on purpose), so the
     /// at-a-glance count answers "show me those" in one tap instead of being a dead number.
-    private func tile(_ type: DeviceType, _ label: String, spoken: String,
-                      enabled: Bool?, _ n: Int) -> some View {
+    private func tile(_ t: DashboardStripTile, enabled: Bool?, _ n: Int) -> some View {
+        let type = t.type
         let off = enabled == false
+        let opensSettings = dashboardTileOpensSettings(enabled: enabled, count: n)
         return Button {
-            if off {
+            if opensSettings {
                 onOpenDetectors()
             } else {
                 LogFocus.pendingCategory = type.category
@@ -379,18 +454,27 @@ struct DashboardView: View {
                     .font(.system(size: 14, weight: .medium))
                     .foregroundStyle(off || n == 0 ? ACABTheme.faint : type.tint)
                     .frame(width: 22, height: 18)
-                // Uppercase keeps OFF on the same cap-height as the numeric state. Both still use
-                // one exact font and one exact line box across all six categories.
-                Text(off ? "OFF" : "\(n)")
+                // Turning a detector off does not erase what was just heard. Keep the number
+                // until it ages out, and show the setting separately from the evidence count.
+                Text("\(n)")
                     .font(ACABTheme.display(18, weight: .bold))
-                    .foregroundStyle(off || n == 0 ? ACABTheme.faint : ACABTheme.text)
+                    .foregroundStyle(n == 0 ? ACABTheme.faint : ACABTheme.text)
                     .monospacedDigit()
                     .lineLimit(1)
                     .frame(height: categoryValueLineHeight)
-                Text(label)
+                Text(t.label)
                     .font(ACABTheme.mono(8, weight: .semibold))
                     .tracking(0.8)
                     .foregroundStyle(off || n == 0 ? ACABTheme.faint : type.textTint)
+                    .lineLimit(1)
+                    .frame(height: categoryCaptionLineHeight)
+                // ONE OFF TREATMENT ON BOTH PHONES: the count stays, and OFF is a dim fourth
+                // line under the label (android StatusScreen.kt CountTile draws the same line).
+                // Dim, not amber: the user switched this detector off, nothing is faulty. The
+                // empty string keeps the slot, so an OFF tile is no taller than its neighbours.
+                Text(off ? "OFF" : "")
+                    .font(ACABTheme.mono(8, weight: .semibold))
+                    .foregroundStyle(ACABTheme.dim)
                     .lineLimit(1)
                     .frame(height: categoryCaptionLineHeight)
             }
@@ -403,29 +487,48 @@ struct DashboardView: View {
             .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
-        .accessibilityLabel(off ? "\(spoken), detector off" : "\(spoken), \(n) active")
-        .accessibilityHint(off ? "opens detector settings on Beacon" : "opens the Log filtered to this category")
+        .accessibilityLabel(dashboardTileAccessibilityLabel(spoken: t.spoken, count: n, off: off))
+        .accessibilityHint(opensSettings ? "opens detector settings on Beacon" : "opens the Log filtered to this category")
     }
 
-    /// Tappable card for the closest device (highest RSSI).
-    private func nearestCard(_ d: Detection) -> some View {
-        VStack(alignment: .leading, spacing: 8) {
-            Kicker("STRONGEST SIGNAL · LIVE", color: ACABTheme.accent)
+    /// The strongest recent match, falling back to explicitly labelled ambient traffic.
+    private func nearestCard(_ sighting: DashboardSighting) -> some View {
+        let d = sighting.detection
+        let kind = sighting.matched ? "MATCH" : (sighting.unclassified ? "UNCLASSIFIED" : "AMBIENT")
+        let recency = ble.demoMode ? "SAMPLE" : "RECENT"
+        return VStack(alignment: .leading, spacing: 8) {
+            // TWIN: android StatusScreen.kt NearestCard `Kicker(title, color = ...)`. Crimson
+            // (accentText, the text cut - the fill tone is under AA as a word) ONLY for a match:
+            // ambient and unclassified traffic is not an alert and reads dim on both phones.
+            Kicker("STRONGEST \(kind) · \(recency)",
+                   color: sighting.matched ? ACABTheme.accentText : ACABTheme.dim)
             NavigationLink {
                 DetectionDetailView(detection: d)
             } label: {
                 HStack(spacing: 12) {
                     CatGlyph(type: d.type, size: 40, filled: true)
                     VStack(alignment: .leading, spacing: 3) {
-                        HStack(spacing: 6) {
-                            Text(categoryTitle(d.type.category))
-                                .font(ACABTheme.display(15, weight: .semibold))
-                                .foregroundStyle(ACABTheme.text)
-                            Text("NODE \(d.nodeName)")
-                                .font(ACABTheme.mono(11, weight: .medium))
-                                .foregroundStyle(ACABTheme.dim)
-                        }
-                        Text("\(d.source.label) · seen \(d.count)× · ~\(approxMeters(d.rssi)) m")
+                        Text(d.displayName)
+                            .font(ACABTheme.display(15, weight: .semibold))
+                            .foregroundStyle(ACABTheme.text)
+                            .lineLimit(2)
+                            .fixedSize(horizontal: false, vertical: true)
+                        // THE FOUR LINES ARE SHARED, line for line, with android StatusScreen.kt
+                        // NearestCard: the name, `inlineCategory · NODE xxxx`, the last-heard age
+                        // on its own dim line, then `source · seen N×` faint. The age stands alone
+                        // so neither line has to wrap beside the glyph and the dBm column.
+                        //
+                        // The inline category, the brand rule everywhere else on Status
+                        // ("body cam", "ALPR"), not the title-case type label. Lowercase except
+                        // where an initialism or proper noun keeps its casing, which is why this
+                        // reads DeviceType.inlineCategory instead of lowercasing `category` here:
+                        // that spelled the ALPR initialism "alpr".
+                        Text("\(d.type.inlineCategory) · NODE \(d.nodeName)")
+                            .font(ACABTheme.mono(10, weight: .medium))
+                            .foregroundStyle(ACABTheme.dim)
+                        Text(dashboardLastHeardLabel(sighting.lastHeard, now: tick, isDemoMode: ble.demoMode))
+                            .font(ACABTheme.mono(10.5)).foregroundStyle(ACABTheme.dim)
+                        Text("\(d.source.label) · seen \(d.count)×")
                             .font(ACABTheme.mono(10.5)).foregroundStyle(ACABTheme.faint)
                     }
                     Spacer()
@@ -433,6 +536,7 @@ struct DashboardView: View {
                         Text("\(d.rssi)")
                             .font(ACABTheme.mono(15, weight: .semibold))
                             .foregroundStyle(ACABTheme.accentText)
+                        Text("dBm").font(ACABTheme.mono(9)).foregroundStyle(ACABTheme.dim)
                         SignalBars(bars: d.signalBars, tint: d.type.tint)
                     }
                     Image(systemName: "chevron.right")
@@ -445,15 +549,6 @@ struct DashboardView: View {
         }
     }
 
-    // Rough RSSI to metres for the hero card, using the SAME constants as the map's
-    // rssiRadiusMeters (TxPower -50 dBm, n ~2.5) so the card and the map's no-GPS ring
-    // never disagree about the same signal. Deliberately fuzzy, a "somewhere around
-    // here" hint, not a measurement.
-    private func approxMeters(_ rssi: Int) -> Int {
-        let d = pow(10.0, (-50.0 - Double(rssi)) / 25.0)
-        return Int(min(max(d, 5), 600).rounded())   // same [5, 600] clamp as the map
-    }
-
     // Fake-but-stable bearing hashed from the MAC, we only have RSSI, not a real one.
     private func angle(for mac: String) -> Double {
         var h: UInt64 = 5381
@@ -461,9 +556,4 @@ struct DashboardView: View {
         return Double(h % 360)
     }
 
-    // Categories render lowercase, brand-wide, so the identifier ("BODY CAM") and the
-    // label ("body cam") stay separate things.
-    private func categoryTitle(_ cat: String) -> String {
-        return cat.lowercased()
-    }
 }

@@ -61,6 +61,40 @@ final class ExportTests: XCTestCase {
         return p.parse()
     }
 
+    // MARK: - an isolated manager
+
+    /// Suites handed out by makeManager, removed after each test.
+    private var isolatedSuites: [(name: String, defaults: UserDefaults)] = []
+
+    override func tearDown() {
+        for suite in isolatedSuites { suite.defaults.removePersistentDomain(forName: suite.name) }
+        isolatedSuites = []
+        super.tearDown()
+    }
+
+    /// Every manager in this file comes from here, never from `BLEManager()`. That initializer
+    /// uses the standard store, which in this hosted unit test is the host app's own container on
+    /// whichever simulator runs the suite: a seen watermark the real app left in one simulator's
+    /// container made testStandardExportSnapshotUsesAuthoritativeStoreAndFreezesScope fail there
+    /// and pass on the others. `seenWatermark` is written under BLEManager's private watermarkKey
+    /// spelling; if that key is renamed the manager loads no watermark and that test's seen-lens
+    /// assertion fails.
+    ///
+    /// This isolates the manager's OWN preferences only. Its init still reads the real install's
+    /// ignore/watch files and starts an async load of its persisted detections. Tests here keep
+    /// those out of their assertions by seeding rows synchronously, without spinning the run loop
+    /// first, or by handing the export an explicit snapshot.
+    private func makeManager(seenWatermark: Date? = nil) throws -> BLEManager {
+        let name = "tech.beacons.tests.export.\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: name))
+        defaults.removePersistentDomain(forName: name)
+        isolatedSuites.append((name, defaults))
+        if let seenWatermark {
+            defaults.set(seenWatermark.timeIntervalSince1970, forKey: "acab.seenWatermark")
+        }
+        return BLEManager(defaults: defaults)
+    }
+
     // MARK: - the drone-column gate (the bug)
 
     func testNonDroneRowLeavesDroneColumnsEmpty() throws {
@@ -120,7 +154,7 @@ final class ExportTests: XCTestCase {
         // The UI projection is deliberately never published. Stop must still see the manager's
         // capture-local live ledger, and the observer coordinate must be the one paired with this
         // exact sighting rather than a session-wide first/closest position.
-        let manager = BLEManager()
+        let manager = try makeManager()
         let d = try decode(Self.nearbyJSON.replacingOccurrences(
             of: "c2:40:d8:1c:2b:96", with: "02:aa:bb:cc:dd:01"))
         let start: Int64 = 1_780_000_000_000
@@ -159,7 +193,7 @@ final class ExportTests: XCTestCase {
         // A replay can land in the authoritative session store during a reconnect and carry times
         // that overlap the user's window. It is not a live in-window observation, so it must never
         // receive the contribution's `.exact` timestamp.
-        let manager = BLEManager()
+        let manager = try makeManager()
         let historyJSON = Self.nearbyJSON
             .replacingOccurrences(of: "c2:40:d8:1c:2b:96", with: "02:aa:bb:cc:dd:02")
             .replacingOccurrences(of: "\"n\":1}", with: "\"n\":1,\"hist\":true,\"seq\":7}")
@@ -181,7 +215,7 @@ final class ExportTests: XCTestCase {
         // For a non-drone, wire lat/lon may be detector GPS and remains useful in a standard Log
         // export. A bounded contribution timestamp describes one exact live sighting, though, so
         // that fallback is too old/ambiguous when the capture ledger has no matching phone fix.
-        let manager = BLEManager()
+        let manager = try makeManager()
         let d = try decode(Self.nearbyJSON.replacingOccurrences(
             of: "c2:40:d8:1c:2b:96", with: "02:aa:bb:cc:dd:03"))
         let start: Int64 = 1_780_000_200_000
@@ -212,7 +246,6 @@ final class ExportTests: XCTestCase {
     }
 
     func testStandardExportSnapshotUsesAuthoritativeStoreAndFreezesScope() throws {
-        let manager = BLEManager()
         let live = try decode(Self.nearbyJSON.replacingOccurrences(
             of: "c2:40:d8:1c:2b:96", with: "02:aa:bb:cc:ee:01"))
         let offlineJSON = Self.droneJSON
@@ -220,19 +253,40 @@ final class ExportTests: XCTestCase {
             .replacingOccurrences(of: "\"n\":15}", with: "\"n\":15,\"hist\":true,\"seq\":8}")
         let offline = try decode(offlineJSON)
         let now = Date(timeIntervalSince1970: 1_780_001_000)
-        manager.testSeedContributionDetection(live, firstSeen: now, lastSeen: now)
-        manager.testSeedContributionDetection(offline, firstSeen: now, lastSeen: now)
-        XCTAssertTrue(manager.detections.isEmpty,
+
+        // The unseen lens is judged against the manager's OWN persisted seen watermark. These two
+        // managers hold identical rows and differ ONLY in the watermark in their isolated suites:
+        // one an hour before both rows were first heard, one an hour after, so they must disagree.
+        // Two managers that read one SHARED store (the standard store, which here is the host
+        // app's container) load the same watermark and give the same answer, so one of the two
+        // unseen assertions below fails whatever that store holds: no watermark or an earlier one
+        // fails the watermarkAfterRows assertion, a later one fails the watermarkBeforeRows one.
+        func seeded(watermark: Date) throws -> BLEManager {
+            let manager = try makeManager(seenWatermark: watermark)
+            manager.testSeedContributionDetection(live, firstSeen: now, lastSeen: now)
+            manager.testSeedContributionDetection(offline, firstSeen: now, lastSeen: now)
+            return manager
+        }
+        let watermarkBeforeRows = try seeded(watermark: now.addingTimeInterval(-3_600))
+        let watermarkAfterRows = try seeded(watermark: now.addingTimeInterval(3_600))
+        XCTAssertTrue(watermarkBeforeRows.detections.isEmpty,
                       "the fixture must bypass the coalesced SwiftUI projection")
 
-        let frozen = manager.detectionExportSnapshot()
+        let frozen = watermarkBeforeRows.detectionExportSnapshot()
         XCTAssertEqual(frozen.ids, [live.id, offline.id])
         XCTAssertEqual(frozen.filtered(category: nil, unseenOnly: false, offlineOnly: true).ids,
                        [offline.id])
         XCTAssertEqual(frozen.filtered(category: "DRONE", unseenOnly: false, offlineOnly: false).ids,
                        [offline.id])
         XCTAssertEqual(frozen.filtered(category: nil, unseenOnly: true, offlineOnly: false).ids,
-                       [live.id, offline.id])
+                       [live.id, offline.id],
+                       "rows first heard after the seen watermark are New")
+
+        let marked = watermarkAfterRows.detectionExportSnapshot()
+        XCTAssertEqual(marked.ids, [live.id, offline.id], "same rows; only the watermark differs")
+        XCTAssertEqual(marked.filtered(category: nil, unseenOnly: true, offlineOnly: false).ids,
+                       Set<String>(),
+                       "rows first heard before the seen watermark are not New")
     }
 
     func testLoneCarriageReturnInUasIdCannotBypassRealEmitterRedaction() throws {
@@ -334,9 +388,9 @@ final class ExportTests: XCTestCase {
         // persistQueue and landed AFTER both snapshots, which is the only reason the two files
         // were header-only and the byte-equality assertion below passed by construction. Win that
         // race on a developer machine and the same test writes real captured MACs and GPS out to
-        // temporaryDirectory. A fixture row removes both halves: no real user state is read, and
-        // there is real content on both sides of the comparison.
-        let manager = BLEManager()
+        // temporaryDirectory. A fixture row removes both halves: no stored row reaches the export,
+        // and there is real content on both sides of the comparison.
+        let manager = try makeManager()
         let snapshot = BLEManager.DetectionExportSnapshot(rows: [try row(Self.nearbyJSON)],
                                                           unseenIDs: [])
         let done = expectation(description: "two exports finish")
@@ -356,6 +410,193 @@ final class ExportTests: XCTestCase {
 
         // No activity owns these test artifacts, so the test may clean up its exact UUID dirs.
         for url in urls { try? FileManager.default.removeItem(at: url.deletingLastPathComponent()) }
+    }
+
+    // MARK: - the kept legacy pair (iOS only)
+
+    /// approx_lat and approx_lon of the one data row in `csv`.
+    private func approxColumns(_ csv: String) throws -> [String] {
+        let records = try XCTUnwrap(ContributionCsv.parseDocument(csv)?.records)
+        XCTAssertEqual(records.count, 2, "one header and one data row")
+        let header = records[0], data = records[1]
+        return [data[try XCTUnwrap(header.firstIndex(of: "approx_lat"))],
+                data[try XCTUnwrap(header.firstIndex(of: "approx_lon"))]]
+    }
+
+    private func legacyRow(_ json: String, loc: CLLocationCoordinate2D?,
+                           legacy: CLLocationCoordinate2D?,
+                           fallbacks: Bool = true) throws -> BLEManager.CSVRowInput {
+        BLEManager.CSVRowInput(d: try decode(json), firstSeen: Date(timeIntervalSince1970: 1_780_000_000),
+                               loc: loc, basis: .exact, allowDetectionCoordinateFallback: fallbacks,
+                               legacyObserverPair: legacy)
+    }
+
+    /// A live nearby row whose board fix was 900 s old when it arrived, so the checkpoint wire arm
+    /// seeds no pin for it.
+    private func staleLiveRow(mac: String) throws -> Detection {
+        let d = try decode(Self.nearbyJSON
+            .replacingOccurrences(of: "c2:40:d8:1c:2b:96", with: mac)
+            .replacingOccurrences(of: "\"n\":1}", with: "\"n\":1,\"gage\":900}"))
+        XCTAssertEqual(d.gpsAgeSec, 900, "fixture: a stale board fix")
+        XCTAssertFalse(d.isHistory, "fixture: a live row")
+        return d
+    }
+
+    /// approx_lat/lon on a STANDARD export: the real observer pin, then the kept legacy pair (what
+    /// the shipped build exported for a row that now has no pin), then the non-drone wire fix. A
+    /// drone keeps its pair and never exports the aircraft, and a contribution row (fallbacks off)
+    /// uses neither. Dropping the legacy step fails the kept-pair and drone assertions with the
+    /// wire fix and a blank; ranking the pair above the pin fails the first assertion; letting a
+    /// contribution row use the pair fails the last.
+    func testStandardExportUsesThePinThenTheKeptLegacyPairThenTheWire() throws {
+        let pin = CLLocationCoordinate2D(latitude: 40.0, longitude: -70.0)
+        let shipped = CLLocationCoordinate2D(latitude: 41.5, longitude: -71.25)
+        func approx(_ r: BLEManager.CSVRowInput) throws -> [String] {
+            try approxColumns(BLEManager.buildCSV([r]))
+        }
+        XCTAssertEqual(try approx(legacyRow(Self.nearbyJSON, loc: pin, legacy: shipped)),
+                       ["40.000000", "-70.000000"], "a real pin outranks the kept pair")
+        XCTAssertEqual(try approx(legacyRow(Self.nearbyJSON, loc: nil, legacy: shipped)),
+                       ["41.500000", "-71.250000"], "the kept pair outranks the wire fix")
+        XCTAssertEqual(try approx(legacyRow(Self.nearbyJSON, loc: nil, legacy: nil)),
+                       ["32.763243", "-117.116077"], "with no pair the wire fallback is unchanged")
+        XCTAssertEqual(try approx(legacyRow(Self.droneJSON, loc: nil, legacy: shipped)),
+                       ["41.500000", "-71.250000"], "a drone keeps its pair")
+        XCTAssertEqual(try approx(legacyRow(Self.droneJSON, loc: nil, legacy: nil)),
+                       ["", ""], "a drone never exports its aircraft as the observer")
+        XCTAssertEqual(try approx(legacyRow(Self.nearbyJSON, loc: nil, legacy: shipped,
+                                            fallbacks: false)),
+                       ["", ""], "a contribution row never uses the kept pair")
+    }
+
+    /// The GPX "Heard:" waypoint reads the same resolver as approx_lat/lon, so a pinless row with a
+    /// kept legacy pair maps at the pair, not at its wire fix. A waypoint resolved without the
+    /// legacy step fails both coordinate assertions.
+    func testGpxHeardWaypointUsesTheKeptLegacyPair() throws {
+        let gpx = BLEManager.buildGPX([try legacyRow(
+            Self.nearbyJSON, loc: nil, legacy: CLLocationCoordinate2D(latitude: 41.5, longitude: -71.25))])
+        XCTAssertEqual(gpx.components(separatedBy: "<wpt ").count - 1, 1)
+        XCTAssertTrue(gpx.contains("lat=\"41.500000\" lon=\"-71.250000\""))
+        XCTAssertFalse(gpx.contains("lat=\"32.763243\""), "not the wire fix")
+    }
+
+    /// The manager wiring for a shipped peakless pair, end to end and without disk. The restore
+    /// keeps it for a live row whose stale board fix seeds no pin; it never becomes a pin (the map
+    /// and the dossier read capturedLocation); the next checkpoint writes it back without a peak;
+    /// the standard export carries it; a contribution capture of the same device does not; and a
+    /// later real pin takes over the export without destroying the pair, which is what the
+    /// checkpoint's kept fields are for. Reverting the restore's keep fails the kept-pair, stored
+    /// and export assertions; reverting the write-back fails the stored assertions; filing the
+    /// pair as a pin fails the capturedLocation assertion; not passing it to the export snapshot
+    /// fails the first export assertion; restoring the old drop, in which a pin retired the pair,
+    /// fails the surviving-pair and kept-field assertions at the end.
+    func testShippedPeaklessPairIsKeptForTheStandardExportAndNeverBecomesAPin() throws {
+        let manager = try makeManager()
+        let d = try staleLiveRow(mac: "02:aa:bb:cc:ff:01")
+        let shipped = CLLocationCoordinate2D(latitude: 41.5, longitude: -71.25)
+        func standardApprox() throws -> [String] {
+            try approxColumns(BLEManager.buildCSV(
+                manager.detectionExportSnapshot().rows.filter { $0.d.id == d.id }))
+        }
+
+        manager.testRestoreCheckpointRow(d, lat: shipped.latitude, lon: shipped.longitude, peak: nil)
+        XCTAssertNil(manager.capturedLocation(for: d.id), "the kept pair is never a pin")
+        let kept = try XCTUnwrap(manager.testObserverPairState(for: d.id))
+        XCTAssertEqual(kept.legacyPair?.latitude, shipped.latitude, "the restore keeps the pair")
+        XCTAssertEqual(kept.stored.lat, shipped.latitude, "the next checkpoint writes it back")
+        XCTAssertEqual(kept.stored.lon, shipped.longitude)
+        XCTAssertNil(kept.stored.peak, "without a peak, so the next restore refuses it as a pin")
+        XCTAssertEqual(try standardApprox(), ["41.500000", "-71.250000"],
+                       "the standard export carries what the shipped build exported")
+
+        let start: Int64 = 1_780_000_300_000
+        manager.beginContributionCapture(startMs: start)
+        manager.testSeedContributionDetection(
+            d,
+            firstSeen: Date(timeIntervalSince1970: Double(start - 5_000) / 1000),
+            lastSeen: Date(timeIntervalSince1970: Double(start + 500) / 1000),
+            observerLocation: nil)
+        let contribution = manager.finishContributionCapture(startMs: start, stopMs: start + 1_000)
+        XCTAssertEqual(contribution.rows.count, 1)
+        XCTAssertEqual(try approxColumns(BLEManager.renderContributionCSV(
+            contribution.rows, includeObserverLocation: true, includeDroneLocation: true,
+            includeOperatorLocation: true)), ["", ""], "a contribution never uses the kept pair")
+
+        let pin = CLLocationCoordinate2D(latitude: 40.25, longitude: -70.5)
+        manager.testConsiderObserverPin(for: d.id, coordinate: pin, rssi: -80)
+        let pinned = try XCTUnwrap(manager.testObserverPairState(for: d.id))
+        XCTAssertEqual(pinned.legacyPair?.latitude, shipped.latitude,
+                       "a real pin does not destroy what the shipped build recorded")
+        XCTAssertEqual(pinned.stored.lat, pin.latitude)
+        XCTAssertEqual(pinned.stored.peak, -80)
+        XCTAssertEqual(pinned.stored.keptLat, shipped.latitude, "the checkpoint stores both")
+        XCTAssertEqual(pinned.stored.keptLon, shipped.longitude)
+        XCTAssertEqual(try standardApprox(), ["40.250000", "-70.500000"],
+                       "and the pin still wins the export")
+    }
+
+    /// A restore that DOES pin the row still preserves the shipped pair. That pair is what a
+    /// shipped build recorded and exported, so only the row leaving destroys it: a restored wire
+    /// pin takes lat/lon with its peak while the pair moves to the checkpoint's kept fields, and
+    /// feeding that stored shape back restores both again on the next launch, where the pin still
+    /// wins the export. A peaked pair with no kept fields is the paired arm's alone, so nothing is
+    /// kept for it. Restoring the old drop, in which a pin retired the pair, fails the three
+    /// surviving-pair assertions; writing only the pin at the checkpoint fails the kept-field
+    /// assertions; a restore that clears the kept table when its own row carries no pair fails the
+    /// raced assertion; ranking the pair as a pin fails the export assertion.
+    func testRestoreThatPinsTheRowStillPreservesTheShippedPair() throws {
+        let manager = try makeManager()
+        let shipped = CLLocationCoordinate2D(latitude: 41.5, longitude: -71.25)
+
+        let ranked = try decode(Self.nearbyJSON.replacingOccurrences(
+            of: "c2:40:d8:1c:2b:96", with: "02:aa:bb:cc:ff:02"))
+        XCTAssertNil(ranked.gpsAgeSec, "fixture: no board age")
+        manager.testRestoreCheckpointRow(ranked, lat: shipped.latitude, lon: shipped.longitude, peak: nil)
+        let rankedState = try XCTUnwrap(manager.testObserverPairState(for: ranked.id))
+        XCTAssertEqual(rankedState.legacyPair?.latitude, shipped.latitude,
+                       "a restored wire pin does not destroy the shipped pair")
+        XCTAssertEqual(try XCTUnwrap(rankedState.stored.lat), 32.763243, accuracy: 1e-9)
+        XCTAssertEqual(rankedState.stored.peak, -87, "the wire pin at the row RSSI")
+        XCTAssertEqual(rankedState.stored.keptLat, shipped.latitude, "the pair rides beside it")
+        XCTAssertEqual(rankedState.stored.keptLon, shipped.longitude)
+
+        // The next launch, from exactly what the checkpoint stored.
+        let relaunched = try makeManager()
+        relaunched.testRestoreCheckpointRow(ranked, lat: rankedState.stored.lat,
+                                            lon: rankedState.stored.lon,
+                                            peak: rankedState.stored.peak,
+                                            keptLat: rankedState.stored.keptLat,
+                                            keptLon: rankedState.stored.keptLon)
+        let reloaded = try XCTUnwrap(relaunched.testObserverPairState(for: ranked.id))
+        XCTAssertEqual(reloaded.legacyPair?.latitude, shipped.latitude, "and again after a relaunch")
+        XCTAssertEqual(reloaded.stored.keptLat, shipped.latitude)
+        XCTAssertEqual(try XCTUnwrap(relaunched.capturedLocation(for: ranked.id)).latitude,
+                       32.763243, accuracy: 1e-9, "the pin restores through the paired arm")
+        XCTAssertEqual(try approxColumns(BLEManager.buildCSV(
+            relaunched.detectionExportSnapshot().rows.filter { $0.d.id == ranked.id })),
+                       ["32.763243", "-117.116077"], "the pin still wins the export")
+
+        let paired = try decode(Self.nearbyJSON.replacingOccurrences(
+            of: "c2:40:d8:1c:2b:96", with: "02:aa:bb:cc:ff:03"))
+        manager.testRestoreCheckpointRow(paired, lat: 40.75, lon: -70.125, peak: -55)
+        let pairedState = try XCTUnwrap(manager.testObserverPairState(for: paired.id))
+        XCTAssertNil(pairedState.legacyPair, "a peaked pair is a pin, not a shipped pair")
+        XCTAssertNil(pairedState.stored.keptLat)
+
+        // The startup race applyLoadedRows handles: a checkpoint row carrying a peak lands on an id
+        // whose earlier restore kept a pair. The pin is taken and the kept pair stays, because only
+        // the row leaving clears it.
+        let stale = try staleLiveRow(mac: "02:aa:bb:cc:ff:04")
+        manager.testRestoreCheckpointRow(stale, lat: shipped.latitude, lon: shipped.longitude, peak: nil)
+        XCTAssertNotNil(try XCTUnwrap(manager.testObserverPairState(for: stale.id)).legacyPair)
+        manager.testRestoreCheckpointRow(stale, lat: 40.75, lon: -70.125, peak: -55)
+        XCTAssertEqual(try XCTUnwrap(manager.capturedLocation(for: stale.id)).latitude,
+                       40.75, accuracy: 1e-9)
+        let racedState = try XCTUnwrap(manager.testObserverPairState(for: stale.id))
+        XCTAssertEqual(racedState.legacyPair?.latitude, shipped.latitude,
+                       "a restored pin keeps it too")
+        XCTAssertEqual(racedState.stored.peak, -55)
+        XCTAssertEqual(racedState.stored.keptLat, shipped.latitude, "and the checkpoint stores both")
     }
 
     // MARK: - GPX

@@ -44,8 +44,6 @@ import java.time.Instant
 import java.time.ZoneId
 import java.time.format.DateTimeFormatter
 import java.util.Locale
-import kotlin.math.pow
-import kotlin.math.roundToInt
 
 /** True when the user has zeroed the system animator duration scale (the OS-level "remove
  *  animations" accessibility setting). Looping ornaments (radar sweep, breathing dots) key off
@@ -301,35 +299,45 @@ fun rssiBars(rssi: Int): Int = when {
     else -> 4
 }
 
-/** Rough RSSI-to-distance in meters, the same log-distance model the map uses
- *  (10^((-50 - rssi) / 25)), clamped to a sane 5..600 m so the number stays honest. */
-fun approxMeters(rssi: Int): Int =
-    10.0.pow((-50.0 - rssi) / 25.0).roundToInt().coerceIn(5, 600)
-
-/** Status pill: amber DEMO in sample-data mode, crimson LINKED + version when
- *  connected, or faint OFFLINE otherwise. Shared by the Status and Map headers. */
+/** Status pill. Existing callers can keep inferring connection from [version]; surfaces that
+ * retain stale status during reconnect/update can provide an authoritative [connected] and a
+ * compact [stateLabel] instead.
+ * TWIN: iOS `LinkChip` in Views/Components.swift - same labels and the same tint rule: DEMO and
+ * the three attention states below (`stateNeedsAttention`) draw the amber dot, label and border
+ * on both phones, so a radio fault never reads as a healthy connected pill. */
 @Composable
-fun LinkChip(version: String?, demo: Boolean = false) {
-    val connected = version != null
+fun LinkChip(
+    version: String?,
+    demo: Boolean = false,
+    connected: Boolean? = null,
+    stateLabel: String? = null,
+) {
+    val linked = connected ?: (version != null)
+    val stateNeedsAttention = stateLabel == "RECONNECTING" || stateLabel == "UPDATING" ||
+        stateLabel == "RADIO FAULT"
     val tone = when {
         demo -> Acab.warn
-        connected -> Acab.accent
+        stateNeedsAttention -> Acab.warn
+        linked -> Acab.accent
         else -> Acab.faint
     }
     val label = when {
         demo -> "DEMO"
-        connected -> "CONNECTED"
+        stateLabel != null -> stateLabel
+        linked -> "CONNECTED"
         else -> "OFFLINE"
     }
     val labelTone = when {
         demo -> Acab.warn
-        connected -> Acab.dim
+        stateNeedsAttention -> Acab.warn
+        linked -> Acab.dim
         else -> Acab.faint
     }
     Row(
         Modifier
             .background(Acab.bg2, CircleShape)
-            .border(1.dp, if (demo) Acab.warn.copy(alpha = 0.4f) else Acab.line, CircleShape)
+            .border(1.dp, if (demo || stateNeedsAttention) Acab.warn.copy(alpha = 0.4f)
+                else Acab.line, CircleShape)
             .padding(horizontal = 11.dp, vertical = 7.dp),
         verticalAlignment = Alignment.CenterVertically,
     ) {

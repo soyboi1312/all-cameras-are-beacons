@@ -45,8 +45,11 @@ struct ACABTone: Equatable {
 /// ACABTheme colour is a dynamic UIColor that picks between the two by the
 /// `accessibilityContrast` trait, so the choice is made per render, not at launch.
 ///
-/// Android twin: `AcabPalette` in Theme.kt. Shared hex values are identical; the alpha tint
-/// for `faint` differs per platform and each side documents its own measurement.
+/// Android twin: `AcabPalette` in Theme.kt. Every token both sides declare is the same colour
+/// to 8-bit precision at both contrast levels, `faint` included (0x8A normal / 0xBF high on
+/// both; the `faint` comment below says why it must stay that way). The only differences are
+/// tokens Android does not declare (`accentSoft`, `danger`, `tabBarBackground`) and one name:
+/// `axonTone` here is `bodyCamTone` there.
 struct ACABPalette: Equatable {
     // Surfaces
     let bg: ACABTone, bg2: ACABTone, bg3: ACABTone
@@ -61,6 +64,11 @@ struct ACABPalette: Equatable {
     let watchTone: ACABTone, glassesTone: ACABTone, netcamTone: ACABTone, sandTone: ACABTone
     // Tab bar (UIKit) backdrop
     let tabBarBackground: ACABTone
+
+    // Map information must not inherit contrast from translucent system material or the tile
+    // underneath it. Keep both the surface and the readable ink opaque in either appearance.
+    var mapInfoBackground: ACABTone { bg2 }
+    var mapInfoText: ACABTone { text }
 
     /// The warm off-white every secondary text tint is built from.
     private static let ink = (r: 240.0 / 255, g: 224.0 / 255, b: 226.0 / 255)
@@ -78,12 +86,18 @@ struct ACABPalette: Equatable {
         lineStrong: ACABTone(0xEE4034, alpha: 0.30),
         text:  ACABTone(0xF4EEF0),
         dim:   inkAt(0.60),
-        // 0.52, not the original 0.33: faint carries real instructions and privacy copy, and at
-        // 0.33 it measured ~2.5:1 against bg (WCAG AA wants 4.5:1 for text). 0.52 lands 4.69:1
-        // on bg, 4.67:1 on bg2 and 4.55:1 on bg3 (composited), so it clears AA everywhere and
-        // the three-step faint < dim < text hierarchy survives. Android sits at 0.54 for the
-        // same token and documents its own numbers.
-        faint: inkAt(0.52),
+        // 0.54, not the original 0.33: faint carries real instructions and privacy copy, and at
+        // 0.33 it measured ~2.5:1 against bg (WCAG AA wants 4.5:1 for text). 0.54 lands 4.98:1
+        // on bg, 4.95:1 on bg2 and 4.80:1 on bg3 (composited), so it clears AA on every surface
+        // with margin and the three-step faint < dim < text hierarchy survives.
+        // WAS 0.52, which measured 4.55:1 on bg3 - five hundredths above failing, and it differed
+        // from Android's 0.54 for no reason: same ink, same three surfaces, same WCAG target, so
+        // there is nothing platform-derived to justify two numbers. 0.54 x 255 = 138 = 0x8A, the
+        // byte Android already ships, so the two are the same colour to 8-bit precision.
+        // TWIN: one derivation, THREE declarations - Android `faint` in ui/theme/Theme.kt and
+        // soyboi.tech css/styles.css `--text-faint` (rgba(240,224,226,0.54)), which copies the
+        // apps and had already lagged once at 0.52. Change all three or none.
+        faint: inkAt(0.54),
         accent:     ACABTone(0xEE4034),
         // Crimson AS TEXT. The fill accent measures 4.42:1 on bg3, under AA for text, and it
         // was used for 9pt version tags and 8pt category captions. This lighter cut clears
@@ -170,6 +184,8 @@ enum ACABTheme {
     static let text  = color { $0.text }
     static let dim   = color { $0.dim }
     static let faint = color { $0.faint }
+    static let mapInfoBackground = color { $0.mapInfoBackground }
+    static let mapInfoText = color { $0.mapInfoText }
 
     // Accent (crimson) + amber
     static let accent     = color { $0.accent }

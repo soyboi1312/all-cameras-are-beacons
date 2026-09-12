@@ -26,8 +26,43 @@ enum LogFocus {
     static let notification = Notification.Name("acabFocusLogCategory")
 }
 
-/// ALPR, DRONE, BODY CAM, TRACKER, GLASSES, CAMERA (Network camera). Reuses each type's
-/// existing tint + glyph (netcamTone + web.camera.fill for the CAMERA / networkCamera entry).
+/// Whether a row belongs to one of the Log / Map category lenses. WATCHED is deliberately an
+/// overlapping category: a starred tracker is still a tracker (and keeps that type's styling),
+/// but it is also reachable through WATCHED. A wire row whose type is `.watched` remains capture-
+/// time evidence in that category after it is unstarred; only `isCurrentlyWatched` represents the
+/// current watchlist and may affect active mute policy elsewhere.
+func detectionMatchesCategory(type: DeviceType, category: String?,
+                              isCurrentlyWatched: Bool) -> Bool {
+    guard let category else { return true }
+    if category == DeviceType.watched.category {
+        return type == .watched || isCurrentlyWatched
+    }
+    return type.category == category
+}
+
+/// Does an ordinary appearance of the logbook run the first-open seen baseline
+/// (BLEManager.seedSeenWatermarkOnce)? Pure, so the rule can be pinned by tests rather than only
+/// by a SwiftUI lifecycle callback. A wrong answer here is not cosmetic: the baseline marks
+/// everything already stored as seen, so running it inside a seeded NEW visit empties the very
+/// lens a notification tap exists to show, and the user reviewing that tap reads "Nothing new".
+///
+/// `deepLinkNew` is the parked acab.pendingNewFilter flag. The other three describe the seeded
+/// NEW visit (see DetectionsView.newVisit): `hasVisit` carries existence separately because nil
+/// is a real starting watermark and must not read as "no visit", and `current` is the watermark
+/// now. The skip lasts for the whole visit, not for one appearance, because a skipped
+/// seedSeenWatermarkOnce is postponed and not cancelled: outside sample data its persisted
+/// once-only flag stays unset, so the next appearance inside the visit (a dossier pop, a
+/// size-class change) would run it and mark the seeded rows seen.
+func logFirstOpenBaselineRuns(deepLinkNew: Bool, hasVisit: Bool,
+                              visitWatermark: Date?, current: Date?) -> Bool {
+    if deepLinkNew { return false }      // this appearance seeds the lens and starts the visit
+    guard hasVisit else { return true }  // no visit in progress, so an ordinary first open
+    return visitWatermark != current     // the watermark moved under the visit, which ended it
+}
+
+/// ALPR, DRONE, BODY CAM, TRACKER, GLASSES, CAMERA (Network camera), and WATCHED. Reuses each
+/// type's existing tint + glyph (netcamTone + web.camera.fill for the CAMERA / networkCamera
+/// entry). WATCHED is dynamic like the rest: it is offered only while at least one row belongs.
 let detectionCategories: [DetectionCategory] = [
     .init(type: .flockCamera,      key: "ALPR",     tileLabel: "ALPR",  chipLabel: "ALPR"),
     .init(type: .drone,            key: "DRONE",    tileLabel: "DRONE", chipLabel: "DRONE"),
@@ -35,6 +70,7 @@ let detectionCategories: [DetectionCategory] = [
     .init(type: .tracker,          key: "TRACKER",  tileLabel: "TRKR",  chipLabel: "TRACKER"),
     .init(type: .recordingGlasses, key: "GLASSES",  tileLabel: "GLAS",  chipLabel: "GLASSES"),
     .init(type: .networkCamera,    key: "CAMERA",   tileLabel: "NETCAM", chipLabel: "NETWORK CAM"),
+    .init(type: .watched,          key: "WATCHED",  tileLabel: "WATCH", chipLabel: "WATCHED"),
 ]
 
 /// Logbook: detection history, with category tiles that double as filters over the
@@ -44,6 +80,25 @@ struct DetectionsView: View {
     @EnvironmentObject var ble: BLEManager
     @State private var filter: String?     // category key: ALPR / DRONE / BODY CAM / TRACKER
     @State private var scope: StatusScope = .all   // all / new (after the seen watermark) / offline-recorded
+    @State private var searchText = ""
+    @State private var sortOrder: DetectionLogSort = .newest
+    @FocusState private var searchFocused: Bool
+    // The seeded NEW visit, or nil. A NEW deep link starts one (the acabOpenLogNew arm, or
+    // onAppear's flag branch on a cold tab) and records the seen watermark as it stood then.
+    // While that record still equals ble.seenWatermark, masterList's onAppear skips the
+    // first-open baseline, so a dossier pop or a size-class change inside the visit cannot mark
+    // the seeded rows seen. The arm says what ends a visit and what a visit fails to end on.
+    @State private var newVisit: SeededNewVisit?
+    // Bumped by every seed so a seeded list starts at the top (seedLens writes it, masterList
+    // applies it). A counter, not a flag: two seeds in a row must each scroll, and the value
+    // doubles as the seed's identity for the applied record below.
+    @State private var seedScrollToken = 0
+    // The last seed this list actually scrolled for, and whether the list was on screen at the
+    // time. A seed can land on a loaded list while another tab is showing (see the acabOpenLogNew
+    // arm), and a scroll aimed at a list that has no layout can be dropped, so an off-screen
+    // application is deliberately not recorded and the next appearance applies it again.
+    @State private var appliedScrollToken = 0
+    @State private var listOnScreen = false
     @State private var selecting = false   // bulk-select mode
     @State private var selection: Set<String> = []   // selected Detection.id
     @State private var exportFile: ExportFile?
@@ -71,7 +126,7 @@ struct DetectionsView: View {
 
     /// Three-way status scope over the feed: everything, only-new (after the seen
     /// watermark), or only records the board buffered offline and replayed.
-    private enum StatusScope { case all, new, offline }
+    private enum StatusScope: Equatable { case all, new, offline }
 
     private struct ExportProblem: Identifiable {
         let id = UUID()
@@ -79,11 +134,110 @@ struct DetectionsView: View {
         let message: String
     }
 
+    /// One seeded NEW visit (see `newVisit`). A struct, not a bare `Date?`, because nil is a real
+    /// starting watermark (no mark was ever set) and must not read as "no visit".
+    private struct SeededNewVisit: Equatable { let watermark: Date? }
+
+    /// The inputs the Log lens reads, so an equal key means the previous result is still the
+    /// right one. Every member is either @State on this screen or @Published on the manager,
+    /// which is what makes the memo safe: body re-runs when any of them moves. ADD A MEMBER
+    /// HERE whenever the lens learns to read something new - a missing axis shows the user a
+    /// filtered list that no longer matches the store, and a Log that under-reports is hidden
+    /// evidence, not a cosmetic bug.
+    ///
+    /// Declared cheapest-first on purpose: the synthesized `==` compares in declaration order
+    /// and short-circuits, so a keystroke, a tile tap or a select-mode tap usually decides on
+    /// the scalars and never walks the row array.
+    private struct LogLensKey: Equatable {
+        let paused: Bool          // also covers frozenExport, which only changes with it
+        /// `isUnseen` compares the manager's per-row first-seen stamps against the watermark,
+        /// and those stamps do NOT travel with `rows`: Detection carries no first/last-seen
+        /// field, and BLEManager.rekey (run from resolveBracketedHistory at a drain's end
+        /// sentinel) rewrites the stamps of rows that were already filed without touching any
+        /// Detection. The republish that follows can therefore come back element-wise equal
+        /// while a row's verdict has flipped from New to seen. A drain whose begin sentinel
+        /// promised rows raises syncingOfflineLog, and handleHistEnd drops it in the same turn
+        /// it re-keys, so this Bool is the axis that moves with the rekey. Gap: a drain whose
+        /// begin sentinel promised no rows never raises it, so a rekey at that drain's end is
+        /// not covered. A manager-owned stamp-revision counter would close that gap and should
+        /// replace this member when one exists.
+        let syncing: Bool
+        let filter: String?
+        let scope: StatusScope
+        let sort: DetectionLogSort
+        let search: String
+        /// `isUnseen` reads the seen watermark. markAllSeen advances the pseudo-band baseline
+        /// in the same call that sets this Date, so the Date moves whenever either does.
+        let watermark: Date?
+        /// `isWatched` reads the watchlist, and the search reads the custom names DeviceNames
+        /// rebuilds from the watched AND ignored lists, so both belong in the key.
+        let watched: [WatchedDevice]
+        let ignored: [IgnoredDevice]
+        let rows: [Detection]
+    }
+
+    /// Memo for the Log lens, and for the query it runs. A reference type held in @State so
+    /// filling it during a body eval is a cache write, not a state change SwiftUI would
+    /// re-render for.
+    ///
+    /// Why it exists: with a non-empty search, the lens derives ten fields per row and folds
+    /// them, over the whole retained store (liveFeedCap 5,000). `body` re-runs on every one of
+    /// the manager's publishes (~3 Hz while detections stream), on every keystroke, and on
+    /// every @State write on this screen, and `shown` was recomputed from scratch each time.
+    /// Two arrays that share storage compare equal without touching an element, so an
+    /// unchanged store is decided cheaply; correctness does not rely on that - a changed store
+    /// falls back to an ordinary element-wise compare and rebuilds. This is the same
+    /// discipline MapTabView applies to its own lens.
+    ///
+    /// A publish that DID change the store (a re-sighted row's RSSI) still rebuilds the result,
+    /// but through `searchIndex`, which keeps every row's folded haystack across publishes and
+    /// refolds only a row whose identity text moved (DetectionLogSearchIndex says which fields).
+    /// The rebuild is then a substring test per row, not a nine-field derivation plus a fold.
+    private final class LogLensMemo {
+        private var cachedKey: LogLensKey?
+        private var cachedRows: [Detection] = []
+        private var cachedText: String?
+        private var cachedQuery = DetectionLogQuery("")
+        let searchIndex = DetectionLogSearchIndex()
+
+        /// One DetectionLogQuery per query change, shared by the list, the empty state and the
+        /// export filename qualifier instead of being rebuilt at each call site.
+        func query(for searchText: String) -> DetectionLogQuery {
+            if cachedText != searchText {
+                cachedText = searchText
+                cachedQuery = DetectionLogQuery(searchText)
+            }
+            return cachedQuery
+        }
+
+        func rows(for key: LogLensKey, build: () -> [Detection]) -> [Detection] {
+            if cachedKey == key { return cachedRows }
+            let built = build()
+            cachedKey = key
+            cachedRows = built
+            return built
+        }
+    }
+
+    @State private var lensMemo = LogLensMemo()
+
+    /// Built once per query change (see LogLensMemo.query), not once per read.
+    private var searchQuery: DetectionLogQuery { lensMemo.query(for: searchText) }
+
     private var shown: [Detection] {
         // Paused: read from the frozen snapshot so the list holds still. Live otherwise.
         let base = paused ? frozenRows : ble.logDetections
-        return base.filter { d in
-            (filter == nil || d.type.category == filter) && matchesScope(d)
+        let key = LogLensKey(paused: paused, syncing: ble.syncingOfflineLog, filter: filter,
+                             scope: scope, sort: sortOrder, search: searchText,
+                             watermark: ble.seenWatermark, watched: ble.watched,
+                             ignored: ble.ignored, rows: base)
+        let query = searchQuery   // resolved before the memo call, not inside its build closure
+        let index = lensMemo.searchIndex
+        return lensMemo.rows(for: key) {
+            applyDetectionLogLens(base, category: filter, unseenOnly: scope == .new,
+                offlineOnly: scope == .offline, query: query, sort: sortOrder,
+                isUnseen: { paused ? frozenExport?.unseenIDs.contains($0.id) == true : ble.isUnseen($0) },
+                isWatched: { ble.isWatched($0) }, index: index)
         }
     }
 
@@ -99,14 +253,6 @@ struct DetectionsView: View {
         frozenExport = nil
         frozenRows = []
         frozenIDs = []
-    }
-    private func matchesScope(_ d: Detection) -> Bool {
-        switch scope {
-        case .all:     return true
-        case .new:
-            return paused ? (frozenExport?.unseenIDs.contains(d.id) == true) : ble.isUnseen(d)
-        case .offline: return d.offline
-        }
     }
     /// Everything one body eval needs from the store, computed in a single pass. shown /
     /// count(cat) / newCount / offlineCount used to be independent computed properties, each
@@ -129,6 +275,11 @@ struct DetectionsView: View {
         var newN = 0, offN = 0, pausedNewN = 0
         for d in ble.logDetections {
             counts[d.type.category, default: 0] += 1
+            // WATCHED overlaps the underlying category. Do not double-count a row the board
+            // already typed watched when that same MAC is still on the current watchlist.
+            if d.type != .watched, ble.isWatched(d) {
+                counts[DeviceType.watched.category, default: 0] += 1
+            }
             if ble.isUnseen(d) { newN += 1 }
             if d.offline { offN += 1 }
             if paused && !frozenIDs.contains(d.id) { pausedNewN += 1 }
@@ -151,6 +302,14 @@ struct DetectionsView: View {
                     // Log cleared out from under a paused view: drop the frozen snapshot so we
                     // don't keep showing rows that no longer exist and can't be resumed away from.
                     if paused && ble.logDetections.isEmpty { resumeFeed() }
+                }
+                // Every category normally keeps its active zero-count tile so a transient store
+                // change cannot strand a hidden filter. WATCHED is intentionally different: the
+                // product only offers that lens while a watched/capture-typed row exists. If the
+                // last member is removed, return to ALL before the tile disappears.
+                .onChange(of: snap.counts[DeviceType.watched.category] ?? 0,
+                          initial: true) { _, count in
+                    if filter == DeviceType.watched.category, count == 0 { filter = nil }
                 }
         }
     }
@@ -201,26 +360,51 @@ struct DetectionsView: View {
         }
     }
 
+    /// Scroll anchor for the top of the master list. Parked on `header`, which sits in the plain
+    /// VStack outside logCard's LazyVStack and is therefore always built, so a seed can scroll to
+    /// it from anywhere in a long log without depending on a lazy row being realized.
+    private static let topAnchorID = "logTop"
+
+    /// Put the master list back at the top for a seed, at most once per seed.
+    /// Called from the token's onChange (the usual path, this list is on screen) and from the
+    /// list's onAppear, because the acabOpenLogNew arm also seeds a loaded list that another tab
+    /// is covering: the seed and MainTabView's tab switch happen in one update, so that attempt
+    /// can reach a list with no layout yet. Only an on-screen application is recorded, which is
+    /// what keeps a dropped one from being counted as done, and the appearance that follows the
+    /// tab switch then applies the same seed. The hop to the next run loop is the one
+    /// SettingsView's openDetectorsToken already documents: the lens writes and the tab switch
+    /// are in this update, so the target reaches its final position first.
+    private func applySeedScroll(_ proxy: ScrollViewProxy, onScreen: Bool) {
+        guard appliedScrollToken != seedScrollToken else { return }
+        let token = seedScrollToken
+        DispatchQueue.main.async {
+            proxy.scrollTo(Self.topAnchorID, anchor: .top)
+            if onScreen { appliedScrollToken = token }
+        }
+    }
+
     /// Today's logbook screen: the whole view when compact, the left column when regular.
     /// Keeps its own nav / sheet / dialog modifiers so both layouts get them.
     private func masterList(_ snap: LogSnapshot) -> some View {
             ZStack(alignment: .bottom) {
                 ACABTheme.bg.ignoresSafeArea()
+                ScrollViewReader { proxy in
                 ScrollView {
                     VStack(alignment: .leading, spacing: 16) {
-                        header(snap)
+                        header(snap).id(Self.topAnchorID)
                         // Persistent board-side loss/censoring flags belong beside the evidence,
                         // not behind a settings disclosure. The Offline Buffer card repeats them.
                         ForEach(ble.status?.bufferHealthNotices ?? [], id: \.self) {
                             BufferHealthBanner(notice: $0)
                         }
                         if !selecting && !ble.logDetections.isEmpty { actionChips }
+                        if !ble.logDetections.isEmpty { searchAndSort(snap) }
                         summaryTiles(snap)
                         if !ble.logDetections.isEmpty { statusFilter(snap) }
                         if ble.logDetections.isEmpty { emptyState }
                         else if snap.shown.isEmpty { noMatchState }
                         else { logCard(snap) }
-                        Spacer(minLength: selecting ? 72 : 8)
+                        Spacer(minLength: 8)
                     }
                     .padding(.horizontal, ACABTheme.pad)
                     .padding(.top, 8)
@@ -233,32 +417,103 @@ struct DetectionsView: View {
                 // Extra bottom margin only at accessibility sizes, so grown content never ends
                 // under the tab bar; zero at default sizes (layout untouched).
                 .contentMargins(.bottom, dynamicTypeSize.isAccessibilitySize ? 24 : 0, for: .scrollContent)
-                if selecting { selectBar }
+                .scrollDismissesKeyboard(.interactively)
+                // Only a seed scrolls (seedLens bumps the token). A lens change the user makes by
+                // hand keeps the offset, which is what Android does too: only MainScreen's seeds
+                // bump logScreenKey, nothing else re-keys LogScreen. Unanimated, because a seed is
+                // a jump to a different lens and not a scroll the user made.
+                // Applied from both ends so the seeded lens always ends up at the top: the token's
+                // change, and this list's appearance when the seed arrived while it was off
+                // screen (applySeedScroll records which seeds it has already served).
+                // NOT device-verified this round: where SwiftUI settles when the lens and the
+                // scroll move in one update still needs a run on hardware.
+                .onChange(of: seedScrollToken) { applySeedScroll(proxy, onScreen: listOnScreen) }
+                .onAppear {
+                    // Guarded because a redundant write here would re-run this whole list body.
+                    if !listOnScreen { listOnScreen = true }
+                    applySeedScroll(proxy, onScreen: true)
+                }
+                .onDisappear { listOnScreen = false }
+                }   // ScrollViewReader, wrapped without re-indenting its body so the diff stays
+                    // on the wrap itself
+            }
+            .safeAreaInset(edge: .bottom, spacing: 0) {
+                if selecting { selectBar(snap) }
             }
             .navigationBarHidden(true)
             .navigationDestination(for: Detection.self) { d in
                 DetectionDetailView(detection: d)
             }
             .onAppear {
-                // Drive-mode surfaces (widget / notification) deep-link here with
-                // the NEW filter pre-armed via this flag; consume it once.
+                // Every NEW deep link parks this flag before it posts acabOpenLogNew (the arm
+                // below lists the posters). It survives to here when no loaded list heard that
+                // post, as on a cold tab; consume it once and start the seeded NEW visit.
                 let deepLinkNew = UserDefaults.standard.bool(forKey: "acab.pendingNewFilter")
+                let runBaseline = logFirstOpenBaselineRuns(
+                    deepLinkNew: deepLinkNew, hasVisit: newVisit != nil,
+                    visitWatermark: newVisit?.watermark, current: ble.seenWatermark)
                 if deepLinkNew {
-                    scope = .new
+                    seedLens(scope: .new, category: nil)
                     UserDefaults.standard.removeObject(forKey: "acab.pendingNewFilter")
-                } else {
+                    newVisit = SeededNewVisit(watermark: ble.seenWatermark)
+                } else if runBaseline {
                     // First ordinary open, baseline the New dots to what is already here so a
-                    // fresh install / first backlog is not a wall of dots. Once-only. Skipped on a
-                    // NEW deep-link, or the baseline would erase the very rows it exists to show.
+                    // fresh install / first backlog is not a wall of dots. Once-only outside
+                    // sample data (BLEManager.seedSeenWatermarkOnce re-baselines the sample log on
+                    // every call). Skipped for the whole seeded NEW visit, or the baseline would
+                    // erase the very rows the link promised.
+                    if newVisit != nil { newVisit = nil }
                     ble.seedSeenWatermarkOnce()
                 }
                 consumeLogFocus()   // Status-tile category handoff, cold-tab path
             }
-            // A Live Activity tap while this tab is already showing never re-fires
-            // onAppear; RootView posts this notification so the filter arms right away.
+            // Every NEW deep link parks acab.pendingNewFilter, then posts this: RootView.onOpenURL
+            // (a Live Activity beacons://log/new tap), DetectionNotifier's
+            // userNotificationCenter(_:didReceive:withCompletionHandler:) (a notification tap) and
+            // OfflineSyncBannerView.viewNew (the offline-sync banner's view action). A tap while
+            // this list is on screen never re-fires onAppear, so the lens is seeded here at post
+            // time. This arm also runs while the Log tab is loaded but another tab is selected:
+            // MainTabView then switches to it and onAppear follows with the flag already gone.
+            // The arm seeds whether or not the list is visible, because a visibility gate that
+            // misread a visible list as hidden would drop the tap until some later appearance.
+            // Either way the arm starts the seeded NEW visit (newVisit).
+            //
+            // The baseline skip lasts for the visit, not for one appearance. A skipped
+            // BLEManager.seedSeenWatermarkOnce is postponed, not cancelled (its once-only key stays
+            // unset), so a skip that ended at the next appearance would run the baseline at the
+            // first dossier pop, mark the seeded rows seen and empty the NEW lens under review.
+            // A visit ends when the watermark moves under it. MainTabView.onChange(of: tab) calls
+            // markAllSeen when the user leaves the Log tab, and the next appearance then runs the
+            // baseline. The MARK SEEN chip moves the watermark too, so it re-records the visit
+            // instead of ending it; otherwise the next pop would mark seen every row that arrived
+            // after the tap. Android ends its skip at the same point: LogScreen runs
+            // seedSeenWatermarkOnce from LaunchedEffect(Unit) only when initialFilter is not
+            // NewOnly, once per key(logScreenKey) composition. MainScreen draws the compact dossier
+            // as an overlay, so closing it never re-runs that gate, and MARK SEEN does not rekey
+            // it. The composition ends when the user leaves the Log tab, and a manual tab tap
+            // resets logFilterSeed.
+            //
+            // What a visit fails to end on: a watermark that returns to the recorded value.
+            // markAllSeen always stamps a new Date, so while this view exists only
+            // BLEManager.exitDemo can do that, by restoring the watermark seedDemoData saved, and
+            // only when the watermark had not moved between the record and the start of sample
+            // data. The skip then holds until the user next leaves the Log tab. A skip never marks
+            // a row seen, so this leaves New dots in place and hides nothing.
+            //
+            // Regular width is closed: seedLens clears selectedDetail, so the right pane drops
+            // back to its placeholder instead of holding a dossier the seeded lens does not list.
+            // That is what Android does on the same seeds, where MainScreen calls setSelected(null)
+            // in the LaunchedEffect(openLogNew) and in openLogCategory.
+            //
+            // Not closed, and compact width only: a NEW link that lands while a dossier is PUSHED
+            // on this stack seeds the lens under the dossier, which stays on top, so the tap shows
+            // no change until the user goes back. That pop is inside the visit and shows the
+            // seeded lens. Closing it needs a NavigationStack path the seed resets, a navigation
+            // change this fix does not make.
             .onReceive(NotificationCenter.default.publisher(for: Notification.Name("acabOpenLogNew"))) { _ in
-                scope = .new
+                seedLens(scope: .new, category: nil)
                 UserDefaults.standard.removeObject(forKey: "acab.pendingNewFilter")
+                newVisit = SeededNewVisit(watermark: ble.seenWatermark)
             }
             // Status-tile category handoff, warm-tab path (see LogFocus).
             .onReceive(NotificationCenter.default.publisher(for: LogFocus.notification)) { _ in
@@ -337,9 +592,76 @@ struct DetectionsView: View {
                 chipLabel("square.and.arrow.up", filter.map { "EXPORT \($0)" } ?? "EXPORT")
             }
             .buttonStyle(.plain)
-            actionChip("checkmark", "MARK SEEN") { ble.markAllSeen(); scope = .all }
+            // Re-record a live seeded NEW visit rather than end it (see the acabOpenLogNew arm):
+            // ending it would let the next dossier pop run a pending first-open baseline and mark
+            // seen every row that arrived after this tap.
+            actionChip("checkmark", "MARK SEEN") {
+                ble.markAllSeen()
+                if newVisit != nil { newVisit = SeededNewVisit(watermark: ble.seenWatermark) }
+                scope = .all
+            }
         }
         }
+    }
+
+    /// Search and sort name the current lens explicitly. Counts describe detections, never the
+    /// number of visible lazy rows, and a query is also honored by CSV/GPX exports.
+    private func searchAndSort(_ snap: LogSnapshot) -> some View {
+        VStack(alignment: .leading, spacing: 8) {
+            HStack(spacing: 10) {
+                Image(systemName: "magnifyingglass").foregroundStyle(ACABTheme.dim)
+                TextField("Search name, MAC or vendor", text: $searchText)
+                    .font(ACABTheme.display(15)).foregroundStyle(ACABTheme.text)
+                    .textInputAutocapitalization(.never).autocorrectionDisabled()
+                    .submitLabel(.search).focused($searchFocused)
+                    .onSubmit { searchFocused = false }
+                    .accessibilityLabel("Search detections by name, MAC address or vendor")
+                if !searchText.isEmpty {
+                    Button { searchText = "" } label: {
+                        Image(systemName: "xmark.circle.fill").foregroundStyle(ACABTheme.dim)
+                            .frame(minWidth: 44, minHeight: 44)
+                    }
+                    .buttonStyle(.plain).accessibilityLabel("Clear search")
+                }
+            }
+            .padding(.leading, 12).padding(.trailing, searchText.isEmpty ? 12 : 0)
+            .frame(minHeight: 48)
+            .background(ACABTheme.bg2, in: RoundedRectangle(cornerRadius: ACABTheme.radiusSm))
+            .overlay(RoundedRectangle(cornerRadius: ACABTheme.radiusSm)
+                .strokeBorder(ACABTheme.line, lineWidth: 1))
+
+            ViewThatFits(in: .horizontal) {
+                HStack(spacing: 10) { logLensSummary(snap); Spacer(minLength: 0); sortMenu }
+                VStack(alignment: .leading, spacing: 4) { logLensSummary(snap); sortMenu }
+            }
+        }
+    }
+
+    private func logLensSummary(_ snap: LogSnapshot) -> some View {
+        let total = paused ? frozenRows.count : ble.logDetections.count
+        let category = filter.map { " · \($0)" } ?? ""
+        return Text("\(snap.shown.count) of \(total)\(paused ? " paused" : " retained")\(category)")
+            .font(ACABTheme.mono(11)).foregroundStyle(ACABTheme.dim)
+            .fixedSize(horizontal: false, vertical: true)
+            .accessibilityLabel("\(snap.shown.count) matching detections of \(total)\(paused ? " in the paused log" : " retained")\(category)")
+    }
+
+    private var sortMenu: some View {
+        Menu {
+            Picker("Sort detections", selection: $sortOrder) {
+                ForEach(DetectionLogSort.allCases, id: \.self) { order in
+                    Text(order.label).tag(order)
+                }
+            }
+        } label: {
+            Label(sortOrder.label, systemImage: "arrow.up.arrow.down")
+                .font(ACABTheme.mono(11, weight: .semibold))
+                .foregroundStyle(ACABTheme.text).padding(.horizontal, 10)
+                .frame(minHeight: 44)
+                .background(ACABTheme.bg2, in: Capsule())
+        }
+        .accessibilityLabel("Sort detections")
+        .accessibilityValue(sortOrder.label)
     }
 
     // The chip's visual, factored out so the plain-action chips and the EXPORT menu share one
@@ -373,8 +695,11 @@ struct DetectionsView: View {
     /// labels quadruple, and the row became unreadable. Default layout untouched.
     @ViewBuilder
     private func summaryTiles(_ snap: LogSnapshot) -> some View {
-        if dynamicTypeSize.isAccessibilitySize {
-            LazyVGrid(columns: Array(repeating: GridItem(.flexible(), spacing: 8), count: 3),
+        if dynamicTypeSize.isAccessibilitySize || shownCategories(snap).count > 6 {
+            // Seven categories fit two readable rows at ordinary sizes; accessibility text
+            // gets wider tiles. Avoid a mostly empty third row pushing the Log below the fold.
+            let columns = dynamicTypeSize.isAccessibilitySize ? 3 : 4
+            LazyVGrid(columns: Array(repeating: GridItem(.flexible(), spacing: 8), count: columns),
                       spacing: 8) {
                 ForEach(shownCategories(snap)) { c in
                     tile(c.type, c.key, c.tileLabel, count: snap.counts[c.key] ?? 0)
@@ -391,11 +716,14 @@ struct DetectionsView: View {
 
     /// Which category tiles to actually render: a category with at least one detection this
     /// session, OR the currently-active filter even at count 0. The active-filter exception is
-    /// REQUIRED: if the user has filtered to a category and its live count momentarily drops to 0
-    /// (eviction / staleness), the tile must NOT vanish out from under them, or the filter breaks
-    /// silently with no visible way to clear it. Empty row (nothing detected yet) is fine.
+    /// required for the six detector categories: a transient eviction must not hide the way back
+    /// out. WATCHED is the deliberate exception to that exception; its contract is to exist only
+    /// while it has a member, and the count-change hook above returns that lens to ALL first.
     private func shownCategories(_ snap: LogSnapshot) -> [DetectionCategory] {
-        detectionCategories.filter { (snap.counts[$0.key] ?? 0) > 0 || filter == $0.key }
+        detectionCategories.filter {
+            let count = snap.counts[$0.key] ?? 0
+            return count > 0 || ($0.key != DeviceType.watched.category && filter == $0.key)
+        }
     }
 
     private func tile(_ type: DeviceType, _ cat: String, _ label: String, count n: Int) -> some View {
@@ -440,6 +768,7 @@ struct DetectionsView: View {
         case "CAMERA", "NETCAM", "NETWORK CAM": return "network cameras"
         case "TRKR", "TRACKER": return "item trackers"
         case "GLAS", "GLASSES": return "recording glasses"
+        case "WATCH", "WATCHED": return "watched devices"
         default: return label.lowercased()
         }
     }
@@ -447,9 +776,13 @@ struct DetectionsView: View {
     /// All / New / Offline segmented chips ("mark all seen" lives in the header chips now).
     private func statusFilter(_ snap: LogSnapshot) -> some View {
         HStack(spacing: 8) {
-            segChip("ALL", ble.logDetections.count, active: scope == .all) { scope = .all }
-            segChip("NEW", snap.newCount, active: scope == .new, tint: ACABTheme.accent) { scope = .new }
-            segChip("OFFLINE", snap.offlineCount, active: scope == .offline) { scope = .offline }
+            ScrollView(.horizontal, showsIndicators: true) {
+                HStack(spacing: 8) {
+                    segChip("ALL", ble.logDetections.count, active: scope == .all) { scope = .all }
+                    segChip("NEW", snap.newCount, active: scope == .new, tint: ACABTheme.accent) { scope = .new }
+                    segChip("OFFLINE", snap.offlineCount, active: scope == .offline) { scope = .offline }
+                }
+            }
             Spacer(minLength: 0)
             // Quick clear at the top: reaching the bottom "clear log..." row is a long scroll
             // once the log is big. Goes through the same confirmation, quiet so it's not a mis-tap
@@ -605,9 +938,11 @@ struct DetectionsView: View {
                         qualifier suppliedQualifier: String? = nil) {
         let base = supplied ?? (paused ? frozenExport : nil) ?? ble.detectionExportSnapshot()
         let scoped = supplied == nil
-            ? base.filtered(category: filter, unseenOnly: scope == .new, offlineOnly: scope == .offline)
+            ? base.reviewed(category: filter, unseenOnly: scope == .new, offlineOnly: scope == .offline,
+                            query: searchQuery, sort: sortOrder,
+                            isWatched: { ble.isWatched($0) })
             : base
-        let qualifier = suppliedQualifier ?? exportQualifier
+        let qualifier = supplied == nil ? (suppliedQualifier ?? exportQualifier) : suppliedQualifier
         ble.writeDetections(format, snapshot: scoped, filenameQualifier: qualifier) { result in
             switch result {
             case .success(let url):
@@ -624,6 +959,13 @@ struct DetectionsView: View {
         }
     }
 
+    /// The filename slug's vocabulary is ONE rule on both platforms, in this order: the category
+    /// key, NEW or OFFLINE, SEARCH, STRONGEST, PAUSED, joined by "-". writeDetections lowercases
+    /// the whole slug and turns spaces into "-", so "BODY CAM" lands as the same "body-cam"
+    /// Android's `it.lowercase().replace(' ', '-')` makes. A file made from a strongest-first or
+    /// paused review says so in its name the way a category or a search does: what left the
+    /// phone was a re-ordered or frozen view, not the log in arrival order.
+    /// TWIN: Android `slugParts` in LogScreen.exportLog, same words, same order.
     private var exportQualifier: String? {
         var parts: [String] = []
         if let filter { parts.append(filter) }
@@ -632,21 +974,34 @@ struct DetectionsView: View {
         case .new: parts.append("NEW")
         case .offline: parts.append("OFFLINE")
         }
+        // Never leak a pasted device name/address into the temporary export filename.
+        if !searchQuery.isEmpty { parts.append("SEARCH") }
+        if sortOrder == .strongest { parts.append("STRONGEST") }
+        if paused { parts.append("PAUSED") }
         return parts.isEmpty ? nil : parts.joined(separator: "-")
     }
 
-    /// Bottom action bar shown in select mode: bulk-mute the selected rows.
-    private var selectBar: some View {
-        HStack(spacing: 10) {
-            Button { selection = Set(shown.map { $0.id }) } label: {
-                Text("SELECT ALL").font(ACABTheme.mono(11, weight: .bold)).tracking(0.5)
+    /// Bottom action bar shown in select mode: bulk-mute the selected rows. Takes the body's
+    /// snapshot rather than reading `shown` itself: this bar used to read it twice more (once
+    /// for the button's action, once eagerly for the trait), so select mode - where every
+    /// checkbox tap re-runs body - paid for three lens passes per eval instead of one.
+    private func selectBar(_ snap: LogSnapshot) -> some View {
+        let layout = dynamicTypeSize.isAccessibilitySize
+            ? AnyLayout(VStackLayout(spacing: 10)) : AnyLayout(HStackLayout(spacing: 10))
+        return layout {
+            Button { selection = Set(snap.shown.map { $0.id }) } label: {
+                Text("SELECT SHOWN").font(ACABTheme.mono(11, weight: .bold)).tracking(0.5)
                     .foregroundStyle(ACABTheme.dim)
-                    .padding(.horizontal, 14).frame(height: 44)
+                    .padding(.horizontal, 14).frame(minHeight: 44)
                     .background(ACABTheme.bg2, in: Capsule())
                     .overlay(Capsule().strokeBorder(ACABTheme.line, lineWidth: 1))
             }
             .buttonStyle(.plain)
-            .accessibilityAddTraits(!shown.isEmpty && selection.isSuperset(of: shown.map(\.id))
+            // allSatisfy, not isSuperset(of: map(\.id)): the superset form built a throwaway
+            // array of every shown row's id on every body eval, and this modifier's argument
+            // is evaluated eagerly whether or not VoiceOver is running.
+            .accessibilityAddTraits(!snap.shown.isEmpty
+                                    && snap.shown.allSatisfy { selection.contains($0.id) }
                                     ? .isSelected : [])
             Button(action: ignoreSelected) {
                 HStack(spacing: 7) {
@@ -654,7 +1009,7 @@ struct DetectionsView: View {
                     Text("MUTE \(selection.count)").font(ACABTheme.mono(12, weight: .bold)).tracking(0.5)
                 }
                 .foregroundStyle(selection.isEmpty ? ACABTheme.faint : ACABTheme.onAccent)
-                .frame(maxWidth: .infinity).frame(height: 44)
+                .frame(maxWidth: .infinity).frame(minHeight: 44)
                 .background(selection.isEmpty ? ACABTheme.bg2 : ACABTheme.accent, in: Capsule())
                 .overlay(Capsule().strokeBorder(selection.isEmpty ? ACABTheme.line : .clear, lineWidth: 1))
             }
@@ -675,8 +1030,59 @@ struct DetectionsView: View {
     private func consumeLogFocus() {
         guard let cat = LogFocus.pendingCategory else { return }
         LogFocus.pendingCategory = nil
-        filter = cat
-        scope = .all
+        seedLens(scope: .all, category: cat)
+    }
+
+    /// A deep-link seed (Live Activity / notification NEW tap, offline-sync banner, Status
+    /// category tile) positions only the axis it names and resets every other lens axis to its
+    /// default. The seed promised specific rows: a search or a category the user set earlier
+    /// would hide them, in a populated list that silently lacks them or behind the no-match
+    /// panel when nothing else matches; a strongest-first sort would bury the newest of them;
+    /// and a frozen snapshot would leave them off the paused list. Android does the same:
+    /// MainScreen bumps logScreenKey on every seed, so LogScreen rebuilds its lens from the seed
+    /// with every other axis at its default, and resumes the paused feed in the same handler.
+    ///
+    /// A seed also leaves bulk-select mode and closes the right-pane dossier, so a seeded visit
+    /// always starts as a plain list. Android drops both structurally: LogScreen keeps select mode
+    /// and its id set in plain `remember` state inside MainScreen's key(logScreenKey) wrapper, and
+    /// every seed bumps that key.
+    ///
+    /// A seed returns the list to the top too (seedScrollToken, applied in masterList). Android
+    /// reaches the same place without writing anything: LogScreen's LazyColumn is declared with
+    /// no state argument, so the default rememberLazyListState it builds lives inside
+    /// key(logScreenKey) and every seed rebuilds it at offset 0. That half is an absence rather
+    /// than a rule anyone wrote, and it is the fragile one: hoisting a rememberLazyListState out
+    /// of LogScreen to carry the offset across tab switches would end the reset silently, so a
+    /// drift pin for that side has to be the absence of rememberLazyListState in LogScreen.kt.
+    /// SwiftUI keeps the content offset across a state change instead, so without the token the
+    /// same notification tap starts at the top on Android and mid-list on iPhone, with the
+    /// newest-first rows it promised above the viewport.
+    private func seedLens(scope newScope: StatusScope, category: String?) {
+        filter = category
+        scope = newScope
+        sortOrder = .newest
+        searchText = ""
+        searchFocused = false
+        if paused { resumeFeed() }   // the live rows the seed exists to show, not a stale snapshot
+        seedScrollToken += 1         // back to the top of the seeded lens, see masterList
+        // A selection carried in from an earlier visit would aim MUTE N at rows the user never
+        // chose, in a list whose contents just changed under the checkboxes. This closes the seed
+        // route to that hazard and only that route: the lens controls stay live during select mode
+        // on both apps, so a selection still outlives a lens change the user makes by hand. Here
+        // only actionChips, pauseButton and the clear chip are gated on `selecting`, while the
+        // tiles (tile), the scope chips (statusFilter) and the search field (searchAndSort) are
+        // not, and ignoreSelected resolves picks over ble.logDetections rather than the shown rows.
+        // Android is the same shape, so closing that is one rule across both apps and is not
+        // decided here: only its action-chip row, PauseChip and clear chip sit behind !selectMode,
+        // and SelectBar onIgnore filters `detections` the same way.
+        // This ends the mode only; the select bar and its labels are untouched.
+        selecting = false
+        selection.removeAll()
+        // Regular width: the open dossier is usually a row the seeded lens does not list, so the
+        // pane would contradict the list beside it. Inert at compact width, where rows push
+        // instead of filling a pane (see row(_:)), and the pane always falls back to its
+        // "Select a detection" placeholder rather than going blank.
+        selectedDetail = nil
     }
 
     private func toggle(_ d: Detection) {
@@ -745,6 +1151,11 @@ struct DetectionsView: View {
             Text(noMatchBody)
                 .font(ACABTheme.mono(11)).foregroundStyle(ACABTheme.faint)
                 .multilineTextAlignment(.center)
+            Button("Clear filters") {
+                searchText = ""; filter = nil; scope = .all
+            }
+            .font(ACABTheme.display(14, weight: .semibold)).foregroundStyle(ACABTheme.text)
+            .frame(minHeight: 44)
             // Keep resume reachable even if the active filter hides every frozen row while paused.
             if paused { pauseButton.padding(.top, 4) }
         }
@@ -760,6 +1171,7 @@ struct DetectionsView: View {
         }
     }
     private var noMatchTitle: String {
+        if !searchQuery.isEmpty { return "No matching detections" }
         switch scope {
         case .new:     return "Nothing new"
         case .offline: return "Nothing offline"
@@ -769,6 +1181,9 @@ struct DetectionsView: View {
         }
     }
     private var noMatchBody: String {
+        if !searchQuery.isEmpty {
+            return "Try a shorter name, vendor or MAC address, or clear the current filters."
+        }
         switch scope {
         case .new:     return "Everything here is marked seen. New hits show up as they arrive."
         case .offline: return "No offline-recorded detections yet. The board buffers these while your phone is away."

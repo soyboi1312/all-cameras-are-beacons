@@ -1,5 +1,6 @@
 import SwiftUI
 import MapKit
+import os
 
 /// One-shot handoff from a detection dossier's location thumbnail to the full map tab.
 /// The tap stashes the coordinate here and posts the notification; MainTabView switches
@@ -12,6 +13,454 @@ enum MapFocus {
     static var pending: CLLocationCoordinate2D?
     static let notification = Notification.Name("acabFocusMap")
 }
+
+/// Resolve the coordinate a detection surface should present. Remote ID owns a drone's subject
+/// coordinate, so a valid aircraft fix always wins and the observer fix is only its no-position
+/// fallback. Every other wire coordinate is the detector/phone fix, not the subject's position;
+/// the manager's strongest-observer sample is the better estimate and therefore wins when present.
+/// Kept outside the view so the full map and Log dossier cannot drift apart on this distinction.
+///
+/// `allowNonDroneWireFallback` gates ONLY that last fallback. TWIN: android
+/// `mapCoordinateForDetection` in AcabBleManager.kt, same parameter and same default, with
+/// `mapWireFallbackAllowed` standing in for the call-site expression below - one rule, one owner.
+/// Every surface that presents this as "where this was heard" passes the gate, because the
+/// shipped q-pin FAQ (byte-identical on both platforms) reserves the last-shared-fix fallback for
+/// offline records, and a live board keeps stamping its last phone fix at ANY age. The default
+/// stays `true` because the ordinary Log export must keep carrying the coordinate either way -
+/// see `allowDetectionCoordinateFallback` in BLEManager.swift.
+func resolvedDetectionMapCoordinate(type: DeviceType,
+                                    wireCoordinate: CLLocationCoordinate2D?,
+                                    strongestObserverCoordinate: CLLocationCoordinate2D?,
+                                    allowNonDroneWireFallback: Bool = true)
+    -> CLLocationCoordinate2D? {
+    if type == .drone { return wireCoordinate ?? strongestObserverCoordinate }
+    return strongestObserverCoordinate ?? (allowNonDroneWireFallback ? wireCoordinate : nil)
+}
+
+/// Region for the Log dossier's tracker thumbnail. Longitude uses the complement of the largest
+/// gap on the globe, so a trail from +179° to -179° fits a narrow antimeridian window instead of
+/// asking MapKit for a nearly world-wide span. Latitude and both spans are kept inside MapKit's
+/// valid world bounds; a lone pin retains the existing neighborhood-scale view.
+///
+/// SHARED WITH ANDROID - the 1.35 pad and the 0.008 floor ARE the same numbers, applied in this
+/// same order (pad first, then floor): DETAIL_MAP_FIT_SCALE and DETAIL_MAP_MIN_SPAN_DEG feeding
+/// `detailBreadcrumbBounds` in DetailScreen.kt. 0.008 deg of latitude is about 890 m, and it is
+/// the fixed span THIS thumbnail used before either side gained a fit: it is there so a lone pin,
+/// or a trail shorter than the 25 m crumb gate, still shows the neighbourhood around the sighting.
+///
+/// The `usableTrail.count >= 2` gate below is shared too: a trail of one valid crumb draws no
+/// polyline on either platform (this thumbnail and Android's both gate the line at two points),
+/// so neither side widens the frame around it. `detailBreadcrumbBounds` applies the same gate
+/// inside the function, so the two pure fit policies agree and not merely the two call sites.
+///
+/// Two platform-derived differences are left, both from the renderer rather than the policy:
+/// osmdroid's extra 24 px fit border, which MKCoordinateRegion needs no equivalent for, and the
+/// latitude ceiling - osmdroid is Web Mercator and clamps to DETAIL_MAP_MAX_LAT, while this keeps
+/// the region inside MapKit's own +/-90 world bounds.
+func detectionDetailMapRegion(pin: CLLocationCoordinate2D,
+                              trail: [CLLocationCoordinate2D]) -> MKCoordinateRegion {
+    let usableTrail = trail.filter(CLLocationCoordinate2DIsValid)
+    var latitudes = [pin.latitude]
+    var longitudes = [pin.longitude]
+    if usableTrail.count >= 2 {
+        latitudes.append(contentsOf: usableTrail.map(\.latitude))
+        longitudes.append(contentsOf: usableTrail.map(\.longitude))
+    }
+
+    let minLat = latitudes.min() ?? pin.latitude
+    let maxLat = latitudes.max() ?? pin.latitude
+    let latitudeDelta = min(180, max((maxLat - minLat) * 1.35, 0.008))
+    let latitudeHalf = latitudeDelta / 2
+    let rawLatitudeCenter = (minLat + maxLat) / 2
+    let latitudeCenter = min(90 - latitudeHalf,
+                             max(-90 + latitudeHalf, rawLatitudeCenter))
+
+    // Normalize into one circular [0, 360) axis, remove its largest empty arc, and fit the
+    // complement. With one point the sole wrap gap is 360°, leaving a zero-width covered arc.
+    let sorted = longitudes.map { lon -> Double in
+        let wrapped = lon.truncatingRemainder(dividingBy: 360)
+        return wrapped < 0 ? wrapped + 360 : wrapped
+    }.sorted()
+    var largestGap = -Double.infinity
+    var arcStart = sorted.first ?? 0
+    if !sorted.isEmpty {
+        for i in sorted.indices {
+            let next = i == sorted.index(before: sorted.endIndex)
+                ? sorted[0] + 360 : sorted[i + 1]
+            let gap = next - sorted[i]
+            if gap > largestGap {
+                largestGap = gap
+                arcStart = next.truncatingRemainder(dividingBy: 360)
+            }
+        }
+    }
+    let coveredLongitude = max(0, 360 - max(0, largestGap))
+    let longitudeDelta = min(360, max(coveredLongitude * 1.35, 0.008))
+    var longitudeCenter = (arcStart + coveredLongitude / 2)
+        .truncatingRemainder(dividingBy: 360)
+    if longitudeCenter > 180 { longitudeCenter -= 360 }
+
+    return MKCoordinateRegion(
+        center: CLLocationCoordinate2D(latitude: latitudeCenter, longitude: longitudeCenter),
+        span: MKCoordinateSpan(latitudeDelta: latitudeDelta,
+                               longitudeDelta: longitudeDelta))
+}
+
+/// How much retained evidence the full map projects. The Log remains the durable evidence surface;
+/// this setting only controls map density. A short default keeps a long Desert-mode drive useful
+/// instead of redrawing days of ambient radios every time a fresh frame arrives.
+enum MapHistoryScope: String, CaseIterable, Identifiable {
+    case recent
+    case all
+
+    /// SHARED WITH ANDROID - this one IS the same number: MAP_RECENT_WINDOW_MS in
+    /// AcabBleManager.kt. Both suites pin the literal (900 here, 15 * 60_000L there) rather than
+    /// the constant, because the map chip and docs/map-performance.md promise "15 minutes" in
+    /// hardcoded copy that a constant edit would not touch.
+    static let recentSeconds: TimeInterval = 15 * 60
+    var id: String { rawValue }
+    var label: String { self == .recent ? "Recent" : "All history" }
+    var shortLabel: String { self == .recent ? "RECENT 15 MIN" : "ALL HISTORY" }
+}
+
+/// Recent is intentionally strict about evidence quality: an exact or reconstructed instant can
+/// be compared with a 15-minute window; an unknown time or a bracket is available under All only.
+/// Kept pure for cross-platform boundary tests and deterministic dense-map regression tests.
+func mapHistoryScopeIncludes(lastSeen: Date?, basis: TimeBasis,
+                             scope: MapHistoryScope, now: Date) -> Bool {
+    guard scope == .recent else { return true }
+    switch basis {
+    case .exact, .reconstructed: break
+    case .bracketed, .unknown: return false
+    }
+    guard let lastSeen else { return false }
+    let age = now.timeIntervalSince(lastSeen)
+    return age.isFinite && age >= 0 && age <= MapHistoryScope.recentSeconds
+}
+
+/// UI refresh ceiling for a detection-driven map update. Camera, filter, scope and focus changes
+/// bypass this and rebuild immediately. The return values are policy, not measured frame rates.
+func mapDetectionRefreshInterval(rowCount: Int) -> TimeInterval {
+    switch rowCount {
+    case 4_000...: return 1.0
+    case 2_000...: return 0.75
+    case 500...:   return 0.5
+    default:       return 0.3
+    }
+}
+
+/// Hard cap on infra ANNOTATIONS, newest-first so a fresh sighting always draws. Far zooms carry
+/// less positional information, so spend fewer custom annotations there; the highest-value
+/// sightings still sort to the front of the cut, so this only changes the budget.
+///
+/// Counted AFTER same-spot grouping, which is the number that matters here: the cap exists to
+/// bound how many annotations MapKit is handed, and a whole standing position now costs one.
+/// Infra is the set that can still be huge once the viewport cull has run, because a city-wide
+/// zoom can legitimately hold the whole persisted store. (Drone rows skip the viewport cull, and
+/// a group holding one sorts to the front of this cut - see the snapshot loop for why - as does a
+/// trailed tracker's trail geometry, though that tracker's own pin is culled with the rest of the
+/// clusterable mass. Neither escaping set is ever more than a handful of rows.)
+///
+/// TWIN: android MapProjection.kt `buildMapRenderPlan`, capped by MapScreen.kt's MAP_MARKER_CAP.
+/// Both sides now cap AFTER grouping, so the cap POINT and the quantity counted agree; what
+/// differs is the budget, and each side derives its own from its own renderer. iOS spends an
+/// adaptive 80/120/180/300 by span because every custom MKAnnotationView carries its own layer
+/// tree, and it caps infra alone - the clusterable mass is bounded separately by
+/// buildMapClusters. Android holds a flat 600 osmdroid overlays across ALL buckets and absorbs
+/// density into its grid CELL instead (`densityScale`), so it needs no span ladder. What the two
+/// sides do share is the grouping rule itself (MapPinRules), not these numbers.
+func mapInfrastructurePinCap(span: MKCoordinateSpan) -> Int {
+    let width = max(span.latitudeDelta, span.longitudeDelta)
+    if width >= 20 { return 80 }
+    if width >= 5 { return 120 }
+    if width >= 1 { return 180 }
+    return 300
+}
+
+func mapTrailPointBudget(span: MKCoordinateSpan) -> Int {
+    let width = max(span.latitudeDelta, span.longitudeDelta)
+    if width >= 20 { return 12 }
+    if width >= 5 { return 16 }
+    if width >= 1 { return 24 }
+    if width >= 0.2 { return 48 }
+    return 120
+}
+
+func mapTotalOverlayVertexBudget(span: MKCoordinateSpan) -> Int {
+    max(span.latitudeDelta, span.longitudeDelta) >= 1 ? 600 : 1_200
+}
+
+/// Evenly retain endpoints and interior samples. The manager already caps raw tracks; this second,
+/// zoom-aware bound limits what MapKit tessellates while keeping the full session trail in memory.
+func simplifiedMapPolyline(_ points: [CLLocationCoordinate2D], maxPoints: Int)
+    -> [CLLocationCoordinate2D] {
+    let usable = points.filter(CLLocationCoordinate2DIsValid)
+    guard maxPoints >= 2, usable.count > maxPoints else { return usable }
+    let last = usable.count - 1
+    var out: [CLLocationCoordinate2D] = []
+    out.reserveCapacity(maxPoints)
+    var previous = -1
+    for i in 0..<maxPoints {
+        let index = Int((Double(i) * Double(last) / Double(maxPoints - 1)).rounded())
+        if index != previous { out.append(usable[index]); previous = index }
+    }
+    return out
+}
+
+/// Bounding-box intersection is deliberately conservative: a line that merely passes through the
+/// viewport survives, while a trail wholly elsewhere costs MapKit nothing. The normal map spans do
+/// not cross the antimeridian; if one does, the longitude test keeps both wrapped halves.
+func mapPolylineIntersectsViewport(_ points: [CLLocationCoordinate2D],
+                                   region: MKCoordinateRegion) -> Bool {
+    let usable = points.filter(CLLocationCoordinate2DIsValid)
+    guard let first = usable.first else { return false }
+    var minLat = first.latitude, maxLat = first.latitude
+    var minLon = first.longitude, maxLon = first.longitude
+    for point in usable.dropFirst() {
+        minLat = min(minLat, point.latitude); maxLat = max(maxLat, point.latitude)
+        minLon = min(minLon, point.longitude); maxLon = max(maxLon, point.longitude)
+    }
+    let halfLat = region.span.latitudeDelta * 0.6
+    let halfLon = region.span.longitudeDelta * 0.6
+    let viewMinLat = region.center.latitude - halfLat
+    let viewMaxLat = region.center.latitude + halfLat
+    guard maxLat >= viewMinLat, minLat <= viewMaxLat else { return false }
+    if region.span.longitudeDelta >= 300 { return true }
+    // A raw box wider than half the globe is normally a short trail crossing the date line
+    // (+179° to -179°). Treat it conservatively after the latitude check; the alternative is
+    // dropping a line that is visibly inside a narrow wrapped viewport.
+    if maxLon - minLon > 180 { return true }
+    let viewMinLon = region.center.longitude - halfLon
+    let viewMaxLon = region.center.longitude + halfLon
+    if viewMinLon >= -180, viewMaxLon <= 180 {
+        return maxLon >= viewMinLon && minLon <= viewMaxLon
+    }
+    let wrappedMin = viewMinLon < -180 ? viewMinLon + 360 : viewMinLon
+    let wrappedMax = viewMaxLon > 180 ? viewMaxLon - 360 : viewMaxLon
+    return maxLon >= wrappedMin || minLon <= wrappedMax
+}
+
+/// Smallest angular separation on the circular longitude axis. MapKit regions near ±180° wrap;
+/// raw subtraction would call -179° two whole worlds away from a viewport centered at +179°.
+func mapLongitudeDistanceDegrees(_ a: Double, _ b: Double) -> Double {
+    guard a.isFinite, b.isFinite else { return .infinity }
+    let raw = abs(a - b).truncatingRemainder(dividingBy: 360)
+    return min(raw, 360 - raw)
+}
+
+/// Quantized grid geometry prevents a tiny pinch delta from assigning every cluster a new identity.
+/// The chosen cell is never smaller than the old span/14 rule, so it cannot increase marker count.
+struct MapClusterGrid: Equatable {
+    let cellDegrees: Double
+    let level: Int
+
+    static func forSpan(_ span: MKCoordinateSpan) -> MapClusterGrid {
+        let raw = max(span.latitudeDelta, span.longitudeDelta) / 14
+        guard raw.isFinite, raw > 0 else { return MapClusterGrid(cellDegrees: 1, level: 0) }
+        let level = Int(ceil(log2(raw)))
+        return MapClusterGrid(cellDegrees: pow(2, Double(level)), level: level)
+    }
+}
+
+struct MapClusterSeed {
+    let id: String
+    let type: DeviceType
+    let coordinate: CLLocationCoordinate2D
+    let lastSeen: Date?
+    let displayName: String
+    let rssi: Int
+}
+
+struct MapProjectedCluster: Identifiable, Equatable {
+    let id: String
+    let coord: CLLocationCoordinate2D
+    let memberIDs: [String]
+    let memberCount: Int
+    let singleType: DeviceType?
+    /// The lone member's name as the bubble speaks it; nil for a clump. Carried so the render
+    /// gate can see a rename without comparing the whole spoken label (see `rendersSame(as:)`).
+    let singleDisplayName: String?
+    let age: MapPinRules.Age
+    let uniformType: DeviceType?
+    let accessibilityLabel: String
+
+    var singleID: String? { memberCount == 1 ? memberIDs.first : nil }
+    var shortTag: String { memberCount == 1 ? (singleType?.shortTag ?? "") : "\(memberCount)" }
+
+    /// Full value equality, label included: what a test asserts when it checks that two builds of
+    /// the same seeds produced the same projection.
+    static func == (a: MapProjectedCluster, b: MapProjectedCluster) -> Bool {
+        a.id == b.id && a.coord.latitude == b.coord.latitude
+            && a.coord.longitude == b.coord.longitude && a.memberIDs == b.memberIDs
+            && a.memberCount == b.memberCount && a.singleType == b.singleType
+            && a.singleDisplayName == b.singleDisplayName
+            && a.age == b.age && a.uniformType == b.uniformType
+            && a.accessibilityLabel == b.accessibilityLabel
+    }
+
+    /// Does this bubble DRAW the same thing, SPEAK the same name, and would a tap resolve the same
+    /// rows? Everything the artwork reads (coord, count, singleType, uniformType, age tier), the
+    /// lone member's spoken name (singleDisplayName, so a custom label reaches VoiceOver the way
+    /// `InfraPin.rendersSame(as:)` already lets leadDisplayName through) and the whole tap payload
+    /// (memberIDs) is compared. `accessibilityLabel` itself is NOT: for a lone member it also
+    /// carries the live dBm reading, which moves on nearly every advert while nothing on the map
+    /// does, and holding the annotation subtree for that was the entire cost the render gate
+    /// exists to avoid. Losing or gaining a member changes `memberIDs`, so a held pass can never
+    /// hide a sighting.
+    func rendersSame(as other: MapProjectedCluster) -> Bool {
+        id == other.id && coord.latitude == other.coord.latitude
+            && coord.longitude == other.coord.longitude && memberIDs == other.memberIDs
+            && memberCount == other.memberCount && singleType == other.singleType
+            && singleDisplayName == other.singleDisplayName
+            && age == other.age && uniformType == other.uniformType
+    }
+}
+
+struct MapClusterBuildMetrics: Equatable {
+    /// COUNTED, one increment per seed the insertion loop actually looks at - not `seeds.count`
+    /// handed back under another name. The one-pass claim in `buildMapClusters` is the thing the
+    /// dense tests assert, so the number has to come from the loop or those assertions cannot
+    /// fail: a second walk over the seeds reports twice the input size and fails them.
+    let inputVisits: Int
+    let bucketCount: Int
+    let mergedRows: Int
+}
+
+private struct MapClusterKey: Hashable, Comparable {
+    let latitude: Int
+    let longitude: Int
+    let level: Int
+
+    static func < (a: MapClusterKey, b: MapClusterKey) -> Bool {
+        if a.level != b.level { return a.level < b.level }
+        if a.latitude != b.latitude { return a.latitude < b.latitude }
+        return a.longitude < b.longitude
+    }
+
+    var id: String { "cluster:\(level):\(latitude):\(longitude)" }
+}
+
+private struct MapClusterBucket {
+    var latitudeSum = 0.0
+    var longitudeSum = 0.0
+    var memberIDs: [String] = []
+    var first: MapClusterSeed?
+    var uniformType: DeviceType?
+    var typeCounts: [Int: Int] = [:]
+
+    mutating func append(_ seed: MapClusterSeed) {
+        latitudeSum += seed.coordinate.latitude
+        longitudeSum += seed.coordinate.longitude
+        memberIDs.append(seed.id)
+        if first == nil { first = seed; uniformType = seed.type }
+        else if uniformType != seed.type { uniformType = nil }
+        typeCounts[seed.type.rawValue, default: 0] += 1
+    }
+}
+
+/// One-pass dense-map grouping. Each seed is inserted once into a numeric bucket; coordinates,
+/// category uniformity and accessibility counts accumulate during that insertion. Finalization is
+/// per bucket rather than another pass over all members. Member IDs stay lightweight and resolve
+/// to current Detection values only if the user taps that one bucket.
+func buildMapClusters(_ seeds: [MapClusterSeed], span: MKCoordinateSpan, now: Date)
+    -> ([MapProjectedCluster], MapClusterBuildMetrics) {
+    guard !seeds.isEmpty else {
+        return ([], MapClusterBuildMetrics(inputVisits: 0, bucketCount: 0, mergedRows: 0))
+    }
+    let grid = MapClusterGrid.forSpan(span)
+    var buckets: [MapClusterKey: MapClusterBucket] = [:]
+    buckets.reserveCapacity(min(seeds.count, 324))
+    var inputVisits = 0
+    for seed in seeds {
+        inputVisits += 1
+        let lat = (seed.coordinate.latitude / grid.cellDegrees).rounded(.down)
+        let lon = (seed.coordinate.longitude / grid.cellDegrees).rounded(.down)
+        guard lat.isFinite, lon.isFinite,
+              let latKey = Int(exactly: lat), let lonKey = Int(exactly: lon) else { continue }
+        let key = MapClusterKey(latitude: latKey, longitude: lonKey, level: grid.level)
+        buckets[key, default: MapClusterBucket()].append(seed)
+    }
+    let clusters = buckets.keys.sorted().compactMap { key -> MapProjectedCluster? in
+        guard let bucket = buckets[key], let first = bucket.first else { return nil }
+        let count = bucket.memberIDs.count
+        let coordinate = CLLocationCoordinate2D(
+            latitude: bucket.latitudeSum / Double(count),
+            longitude: bucket.longitudeSum / Double(count))
+        let label: String
+        if count == 1 {
+            label = mapPinAccessibilityLabel(type: first.type, displayName: first.displayName,
+                                             rssi: first.rssi,
+                                             age: MapPinRules.age(lastSeen: first.lastSeen, now: now))
+        } else {
+            let parts = bucket.typeCounts.keys.sorted().compactMap { raw -> String? in
+                guard let type = DeviceType(rawValue: raw), let n = bucket.typeCounts[raw] else { return nil }
+                let spoken = mapSpokenType(type)
+                return n == 1 ? "one \(spoken)" : "\(n) detections of type \(spoken)"
+            }
+            label = "\(count) detections in this area: \(parts.joined(separator: ", "))"
+        }
+        return MapProjectedCluster(
+            id: key.id, coord: coordinate, memberIDs: bucket.memberIDs, memberCount: count,
+            singleType: count == 1 ? first.type : nil,
+            singleDisplayName: count == 1 ? first.displayName : nil,
+            age: count == 1 ? MapPinRules.age(lastSeen: first.lastSeen, now: now) : .recent,
+            uniformType: bucket.uniformType, accessibilityLabel: label)
+    }
+    return (clusters, MapClusterBuildMetrics(
+        inputVisits: inputVisits, bucketCount: clusters.count,
+        mergedRows: max(0, seeds.count - clusters.count)))
+}
+
+private func mapSpokenType(_ type: DeviceType) -> String {
+    switch type {
+    case .flockCamera:      return "automatic license plate reader camera"
+    case .flockRaven:       return "Flock Raven audio sensor"
+    case .axonBodyCam:      return "body camera"
+    case .drone:            return "drone with remote identification"
+    case .tracker:          return "item tracker"
+    case .nearbyDevice:     return "nearby device"
+    case .watched:          return "watched device"
+    case .recordingGlasses: return "recording glasses"
+    case .networkCamera:    return "network camera"
+    case .unknown:          return "unknown device"
+    }
+}
+
+private func mapPinAccessibilityLabel(type: DeviceType, displayName: String, rssi: Int,
+                                      age: MapPinRules.Age) -> String {
+    let spoken = mapSpokenType(type)
+    let name = displayName == type.label ? spoken : "\(displayName), \(spoken)"
+    let stale = age == .stale ? " Not heard in the last hour." : ""
+    return "\(name). Signal strength \(rssi) decibels relative to one milliwatt.\(stale)"
+}
+
+/// Prevent broad ObservableObject changes above the map from re-evaluating hundreds of MapKit
+/// annotations when the cached render projection did not change.
+private struct MapRenderGate<Content: View>: View, Equatable {
+    let revision: UInt64
+    let content: () -> Content
+
+    init(revision: UInt64, @ViewBuilder content: @escaping () -> Content) {
+        self.revision = revision
+        self.content = content
+    }
+
+    static func == (a: MapRenderGate<Content>, b: MapRenderGate<Content>) -> Bool {
+        a.revision == b.revision
+    }
+
+    var body: some View { content() }
+}
+
+/// Instruments-only timing for the two map stages. INTERVALS ship; their count ARGUMENTS are
+/// DEBUG-only, because os_signpost arguments land in the OS unified log, which this app cannot
+/// clear (see the note at the MapProjection `.end` call). Nothing here ever carries a coordinate,
+/// a MAC or a name.
+private let mapPerformanceLog = OSLog(subsystem: "com.soyboi.Beacons", category: "MapPerformance")
+/// Visible-map maintenance only: expires the 15-minute lens and advances age styling while a
+/// disconnected/quiet scanner emits no detections. It is intentionally slow; live arrivals use
+/// the adaptive leading/trailing refresh path instead.
+private let mapMaintenanceTimer = Timer.publish(every: 30, on: .main, in: .common).autoconnect()
 
 /// Located detections on a dark map, filterable by category. Fixed installs
 /// (Flock/body-cam/tracker) sit at our position when we heard them; drones plot
@@ -40,41 +489,90 @@ struct MapTabView: View {
                                                    span: .init(latitudeDelta: 0.02, longitudeDelta: 0.02))
     @State private var emptyDismissed = false
     @State private var legendExpanded = false     // F18: legend rests as a small info chip
-    @State private var showLayersPanel = false    // the LAYERS popover (known-ALPR dataset layer)
+    @State private var showMapOptions = false     // one readable sheet for scope, display and layers
     // One-shot camera fit to the located detections' bounding region (see fitToDetections).
     // Also set when a dossier handoff places the camera, so the fit never yanks it away.
     @State private var didFitToDetections = false
     @AppStorage("map.showBreadcrumbs") private var showBreadcrumbs = true    // tracker trails on the map (persisted)
     @AppStorage("map.showLabels") private var showLabels = false             // pin captions, off for a cleaner map (persisted)
-    @State private var mapSettingsOpen = false    // the on-map settings dropdown
+    @AppStorage("map.historyScope") private var historyScopeRaw = MapHistoryScope.recent.rawValue
     @State private var alprChecking = false       // manual "check for updates" in flight (double-tap guard)
     @State private var alprJustChecked = false    // brief window after a manual check: row shows the outcome
     @Environment(\.horizontalSizeClass) private var hSize   // T5: dossier as inspector on regular width
 
+    /// The expensive map projection is state, not a body-local computed value. BLEManager remains
+    /// an ObservableObject used by the surrounding chrome, but unrelated publishes cannot force a
+    /// store walk or MapKit content rebuild. Detection-driven refreshes are coalesced below.
+    @State private var snapshot: MapSnapshot = .empty
+    @State private var mapRenderRevision: UInt64 = 0
+    @State private var isMapVisible = false
+    @State private var suppressNextScopeRefit = false
+
+    private final class SnapshotRefreshState {
+        var lastStamp: TimeInterval = -.greatestFiniteMagnitude
+        var pending: DispatchWorkItem?
+    }
+    @State private var snapshotRefreshState = SnapshotRefreshState()
+
+    private var historyScope: MapHistoryScope {
+        MapHistoryScope(rawValue: historyScopeRaw) ?? .recent
+    }
+
+    private var historyScopeBinding: Binding<MapHistoryScope> {
+        Binding(get: { historyScope }, set: { historyScopeRaw = $0.rawValue })
+    }
+
+    private func bumpMapRenderRevision() { mapRenderRevision &+= 1 }
+
     /// Known ALPR camera points to draw right now: only when the layer is on and the map is
     /// zoomed in enough to be useful, culled to the viewport and capped for performance.
-    /// Held in @State (not recomputed in body): body re-evaluates ~3 Hz off every detection
-    /// publish, and the underlying nodes(in:) is a linear scan of the whole dataset. We refresh
-    /// it only where its inputs actually change (camera move, layer toggle, dataset load).
+    /// Held in @State (not recomputed in body): body can still re-evaluate off broad manager
+    /// publishes, while the underlying query now searches a latitude-sorted spatial index. We
+    /// refresh only where its inputs actually change (camera move, layer toggle, dataset load),
+    /// so even that bounded query never becomes detection-publish work.
     @State private var alprVisible: [ALPRPoint] = []
 
     /// Recompute the viewport-culled ALPR points. Called on the events that change its inputs,
     /// never in body. Clears out when the layer is off or the map is zoomed too far out.
-    private func refreshALPRVisible() {
+    private func refreshALPRVisible(region requestedRegion: MKCoordinateRegion? = nil) {
         // HYSTERESIS, not a single cliff. A lone 0.35 threshold can flip-flop across the boundary
         // (dots appear -> content grows -> zoom crosses back -> dots vanish -> ...), re-invalidating
         // body forever. Separate on/off thresholds make that physically impossible.
+        let activeRegion = requestedRegion ?? region
         let limit = alprVisible.isEmpty ? 0.30 : 0.40
-        guard alpr.enabled, span.latitudeDelta < limit else {
-            if !alprVisible.isEmpty { alprVisible = [] }   // only WRITE when it actually changes
+        guard alpr.enabled, activeRegion.span.latitudeDelta < limit else {
+            if !alprVisible.isEmpty {
+                alprVisible = []
+                bumpMapRenderRevision()
+            }
             return
         }
-        var next = alpr.nodes(in: region, cap: 500).map {
+        // Interval always, counts only in DEBUG: `visible` is a viewport-derived number and the
+        // unified log is not a store this app can clear. See the note on the MapProjection
+        // signpost in makeSnapshot.
+        let signpostID = OSSignpostID(log: mapPerformanceLog)
+        #if DEBUG
+        os_signpost(.begin, log: mapPerformanceLog, name: "MapALPRQuery",
+                    signpostID: signpostID, "nodes=%{public}d", alpr.nodes.count)
+        #else
+        os_signpost(.begin, log: mapPerformanceLog, name: "MapALPRQuery", signpostID: signpostID)
+        #endif
+        let visibleNodes = alpr.nodes(in: activeRegion, cap: 500)
+        #if DEBUG
+        os_signpost(.end, log: mapPerformanceLog, name: "MapALPRQuery",
+                    signpostID: signpostID, "visible=%{public}d", visibleNodes.count)
+        #else
+        os_signpost(.end, log: mapPerformanceLog, name: "MapALPRQuery", signpostID: signpostID)
+        #endif
+        var next = visibleNodes.map {
             ALPRPoint(id: $0.id, coord: $0.coord, maker: $0.maker, tier: $0.tier)
         }
         applyPeek(&next)   // stamp "a live pin is standing on this camera" HERE, in the cull pass
         // ALPRPoint is Equatable: an unchanged viewport costs zero @State writes / zero invalidations.
-        if next != alprVisible { alprVisible = next }
+        if next != alprVisible {
+            alprVisible = next
+            bumpMapRenderRevision()
+        }
     }
 
     /// Rendered pin coordinates carried over from the last body pass, plus the throttle state for
@@ -111,7 +609,10 @@ struct MapTabView: View {
         peekState.lastStamp = ProcessInfo.processInfo.systemUptime
         var next = alprVisible
         applyPeek(&next)
-        if next != alprVisible { alprVisible = next }
+        if next != alprVisible {
+            alprVisible = next
+            bumpMapRenderRevision()
+        }
     }
 
     /// Coalesced entry point for "the drawn pins changed, re-match the rings". The leading edge
@@ -157,52 +658,59 @@ struct MapTabView: View {
         return nil
     }
 
-    /// Where the pin goes: a drone's own broadcast coordinate if it has one, else
-    /// the phone's position at our closest pass to it (strongest signal we got);
-    /// Flock / body-cam / tracker, the board has no GPS.
+    /// Where the pin goes: a drone's own broadcast coordinate if it has one, else the phone's
+    /// position at our strongest located sighting. For every non-drone, prefer that strongest
+    /// observer sample over the latest detector coordinate carried by the wire row, and accept
+    /// that wire row as a LIVE pin only while the board's own fix is still current - a frozen
+    /// coordinate is not a missing coordinate, it pins the rest of the drive on the driveway.
+    /// Android's `mapCoord`/`mapEvidenceSnapshot` pass the same gate (`mapWireFallbackAllowed`).
     private func mapCoord(for d: Detection) -> CLLocationCoordinate2D? {
-        d.coordinate ?? ble.capturedLocation(for: d.id)
+        resolvedDetectionMapCoordinate(type: d.type, wireCoordinate: d.coordinate,
+                                       strongestObserverCoordinate: ble.capturedLocation(for: d.id),
+                                       allowNonDroneWireFallback: d.isHistory || ble.demoMode
+                                           || liveWireObserverFixIsCurrent(gpsAgeSec: d.gpsAgeSec))
     }
 
     /// Nearby devices, item trackers, and the rotating-MAC accumulators (recording glasses,
     /// network cameras, which can mint hundreds of same-spot rows over days) accumulate into
-    /// count bubbles. Surveillance infrastructure (Flock ALPR, Raven, drone, body cam, watched)
-    /// ALWAYS renders as an individual marker, so a camera is never lost inside a clump. (A
-    /// tracker later flagged as "following" will promote back to an individual marker.)
+    /// count bubbles. Surveillance infrastructure (Flock ALPR, Raven, drone, body cam, watched) is
+    /// NEVER absorbed into a bubble: whenever it draws, at any span, it draws as its own marker,
+    /// so a camera is never lost inside a clump. (What CAN withhold one is the annotation budget -
+    /// see mapInfrastructurePinCap - and that omits the marker rather than hiding it in a count.
+    /// A tracker later flagged as "following" will promote back to an individual marker.)
+    ///
+    /// TWIN: android MapScreen.kt `clusterable`, which holds the same type set. The gate AROUND
+    /// it is not shared, and that is deliberate on both sides: Android's buildMapRenderPlan also
+    /// folds every non-RID row into its adaptive grid below MAP_FAR_ZOOM, so a far-zoom Flock pin
+    /// there becomes a member of a count bubble. iOS instead keeps the individual artwork and
+    /// narrows mapInfrastructurePinCap, so a far-zoom pin iOS cannot afford is cut rather than
+    /// clumped. Either way the rows stay reachable - Android through the bubble's member sheet,
+    /// iOS through the Log.
     private func clusterable(_ d: Detection) -> Bool {
         d.type == .nearbyDevice || d.type == .tracker
             || d.type == .recordingGlasses || d.type == .networkCamera
     }
 
-    /// Hard cap on infra ANNOTATIONS, newest-first so a fresh sighting always draws. Counted
-    /// AFTER same-spot grouping, which is the number that matters here: the cap exists to bound
-    /// how many annotations MapKit is handed, and a whole standing position now costs one.
-    /// Infra is the set that can still be huge once the viewport cull has run, because a
-    /// city-wide zoom can legitimately hold the whole persisted store. (Drone rows skip the
-    /// viewport cull, and a group holding one sorts to the front of this cut - see the snapshot
-    /// loop for why - as does a trailed tracker's trail geometry, though that tracker's own pin
-    /// is culled with the rest of the clusterable mass. Neither escaping set is ever more than a
-    /// handful of rows.)
-    ///
-    /// NOT the same shape as Android, and the difference is deliberate on both sides. Android
-    /// caps ROWS, taken from the mixed newest-first feed BEFORE anything splits infra from the
-    /// clusterable mass, so its grouping only reduces how many markers the surviving rows draw
-    /// (MapScreen.kt's MAP_MARKER_CAP; its own comment states that grouping does not widen that
-    /// cap). iOS caps ANNOTATIONS after grouping. So the cap POINT, the quantity counted, and
-    /// the number are each platform's own; what the two sides do share is the grouping rule
-    /// itself (MapPinRules), not this.
-    private static let infraPinCap = 300
     /// Above this many visible pins the per-pin repeatForever ping animation is dropped:
     /// hundreds of independent Core Animation loops with shadows peg older devices on
     /// their own, cull or no cull.
     private static let animatedPinCap = 40
+    private static let overlayRowCap = 64
 
     /// One store row inside a same-spot bucket, with its `lastSeen` stamp resolved once during
     /// the store walk. A named type rather than a tuple so `InfraPin` can hold the bucket exactly
     /// as it was filled, with no repacking.
+    ///
+    /// Membership identity for the render gate is `id` plus `type` (MapPinRules.sameMembers):
+    /// WHICH sighting this is and what it counts as. `seen` and `rssi` are deliberately left out
+    /// of it - see `InfraPin.rendersSame(as:)`. `type` is in because it decides both the lead and
+    /// the member sheet's order (MapPinRules).
     private struct SpotRow {
-        let detection: Detection
+        let id: String
+        let type: DeviceType
         let seen: Date?
+        let displayName: String
+        let rssi: Int
     }
 
     /// ONE rendered infrastructure annotation, which may stand for several sightings.
@@ -222,14 +730,17 @@ struct MapTabView: View {
     ///
     /// `lead` is the pin that draws, chosen in one allocation-free scan. `group` is the bucket
     /// the store walk filled, kept UNORDERED: putting it in draw order belongs to the tap, not
-    /// to the snapshot pass, so it happens in `orderedMembers()` (see the note there).
+    /// to the snapshot pass, so it happens in `orderedMemberIDs(lastSeen:)`, which says why.
     private struct InfraPin: Identifiable {
         /// Stable across passes: the grid cell, not the lead's id. Keying on the lead would
         /// change identity the moment a more important sighting arrives, and MapKit pops an
         /// annotation whose identity changed.
         let id: String
         let coord: CLLocationCoordinate2D
-        let lead: Detection
+        let leadID: String
+        let leadType: DeviceType
+        let leadDisplayName: String
+        let leadRSSI: Int
         /// The whole bucket in store order (newest-first, as the feed hands it over), held by
         /// reference: the snapshot pass never copies it and never re-orders it.
         let group: [SpotRow]
@@ -249,17 +760,135 @@ struct MapTabView: View {
         /// whether a tap opens a dossier or the member sheet.
         var count: Int { group.count }
 
-        /// The group in draw order, lead first. Resolved ON DEMAND - at a tap, and nowhere else.
+        /// The group in draw order, lead first. Resolved ON DEMAND, at a tap and nowhere else.
         /// The snapshot runs at publish and camera-move cadence and this list is read at most
         /// once per tap, for the ONE pin the finger landed on; ordering every group in the
         /// snapshot instead ran a sort, and the arrays that sort builds, per pin per pass for a
-        /// list almost nothing ever read. Same order `MapPinRules.ordered` has always produced,
-        /// from the same function, so what the sheet gets is unchanged.
-        func orderedMembers() -> [Detection] {
-            guard count > 1 else { return [lead] }
-            return MapPinRules.ordered(group, type: { $0.detection.type }, lastSeen: { $0.seen })
-                .map(\.detection)
+        /// list almost nothing ever read. The order is `MapPinRules.ordered`, the rule `lead` is
+        /// pinned against.
+        ///
+        /// The stamps come from `lastSeen`, read at the tap, and NOT from each member's `seen`.
+        /// The render gate holds this pin through a pure re-ordering of its members
+        /// (`rendersSame(as:)`), and a recency crossing between two members is exactly that, so
+        /// the `seen` stamps a held pin carries can trail the feed for as long as the gate holds.
+        /// Sorting on them froze the sheet's "then most recent" half at whatever the last pass
+        /// the gate let through left on this pin, and nothing in the sheet would have shown it:
+        /// ClusterListSheet draws one DetectionRow per member, and no row prints a last-seen
+        /// age. The only age there is the LOC chip, a GPS-fix age off the row's own `gpsAgeSec`
+        /// (Detection.locationAgeText), so the row order is the whole recency cue the sheet has.
+        /// Read at the tap, a member heard since the snapshot takes its place in the current
+        /// order; if that makes it the lead, it tops the sheet and the next snapshot redraws the
+        /// pin as it, because `leadID` is in the render key.
+        func orderedMemberIDs(lastSeen: (String) -> Date?) -> [String] {
+            guard count > 1 else { return [leadID] }
+            return MapPinRules.ordered(group, type: { $0.type }, lastSeen: { lastSeen($0.id) })
+                .map(\.id)
         }
+
+        /// Does this pin DRAW the same thing, and would a tap on it resolve the same rows?
+        /// The render gate's whole job is to answer that, so this compares the pin's artwork
+        /// (coord, lead type, badge count through `group`, age tier), its VoiceOver nouns
+        /// (lead display name), and its tap payload (leadID plus every member's id and type).
+        /// The members are compared as a SET (MapPinRules.sameMembers, which says why): the
+        /// bucket is filled in feed order, the feed is re-sorted newest-first on every publish,
+        /// so two members still being heard swap places whenever their stamps cross. Compared in
+        /// order, that swap alone re-ran the annotation rebuild this gate exists to prevent, and
+        /// nothing drawn reads the order.
+        ///
+        /// NOT compared: `leadRSSI`, `leadSeen`, and each member's `seen`/`rssi`. A live row
+        /// re-adverts with a fresh stamp and a wobbling dBm reading and nothing on the map moves:
+        /// no pin, no badge, no dimming. Keeping them here meant the gate reported a changed map
+        /// on essentially every publish for any device still being heard, which is exactly the
+        /// annotation rebuild it exists to prevent. The member `seen` stamps are not read at the
+        /// tap either: `orderedMemberIDs(lastSeen:)` takes live ones, so the member sheet's order
+        /// cannot lag a held pass. The one thing that can lag a held pass is the dBm number inside
+        /// `infraAccessibilityLabel`; a gated subtree is not rebuilt, so moving that string into
+        /// the view would not refresh it either. Age tier, membership, the lead, and every
+        /// coordinate DO invalidate, so a held pass can never hide a sighting.
+        func rendersSame(as other: InfraPin) -> Bool {
+            id == other.id && coord.latitude == other.coord.latitude
+                && coord.longitude == other.coord.longitude && leadID == other.leadID
+                && leadType == other.leadType && leadDisplayName == other.leadDisplayName
+                && age == other.age && holdsDrone == other.holdsDrone
+                && MapPinRules.sameMembers(group, other.group, id: { $0.id }, type: { $0.type })
+        }
+    }
+
+    private struct DroneOverlay: Identifiable {
+        let detection: Detection
+        let track: [CLLocationCoordinate2D]
+        /// Where the no-fix RSSI ring is centred, resolved AT SNAPSHOT TIME: the phone's own
+        /// position, and only for a drone that broadcast no position of its own. nil for every
+        /// drone that did broadcast one, and for a no-fix drone heard while the phone had no fix
+        /// either - no centre, no ring, which is exactly what drew before.
+        ///
+        /// It is a stored field rather than a live `ble.selfCoord` read inside `droneOverlay`
+        /// because the gate withholds the whole MapKit subtree: a centre the draw reads live is a
+        /// centre the render key cannot compare, so the ring went on sitting at a phone position
+        /// the user had already left. A cache that outlives what it caches is the one failure this
+        /// gate must not have.
+        let selfCenter: CLLocationCoordinate2D?
+        var id: String { detection.id }
+
+        /// Only the geometry `droneOverlay` and the OP annotation actually draw. RSSI counts for
+        /// exactly one shape: the no-fix ring, whose radius IS the signal reading (see
+        /// `rssiRadiusMeters`), so it is compared only when the drone broadcast no position of
+        /// its own. That same ring's CENTRE is `selfCenter`, compared unconditionally: it is nil
+        /// whenever no ring draws, so an ordinary drone pays one nil-vs-nil test for it.
+        /// Comparing the whole Detection instead put every drone's `rssi` and `count` into the
+        /// render key, which no overlay reads. Android sizes the same ring with the same formula
+        /// from the same raw reading but keeps the reading out of its key: MapOverlaySignature
+        /// (MapScreen.kt) has no RSSI field at all, and the pass after that rebuild gate resizes
+        /// the drawn ring's polygon in place (DrawnRing). So on both apps the no-fix ring's radius
+        /// follows the latest reading; only iOS re-renders the gated map content to move it.
+        func rendersSame(as other: DroneOverlay) -> Bool {
+            guard detection.id == other.detection.id,
+                  MapTabView.coordinatesEqual(detection.coordinate, other.detection.coordinate),
+                  MapTabView.coordinatesEqual(detection.pilotCoordinate,
+                                              other.detection.pilotCoordinate),
+                  MapTabView.coordinatesEqual(selfCenter, other.selfCenter),
+                  MapTabView.coordinatesEqual(track, other.track) else { return false }
+            return detection.coordinate != nil || detection.rssi == other.detection.rssi
+        }
+    }
+
+    private struct TrackerTrail: Identifiable, Equatable {
+        let id: String
+        let coordinates: [CLLocationCoordinate2D]
+
+        static func == (a: TrackerTrail, b: TrackerTrail) -> Bool {
+            a.id == b.id && MapTabView.coordinatesEqual(a.coordinates, b.coordinates)
+        }
+    }
+
+    private static func coordinatesEqual(_ a: [CLLocationCoordinate2D],
+                                         _ b: [CLLocationCoordinate2D]) -> Bool {
+        a.count == b.count && !zip(a, b).contains {
+            $0.latitude != $1.latitude || $0.longitude != $1.longitude
+        }
+    }
+
+    /// CLLocationCoordinate2D has no Equatable conformance, so an optional one cannot be compared
+    /// with `==` either. Two absent coordinates are the same coordinate.
+    private static func coordinatesEqual(_ a: CLLocationCoordinate2D?,
+                                         _ b: CLLocationCoordinate2D?) -> Bool {
+        switch (a, b) {
+        case (nil, nil): return true
+        case let (l?, r?): return l.latitude == r.latitude && l.longitude == r.longitude
+        default: return false
+        }
+    }
+
+    /// Element-wise render comparison, short-circuiting on the first difference and on a length
+    /// change. Used instead of `==` on the snapshot's pin arrays: what the gate needs to know is
+    /// whether the map DRAWS the same thing, which is a narrower question than value equality
+    /// (see `InfraPin.rendersSame(as:)`).
+    private static func rendersSame<T>(_ a: [T], _ b: [T], by same: (T, T) -> Bool) -> Bool {
+        guard a.count == b.count else { return false }
+        for i in a.indices {
+            if !same(a[i], b[i]) { return false }
+        }
+        return true
     }
 
     /// Everything one body eval needs from the store, computed in a SINGLE pass. located /
@@ -275,100 +904,236 @@ struct MapTabView: View {
     /// sort to the FRONT of the cut, which is a ranking and not an exemption - see holdsDrone -
     /// so past a cap's worth of them the cut reaches those too), and the bubbles by the cull.
     private struct PinSet: Equatable {
-        let coords: [CLLocationCoordinate2D]
-        static func == (a: PinSet, b: PinSet) -> Bool {
-            a.coords.count == b.coords.count
-                && !zip(a.coords, b.coords).contains {
-                    $0.latitude != $1.latitude || $0.longitude != $1.longitude
-                }
+        struct Item: Equatable {
+            let id: String
+            let latitude: Double
+            let longitude: Double
+        }
+        let items: [Item]
+        var coords: [CLLocationCoordinate2D] {
+            items.map { CLLocationCoordinate2D(latitude: $0.latitude, longitude: $0.longitude) }
         }
     }
 
     private struct MapSnapshot {
         let totalLocated: Int
+        let retainedLocated: Int
+        let representedRows: Int
+        let markerCount: Int
+        let mergedRows: Int
+        /// Rows that passed the filter but sit OUTSIDE the current viewport. Counted apart from
+        /// `droppedRows` because the two have nothing in common: this one is undone by panning,
+        /// and it is normally the whole gap between `retainedLocated` and what the map draws.
+        let viewportCulled: Int
+        /// Rows a BUDGET withheld: on screen, past the marker cap, so not drawn at this zoom.
+        /// The header names this separately from `viewportCulled` so aggregation and a cap are
+        /// never reported as one number, and neither is ever mistaken for evidence deletion.
+        let droppedRows: Int
         let counts: [String: Int]   // located per category, unfiltered (feeds the chips)
         /// Every LOCATED drone row that passed the filter, in store order and NOT viewport-culled.
         /// This is the overlay feed only - flight path, launch glyph, operator tether, operator
         /// marker - and it is deliberately independent of which row won its same-spot group. The
         /// drone's PIN comes out of `infra` like every other grouped row.
-        let drones: [Detection]
+        let drones: [DroneOverlay]
         let infra: [InfraPin]       // same-spot grouped, capped newest-first; culled except for drone rows
-        let clusters: [Cluster]
-        let trackerTrails: [Detection]   // trackers with >= 2 crumbs; trail geometry, NOT viewport-culled
+        let clusters: [MapProjectedCluster]
+        let trackerTrails: [TrackerTrail]
         let pinsAnimated: Bool      // ping rings only under animatedPinCap
+        let simplifiedArtwork: Bool
         let pins: PinSet            // the drawn pins' coordinates; feeds the ring-peek match
         /// At least one drawn pin is in the STALE tier, so the legend explains the dim treatment.
         /// Gated for the same reason the ring-peek and lower-confidence rows are: a legend that
         /// names a treatment nothing on screen is using reads as a rendering bug.
         let hasStalePins: Bool
+        /// The LENS this projection was taken through, carried so `mapAccessibilityLabel` can
+        /// speak it. That label lives INSIDE the gated subtree, so any state it reads that the
+        /// render key does not compare goes on being spoken after it stopped being true: switch
+        /// the category chip while every scoped row already belongs to that one category and the
+        /// pin set is byte-for-byte identical, the gate holds, and VoiceOver keeps naming the
+        /// PREVIOUS filter. Same for the scope and for the location-permission story behind the
+        /// empty map. All three are scalars, so the gate pays nothing for them, and the label
+        /// reads them from HERE rather than from the view, which makes it structurally unable to
+        /// describe a lens the pins it is attached to were not built through.
+        let spokenFilter: String?               // active category chip, nil = all types
+        let spokenScope: MapHistoryScope
+        let spokenLocationDenied: Bool          // `ble.locationDenied && !ble.demoMode`
+
+        static let empty = MapSnapshot(
+            totalLocated: 0, retainedLocated: 0,
+            representedRows: 0, markerCount: 0, mergedRows: 0, viewportCulled: 0, droppedRows: 0,
+            counts: [:], drones: [], infra: [], clusters: [], trackerTrails: [],
+            pinsAnimated: false, simplifiedArtwork: false, pins: PinSet(items: []),
+            hasStalePins: false, spokenFilter: nil, spokenScope: .recent,
+            spokenLocationDenied: false)
+
+        /// Would the map content closure draw - and SAY - the same thing? This is the render
+        /// gate's only question, and it is deliberately narrower than value equality: the
+        /// per-element rules (`InfraPin.rendersSame(as:)`, `MapProjectedCluster.rendersSame(as:)`,
+        /// `DroneOverlay.rendersSame(as:)`) leave out the signal reading and the last-heard stamp,
+        /// which move on nearly every advert of any device still being heard and move nothing on
+        /// screen. Every coordinate, every membership list, every age tier and both artwork modes
+        /// ARE compared, so a pass held here can never drop a pin, a badge count or a sheet row.
+        ///
+        /// The three counts are here because `mapAccessibilityLabel` is inside the gated subtree
+        /// and speaks them: `representedRows` and `markerCount` follow from the pin arrays above,
+        /// but the retained/scoped totals and the withheld count can move while every pin stays
+        /// put (an arrival off screen, a row cut at the marker cap). None of the three moves on a
+        /// signal-only publish, so keeping them exact costs the gate nothing. The header itself
+        /// reads them outside the gate, from the freshly installed snapshot. The same reasoning
+        /// puts the three `spoken*` lens fields here: that label names the filter, the scope and
+        /// the permission story too, and a filter change that lands on an identical pin set moves
+        /// none of the counts.
+        ///
+        /// NOT solved here, deliberately: `ble.detections` is re-sorted newest-first on every
+        /// publish, so when several drawn devices are being heard at once the pin arrays can come
+        /// back holding the same pins in a different ORDER, and this element-wise walk reports a
+        /// changed map. Order is real render state (annotation z-order), so it cannot simply be
+        /// ignored; making a re-sort free needs a stable pin order in the snapshot or an
+        /// order-insensitive key, which is a larger change than the render key.
+        func rendersSameMap(as other: MapSnapshot) -> Bool {
+            pinsAnimated == other.pinsAnimated
+                && simplifiedArtwork == other.simplifiedArtwork
+                && totalLocated == other.totalLocated
+                && retainedLocated == other.retainedLocated
+                && droppedRows == other.droppedRows
+                && spokenFilter == other.spokenFilter
+                && spokenScope == other.spokenScope
+                && spokenLocationDenied == other.spokenLocationDenied
+                && trackerTrails == other.trackerTrails
+                && MapTabView.rendersSame(infra, other.infra) { $0.rendersSame(as: $1) }
+                && MapTabView.rendersSame(clusters, other.clusters) { $0.rendersSame(as: $1) }
+                && MapTabView.rendersSame(drones, other.drones) { $0.rendersSame(as: $1) }
+        }
     }
 
-    private func makeSnapshot() -> MapSnapshot {
+    private func makeSnapshot(region requestedRegion: MKCoordinateRegion? = nil) -> MapSnapshot {
         // ONE clock reading for the whole pass, so two pins built microseconds apart can never
-        // land in different age tiers. The tier is re-derived on the passes that already rebuild
-        // the map (a publish, a camera move, a filter tap); there is no timer behind it, so a pin
-        // holds its tier until the next rebuild.
+        // land in different age tiers. The tier is re-derived on event-driven rebuilds and the
+        // visible map's low-frequency maintenance tick, so Recent expires even while disconnected.
+        let signpostID = OSSignpostID(log: mapPerformanceLog)
+        #if DEBUG
+        os_signpost(.begin, log: mapPerformanceLog, name: "MapProjection", signpostID: signpostID,
+                    "rows=%{public}d", ble.detections.count)
+        #else
+        os_signpost(.begin, log: mapPerformanceLog, name: "MapProjection", signpostID: signpostID)
+        #endif
+        let activeRegion = requestedRegion ?? region
+        let activeSpan = activeRegion.span
         let now = Date()
+        // ONE phone-position reading for the whole pass, for the same reason as the clock above:
+        // two no-fix drone rings built microseconds apart must not end up centred on different
+        // positions. It is a cached-fix lookup, not a radio call (see `selfCoord` in BLEManager),
+        // and it feeds `DroneOverlay.selfCenter`, which the render key compares - so the ring can
+        // no longer freeze at a position the phone has left while the gate holds the subtree.
+        let selfCoordThisPass = ble.selfCoord
+        var retainedLocated = 0
         var total = 0
+        var filteredLocated = 0
+        var viewportCulled = 0
         var counts: [String: Int] = [:]
-        var drones: [Detection] = []
-        var trackerTrails: [Detection] = []
-        var clusterPoints: [(d: Detection, c: CLLocationCoordinate2D)] = []
+        var drones: [DroneOverlay] = []
+        var trackerTrails: [TrackerTrail] = []
+        var clusterSeeds: [MapClusterSeed] = []
+        var renderedOverlayVertices = 0
+        let overlayBudget = mapTotalOverlayVertexBudget(span: activeSpan)
+        let perTrailBudget = mapTrailPointBudget(span: activeSpan)
         // Same-spot buckets, filled IN THIS PASS: grouping costs one hash per grouped row and no
         // second walk of the store. Held as an ARRAY plus an index map, not as a dictionary of
         // members: the groups have to come out in a fixed order (first appearance in the store's
-        // newest-first feed), because `pins` below is compared element by element to decide
-        // whether the drawn pin set moved. Dictionary iteration order is not part of that
-        // contract, and a set that reshuffled for free would re-run the ring-peek match on every
-        // publish that changed nothing.
+        // newest-first feed), because `infra`, built from them, is compared element by element in
+        // `rendersSameMap` to decide whether the drawn map moved. Dictionary iteration order is
+        // not part of that contract, and a group order that reshuffled for free would report a
+        // changed map, and rebuild the annotations, on a publish that changed nothing. (`pins` is
+        // sorted by id before it is built, so the ring-peek match never sees this order.)
         var spotIndex: [MapPinRules.SpotKey: Int] = [:]
         var spots: [(key: MapPinRules.SpotKey, coord: CLLocationCoordinate2D,
                      rows: [SpotRow], drone: Bool)] = []
         // Rows whose coordinate cannot be bucketed at all (a corrupt cache, a garbled fix).
         // They render exactly as they do today: one pin each, ungrouped.
-        var unbucketed: [(d: Detection, c: CLLocationCoordinate2D, seen: Date?)] = []
+        var unbucketed: [(row: SpotRow, c: CLLocationCoordinate2D)] = []
         for d in ble.detections {
             guard let c = mapCoord(for: d) else { continue }
+            retainedLocated += 1
+            let seen = ble.lastSeenDate(for: d.id)
+            let basis = ble.timeBasis(for: d.id, stamp: seen)
+            guard mapHistoryScopeIncludes(lastSeen: seen, basis: basis,
+                                          scope: historyScope, now: now) else { continue }
+            let currentlyWatched = ble.isWatched(d)
             total += 1
             counts[d.type.category, default: 0] += 1
-            guard filter == nil || d.type.category == filter else { continue }
+            if d.type != .watched, currentlyWatched {
+                counts[DeviceType.watched.category, default: 0] += 1
+            }
+            guard detectionMatchesCategory(type: d.type, category: filter,
+                                           isCurrentlyWatched: currentlyWatched) else { continue }
+            filteredLocated += 1
             let isDrone = d.type == .drone
             if isDrone {
-                // The OVERLAY feed, taken before anything decides which pin draws: droneOverlay
-                // and the operator marker below run off THIS list, once per located drone row,
-                // so a drone whose pin was absorbed into a group led by another sighting still
-                // draws its full flight path, tether, launch glyph and operator pin. NOT
-                // viewport-culled either, because that geometry can cross the viewport while the
-                // drone's own coordinate sits outside it, and drone counts are tiny.
-                drones.append(d)
+                let rawTrack = ble.track(for: d.id)
+                var footprint = rawTrack
+                if let own = d.coordinate { footprint.append(own) }
+                if let pilot = d.pilotCoordinate { footprint.append(pilot) }
+                if footprint.isEmpty { footprint.append(c) }
+                if drones.count < Self.overlayRowCap,
+                   mapPolylineIntersectsViewport(footprint, region: activeRegion) {
+                    let remaining = max(0, overlayBudget - renderedOverlayVertices)
+                    let renderedTrack = remaining >= 2
+                        ? simplifiedMapPolyline(rawTrack, maxPoints: min(perTrailBudget, remaining)) : []
+                    renderedOverlayVertices += renderedTrack.count
+                    // The no-fix ring's centre is carried in the overlay so the render key can
+                    // compare it; only a drone that broadcast no position of its own gets one.
+                    drones.append(DroneOverlay(
+                        detection: d, track: renderedTrack,
+                        selfCenter: d.coordinate == nil ? selfCoordThisPass : nil))
+                }
             }
             if clusterable(d) {
-                // A tracker that has walked with us gets a breadcrumb trail. NOT viewport-culled
-                // (same reasoning as drones: the trail can cross the viewport while the pin is
-                // outside it); the set is tiny since crumbs need real movement to accumulate.
-                if d.type == .tracker, ble.crumbTrail(for: d.id).count >= 2 { trackerTrails.append(d) }
-                if inViewport(c) { clusterPoints.append((d, c)) }
-            } else if isDrone || inViewport(c) {
+                if showBreadcrumbs, d.type == .tracker {
+                    let rawTrail = ble.crumbTrail(for: d.id)
+                    let remaining = max(0, overlayBudget - renderedOverlayVertices)
+                    if rawTrail.count >= 2, remaining >= 2,
+                       trackerTrails.count < Self.overlayRowCap,
+                       mapPolylineIntersectsViewport(rawTrail, region: activeRegion) {
+                        let rendered = simplifiedMapPolyline(
+                            rawTrail, maxPoints: min(perTrailBudget, remaining))
+                        if rendered.count >= 2 {
+                            trackerTrails.append(TrackerTrail(id: d.id, coordinates: rendered))
+                            renderedOverlayVertices += rendered.count
+                        }
+                    }
+                }
+                if inViewport(c, region: activeRegion) {
+                    clusterSeeds.append(MapClusterSeed(
+                        id: d.id, type: d.type, coordinate: c, lastSeen: seen,
+                        displayName: d.displayName, rssi: d.rssi))
+                } else {
+                    viewportCulled += 1
+                }
+            } else if isDrone || inViewport(c, region: activeRegion) {
                 // Drones group with the infra rows rather than drawing from a set of their own.
                 // Two pins at one coordinate means one of them takes every tap and the covered
                 // one takes none; grouped, the coordinate draws ONE badged pin whose sheet
                 // reaches every member, drone included. The drone keeps its viewport exemption
                 // here so a pin that draws today still draws: outside the viewport the infra rows
                 // were culled, so its group holds drone rows only and the pin is the drone's.
-                let seen = ble.lastSeenDate(for: d.id)
+                let row = SpotRow(id: d.id, type: d.type, seen: seen,
+                                  displayName: d.displayName, rssi: d.rssi)
                 guard let key = MapPinRules.spotKey(c) else {
-                    unbucketed.append((d, c, seen)); continue
+                    unbucketed.append((row, c)); continue
                 }
                 if let i = spotIndex[key] {
-                    spots[i].rows.append(SpotRow(detection: d, seen: seen))
+                    spots[i].rows.append(row)
                     if isDrone { spots[i].drone = true }
                 } else {
                     // The first row in a cell fixes where its pin draws. Deliberately NOT an
                     // average of the members: these coordinates are one standing position, and
                     // averaging them would move the pin off a real recorded fix for no gain.
                     spotIndex[key] = spots.count
-                    spots.append((key, c, [SpotRow(detection: d, seen: seen)], isDrone))
+                    spots.append((key, c, [row], isDrone))
                 }
+            } else {
+                // Off screen: not withheld by any budget, and one pan away from drawing.
+                viewportCulled += 1
             }
         }
         var infra: [InfraPin] = []
@@ -383,47 +1148,66 @@ struct MapTabView: View {
         // the 300-pin cap below could throw any of it away.
         for spot in spots {
             guard let lead = MapPinRules.lead(spot.rows,
-                                              type: { $0.detection.type },
+                                              type: { $0.type },
                                               lastSeen: { $0.seen }) else { continue }
-            infra.append(InfraPin(id: spot.key.id, coord: spot.coord, lead: lead.detection,
-                                  group: spot.rows,
+            infra.append(InfraPin(id: spot.key.id, coord: spot.coord,
+                                  leadID: lead.id, leadType: lead.type,
+                                  leadDisplayName: lead.displayName, leadRSSI: lead.rssi, group: spot.rows,
                                   age: MapPinRules.age(lastSeen: lead.seen, now: now),
                                   leadSeen: lead.seen, holdsDrone: spot.drone))
         }
         for r in unbucketed {
-            infra.append(InfraPin(id: r.d.id, coord: r.c, lead: r.d,
-                                  group: [SpotRow(detection: r.d, seen: r.seen)],
-                                  age: MapPinRules.age(lastSeen: r.seen, now: now),
-                                  leadSeen: r.seen, holdsDrone: r.d.type == .drone))
+            infra.append(InfraPin(id: r.row.id, coord: r.c,
+                                  leadID: r.row.id, leadType: r.row.type,
+                                  leadDisplayName: r.row.displayName, leadRSSI: r.row.rssi,
+                                  group: [r.row],
+                                  age: MapPinRules.age(lastSeen: r.row.seen, now: now),
+                                  leadSeen: r.row.seen, holdsDrone: r.row.type == .drone))
         }
-        if infra.count > Self.infraPinCap {
+        let infraCap = mapInfrastructurePinCap(span: activeSpan)
+        if infra.count > infraCap {
             // Drone-bearing groups first, then newest lead. Drones are the one set that skipped
             // the viewport cull, so cutting one here would delete a pin that draws today and
             // strand the flight path the overlay pass still emits for that row. The id tie-break
             // is what makes the surviving set the SAME set pass to pass when stamps are equal:
             // sort is not stable, and a cut list that reshuffled would move the drawn pin set
             // for free (see the `pins` note below).
-            infra.sort {
-                if $0.holdsDrone != $1.holdsDrone { return $0.holdsDrone }
-                let a = $0.leadSeen ?? .distantPast, b = $1.leadSeen ?? .distantPast
-                return a == b ? $0.id < $1.id : a > b
-            }
-            infra.removeSubrange(Self.infraPinCap...)
+            infra = bestInfrastructurePins(infra, limit: infraCap)
         }
-        let clusters = buildClusters(clusterPoints, now: now)
+        let (clusters, _) = buildMapClusters(clusterSeeds, span: activeSpan, now: now)
         // Drones are NOT added on top: their pins are inside `infra` now, so adding the overlay
         // feed would count those rows a second time and trip the animation cap early. (The
         // operator marker has never been counted either - it carries no ping to drop.)
         let pinCount = infra.count + clusters.count
+        let representedRows = infra.reduce(0) { $0 + $1.count }
+            + clusters.reduce(0) { $0 + $1.memberCount }
+        let mergedRows = max(0, representedRows - pinCount)
+        // Rows a DISPLAY BUDGET withheld, and nothing else. `filteredLocated - viewportCulled` is
+        // what reached a bucket or a cluster seed, so the residue after `representedRows` is what
+        // the marker cap cut in `bestInfrastructurePins` (plus the one row shape nothing can
+        // bucket: a coordinate `MapClusterKey` cannot hold). Subtracting the off-screen rows is
+        // the whole point: at a city-block zoom over a large All-history store they are thousands
+        // of ordinary rows that the header used to report as withheld by a budget and that the
+        // VoiceOver summary used to call "combined into markers".
+        let droppedRows = max(0, filteredLocated - viewportCulled - representedRows)
+        let simplifiedArtwork = max(activeSpan.latitudeDelta, activeSpan.longitudeDelta) >= 1
+            || pinCount > 160
         // Where the pins that ACTUALLY draw are, collected in THIS pass so the ring-peek match
         // never has to take a second one. Count bubbles are deliberately excluded: a bubble already
         // says "several things here" and opens a list naming them, so it never leaves the user
         // guessing the way a lone pin sitting on a hidden ring does. Infra is read AFTER the cap,
         // so a pin the map dropped can never light a ring.
-        var pinCoords: [CLLocationCoordinate2D] = []
-        pinCoords.reserveCapacity(pinCount)
-        for p in infra { pinCoords.append(p.coord) }
-        for c in clusters where c.single != nil { pinCoords.append(c.coord) }
+        var pinItems: [PinSet.Item] = []
+        pinItems.reserveCapacity(pinCount)
+        for p in infra {
+            pinItems.append(PinSet.Item(id: "infra:\(p.id)", latitude: p.coord.latitude,
+                                        longitude: p.coord.longitude))
+        }
+        for c in clusters where c.singleID != nil {
+            pinItems.append(PinSet.Item(id: c.id, latitude: c.coord.latitude,
+                                        longitude: c.coord.longitude))
+        }
+        pinItems.sort { $0.id < $1.id }
         // Reads the tiers already resolved above, and stops at the first STALE pin it meets:
         // `contains` short-circuits and the `||` is lazy, so this is a search and not a tally,
         // and it never walks past the answer. Only a pass with NO stale pin anywhere reads both
@@ -436,62 +1220,117 @@ struct MapTabView: View {
         // screen either way, because it describes the pin that drew.
         let stale = infra.contains { $0.age == .stale }
             || clusters.contains { $0.age == .stale }
-        return MapSnapshot(totalLocated: total, counts: counts, drones: drones, infra: infra,
-                           clusters: clusters, trackerTrails: trackerTrails,
-                           pinsAnimated: pinCount <= Self.animatedPinCap,
-                           pins: PinSet(coords: pinCoords),
-                           hasStalePins: stale)
+        // SIGNPOST PAYLOADS ARE DEBUG-ONLY. os_signpost arguments are written to the OS unified
+        // log, which this app cannot clear, which survives deleting the app, and which a
+        // sysdiagnose collects wholesale - and %{public} opts them out of redaction. They are
+        // counts, never a coordinate or an identifier, but they are still derived from the
+        // viewport of a person whose phone may be seized, and a shipping user gets nothing from
+        // them. Release still emits the bare INTERVAL, so profiling a Release build with
+        // Instruments (docs/map-performance.md) still shows how many map projections ran and how
+        // long each took; only the numbers stop being recorded on the device.
+        #if DEBUG
+        os_signpost(.end, log: mapPerformanceLog, name: "MapProjection", signpostID: signpostID,
+                    "scoped=%{public}d represented=%{public}d markers=%{public}d merged=%{public}d culled=%{public}d dropped=%{public}d vertices=%{public}d",
+                    total, representedRows, pinCount, mergedRows, viewportCulled, droppedRows,
+                    renderedOverlayVertices)
+        #else
+        os_signpost(.end, log: mapPerformanceLog, name: "MapProjection", signpostID: signpostID)
+        #endif
+        return MapSnapshot(
+            totalLocated: total, retainedLocated: retainedLocated,
+            representedRows: representedRows,
+            markerCount: pinCount, mergedRows: mergedRows,
+            viewportCulled: viewportCulled, droppedRows: droppedRows,
+            counts: counts, drones: drones, infra: infra, clusters: clusters,
+            trackerTrails: trackerTrails,
+            pinsAnimated: !simplifiedArtwork && pinCount <= Self.animatedPinCap,
+            simplifiedArtwork: simplifiedArtwork, pins: PinSet(items: pinItems),
+            hasStalePins: stale,
+            spokenFilter: filter, spokenScope: historyScope,
+            spokenLocationDenied: ble.locationDenied && !ble.demoMode)
+    }
+
+    /// Keep only the highest-priority infrastructure markers without sorting every candidate.
+    /// The heap root is the worst retained pin, so each extra candidate costs O(log limit); the
+    /// final stable sort touches at most the adaptive 80...300 marker budget.
+    private func bestInfrastructurePins(_ candidates: [InfraPin], limit: Int) -> [InfraPin] {
+        guard limit > 0, candidates.count > limit else { return candidates }
+        func ranksBefore(_ a: InfraPin, _ b: InfraPin) -> Bool {
+            if a.holdsDrone != b.holdsDrone { return a.holdsDrone }
+            let at = a.leadSeen ?? .distantPast, bt = b.leadSeen ?? .distantPast
+            return at == bt ? a.id < b.id : at > bt
+        }
+        func isWorse(_ a: InfraPin, than b: InfraPin) -> Bool { ranksBefore(b, a) }
+        var heap: [InfraPin] = []
+        heap.reserveCapacity(limit)
+        for candidate in candidates {
+            if heap.count < limit {
+                heap.append(candidate)
+                var child = heap.count - 1
+                while child > 0 {
+                    let parent = (child - 1) / 2
+                    guard isWorse(heap[child], than: heap[parent]) else { break }
+                    heap.swapAt(child, parent); child = parent
+                }
+                continue
+            }
+            guard ranksBefore(candidate, heap[0]) else { continue }
+            heap[0] = candidate
+            var parent = 0
+            while true {
+                let left = parent * 2 + 1
+                guard left < heap.count else { break }
+                let right = left + 1
+                var worse = left
+                if right < heap.count, isWorse(heap[right], than: heap[left]) { worse = right }
+                guard isWorse(heap[worse], than: heap[parent]) else { break }
+                heap.swapAt(parent, worse); parent = worse
+            }
+        }
+        return heap.sorted(by: ranksBefore)
+    }
+
+    private func installFreshSnapshot(region requestedRegion: MKCoordinateRegion? = nil) {
+        snapshotRefreshState.pending?.cancel()
+        snapshotRefreshState.pending = nil
+        let next = makeSnapshot(region: requestedRegion)
+        let mapChanged = !next.rendersSameMap(as: snapshot)
+        snapshot = next
+        snapshotRefreshState.lastStamp = ProcessInfo.processInfo.systemUptime
+        if mapChanged { bumpMapRenderRevision() }
+    }
+
+    /// Leading + trailing throttle: the first quiet update appears immediately; a Desert-mode
+    /// burst collapses behind it but always receives one final projection at the end of the gap.
+    private func scheduleDetectionSnapshotRefresh() {
+        let interval = mapDetectionRefreshInterval(rowCount: ble.detections.count)
+        let elapsed = ProcessInfo.processInfo.systemUptime - snapshotRefreshState.lastStamp
+        let wait = interval - elapsed
+        guard wait > 0 else { installFreshSnapshot(); return }
+        guard snapshotRefreshState.pending == nil else { return }
+        let work = DispatchWorkItem { installFreshSnapshot() }
+        snapshotRefreshState.pending = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + wait, execute: work)
+    }
+
+    private func cancelSnapshotRefresh() {
+        snapshotRefreshState.pending?.cancel()
+        snapshotRefreshState.pending = nil
     }
 
     /// Inside the current viewport (plus a 20% margin so bubbles don't pop at the edges while panning).
-    private func inViewport(_ c: CLLocationCoordinate2D) -> Bool {
+    private func inViewport(_ c: CLLocationCoordinate2D, region: MKCoordinateRegion) -> Bool {
         abs(c.latitude  - region.center.latitude)  <= region.span.latitudeDelta  * 0.6 &&
-        abs(c.longitude - region.center.longitude) <= region.span.longitudeDelta * 0.6
-    }
-
-    /// Grid-clustered bubbles for ONLY the clusterable hits. Cell size scales with the
-    /// current zoom (span / 14), so zooming in splits dense Desert-mode clumps apart and
-    /// zooming out merges them.
-    private func buildClusters(_ points: [(d: Detection, c: CLLocationCoordinate2D)],
-                               now: Date) -> [Cluster] {
-        // Points arrive VIEWPORT-CULLED from the snapshot pass. Without that cull every located
-        // point in the whole store becomes a bucket, so a deep Desert-mode log hands MapKit
-        // thousands of Annotations rebuilt on every publish (~3 Hz) and pegs the main thread.
-        // Same culling refreshALPRVisible already does for the ALPR dots.
-        guard !points.isEmpty else { return [] }
-        let cell = max(span.latitudeDelta, span.longitudeDelta) / 14
-        guard cell > 0 else {
-            return points.map { Cluster(coord: $0.c, members: [$0.d], age: singleAge($0.d, now: now)) }
-        }
-        var buckets: [String: [(d: Detection, c: CLLocationCoordinate2D)]] = [:]
-        for p in points {
-            let gx = (p.c.latitude / cell).rounded(.down)
-            let gy = (p.c.longitude / cell).rounded(.down)
-            buckets["\(gx):\(gy)", default: []].append(p)
-        }
-        return buckets.map { key, members in
-            // Average the members so the bubble sits in the middle of the clump.
-            let lat = members.reduce(0) { $0 + $1.c.latitude } / Double(members.count)
-            let lon = members.reduce(0) { $0 + $1.c.longitude } / Double(members.count)
-            return Cluster(id: key, coord: CLLocationCoordinate2D(latitude: lat, longitude: lon),
-                           members: members.map(\.d),
-                           // Only a LONE member draws a pin, so only a lone member needs an age.
-                           // A count bubble already aggregates rows of mixed ages and carries no
-                           // age cue, and resolving a stamp per member would put a lookup on every
-                           // row of a dense Desert clump for something nothing draws.
-                           age: members.count == 1 ? singleAge(members[0].d, now: now) : .recent)
-        }
-    }
-
-    private func singleAge(_ d: Detection, now: Date) -> MapPinRules.Age {
-        MapPinRules.age(lastSeen: ble.lastSeenDate(for: d.id), now: now)
+        mapLongitudeDistanceDegrees(c.longitude, region.center.longitude)
+            <= min(180, region.span.longitudeDelta * 0.6)
     }
 
     var body: some View {
-        let snap = makeSnapshot()   // ONE store pass per body eval; every layer below reads this
+        let snap = snapshot
         NavigationStack {
             ZStack(alignment: .top) {
-                map(snap)
+                MapRenderGate(revision: mapRenderRevision) { map(snap) }
+                    .equatable()
                 VStack(spacing: 12) {
                     header(snap)
                     filterBar(snap)
@@ -510,35 +1349,25 @@ struct MapTabView: View {
             .overlay(alignment: .bottomLeading) {
                 legend(snap).padding(ACABTheme.pad).padding(.bottom, 6)
             }
-            // Tap-away scrim: present ONLY while the settings menu is open. Layered above the
-            // map (and the legend) but below the controls VStack that follows, so a tap anywhere
-            // off the dropdown closes the menu (true tap-away, unlike the legend's tap-the-panel).
-            .overlay {
-                if mapSettingsOpen {
-                    Color.clear.contentShape(Rectangle())
-                        .onTapGesture { withAnimation(.easeOut(duration: 0.2)) { mapSettingsOpen = false } }
-                        .ignoresSafeArea()
-                }
-            }
             .overlay(alignment: .bottomTrailing) {
                 VStack(alignment: .trailing, spacing: 10) {
-                    if mapSettingsOpen {
-                        mapSettingsPanel
-                            .transition(.opacity.combined(with: .move(edge: .bottom)))
-                    }
                     settingsButton
                     recenterButton
                 }
                 .padding(ACABTheme.pad).padding(.bottom, 6)
-                .animation(.easeOut(duration: 0.2), value: mapSettingsOpen)
             }
             .overlay(alignment: .bottom) {
                 if let hint = alprHint {
                     Text(hint)
-                        .font(ACABTheme.mono(10)).foregroundStyle(ACABTheme.dim)
-                        .padding(.horizontal, 12).padding(.vertical, 7)
-                        .background(.ultraThinMaterial, in: Capsule())
-                        .overlay(Capsule().strokeBorder(ACABTheme.line, lineWidth: 1))
+                        .font(ACABTheme.display(13)).foregroundStyle(ACABTheme.mapInfoText)
+                        .multilineTextAlignment(.center)
+                        .fixedSize(horizontal: false, vertical: true)
+                        .padding(.horizontal, 14).padding(.vertical, 10)
+                        .background(ACABTheme.mapInfoBackground,
+                                    in: RoundedRectangle(cornerRadius: ACABTheme.radiusSm))
+                        .overlay(RoundedRectangle(cornerRadius: ACABTheme.radiusSm)
+                            .strokeBorder(ACABTheme.lineStrong, lineWidth: 1))
+                        .padding(.horizontal, ACABTheme.pad)
                         .padding(.bottom, 26)
                         .transition(.opacity)
                 }
@@ -548,11 +1377,11 @@ struct MapTabView: View {
             .overlay(alignment: .bottom) {
                 if showALPRInfo {
                     Button { withAnimation(.easeOut(duration: 0.15)) { showALPRInfo = false } } label: {
-                        HStack(spacing: 6) {
+                        HStack(alignment: .top, spacing: 10) {
                             Circle().strokeBorder((tappedALPRTier == 1 ? ACABTheme.flockTone : ACABTheme.warn).opacity(0.95),
                                                   style: StrokeStyle(lineWidth: 2,
                                                                      dash: tappedALPRTier == 1 ? [] : [2, 1.8]))
-                                .frame(width: 9, height: 9)
+                                .frame(width: 11, height: 11).padding(.top, 4)
                             // The line the journalist needed: a pin is a MAPPED LOCATION, not a
                             // live detection, and most fixed ALPRs backhaul over cellular so they
                             // are silent to this hardware whether or not one is standing there.
@@ -560,27 +1389,38 @@ struct MapTabView: View {
                             // manufacturer for it, which is the shape a misidentified pole takes.
                             // On a PEEKING ring that denial is the one thing it must not say; see
                             // alprCalloutDetail.
-                            VStack(alignment: .leading, spacing: 2) {
+                            VStack(alignment: .leading, spacing: 5) {
                                 // TIER FIRST, then maker. Testing maker first printed "known
                                 // ALPR" for a hand-typed name, contradicting the second line
                                 // directly beneath it. The maker is still shown when we have one:
                                 // an unverified node's NAME is the doubtful part, not its presence.
                                 Text(ALPRAttribution.headline(
                                     tier: tappedALPRTier, maker: tappedALPRMaker))
-                                    .font(ACABTheme.mono(10.5)).foregroundStyle(ACABTheme.dim)
+                                    .font(ACABTheme.display(14, weight: .semibold))
+                                    .foregroundStyle(ACABTheme.mapInfoText)
                                 Text(alprCalloutDetail(tier: tappedALPRTier,
                                                        maker: tappedALPRMaker,
                                                        peek: tappedALPRPeek))
-                                    .font(ACABTheme.mono(9)).foregroundStyle(ACABTheme.faint)
+                                    .font(ACABTheme.display(13)).foregroundStyle(ACABTheme.mapInfoText)
                             }
+                            .fixedSize(horizontal: false, vertical: true)
+                            Image(systemName: "xmark")
+                                .font(.system(size: 12, weight: .semibold))
+                                .foregroundStyle(ACABTheme.mapInfoText).padding(.top, 4)
+                                .accessibilityHidden(true)
                         }
-                        .padding(.horizontal, 12).padding(.vertical, 7)
-                        .background(.ultraThinMaterial, in: Capsule())
-                        .overlay(Capsule().strokeBorder(ACABTheme.line, lineWidth: 1))
+                        .padding(14)
+                        .frame(maxWidth: 420, alignment: .leading)
+                        .background(ACABTheme.mapInfoBackground,
+                                    in: RoundedRectangle(cornerRadius: ACABTheme.radiusSm))
+                        .overlay(RoundedRectangle(cornerRadius: ACABTheme.radiusSm)
+                            .strokeBorder(ACABTheme.lineStrong, lineWidth: 1))
                         .frame(minHeight: 44)
                         .contentShape(Rectangle())
                     }
                     .buttonStyle(.plain)
+                    .accessibilityHint("Dismisses mapped-camera information")
+                    .padding(.horizontal, ACABTheme.pad)
                     .padding(.bottom, 60)
                     .transition(.opacity)
                 }
@@ -599,6 +1439,7 @@ struct MapTabView: View {
                 .environmentObject(ble)
                 .presentationDetents([.medium, .large])
             }
+            .sheet(isPresented: $showMapOptions) { mapOptionsSheet }
             // Dossier "OPEN IN MAP" handoff. Cold tab: the stash is consumed on first
             // compose. Warm tab (including a dossier opened from this very map): drop
             // our own presented dossier so it isn't in the way, then fly. The sheet
@@ -606,15 +1447,59 @@ struct MapTabView: View {
             // own, so the clear here is what closes it.
             // Focus is consumed BEFORE the detections fit so an explicit handoff always wins.
             .onAppear {
+                isMapVisible = true
                 // Location is optional for pairing. Ask only when the user opens the one
                 // surface that needs observer coordinates; existing grants simply resume fixes.
                 if !ble.demoMode { ble.requestLocationAccessIfNeeded() }
-                consumePendingFocus()
+                if MapFocus.pending != nil {
+                    consumePendingFocus()
+                } else {
+                    installFreshSnapshot()
+                    fitToDetections()
+                }
+            }
+            .onDisappear {
+                isMapVisible = false
+                cancelSnapshotRefresh()
+            }
+            // @Published emits from willSet. Defer one run-loop turn so projection reads the
+            // installed array/set, not the previous value from the manager.
+            .onReceive(ble.$detections.dropFirst()) { _ in
+                DispatchQueue.main.async {
+                    guard isMapVisible else { return }
+                    scheduleDetectionSnapshotRefresh()
+                }
+            }
+            .onReceive(ble.$watched.dropFirst()) { _ in
+                DispatchQueue.main.async {
+                    guard isMapVisible else { return }
+                    installFreshSnapshot()
+                }
+            }
+            .onReceive(mapMaintenanceTimer) { _ in
+                guard isMapVisible else { return }
+                installFreshSnapshot()
+            }
+            .onChange(of: filter) { _, _ in installFreshSnapshot() }
+            .onChange(of: historyScopeRaw) { _, _ in
+                if suppressNextScopeRefit {
+                    suppressNextScopeRefit = false
+                    return
+                }
+                didFitToDetections = false
+                installFreshSnapshot()
                 fitToDetections()
             }
-            // Late first fix: the tab opened before anything was locatable. One-shot, so it
-            // can never fight a user pan after it has fired once.
-            .onChange(of: ble.detections.count) { _, _ in fitToDetections() }
+            .onChange(of: showBreadcrumbs) { _, _ in installFreshSnapshot() }
+            .onChange(of: showLabels) { _, _ in bumpMapRenderRevision() }
+            .onChange(of: alpr.enabled) { _, _ in refreshALPRVisible() }
+            .onChange(of: alpr.showUnverified) { _, _ in refreshALPRVisible() }
+            .onChange(of: alpr.nodes.count) { _, _ in refreshALPRVisible() }
+            // Late first fix: the tab may open with an EXISTING row that is not located yet, so
+            // row count never changes when its first paired coordinate arrives. Key this retry to
+            // located membership instead. fitToDetections remains one-shot, so later strongest-
+            // RSSI pin migrations never fight a user pan.
+            .onChange(of: snap.totalLocated) { _, _ in fitToDetections() }
             // Demo seeds re-place around the user when the first GPS fix arrives - same COUNT,
             // new coordinates - so the hook above never fires and a one-shot fit taken on the
             // authored-city coords would strand the camera over six invisible pins (the exact
@@ -630,10 +1515,17 @@ struct MapTabView: View {
             .onChange(of: demoSeedKey) { _, _ in
                 guard ble.demoMode else { return }
                 didFitToDetections = false
+                installFreshSnapshot()
                 fitToDetections()
                 // The re-placed seeds are new PIN COORDINATES, so the map's pin-set handler
                 // re-matches the rings on the body pass this very change triggers. Nothing to do
                 // here: stamping now would only match the pins from before they moved.
+            }
+            // WATCHED exists only while at least one located row belongs to it. If an unstar or
+            // eviction removes the final member, drop the lens before its chip disappears.
+            .onChange(of: snap.counts[DeviceType.watched.category] ?? 0,
+                      initial: true) { _, count in
+                if filter == DeviceType.watched.category, count == 0 { filter = nil }
             }
             .onReceive(NotificationCenter.default.publisher(for: MapFocus.notification)) { _ in
                 selected = nil
@@ -659,7 +1551,14 @@ struct MapTabView: View {
     /// the user opened the tab to see.
     private func fitToDetections() {
         guard !didFitToDetections, MapFocus.pending == nil else { return }
-        let coords = ble.detections.compactMap { mapCoord(for: $0) }
+        let now = Date()
+        let coords = ble.detections.compactMap { d -> CLLocationCoordinate2D? in
+            let seen = ble.lastSeenDate(for: d.id)
+            guard mapHistoryScopeIncludes(lastSeen: seen,
+                                          basis: ble.timeBasis(for: d.id, stamp: seen),
+                                          scope: historyScope, now: now) else { return nil }
+            return mapCoord(for: d)
+        }
         guard let first = coords.first else { return }
         didFitToDetections = true
         var minLat = first.latitude,  maxLat = first.latitude
@@ -677,6 +1576,7 @@ struct MapTabView: View {
                     center: first,
                     span: MKCoordinateSpan(latitudeDelta: 0.02, longitudeDelta: 0.02)))
             }
+            bumpMapRenderRevision()
             return
         }
         let center = CLLocationCoordinate2D(latitude: (minLat + maxLat) / 2,
@@ -686,6 +1586,7 @@ struct MapTabView: View {
         withAnimation(.easeInOut(duration: 0.5)) {
             camera = .region(MKCoordinateRegion(center: center, span: span))
         }
+        bumpMapRenderRevision()
     }
 
     /// City-block zoom for the dossier handoff, roughly 600 m across.
@@ -699,9 +1600,22 @@ struct MapTabView: View {
         guard let coord = MapFocus.pending else { return }
         MapFocus.pending = nil
         didFitToDetections = true
-        withAnimation(.easeInOut(duration: 0.6)) {
-            camera = .region(MKCoordinateRegion(center: coord, span: Self.focusSpan))
+        // An explicit dossier handoff must reveal that retained row even if it is older than the
+        // default 15-minute lens or belongs to a category different from the active chip. The
+        // visible header reports both changes, so this is never a silent filter mutation.
+        if historyScope != .all {
+            suppressNextScopeRefit = true
+            historyScopeRaw = MapHistoryScope.all.rawValue
         }
+        filter = nil
+        let target = MKCoordinateRegion(center: coord, span: Self.focusSpan)
+        region = target
+        span = target.span
+        installFreshSnapshot(region: target)
+        withAnimation(.easeInOut(duration: 0.6)) {
+            camera = .region(target)
+        }
+        bumpMapRenderRevision()
     }
 
     private func map(_ snap: MapSnapshot) -> some View {
@@ -732,7 +1646,7 @@ struct MapTabView: View {
             // Tracker breadcrumb trails: the phone's path while a separated tracker stayed with
             // us. Drawn UNDER the live pins (like the ALPR layer) so the tracker's own pin sits on
             // top, and DASHED teal so it reads distinct from the SOLID amber drone flight paths.
-            // Hidden when the "breadcrumb trail" setting is off.
+            // Hidden when the "phone breadcrumb trails" map setting is off.
             if showBreadcrumbs {
                 ForEach(snap.trackerTrails) { d in
                     trackerTrail(d)
@@ -747,9 +1661,9 @@ struct MapTabView: View {
             // the two coincide - a grounded drone, or any zoom-out that collapses the tether.
             // That is the better way round: the pin is the tappable thing that opens the dossier,
             // and OP is a non-interactive marker the tether already identifies.
-            ForEach(snap.drones) { d in
-                droneOverlay(d)
-                if let pilot = d.pilotCoordinate {
+            ForEach(snap.drones) { overlay in
+                droneOverlay(overlay)
+                if let pilot = overlay.detection.pilotCoordinate {
                     Annotation(showLabels ? "OP" : "", coordinate: pilot) { OperatorPin() }
                 }
             }
@@ -758,17 +1672,26 @@ struct MapTabView: View {
             // position collapse into one pin carrying a small count badge; the tap opens the same
             // member sheet a count bubble opens, so nothing is left buried under the pin on top.
             ForEach(snap.infra) { p in
-                Annotation(showLabels ? p.lead.type.shortTag : "", coordinate: p.coord) {
+                Annotation(showLabels ? p.leadType.shortTag : "", coordinate: p.coord) {
                     Button {
                         // The member list is put in draw order HERE, on the tap, for this one
-                        // pin - never in the snapshot pass for every pin on the map.
-                        if p.count == 1 { selected = p.lead }
-                        else { cluster = Cluster(id: p.id, coord: p.coord, members: p.orderedMembers()) }
+                        // pin and on the stamps as they stand now: never in the snapshot pass for
+                        // every pin on the map, and never on the stamps this held pin carries.
+                        if p.count == 1 { selected = ble.detection(for: p.leadID) }
+                        else {
+                            let members = p
+                                .orderedMemberIDs(lastSeen: { ble.lastSeenDate(for: $0) })
+                                .compactMap { ble.detection(for: $0) }
+                            if !members.isEmpty {
+                                cluster = Cluster(id: p.id, coord: p.coord, members: members)
+                            }
+                        }
                     } label: {
-                        MapPin(type: p.lead.type,
+                        MapPin(type: p.leadType,
                                animated: snap.pinsAnimated && p.age == .fresh,
                                badge: p.count,
-                               dimmed: p.age == .stale)
+                               dimmed: p.age == .stale,
+                               simplified: snap.simplifiedArtwork)
                     }
                     .buttonStyle(.plain)
                     .frame(minWidth: 44, minHeight: 44)
@@ -783,23 +1706,32 @@ struct MapTabView: View {
             // pin; a clump renders one count bubble so a dense log stays legible.
             ForEach(snap.clusters) { c in
                 Annotation(showLabels ? c.shortTag : "", coordinate: c.coord) {
-                    if let only = c.single {
-                        Button { selected = only } label: {
-                            MapPin(type: only.type,
+                    if let onlyID = c.singleID, let onlyType = c.singleType {
+                        Button { selected = ble.detection(for: onlyID) } label: {
+                            MapPin(type: onlyType,
                                    animated: snap.pinsAnimated && c.age == .fresh,
-                                   dimmed: c.age == .stale)
+                                   dimmed: c.age == .stale,
+                                   simplified: snap.simplifiedArtwork)
                         }
                             .buttonStyle(.plain)
                             .frame(minWidth: 44, minHeight: 44)
                             .contentShape(Rectangle())
-                            .accessibilityLabel(pinAccessibilityLabel(only, age: c.age))
+                            .accessibilityLabel(c.accessibilityLabel)
                             .accessibilityHint("Opens detection details")
                     } else {
-                        Button { cluster = c } label: { ClusterBubble(cluster: c) }
+                        Button {
+                            let members = c.memberIDs.compactMap { ble.detection(for: $0) }
+                            if !members.isEmpty {
+                                cluster = Cluster(id: c.id, coord: c.coord, members: members)
+                            }
+                        } label: {
+                            ClusterBubble(count: c.memberCount, uniformType: c.uniformType,
+                                          simplified: snap.simplifiedArtwork)
+                        }
                             .buttonStyle(.plain)
                             .frame(minWidth: 44, minHeight: 44)
                             .contentShape(Rectangle())
-                            .accessibilityLabel(clusterAccessibilityLabel(c))
+                            .accessibilityLabel(c.accessibilityLabel)
                             .accessibilityHint("Opens the detections in this area")
                     }
                 }
@@ -826,13 +1758,9 @@ struct MapTabView: View {
                || abs(r.span.latitudeDelta  - region.span.latitudeDelta)  > eps
                || abs(r.span.longitudeDelta - region.span.longitudeDelta) > eps else { return }
             span = r.span; region = r
-            refreshALPRVisible()   // viewport changed: re-cull the drawn ALPR points
+            installFreshSnapshot(region: r)
+            refreshALPRVisible(region: r)   // viewport changed: re-cull the drawn ALPR points
         }
-        // refresh on the other two inputs: the layer toggling on/off, and the dataset finishing
-        // its load. nodes.count is a cheap Equatable proxy for "the dataset changed".
-        .onChange(of: alpr.enabled) { _, _ in refreshALPRVisible() }
-        .onChange(of: alpr.showUnverified) { _, _ in refreshALPRVisible() }
-        .onChange(of: alpr.nodes.count) { _, _ in refreshALPRVisible() }
         // The rings do not move when the pins do, but the PEEK does: a filter change hides or
         // reveals pins, a new sighting adds one, and a drone steps along its track, all without
         // touching the viewport. Keyed to the pin SET this pass actually drew - not to a count,
@@ -862,47 +1790,47 @@ struct MapTabView: View {
 
     /// One spoken sentence carrying the map's actual state: the pin content for VoiceOver
     /// users, or which of the two empty stories (permission vs nothing located) applies.
+    ///
+    /// EVERY input comes off the snapshot, never off the view. This runs inside the render gate,
+    /// so a fact read live here is a fact the gate can hold past its expiry - and the lens facts
+    /// are exactly the ones that move without moving a pin. `MapSnapshot.spokenFilter` and its
+    /// two neighbours are in the render key for that reason; reading them from the same place
+    /// keeps the sentence and the key from ever drifting apart.
     private func mapAccessibilityLabel(_ snap: MapSnapshot) -> String {
         if snap.totalLocated == 0 {
-            if ble.locationDenied && !ble.demoMode {
+            if snap.spokenLocationDenied {
                 return "Map. The app cannot record where your phone heard detections while Location is off. Drones that broadcast Remote ID coordinates can still appear."
+            }
+            if snap.spokenScope == .recent, snap.retainedLocated > 0 {
+                return "Map. No located detections in the previous fifteen minutes. \(snap.retainedLocated) older located detections remain retained in the Log."
             }
             return "Map. No located detections yet."
         }
-        let shown = displayedLocatedCount(snap)
-        let filtered = filter.map { " filtered to \($0.lowercased())" } ?? ""
-        return "Map showing \(shown) located detection\(shown == 1 ? "" : "s")\(filtered)."
-    }
-
-    private func pinAccessibilityLabel(_ d: Detection, age: MapPinRules.Age) -> String {
-        let type = spokenType(d.type)
-        let name = d.displayName == d.type.label ? type : "\(d.displayName), \(type)"
-        // The dim treatment is a purely visual cue, so VoiceOver is told the same fact in words.
-        let stale = age == .stale ? " Not heard in the last hour." : ""
-        return "\(name). Signal strength \(d.rssi) decibels relative to one milliwatt.\(stale)"
+        let shown = snap.representedRows
+        let filtered = snap.spokenFilter.map { " filtered to \($0.lowercased())" } ?? " across all types"
+        let scope = snap.spokenScope == .recent
+            ? "from the previous fifteen minutes" : "from all history"
+        // Two different facts, and only the first is aggregation: markers standing for more rows
+        // than there are markers, and rows a cap withheld at this zoom. Saying "combined" for the
+        // second told a VoiceOver user that rows had been folded into the pins on screen when they
+        // had not been drawn at all - and before droppedRows counted the cap alone, it fired for
+        // every off-screen row, i.e. on nearly every zoomed-in pass.
+        let combined = snap.markerCount < shown
+            ? " Combined into \(snap.markerCount) markers for this view."
+            : ""
+        let withheld = snap.droppedRows > 0
+            ? " \(snap.droppedRows) more are not drawn at this zoom and stay in the Log."
+            : ""
+        return "Map showing \(shown) located detection\(shown == 1 ? "" : "s") \(scope)\(filtered). \(snap.retainedLocated) located detections retained.\(combined)\(withheld)"
     }
 
     /// A grouped infra pin speaks the sighting it DRAWS plus how many it stands for, because the
     /// count badge is the only thing on screen saying the other members exist.
     private func infraAccessibilityLabel(_ p: InfraPin) -> String {
-        let base = pinAccessibilityLabel(p.lead, age: p.age)
+        let base = mapPinAccessibilityLabel(type: p.leadType, displayName: p.leadDisplayName,
+                                            rssi: p.leadRSSI, age: p.age)
         guard p.count > 1 else { return base }
         return "\(base) This pin represents \(p.count) detections at the same spot."
-    }
-
-    private func spokenType(_ type: DeviceType) -> String {
-        switch type {
-        case .flockCamera:      return "automatic license plate reader camera"
-        case .flockRaven:       return "Flock Raven audio sensor"
-        case .axonBodyCam:      return "body camera"
-        case .drone:            return "drone with remote identification"
-        case .tracker:          return "item tracker"
-        case .nearbyDevice:     return "nearby device"
-        case .watched:          return "watched device"
-        case .recordingGlasses: return "recording glasses"
-        case .networkCamera:    return "network camera"
-        case .unknown:          return "unknown device"
-        }
     }
 
     private func alprAccessibilityLabel(_ point: ALPRPoint) -> String {
@@ -936,21 +1864,12 @@ struct MapTabView: View {
         return "\(body) \u{00B7} \(Self.alprPeekSentence)"
     }
 
-    private func clusterAccessibilityLabel(_ cluster: Cluster) -> String {
-        let groups = Dictionary(grouping: cluster.members, by: { spokenType($0.type) })
-            .map { type, rows in
-                rows.count == 1 ? "one \(type)" : "\(rows.count) detections of type \(type)"
-            }
-            .sorted()
-            .joined(separator: ", ")
-        return "\(cluster.members.count) detections in this area: \(groups)"
-    }
-
     /// Drone-only overlays: the flight-path line, a launch marker at the first fix,
     /// and a dashed tether to the operator.
     @MapContentBuilder
-    private func droneOverlay(_ d: Detection) -> some MapContent {
-        let track = ble.track(for: d.id)
+    private func droneOverlay(_ overlay: DroneOverlay) -> some MapContent {
+        let d = overlay.detection
+        let track = overlay.track
         if track.count >= 2 {
             MapPolyline(coordinates: track)
                 .stroke(ACABTheme.droneTone.opacity(0.85), lineWidth: 2.5)
@@ -968,7 +1887,12 @@ struct MapTabView: View {
                 .stroke(ACABTheme.droneTone.opacity(0.5),
                         style: StrokeStyle(lineWidth: 1.5, dash: [5, 4]))
         }
-        if d.coordinate == nil, let me = ble.selfCoord {   // no GPS fix: draw an RSSI ring around us instead
+        // No GPS fix: draw an RSSI ring around us instead. The centre comes off the overlay, NOT
+        // off `ble.selfCoord`: this subtree is inside the render gate, so a live read here would
+        // freeze at whatever position the phone held on the pass that last rebuilt the map. The
+        // snapshot sets it only when the drone broadcast no position of its own, so `selfCenter`
+        // being non-nil is the same condition `d.coordinate == nil` used to test.
+        if let me = overlay.selfCenter {
             MapCircle(center: me, radius: rssiRadiusMeters(d.rssi))
                 .foregroundStyle(ACABTheme.droneTone.opacity(0.08))
                 .stroke(ACABTheme.droneTone.opacity(0.5), lineWidth: 1.5)
@@ -978,8 +1902,8 @@ struct MapTabView: View {
     /// A tracker's breadcrumb trail: the phone's path while a separated tag stayed with us.
     /// Dashed teal, distinct from the solid amber drone flight paths that use the same MapPolyline.
     @MapContentBuilder
-    private func trackerTrail(_ d: Detection) -> some MapContent {
-        let crumbs = ble.crumbTrail(for: d.id)
+    private func trackerTrail(_ trail: TrackerTrail) -> some MapContent {
+        let crumbs = trail.coordinates
         if crumbs.count >= 2 {
             MapPolyline(coordinates: crumbs)
                 .stroke(ACABTheme.trackerTone.opacity(0.85),
@@ -994,34 +1918,56 @@ struct MapTabView: View {
         return min(max(d, 5), 600)
     }
 
+    /// NO LINK CHIP HERE, deliberately, and the same on Android (MapScreen.kt's header Column).
+    /// The connection pill lives on Status and Beacon, which are where a user goes to ask "is my
+    /// board there". On the Map it only competed with the counts for a narrow header: on a 411dp
+    /// Android phone the row measured the text column first and "CONNECTED" wrapped mid-word over
+    /// three lines. iOS never wrapped, because Kicker pins one line at default type, but the pill
+    /// is redundant here on both platforms. Dropping it also gives the counts the full width.
     private func header(_ snap: MapSnapshot) -> some View {
-        let shown = displayedLocatedCount(snap)
-        return HStack(alignment: .firstTextBaseline) {
-            VStack(alignment: .leading, spacing: 3) {
-                Text("Map").font(ACABTheme.display(26, weight: .semibold)).foregroundStyle(ACABTheme.text)
-                Kicker("\(shown) SIGHTING\(shown == 1 ? "" : "S")")
-            }
-            Spacer()
-            LinkChip(version: ble.status?.version, connected: ble.connectionState == .connected, demo: ble.demoMode)
+        return VStack(alignment: .leading, spacing: 4) {
+            Text("Map").font(ACABTheme.display(26, weight: .semibold)).foregroundStyle(ACABTheme.text)
+            Kicker("\(historyScope.shortLabel) · \(activeFilterLabel)")
+            Text(projectionSummary(snap))
+                .font(ACABTheme.mono(10, weight: .medium))
+                .foregroundStyle(ACABTheme.faint)
+                .monospacedDigit()
         }
+        .frame(maxWidth: .infinity, alignment: .leading)
     }
 
-    /// The header and spoken map summary describe the active filter, not the all-category total
-    /// hidden behind it. Filter chips retain unfiltered counts so switching remains informative.
-    private func displayedLocatedCount(_ snap: MapSnapshot) -> Int {
-        guard let filter else { return snap.totalLocated }
-        return snap.counts[filter] ?? 0
+    private var activeFilterLabel: String {
+        guard let filter else { return "ALL TYPES" }
+        return detectionCategories.first(where: { $0.key == filter })?.chipLabel ?? filter
     }
 
-    /// Scrolling category chips; tap one to narrow the pins. The ALL chip, the LAYERS control,
-    /// and their divider are ALWAYS present; the category chips after them are dynamic (see
-    /// `shownCategories`).
+    /// Honest projection accounting: rows represented by the current viewport, the evidence the
+    /// Log still retains, and how many MapKit annotations carry the visible rows. THREE causes get
+    /// THREE separate numbers, because only one of them is a budget: rows merged into a marker
+    /// ("simplified"), rows off screen ("outside this view", undone by panning), and rows a cap
+    /// withheld ("outside display budget"). Naming them apart is what keeps aggregation from
+    /// reading as evidence deletion - and it stops a zoomed-in viewport over a large store from
+    /// reporting thousands of ordinary off-screen rows as withheld by a budget.
+    private func projectionSummary(_ snap: MapSnapshot) -> String {
+        var parts = ["\(snap.representedRows.formatted()) displayed",
+                     "\(snap.retainedLocated.formatted()) retained"]
+        if snap.markerCount != snap.representedRows || snap.simplifiedArtwork {
+            parts.append("\(snap.markerCount.formatted()) markers")
+        }
+        if snap.viewportCulled > 0 {
+            parts.append("\(snap.viewportCulled.formatted()) outside this view")
+        }
+        if snap.droppedRows > 0 { parts.append("\(snap.droppedRows.formatted()) outside display budget") }
+        if snap.mergedRows > 0 || snap.simplifiedArtwork { parts.append("simplified") }
+        return parts.joined(separator: " · ")
+    }
+
+    /// Scrolling category chips; tap one to narrow the pins. Reference layers and map display
+    /// policy live together in the readable Options sheet, rather than masquerading as a type.
     private func filterBar(_ snap: MapSnapshot) -> some View {
         ScrollView(.horizontal, showsIndicators: false) {
             HStack(spacing: 8) {
                 chip(nil, "ALL", snap.totalLocated)
-                layersChip   // reference layers sit up front (after ALL) so they are found without scrolling
-                Rectangle().fill(ACABTheme.line).frame(width: 1, height: 18).padding(.horizontal, 2)   // divider: layers vs category filters
                 ForEach(shownCategories(snap)) { c in
                     chip(c.key, c.chipLabel, snap.counts[c.key] ?? 0)
                 }
@@ -1032,11 +1978,14 @@ struct MapTabView: View {
 
     /// Which category chips to actually render: a category with at least one LOCATED detection
     /// this session, OR the currently-active filter even at count 0. The active-filter exception
-    /// is REQUIRED: if the user has filtered to a category and its located count momentarily drops
-    /// to 0 (eviction / staleness), the chip must NOT vanish out from under them, or the filter
-    /// breaks silently with no visible way back to ALL.
+    /// keeps ordinary detector lenses visible through a transient eviction. WATCHED is different
+    /// by contract: it exists only while a located member does, and the count-change hook above
+    /// returns its empty lens to ALL before this removes the chip.
     private func shownCategories(_ snap: MapSnapshot) -> [DetectionCategory] {
-        detectionCategories.filter { (snap.counts[$0.key] ?? 0) > 0 || filter == $0.key }
+        detectionCategories.filter {
+            let count = snap.counts[$0.key] ?? 0
+            return count > 0 || ($0.key != DeviceType.watched.category && filter == $0.key)
+        }
     }
 
     /// Recenter on the phone's position. Replaces Apple's MapUserLocationButton, which lands under our
@@ -1044,13 +1993,10 @@ struct MapTabView: View {
     /// above can stay a fixed region instead of .automatic (see the loop note on `camera`).
     private var recenterButton: some View {
         Button {
-            // The tap-away scrim sits BELOW this control (it has to, or the buttons stop taking
-            // taps), so a tap here never reaches it and the open menu would stay up while the map
-            // flew away under it. Close it here too.
-            if mapSettingsOpen { withAnimation(.easeOut(duration: 0.2)) { mapSettingsOpen = false } }
             withAnimation(.easeInOut(duration: 0.35)) {
                 camera = .userLocation(fallback: .region(MapTabView.fallbackRegion))
             }
+            bumpMapRenderRevision()
         } label: {
             Image(systemName: "location.fill")
                 .font(.system(size: 13, weight: .bold))
@@ -1065,15 +2011,15 @@ struct MapTabView: View {
         .accessibilityLabel("Center on my location")
     }
 
-    /// Cog companion to the recenter/legend controls: opens the map settings dropdown. Its
-    /// collapsed look matches the legend's info chip (small dark circular chip).
+    /// Cog companion to the recenter/legend controls: opens one readable options sheet for
+    /// history scope, display density and reference layers.
     private var settingsButton: some View {
         Button {
-            withAnimation(.easeOut(duration: 0.2)) { mapSettingsOpen.toggle() }
+            showMapOptions = true
         } label: {
             Image(systemName: "gearshape.fill")
                 .font(.system(size: 13, weight: .semibold))
-                .foregroundStyle(mapSettingsOpen ? ACABTheme.text : ACABTheme.dim)
+                .foregroundStyle(ACABTheme.dim)
                 .frame(width: 34, height: 34)
                 .background(.ultraThinMaterial, in: Circle())
                 .overlay(Circle().strokeBorder(ACABTheme.line, lineWidth: 1))
@@ -1082,60 +2028,114 @@ struct MapTabView: View {
                 .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
-        .accessibilityLabel("Map settings")
-        .accessibilityValue(mapSettingsOpen ? "expanded" : "collapsed")
+        .accessibilityLabel("Map options")
+        .accessibilityHint("Opens history, display, and reference layer options")
     }
 
-    /// The map settings dropdown: persisted toggles plus the known-ALPR layer row, styled like
-    /// `legendPanel`. Opened by `settingsButton`; the tap-away scrim in `body` closes it on a
-    /// tap off the card. The ALPR toggle here and the filter-bar chip drive the same store, so
-    /// they can never disagree.
-    private var mapSettingsPanel: some View {
-        VStack(alignment: .leading, spacing: 12) {
-            Toggle(isOn: $showBreadcrumbs) {
-                Text("breadcrumb trail").font(ACABTheme.mono(11)).foregroundStyle(ACABTheme.dim)
-            }
-            // Same sentence the SEEN WITH YOU panel ends on, deliberately word for word. This
-            // toggle is the other tracker-only surface a user will assume covers everything, and a
-            // trail that quietly skips body cams while claiming nothing is the kind of silence
-            // that gets read as "nothing was there".
-            Text(FollowEvidence.scopeLine)
-                .font(ACABTheme.mono(8.5)).foregroundStyle(ACABTheme.faint)
-                .fixedSize(horizontal: false, vertical: true)
-            Toggle(isOn: $showLabels) {
-                Text("icon labels").font(ACABTheme.mono(11)).foregroundStyle(ACABTheme.dim)
-            }
-            Toggle(isOn: Binding(get: { alpr.enabled }, set: { alpr.setEnabled($0) })) {
-                Text("known ALPR").font(ACABTheme.mono(11)).foregroundStyle(ACABTheme.dim)
-            }
-            if alpr.enabled {
-                VStack(alignment: .leading, spacing: 7) {
-                    Text(alprStatusLine)
-                        .font(ACABTheme.mono(8.5)).foregroundStyle(ACABTheme.faint)
-                        .fixedSize(horizontal: false, vertical: true)
-                    // Opt-in for the tier nobody could name a manufacturer for. Off by default
-                    // because those pins are where "your app is wrong" reports come from: the user
-                    // drives to one, finds an empty pole, and blames the detector rather than the
-                    // stranger who mapped it. Kept as a row instead of dropped from the dataset so
-                    // the mappers who want to see and fix them still can.
-                    if alpr.unverifiedCount > 0 {
-                        Toggle(isOn: Binding(get: { alpr.showUnverified },
-                                             set: { alpr.setShowUnverified($0) })) {
-                            Text("lower-confidence pins").font(ACABTheme.mono(10)).foregroundStyle(ACABTheme.faint)
+    private var mapOptionsSheet: some View {
+        NavigationStack {
+            ZStack {
+                ACABTheme.bg.ignoresSafeArea()
+                ScrollView {
+                    VStack(alignment: .leading, spacing: 18) {
+                        mapOptionsSection("HISTORY") {
+                            Picker("Map history", selection: historyScopeBinding) {
+                                ForEach(MapHistoryScope.allCases) { scope in
+                                    Text(scope.label).tag(scope)
+                                }
+                            }
+                            .pickerStyle(.segmented)
+                            .accessibilityHint("Recent shows the previous fifteen minutes; All history shows every retained located detection")
+                            Text("Recent shows detections with a trustworthy time from the previous 15 minutes. All history changes only this map; the Log keeps every retained detection either way.")
+                                .font(ACABTheme.mono(12)).foregroundStyle(ACABTheme.dim)
+                                .fixedSize(horizontal: false, vertical: true)
                         }
-                        Text(alprUnverifiedLine)
-                            .font(ACABTheme.mono(8.5)).foregroundStyle(ACABTheme.faint)
-                            .fixedSize(horizontal: false, vertical: true)
+
+                        mapOptionsSection("DISPLAY") {
+                            Text(projectionSummary(snapshot))
+                                .font(ACABTheme.mono(12, weight: .bold))
+                                .foregroundStyle(ACABTheme.text)
+                                .monospacedDigit()
+                                .fixedSize(horizontal: false, vertical: true)
+                            Text("dense and far-away sightings combine into fewer markers. pin sheets still reveal the detections represented by a marker; retained Log evidence is never removed.")
+                                .font(ACABTheme.mono(12)).foregroundStyle(ACABTheme.dim)
+                                .fixedSize(horizontal: false, vertical: true)
+                            // "phone", not "tracker": the drawn line is the PHONE's path while a
+                            // tracker stayed with us, not the tag's own route (q-breadcrumbs says
+                            // so). BYTE-IDENTICAL to Android's MapSettingRow label in MapScreen.kt
+                            // - same words AND same case, so the two map options sheets cannot
+                            // drift on this row.
+                            Toggle("phone breadcrumb trails", isOn: $showBreadcrumbs)
+                                .font(ACABTheme.display(15, weight: .medium))
+                            Text(FollowEvidence.scopeLine)
+                                .font(ACABTheme.mono(11)).foregroundStyle(ACABTheme.faint)
+                                .fixedSize(horizontal: false, vertical: true)
+                            Toggle("icon labels", isOn: $showLabels)
+                                .font(ACABTheme.display(15, weight: .medium))
+                        }
+
+                        // BYTE-IDENTICAL to Android MapScreen.kt's `Kicker("REFERENCE OVERLAYS ·
+                        // NOT FILTERS")`, header and the ALPR note below alike: the toggles here
+                        // draw reference data over the map and never hide a detection, and the
+                        // two sheets must say so in the same words. The source credit
+                        // ("cameras: OpenStreetMap ODbL · DeFlock") is the map legend's job on
+                        // both phones; the note carries the privacy disclosure.
+                        mapOptionsSection("REFERENCE OVERLAYS · NOT FILTERS") {
+                            Toggle("known ALPR cameras",
+                                   isOn: Binding(get: { alpr.enabled },
+                                                 set: { alpr.setEnabled($0); if $0 { alpr.refresh() } }))
+                                .font(ACABTheme.display(15, weight: .medium))
+                            Text("draws community-mapped camera locations, on by default. the dataset is one offline download; no location, viewport, or detection data is attached, and the site host sees an ordinary web request. pins are mapped locations, not live detections.")
+                                .font(ACABTheme.mono(12)).foregroundStyle(ACABTheme.dim)
+                                .fixedSize(horizontal: false, vertical: true)
+                            if alpr.enabled {
+                                Text(alprStatusLine)
+                                    .font(ACABTheme.mono(11)).foregroundStyle(ACABTheme.faint)
+                                    .fixedSize(horizontal: false, vertical: true)
+                                if alpr.unverifiedCount > 0 {
+                                    Toggle("lower-confidence pins",
+                                           isOn: Binding(get: { alpr.showUnverified },
+                                                         set: { alpr.setShowUnverified($0) }))
+                                        .font(ACABTheme.display(14, weight: .medium))
+                                    Text(alprUnverifiedLine)
+                                        .font(ACABTheme.mono(11)).foregroundStyle(ACABTheme.faint)
+                                        .fixedSize(horizontal: false, vertical: true)
+                                }
+                                alprCheckRow
+                            }
+                        }
                     }
-                    alprCheckRow
+                    .padding(ACABTheme.pad)
+                }
+            }
+            .navigationTitle("Map options")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .confirmationAction) {
+                    Button("Done") { showMapOptions = false }
+                        .font(ACABTheme.mono(13, weight: .bold))
+                        .foregroundStyle(ACABTheme.accentText)
                 }
             }
         }
         .tint(ACABTheme.accent)
-        .frame(width: 172, alignment: .leading)   // constrain so the switch and label separate cleanly
-        .padding(11)
-        .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: ACABTheme.radiusSm, style: .continuous))
-        .overlay(RoundedRectangle(cornerRadius: ACABTheme.radiusSm, style: .continuous)
+        .preferredColorScheme(.dark)
+        .presentationDetents([.medium, .large])
+        .presentationDragIndicator(.visible)
+        .presentationBackground(ACABTheme.bg)
+    }
+
+    private func mapOptionsSection<Content: View>(
+        _ title: String, @ViewBuilder content: () -> Content
+    ) -> some View {
+        VStack(alignment: .leading, spacing: 12) {
+            Kicker(title)
+            content()
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .padding(16)
+        .background(ACABTheme.bg2, in: RoundedRectangle(cornerRadius: ACABTheme.radius, style: .continuous))
+        .overlay(RoundedRectangle(cornerRadius: ACABTheme.radius, style: .continuous)
             .strokeBorder(ACABTheme.line, lineWidth: 1))
     }
 
@@ -1241,71 +2241,6 @@ struct MapTabView: View {
         return out.string(from: d)
     }
 
-    /// Entry to the map's reference LAYERS. This replaced the old "ALPR MAP" chip, which sat in
-    /// the filter row and looked like a seventh filter while actually toggling a dataset
-    /// download - a category of action the row's other chips never take. Same capsule anatomy,
-    /// but named for what it holds; the popover explains the one-time offline download and is
-    /// where a default-on layer gets turned off. Fill tracks the layer being on so the
-    /// collapsed chip still shows the state at a glance.
-    private var layersChip: some View {
-        Button { showLayersPanel = true } label: {
-            HStack(spacing: 5) {
-                if alpr.loading {
-                    ProgressView().controlSize(.mini).tint(alpr.enabled ? ACABTheme.onAccent : ACABTheme.dim)
-                } else {
-                    Image(systemName: "square.3.layers.3d")
-                        .font(.system(size: 11, weight: .bold))
-                }
-                Text("LAYERS").font(ACABTheme.mono(10.5, weight: .bold)).tracking(0.5)
-            }
-            .foregroundStyle(alpr.enabled ? ACABTheme.onAccent : ACABTheme.dim)
-            .padding(.horizontal, 11).padding(.vertical, 7)
-            .background(alpr.enabled ? ACABTheme.flockTone : ACABTheme.bg2, in: Capsule())
-            .overlay(Capsule().strokeBorder(alpr.enabled ? .clear : ACABTheme.line, lineWidth: 1))
-            // 44pt hit target; drawn capsule unchanged.
-            .frame(minHeight: 44)
-            .contentShape(Rectangle())
-        }
-        .buttonStyle(.plain)
-        .accessibilityLabel("Map layers")
-        .accessibilityValue(alpr.enabled ? "known automatic license plate reader cameras layer on" : "no layers on")
-        .popover(isPresented: $showLayersPanel) {
-            layersPanel.presentationCompactAdaptation(.popover)
-        }
-    }
-
-    /// The LAYERS popover: the known-ALPR toggle (on by default) plus the one line explaining
-    /// the one-time offline dataset download. The map-settings panel keeps its own toggle; both
-    /// drive the same store, so they can never disagree.
-    private var layersPanel: some View {
-        VStack(alignment: .leading, spacing: 10) {
-            Kicker("LAYERS")
-            Toggle(isOn: Binding(get: { alpr.enabled },
-                                 set: { alpr.setEnabled($0); if $0 { alpr.refresh() } })) {
-                Text("known ALPR cameras").font(ACABTheme.mono(11)).foregroundStyle(ACABTheme.text)
-            }
-            .tint(ACABTheme.accent)
-            // Kept inside the guarantee the privacy page makes for this layer (web/privacy.html,
-            // "Known-ALPR map layer"): no viewport, no location, no detections, no per-view
-            // lookups - and a plain file download that the site host sees the way any web server
-            // sees a request. The old wording promised "nothing about you or your map view is
-            // ever sent", a stronger claim than the privacy page or the store's own comment
-            // makes, and this app's users are the last people who should be told a fetch is
-            // unobservable when it is not.
-            Text("draws community-mapped camera locations, on by default. the dataset is one offline download; no location, viewport, or detection data is attached, and the site host sees an ordinary web request. pins are mapped locations, not live detections.")
-                .font(ACABTheme.mono(9.5)).foregroundStyle(ACABTheme.dim)
-                .fixedSize(horizontal: false, vertical: true)
-            if alpr.enabled {
-                Text(alprStatusLine)
-                    .font(ACABTheme.mono(8.5)).foregroundStyle(ACABTheme.faint)
-                    .fixedSize(horizontal: false, vertical: true)
-            }
-        }
-        .padding(14)
-        .frame(width: 250)
-        .presentationBackground(ACABTheme.bg2)
-    }
-
     private func chip(_ cat: String?, _ label: String, _ n: Int) -> some View {
         let active = filter == cat
         let tint = catTint(cat)
@@ -1336,6 +2271,7 @@ struct MapTabView: View {
         case "TRACKER":  return ACABTheme.trackerTone
         case "GLASSES":  return ACABTheme.glassesTone
         case "CAMERA":   return ACABTheme.netcamTone
+        case "WATCHED":  return DeviceType.watched.tint
         default:         return ACABTheme.accent
         }
     }
@@ -1348,6 +2284,7 @@ struct MapTabView: View {
         case "CAMERA", "NETCAM", "NETWORK CAM": return "network cameras"
         case "TRKR", "TRACKER": return "item trackers"
         case "GLAS", "GLASSES": return "recording glasses"
+        case "WATCH", "WATCHED": return "watched devices"
         case "ALL": return "all categories"
         default: return label.lowercased()
         }
@@ -1387,9 +2324,9 @@ struct MapTabView: View {
                 } label: {
                     Image(systemName: "info")
                         .font(.system(size: 13, weight: .semibold))
-                        .foregroundStyle(ACABTheme.dim)
+                        .foregroundStyle(ACABTheme.mapInfoText)
                         .frame(width: 34, height: 34)
-                        .background(.ultraThinMaterial, in: Circle())
+                        .background(ACABTheme.mapInfoBackground, in: Circle())
                         .overlay(Circle().strokeBorder(ACABTheme.line, lineWidth: 1))
                         // 44pt hit target around the 34pt chip.
                         .frame(minWidth: 44, minHeight: 44)
@@ -1416,7 +2353,7 @@ struct MapTabView: View {
                         .font(.system(size: 9, weight: .bold)).foregroundStyle(ACABTheme.netcamTone)
                         .frame(width: 8, height: 8)
                 }
-                Text("Network camera").font(ACABTheme.mono(11)).foregroundStyle(ACABTheme.dim)
+                Text("Network camera").font(ACABTheme.mono(12)).foregroundStyle(ACABTheme.mapInfoText)
             }
             // The dim treatment, named. A pin persisted from yesterday used to look exactly like a
             // live hit, so the cue only works if the panel says what it means. The swatch is the
@@ -1432,7 +2369,7 @@ struct MapTabView: View {
                             .frame(width: 8, height: 8)
                     }
                     Text("Dimmed: last heard over an hour ago")
-                        .font(ACABTheme.mono(11)).foregroundStyle(ACABTheme.dim)
+                        .font(ACABTheme.mono(12)).foregroundStyle(ACABTheme.mapInfoText)
                 }
                 .padding(.top, 6)
                 .overlay(alignment: .top) {
@@ -1447,7 +2384,7 @@ struct MapTabView: View {
                         Circle().strokeBorder(ACABTheme.flockTone.opacity(0.95), lineWidth: 2)
                             .frame(width: 9, height: 9)
                     }
-                    Text("Known ALPR").font(ACABTheme.mono(11)).foregroundStyle(ACABTheme.dim)
+                    Text("Known ALPR").font(ACABTheme.mono(12)).foregroundStyle(ACABTheme.mapInfoText)
                 }
                 // The ring-peek cue, named. Gated on a ring actually peeking right now, the same
                 // rule the lower-confidence row below follows: a legend that explains a treatment
@@ -1465,7 +2402,7 @@ struct MapTabView: View {
                             }
                         }
                         Text("Live hit on a mapped camera")
-                            .font(ACABTheme.mono(11)).foregroundStyle(ACABTheme.dim)
+                            .font(ACABTheme.mono(12)).foregroundStyle(ACABTheme.mapInfoText)
                     }
                 }
                 // Unverified tier. Hollow + DASHED, matching ALPRDot: the swatch has to be the
@@ -1482,7 +2419,7 @@ struct MapTabView: View {
                                                   style: StrokeStyle(lineWidth: 2, dash: [2, 1.8]))
                                 .frame(width: 9, height: 9)
                         }
-                        Text("ALPR (lower confidence)").font(ACABTheme.mono(11)).foregroundStyle(ACABTheme.dim)
+                        Text("ALPR (lower confidence)").font(ACABTheme.mono(12)).foregroundStyle(ACABTheme.mapInfoText)
                     }
                     .padding(.top, 6)
                     .overlay(alignment: .top) {
@@ -1490,7 +2427,7 @@ struct MapTabView: View {
                     }
                 }
                 Text("cameras: OpenStreetMap ODbL · DeFlock")
-                    .font(ACABTheme.mono(8.5)).foregroundStyle(ACABTheme.faint)
+                    .font(ACABTheme.mono(11)).foregroundStyle(ACABTheme.mapInfoText)
             }
         }
         // Hug the content, but never past the screen. fixedSize(horizontal:) alone means "take my
@@ -1500,15 +2437,16 @@ struct MapTabView: View {
         .fixedSize(horizontal: false, vertical: true)
         .frame(maxWidth: 260, alignment: .leading)
         .padding(11)
-        .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: ACABTheme.radiusSm, style: .continuous))
+        .background(ACABTheme.mapInfoBackground,
+                    in: RoundedRectangle(cornerRadius: ACABTheme.radiusSm, style: .continuous))
         .overlay(RoundedRectangle(cornerRadius: ACABTheme.radiusSm, style: .continuous)
-            .strokeBorder(ACABTheme.line, lineWidth: 1))
+            .strokeBorder(ACABTheme.lineStrong, lineWidth: 1))
     }
 
     private func legendRow(_ c: Color, _ t: String) -> some View {
         HStack(spacing: 7) {
             legendSwatch { Circle().fill(c).frame(width: 8, height: 8).shadow(color: c.opacity(0.6), radius: 3) }
-            Text(t).font(ACABTheme.mono(11)).foregroundStyle(ACABTheme.dim)
+            Text(t).font(ACABTheme.mono(12)).foregroundStyle(ACABTheme.mapInfoText)
         }
     }
 
@@ -1525,13 +2463,17 @@ struct MapTabView: View {
     /// True when the "empty" story is a permission problem, not a data one. Demo mode exempts
     /// itself: its seeds carry coordinates regardless of the phone's location permission.
     private var emptyBecausePermission: Bool { ble.locationDenied && !ble.demoMode }
+    private var emptyBecauseHistoryScope: Bool {
+        !emptyBecausePermission && historyScope == .recent && snapshot.retainedLocated > 0
+    }
 
     /// Two distinct empty stories over the same slot. Permission off gets the actionable one
     /// (Open Settings); otherwise it is the honest "nothing located yet". Detections existing
     /// is the third state: the banner never mounts (see body) and the camera fits to them.
     private var emptyBanner: some View {
         VStack(spacing: 9) {
-            Image(systemName: emptyBecausePermission ? "location.slash" : "mappin.slash")
+            Image(systemName: emptyBecausePermission ? "location.slash"
+                  : emptyBecauseHistoryScope ? "clock.arrow.circlepath" : "mappin.slash")
                 .font(.system(size: 28)).foregroundStyle(ACABTheme.faint)
             if emptyBecausePermission {
                 Text("Location is off, so the app can't record where your phone heard detections. Drones that broadcast Remote ID coordinates can still appear on the map.")
@@ -1544,6 +2486,25 @@ struct MapTabView: View {
                         .foregroundStyle(ACABTheme.accentText)
                         .padding(.horizontal, 14)
                         .frame(minHeight: 44)   // 44pt target
+                        .overlay(Capsule().strokeBorder(ACABTheme.lineStrong, lineWidth: 1))
+                        .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+            } else if emptyBecauseHistoryScope {
+                Text("No recent located detections")
+                    .font(ACABTheme.display(14, weight: .medium)).foregroundStyle(ACABTheme.dim)
+                Text("The Recent map covers the previous 15 minutes. Older located detections are still retained in the Log.")
+                    .font(ACABTheme.mono(11)).foregroundStyle(ACABTheme.faint)
+                    .multilineTextAlignment(.center).frame(maxWidth: 260)
+                    .fixedSize(horizontal: false, vertical: true)
+                Button {
+                    historyScopeRaw = MapHistoryScope.all.rawValue
+                } label: {
+                    Text("SHOW ALL HISTORY")
+                        .font(ACABTheme.mono(11, weight: .bold)).tracking(1)
+                        .foregroundStyle(ACABTheme.accentText)
+                        .padding(.horizontal, 14)
+                        .frame(minHeight: 44)
                         .overlay(Capsule().strokeBorder(ACABTheme.lineStrong, lineWidth: 1))
                         .contentShape(Rectangle())
                 }
@@ -1565,7 +2526,7 @@ struct MapTabView: View {
             .strokeBorder(ACABTheme.line, lineWidth: 1))
         // Hit-testing stays ON when the Open Settings button is present (it has to be tappable);
         // the informational variant lets touches fall through so the map still pans behind it.
-        .allowsHitTesting(emptyBecausePermission)
+        .allowsHitTesting(emptyBecausePermission || emptyBecauseHistoryScope)
         .overlay(alignment: .topTrailing) {
             // Dismiss (x) on BOTH variants (the informational one used to have none). It lives in
             // this overlay, layered OVER the card AFTER the .allowsHitTesting above, so it stays
@@ -1733,6 +2694,42 @@ enum MapPinRules {
         return best
     }
 
+    /// Are `a` and `b` the same same-spot members, whatever order the feed listed them in?
+    ///
+    /// The render gate compares an infra pin's bucket with this (`InfraPin.rendersSame(as:)`).
+    /// Buckets are filled in feed order, and `publishDetections` (BLEManager) re-sorts the feed
+    /// newest-first on every publish, so two members that are both still being heard swap places
+    /// whenever their stamps cross. Compared element by element, that swap alone reported a
+    /// changed map and rebuilt every annotation for it. Nothing drawn reads the order: the pin
+    /// draws the lead (compared on the pin by id, type and name), the badge draws the count, and
+    /// a tap orders the members through `ordered` on stamps it reads at that moment
+    /// (`InfraPin.orderedMemberIDs(lastSeen:)`). All that takes from the bucket's order is the
+    /// arrival-index tie-break, which only separates members tied on both priority and stamp, an
+    /// order the feed's own sort never fixed. What this therefore no longer invalidates on is a
+    /// pure re-ordering of the same ids and types inside one bucket, and nothing else.
+    ///
+    /// Hot path cost: the element-wise walk, allocation-free. That walk IS the whole test for any
+    /// bucket whose members and order both held, a bucket of one included (nearly every pin). A
+    /// same-size bucket whose walk stops early pays the id-keyed dictionary, O(n) and one
+    /// allocation: one whose order moved, in place of the annotation rebuild that used to cost,
+    /// and one with a member swapped out, whose pass rebuilds anyway. Ids are unique within a
+    /// bucket because the feed is built from `store.values`, a dictionary keyed by id
+    /// (BLEManager.publishDetections), so equal counts plus "every id of `a` is in `b` with the
+    /// same type" is set equality.
+    static func sameMembers<T>(_ a: [T], _ b: [T],
+                               id: (T) -> String,
+                               type: (T) -> DeviceType) -> Bool {
+        guard a.count == b.count else { return false }
+        var i = 0
+        while i < a.count, id(a[i]) == id(b[i]), type(a[i]) == type(b[i]) { i += 1 }
+        if i == a.count { return true }
+        var members: [String: DeviceType] = [:]
+        members.reserveCapacity(b.count)
+        for m in b { members[id(m)] = type(m) }
+        for m in a where members[id(m)] != type(m) { return false }
+        return true
+    }
+
     // MARK: Age
 
     /// How old the sighting behind a pin is, in the three tiers the map draws.
@@ -1790,6 +2787,9 @@ private struct MapPin: View {
     /// STALE tier: the pin keeps its size, its glyph and its colour family, and only its
     /// intensity drops. Never a hide, never a shrink, never a shared "old" colour.
     var dimmed = false
+    /// Dense/far projections retain the category glyph and hit target but omit per-marker glows.
+    /// Hundreds of offscreen-rendered shadows are a disproportionate compositing cost.
+    var simplified = false
     @State private var ping = false
     // Reduce Motion drops the looping ping ring entirely, same as the dense-map cap does.
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
@@ -1810,7 +2810,7 @@ private struct MapPin: View {
                 .overlay(Circle().strokeBorder(ACABTheme.bg, lineWidth: 2.5))
                 // The glow goes with the colour: a stale pin that still bloomed would keep
                 // drawing the eye, which is the exact thing the tier exists to stop.
-                .shadow(color: type.tint.opacity(dimmed ? 0 : 0.7), radius: 6)
+                .shadow(color: type.tint.opacity(dimmed || simplified ? 0 : 0.7), radius: 6)
             Image(systemName: type.symbol).font(.system(size: 12, weight: .bold))
                 .foregroundStyle(ACABTheme.bg)
             if let badge, badge > 1 { countBadge(badge) }
@@ -2045,34 +3045,20 @@ struct Cluster: Identifiable {
     var id: String
     let coord: CLLocationCoordinate2D
     let members: [Detection]
-    /// Age tier of the LONE member, when there is one. A multi-member bubble is not a pin and
-    /// carries no age cue, so it stays .recent (full colour, no ping) whatever its rows hold.
-    let age: MapPinRules.Age
 
-    init(id: String = UUID().uuidString, coord: CLLocationCoordinate2D, members: [Detection],
-         age: MapPinRules.Age = .recent) {
-        self.id = id; self.coord = coord; self.members = members; self.age = age
+    init(id: String = UUID().uuidString, coord: CLLocationCoordinate2D, members: [Detection]) {
+        self.id = id; self.coord = coord; self.members = members
     }
-
-    /// The lone member when this isn't really a cluster (count == 1).
-    var single: Detection? { members.count == 1 ? members.first : nil }
-
-    /// The category tint for the whole bubble: a uniform clump keeps its category tint,
-    /// a mixed clump goes neutral.
-    var tint: Color {
-        let cats = Set(members.map { $0.type.category })
-        return cats.count == 1 ? (members.first?.type.tint ?? ACABTheme.accent) : ACABTheme.text
-    }
-
-    var shortTag: String { members.count == 1 ? (members.first?.type.shortTag ?? "") : "\(members.count)" }
 }
 
 /// A count bubble for a multi-member cluster, sized up a touch for bigger clumps.
 private struct ClusterBubble: View {
-    let cluster: Cluster
-    private var n: Int { cluster.members.count }
+    let count: Int
+    let uniformType: DeviceType?
+    var simplified = false
+    private var tint: Color { uniformType?.tint ?? ACABTheme.text }
     private var diameter: CGFloat {
-        switch n {
+        switch count {
         case ..<10:  return 34
         case ..<50:  return 40
         case ..<200: return 46
@@ -2081,12 +3067,14 @@ private struct ClusterBubble: View {
     }
     var body: some View {
         ZStack {
-            Circle().fill(cluster.tint.opacity(0.22)).frame(width: diameter + 10, height: diameter + 10)
+            if !simplified {
+                Circle().fill(tint.opacity(0.22)).frame(width: diameter + 10, height: diameter + 10)
+            }
             Circle().fill(ACABTheme.bg2).frame(width: diameter, height: diameter)
-                .overlay(Circle().strokeBorder(cluster.tint, lineWidth: 2))
-                .shadow(color: cluster.tint.opacity(0.5), radius: 5)
-            Text("\(n)")
-                .font(ACABTheme.display(n < 100 ? 15 : 13, weight: .bold))
+                .overlay(Circle().strokeBorder(tint, lineWidth: 2))
+                .shadow(color: tint.opacity(simplified ? 0 : 0.5), radius: 5)
+            Text("\(count)")
+                .font(ACABTheme.display(count < 100 ? 15 : 13, weight: .bold))
                 .foregroundStyle(ACABTheme.text).monospacedDigit()
         }
     }
@@ -2100,14 +3088,18 @@ private struct ClusterListSheet: View {
     @Environment(\.dismiss) private var dismiss
 
     /// Rows render in the order the CALLER built, never re-sorted here. An infra pin hands over
-    /// `InfraPin.orderedMembers()` - priority first, then most recent - which is the same rule
-    /// that chose the pin the finger landed on, so that row is the one on top; a count bubble
-    /// hands over store order (the feed's newest-first). Re-sorting by lastSeen alone threw the
-    /// priority half away, so a tap on a body-cam pin could open a sheet led by a fresher
-    /// unknown row, and Android's twin sheet renders `PinGroup.members` untouched (MapScreen.kt),
-    /// so the same tap read differently on the two phones. It was also a sort per body eval - two
-    /// `lastSeenDate` lookups per comparison - inside a view that holds `ble` and therefore
-    /// re-runs at the ~3 Hz publish, for a list that cannot change while the sheet is open.
+    /// the rows behind `InfraPin.orderedMemberIDs(lastSeen:)`: priority first, then most recent
+    /// on the stamps read at the tap. That is the same rule that chose the pin the finger landed
+    /// on, so that row is the one on top, except that a same-priority member heard since the pin
+    /// was drawn can top the sheet a moment before the next snapshot redraws the pin as that
+    /// member. A count bubble hands over store order (the feed's newest-first). Re-sorting by
+    /// lastSeen alone threw the priority half away, so a tap on a body-cam pin could open a sheet
+    /// led by a fresher unknown row, while Android's twin sheet renders `clusterMembers`
+    /// untouched: the list orderSameSpotMembers (MapProjection.kt) ordered for the tapped pin on
+    /// the stamps its draw loop read at the last rebuild (MapScreen.kt). So the same tap read
+    /// differently on the two phones. It was also a sort per body eval, two `lastSeenDate`
+    /// lookups per comparison, inside a view that holds `ble` and therefore re-runs at the ~3 Hz
+    /// publish, for a list that cannot change while the sheet is open.
     var body: some View {
         ZStack {
             ACABTheme.bg.ignoresSafeArea()

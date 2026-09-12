@@ -61,6 +61,59 @@ enum DeviceType: Int, CaseIterable, Identifiable, Codable {
         }
     }
 
+    /// `label` as it reads INSIDE a lowercase sentence, e.g. the Related help disclosure's
+    /// "3 answers for ALPR camera". Hand-written per case rather than `label.lowercased()`,
+    /// which flattened the proper nouns: Flock Raven became "flock raven" and the ALPR
+    /// initialism became "alpr". faq-content.json states the rule this obeys, "lowercase-plain,
+    /// honest about limits; proper nouns keep their casing". No single transform derives it,
+    /// because `label` itself mixes title case ("ALPR Camera", "Body Camera") with sentence
+    /// case ("Recording glasses", "Network camera").
+    ///
+    /// BYTE-IDENTICAL to android Models.kt DeviceType.inlineLabel, case for case.
+    /// nearbyDevice and unknown carry an empty faqKey so no help panel renders for them, but
+    /// the values are defined so any future caller reads the same rule.
+    var inlineLabel: String {
+        switch self {
+        case .flockCamera: return "ALPR camera"
+        case .flockRaven:  return "Flock Raven"
+        case .axonBodyCam: return "body camera"
+        case .drone:       return "drone"
+        case .tracker:     return "tracker"
+        case .nearbyDevice:return "nearby device"
+        case .watched:     return "watched device"
+        case .recordingGlasses: return "recording glasses"
+        case .networkCamera: return "network camera"
+        case .unknown:     return "unknown"
+        }
+    }
+
+    /// `category` as it reads in DISPLAY text, where the surrounding voice is lowercase: the
+    /// dossier badge pill ("ALPR · PLATE READER") and the Status nearest card ("ALPR · NODE
+    /// 2A10"). Same rule and same reason as `inlineLabel` above: `category.lowercased()` turned
+    /// the ALPR initialism into "alpr".
+    ///
+    /// This is DISPLAY ONLY and is never a key. `category` itself is unchanged and stays the
+    /// identifier the Log/Map filters, the category counts, the widget rows and the drive
+    /// surface all match on, so nothing that compares strings is touched by this.
+    ///
+    /// BYTE-IDENTICAL to android Models.kt DeviceType.inlineCategory, case for case. Written as
+    /// one arm per case, not a combined `.flockCamera, .flockRaven` arm, so the drift check can
+    /// compare the two platforms arm for arm.
+    var inlineCategory: String {
+        switch self {
+        case .flockCamera: return "ALPR"
+        case .flockRaven:  return "ALPR"
+        case .axonBodyCam: return "body cam"
+        case .drone:       return "drone"
+        case .tracker:     return "tracker"
+        case .nearbyDevice:return "nearby"
+        case .watched:     return "watched"
+        case .recordingGlasses: return "glasses"
+        case .networkCamera: return "camera"
+        case .unknown:     return "unknown"
+        }
+    }
+
     var shortTag: String {
         switch self {
         case .flockCamera: return "ALPR"
