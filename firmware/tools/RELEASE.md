@@ -40,14 +40,66 @@ release: that image bakes the new root but is signed by the retiring key, so eve
 accepts it and trusts the new root from its next boot. The tooling admits a signer that differs
 from the baked root for that one release and for nothing else.
 
-The 2.0.7 cut is that release for the current rotation: it bakes the production key (SPKI SHA-256
+The 2.0.7 cut is the transition release: it bakes the production key (SPKI SHA-256
 `c5d86430652e89c02dc357a1ee15601f95ea18726dbeed486d9b98f57c0399e9`) and is signed by the retiring
 development key (`39e03b1581db574822be12631df557ac136a3c5b9c00b8e32e07dc4a9b6d3df1`), which signed
 every image through 2.0.6. Every image from 2.0.8 on is signed by the production key alone.
+The 2.0.8 source tree closes the transition exception (`OTA_ROTATION = None`); signing still
+requires the production key setup described in step 7 below before release artifacts are staged.
 
 boards still trusting the development key must install the transition image before moving to
 production-key-only releases. a board that skips the transition needs a USB flash once the
 development-key update path is retired.
+
+### Keeping the transition image reachable
+
+Nothing in the tooling enforces this. It is an operator requirement, and the steps below are
+satisfied literally by a same-day follow-on release.
+
+The app manifest carries exactly one `version` per product key, and neither app knows which root a
+board trusts: the offer gate is a plain version comparison (`updateAvailable(latest:)` on iOS,
+`s3UpdateStale` on Android). Publishing the next release over the transition release therefore
+deletes the only image a development-key board can install, while still offering that board an
+update it must reject.
+
+- Leave the transition release published as each product's `version` long enough for fielded
+  boards to reconnect and take it. There is no soak gate in the tooling and no dwell criterion in
+  the steps below, so the release owner picks the interval. The dwell is a PUSH decision, not a
+  state either tree holds: once `release.sh` completes its build-and-stage step (3/5) for the next
+  version, each stager its profile selects has rewritten its products' `firmware-latest.json`
+  entries and app artifacts in the sibling repository's working tree with the next release's
+  bytes, at the same published paths. `build-beacon-flasher.sh`, which runs
+  `stage_beacon_revb.py` for rev-B, covers both beacon revisions and the nRF package;
+  `web/build-flasher.sh` covers the three Colonel Panic images and also writes them, with their
+  other USB flash parts, to this repository's `web/firmware/`. A run that stops before a stager
+  commits leaves that stager's files as they were, because staging follows preflight and tests
+  and each stager restores every file it replaced when it fails. After a `--profile all` run
+  nothing staged still carries the transition release; a single-profile run leaves the other
+  profile's entries and images where they were. Only what the published URLs serve still carries
+  it, and that changes when the sibling's `main` is pushed or anything deploys the sibling's
+  working tree directly, such as a local `npx wrangler deploy` (and, for `web/`, when this
+  repository's `main` is pushed, since Pages deploys `web/` on push). Cutting the next SOURCE
+  version does not close the window; pushing or deploying its staged manifest does.
+- Keep the transition artifacts installable for as long as any board may still be below them.
+  Each stager replaces a product's app artifact at its published path, so the next push
+  overwrites those bytes at the same URL and the manifest has no second entry to fall back to.
+  Once a product's next version has been staged, its transition signature survives only in the
+  sibling's `firmware-latest.json` history, and its transition image only in git history (the
+  sibling's, plus this repository's `web/firmware/` for the three Colonel Panic images) and at the
+  still-served URLs, so retain a copy outside the publish path before staging if it must be
+  retrievable afterwards.
+- A board that misses the window needs a USB flash. The revision-specific browser flashers are the
+  supported path, `flash.html` for rev-A and `flash-revb.html` for rev-B. Never cross-flash
+  revisions.
+
+If this is ignored, the board is not bricked and loses no data: `otaDoFinish` verifies the detached
+signature against the baked root after size and CRC and before `Update.end(true)`, aborts with
+`OTA_ERR_SIG`, and the unit keeps running its current firmware and keeps detecting. What the owner
+gets instead is a full image transfer over Bluetooth that fails at the very end, every time it is
+retried, with no in-app route to the image that would work. When the cut also carries an nRF
+package, the one-click flow runs the nRF leg first and that leg is accepted, because both apps
+carry a two-key trusted list, so the board is also left with an advanced co-processor and an S3
+that never moved.
 
 To rotate:
 
@@ -83,7 +135,9 @@ To rotate:
    signature verifies), and requires the pub file to be the retiring signer. Outside the window the
    pub file must be the recorded root. A declaration whose release either declared version has
    moved past, or that only one declared version names, is a FAIL row, not a skip.
-6. Smoke-test a real board, then publish the manifest.
+6. Smoke-test a real board, then publish the manifest. Leave it published as each product's
+   `version` for the dwell chosen under *Keeping the transition image reachable* above, before any
+   production-key-only release replaces it.
 7. Before the next version is cut: place the new private key at
    `firmware/tools/ota_signing/beacon_ota_key.pem`, its public half at `beacon_ota_pub.pem`, and
    the same public key as the git-tracked `beacon_ota_pub.der` (that file is what a fresh clone

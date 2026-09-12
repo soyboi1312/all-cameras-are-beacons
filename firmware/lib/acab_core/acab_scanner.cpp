@@ -25,6 +25,7 @@
 #include "acab_ble_service.h"
 #ifdef ACAB_CAPTURE_BUILD
 #include "alpr_candidates.h"  // exact-width registered-prefix watchlist; never a classifier
+#include "vendor_capture.h"   // SIG vendor identifier table + routing (pure, host-tested)
 #endif
 // Same guard as the shared advName buffer in acabScannerIngestBLE: the capture build's body-cam
 // name candidates AND the ACAB_DIAG Pigvision marker both match against it, and ACAB_DIAG can be
@@ -850,61 +851,14 @@ static void logBodyCamNameCandidate(const uint8_t mac[6], const char* name, int 
 // NimBLE scan callback below, and by a dual-radio build for adverts forwarded
 // from a companion nRF52840 over UART. Counts toward acabScannerBleSeen().
 #ifdef ACAB_CAPTURE_BUILD
-// ---------------------------------------------------------------------------------------------
 // OFFICIAL VENDOR BLE IDENTIFIERS - capture builds only, and deliberately NOT a classifier.
-//
-// These are Bluetooth SIG ASSIGNED NUMBERS, i.e. registered to a named company, which makes them
-// a categorically better class of evidence than the MAC OUI lists this project has been burned by.
-// An OUI names whoever made the radio module (Liteon, Espressif, Murata) and is shared across
-// millions of unrelated devices. A SIG company ID or a 16-bit service UUID is issued to the
-// product vendor. Matching one says "this is that company's equipment" with far less ambiguity.
-//
-// WHAT IT STILL DOES NOT SAY IS *WHICH* PRODUCT. Axon's own Device Manager compatibility list
-// spans Body 2/3/4 and Body Mini, Flex, Signal Sidearm holster sensors, Signal Vehicle and Fleet
-// gear, and TASER 7/10 handles and batteries. Motorola Solutions covers APX radios, V500/V700/
-// VB400 cameras, M500 in-car video, Holster Aware sensors and accessories - and the same vendor
-// identifiers are carried by fire, EMS, security and retail hardware. So the eventual shipping
-// label is "<vendor> equipment, device type unknown", never "Body camera". This build exists to
-// find out which values map to which products BEFORE any of that is written.
-//
-// THE LOCAL NAME IS THE PAYLOAD THAT MATTERS. The identifier tells you the vendor; the advertised
-// name is the only field likely to separate a Body 4 from a TASER 10 battery. It is logged beside
-// every hit for exactly that reason.
-//
-// Sources: Bluetooth SIG Assigned Numbers (company identifiers + 16-bit UUIDs). Both vendors are
-// live locally, which is why this is worth the flash: San Diego has an active Axon body-camera
-// contract and a five-year TASER 10 agreement.
-struct VendorBleId {
-    uint8_t     kind;    // 0 = manufacturer company ID (AD 0xFF), 1 = 16-bit service UUID
-    uint16_t    val;
-    const char* tag;
-};
-static const VendorBleId VENDOR_BLE_ID[] = {
-    // --- Axon / TASER. FIRST validation target: locally deployed, and the narrower vendor. ---
-    { 0, 0x034D, "AXON-CID" },   // TASER International, manufacturer company ID
-    { 1, 0xFC81, "AXON-SVC" },   // Axon Enterprise, 16-bit service UUID
-    { 1, 0xFE6B, "AXON-SVC" },   // TASER International
-    { 1, 0xFE6C, "AXON-SVC" },   // TASER International
-    // --- Motorola Solutions. Second in the SHIPPING order, but riding along in capture from the
-    // start on purpose: a drive not instrumented today cannot be re-taken retroactively, and the
-    // cost of carrying three more comparisons is nil. Kept tagged separately so the analysis can
-    // hold them apart, and so the Axon work is never blocked on Motorola data. ---
-    { 0, 0x04EC, "MOTO-CID" },   // Motorola Solutions, manufacturer company ID
-    { 1, 0xFD8E, "MOTO-SVC" },   // Motorola Solutions
-    { 1, 0xFE04, "MOTO-SVC" },   // Motorola Solutions
-};
-#define VENDOR_BLE_ID_N (sizeof(VENDOR_BLE_ID) / sizeof(VENDOR_BLE_ID[0]))
+// The table, the group routing, the identifier scan and the per-MAC reservation all live in
+// vendor_capture.h so the host suite can exercise them without Arduino or NimBLE
+// (test_vendor_capture.cpp). Read that header first: it carries the reasoning for why a SIG
+// assigned number is better evidence than an OUI, why solicitation is held apart from
+// confirmation, and why each group gets its own reservation. What stays here is the STATE those
+// decisions run over: the per-group tables, the counters, and the serial rendering.
 
-struct VendorRec {
-    uint8_t  mac[6];
-    uint32_t n;
-    int8_t   best;
-    uint8_t  hits;        // bitmask over VENDOR_BLE_ID, so one line shows every identifier a device carries
-    uint32_t firstMs;
-    uint32_t lastLogMs;
-    bool     used;
-};
-static const size_t   VENDOR_MAX = 12;
 // Own constant rather than reusing the WiFi side's WATCH_LOG_EVERY_MS, which is declared further
 // down the file and lives inside the ACAB_DIAG_WIFI guard. Borrowing it would make this block fail
 // to compile in a capture build without WiFi diag, for no benefit.
@@ -914,86 +868,80 @@ static const uint32_t VENDOR_LOG_EVERY_MS = 5000;
 // would fill a shared table and the Axon device the trip was made for would never get a row. Axon
 // is the first validation target, so it gets its own reservation and cannot be starved by traffic
 // from the vendor that is only here opportunistically. Sizes are deliberately lopsided for the
-// same reason. A device carrying BOTH vendors' identifiers lands in the Axon table (checked
-// first), which is the correct bias for what this capture is for.
+// same reason. An ADVERT carrying identifiers from more than one group is slotted into the
+// lowest-numbered group's table (VG_AXON first), which is the correct bias for what this capture
+// is for. That is decided per advert, not per device: no lookup spans the tables, so a MAC whose
+// adverts route to two groups can hold a row in each (GROUP ROUTING in vendor_capture.h).
+//
+// PCAM gets its own reservation on the same argument. IT IS CURRENTLY UNDERSIZED, AND THE MEASURED
+// COUNT SAYS SO: eight slots were sized from ten PCAM_-NAMED devices, but the row matches the
+// COMPANY ID, and 19 distinct MACs carried 0x087F on the 2026-09-04 drive alone. With no eviction
+// the first eight own the table for the whole boot and the other eleven get no aggregate row -
+// including the -56 dBm best sighting, which arrives ninth. Sizing this to the population the row
+// actually matches is a PENDING DECISION, not an oversight to fix silently; the counts are in
+// docs/captures/vendor-cid-087f-2026-09-04.txt.
+//
+// The reservation still earns its place meanwhile: it is what stops a PCAM cluster from eating the
+// Axon rows the drive was made for. Overflow is not silent - vendorFind counts it per table and the
+// ingest path prints a throttled "[vendor] TABLE FULL (pcam, 8 slots) dropped=N - this capture is
+// INCOMPLETE". Read that notice to see WHICH table overflowed: each table keeps its own `full`, but
+// the wifi_diag line carries only vendor_full, their sum across all three tables, and no accessor
+// returns one table's count. THE NOTICE CAN BE ABSENT while vendor_full is non-zero: fullLastLogMs
+// starts at 0, so a refusal inside the first VENDOR_LOG_EVERY_MS of uptime is throttled away, and
+// if that table is never asked again nothing ever names it. Seeding the stamp so the first refusal
+// always prints is a behaviour change, not a comment fix. dropped=N counts refused ADVERTS, not
+// devices: acabVendorFind bumps it on every call that finds no free slot and remembers no refused
+// MAC, so one unslotted device on a long dwell can account for all of N. Once any table has
+// refused an advert (vendor_full > 0), vendor_macs is only a floor on the rows the capture needed
+// and bounds the distinct-MAC count in neither direction: it counts rows, and a MAC whose adverts
+// have different lowest groups can hold a row in more than one table. No counter records how many
+// MACs got no row at all. The comment on acabScannerVendorMacs in acab_scanner.h owns that rule;
+// this block, the PER-MAC RESERVATION and GROUP ROUTING blocks in vendor_capture.h, reservation()
+// in test_vendor_capture.cpp and docs/signatures.md all restate it.
 struct VendorTable {
-    VendorRec*  rec;
+    AcabVendorRec* rec;
     size_t      n;
-    uint32_t    full;           // adverts dropped because every slot was taken
+    uint32_t    full;           // adverts refused because every slot was taken (not devices)
     uint32_t    fullLastLogMs;  // throttle for the overflow notice, see below
     const char* what;
 };
-static VendorRec gVendorAxRec[12];
-static VendorRec gVendorMoRec[8];
-static VendorTable gVendorTab[2] = {
-    { gVendorAxRec, 12, 0, 0, "axon" },
-    { gVendorMoRec,  8, 0, 0, "moto" },
+// ONE OWNER PER SIZE. The array bound is the capacity and VendorTable::n is derived from it, so
+// resizing the PCAM table (the pending decision above) is a one-place edit. With the literal
+// written twice, an n above the bound would send acabVendorFind (which walks rec[0..n)) past the
+// array, and an n below it would strand slots and misreport "N slots" on the overflow notice.
+#define VENDOR_SLOTS(arr) (sizeof(arr) / sizeof((arr)[0]))
+static AcabVendorRec gVendorAxRec[12];
+static AcabVendorRec gVendorMoRec[8];
+static AcabVendorRec gVendorPcRec[8];
+static VendorTable gVendorTab[VG_N] = {
+    { gVendorAxRec, VENDOR_SLOTS(gVendorAxRec), 0, 0, "axon" },
+    { gVendorMoRec, VENDOR_SLOTS(gVendorMoRec), 0, 0, "moto" },
+    { gVendorPcRec, VENDOR_SLOTS(gVendorPcRec), 0, 0, "pcam" },
 };
 static volatile uint32_t gVendorAxon = 0;   // adverts carrying ANY Axon/TASER identifier
 static volatile uint32_t gVendorMoto = 0;
+static volatile uint32_t gVendorPcam = 0;
 uint32_t acabScannerVendorAxon() { return gVendorAxon; }
 uint32_t acabScannerVendorMoto() { return gVendorMoto; }
-uint32_t acabScannerVendorFull() { return gVendorTab[0].full + gVendorTab[1].full; }
+uint32_t acabScannerVendorPcam() { return gVendorPcam; }
+uint32_t acabScannerVendorFull() {
+    uint32_t n = 0;
+    for (size_t t = 0; t < VG_N; t++) n += gVendorTab[t].full;
+    return n;
+}
 uint32_t acabScannerVendorMacs() {
     uint32_t n = 0;
-    for (size_t t = 0; t < 2; t++)
+    for (size_t t = 0; t < VG_N; t++)
         for (size_t i = 0; i < gVendorTab[t].n; i++) if (gVendorTab[t].rec[i].used) n++;
     return n;
 }
-static VendorRec* vendorFind(VendorTable* tab, const uint8_t* mac) {
-    VendorRec* freeSlot = nullptr;
-    for (size_t i = 0; i < tab->n; i++) {
-        if (tab->rec[i].used && memcmp(tab->rec[i].mac, mac, 6) == 0) return &tab->rec[i];
-        if (!tab->rec[i].used && !freeSlot) freeSlot = &tab->rec[i];
-    }
-    if (!freeSlot) { tab->full++; return nullptr; }
-    memset(freeSlot, 0, sizeof(*freeSlot));
-    memcpy(freeSlot->mac, mac, 6);
-    freeSlot->best = -127;
-    freeSlot->firstMs = millis();
-    freeSlot->used = true;
-    return freeSlot;
+// Binds the pure reservation decision (acabVendorFind, vendor_capture.h) to this table's storage
+// and to the Arduino clock. The decision itself - first-fit, no eviction, count the overflow - is
+// host-tested; this wrapper is only the plumbing.
+static AcabVendorRec* vendorFind(VendorTable* tab, const uint8_t* mac) {
+    return acabVendorFind(tab->rec, tab->n, mac, millis(), &tab->full);
 }
 
-// Bitmask of VENDOR_BLE_ID entries this advert structurally carries.
-//
-// Decoding lives in ble_adv16.h so there is ONE implementation: whatever proves out in a field
-// capture is byte-for-byte what a shipping classifier would later match on. An inline copy here
-// would drift from the shipping path, and the whole point of the capture is to justify that path.
-// It walks AD 0x02/0x03 (service UUID lists), 0x14 (solicitation) and 0x16 (service data, UUID in
-// the first two bytes only), and reads EVERY 0xFF structure rather than latching the first.
-// SOLICITATION IS KEPT APART FROM CONFIRMATION, and the distinction is not pedantic.
-//
-// AD 0x02/0x03 (service UUID lists) and 0x16 (service data) are a device SAYING WHAT IT IS. AD
-// 0x14 is service SOLICITATION: per the Core Specification Supplement it is a peripheral inviting
-// centrals that PROVIDE the named service. So an Axon UUID in 0x14 is a device looking FOR Axon
-// equipment - plausibly a phone running Axon's app, or an accessory hunting for a camera. Folding
-// it into the same mask would let a bystander's handset be counted as vendor equipment, which is
-// the precise failure mode this whole capture-first approach exists to avoid.
-//
-// It is still worth recording. "Something here was looking for an Axon service" is a real
-// observation, and near a confirmed device the two together are more informative than either. It
-// just never counts as vendor-confirmed, and it is rendered on its own axis.
-struct VendorScanCtx { uint8_t mask; uint8_t solicit; };
-static void vendorUuidCb(uint16_t u, uint8_t adType, void* ctx) {
-    VendorScanCtx* c = (VendorScanCtx*)ctx;
-    for (size_t k = 0; k < VENDOR_BLE_ID_N; k++) {
-        if (VENDOR_BLE_ID[k].kind != 1 || VENDOR_BLE_ID[k].val != u) continue;
-        if (adType == ACAB_AD_UUID16_SOLICIT) c->solicit |= (uint8_t)(1u << k);
-        else                                  c->mask    |= (uint8_t)(1u << k);
-    }
-}
-static void vendorCidCb(uint16_t cid, void* ctx) {
-    VendorScanCtx* c = (VendorScanCtx*)ctx;
-    for (size_t k = 0; k < VENDOR_BLE_ID_N; k++)
-        if (VENDOR_BLE_ID[k].kind == 0 && VENDOR_BLE_ID[k].val == cid) c->mask |= (uint8_t)(1u << k);
-}
-static void vendorScanAdv(const uint8_t* adv, size_t len, uint8_t* mask, uint8_t* solicit) {
-    VendorScanCtx c; c.mask = 0; c.solicit = 0;
-    acabAdvForEachUuid16(adv, len, vendorUuidCb, &c);
-    acabAdvForEachCompanyId(adv, len, vendorCidCb, &c);
-    *mask = c.mask; *solicit = c.solicit;
-}
 
 // ---------------------------------------------------------------------------------------------
 // GROUND-TRUTH MARKER WINDOWS - capture builds only. {"mark":"<label>"} over the config channel.
@@ -1167,29 +1115,48 @@ void acabScannerIngestBLE(const uint8_t mac[6], const uint8_t* payload, size_t p
     uint8_t vendorHit = 0, vendorSol = 0;
     if (!isReplay && payload && plen) {
         uint8_t hit = 0, sol = 0;
-        vendorScanAdv(payload, plen, &hit, &sol);
+        acabVendorScanAdv(payload, plen, &hit, &sol);
         vendorHit = hit; vendorSol = sol;
         // Only a CONFIRMED identifier opens a vendor record. A solicitation-only advert is carried
         // into the marker window (below) but never counted as this vendor's equipment.
         if (hit) {
-            bool axon = false, moto = false;
-            for (size_t k = 0; k < VENDOR_BLE_ID_N; k++) {
-                if (!(hit & (1u << k))) continue;
-                if (VENDOR_BLE_ID[k].tag[0] == 'A') axon = true; else moto = true;
-            }
-            if (axon) gVendorAxon++;
-            if (moto) gVendorMoto++;
-            VendorTable* tab = axon ? &gVendorTab[0] : &gVendorTab[1];
-            VendorRec* v = vendorFind(tab, mac);
+            // Count every group the advert named, then slot THIS ADVERT once, into the lowest
+            // group present. Per advert, not per device: a MAC whose packets route to two groups
+            // can hold a row in both tables (GROUP ROUTING in vendor_capture.h). Both decisions are
+            // in vendor_capture.h and host-tested; see acabVendorGroupMask / acabVendorSlotGroup.
+            const uint8_t groups = acabVendorGroupMask(hit);
+            if (groups & (1u << VG_AXON)) gVendorAxon++;
+            if (groups & (1u << VG_MOTO)) gVendorMoto++;
+            if (groups & (1u << VG_PCAM)) gVendorPcam++;
+            // g < VG_N is guaranteed here and the index below depends on it: this whole block
+            // is under `if (hit)`, every set bit in `hit` names a row (only the header's two
+            // callbacks set bits, each at a row index below VENDOR_BLE_ID_N), and every row
+            // declares a VendorGroup below VG_N - the header enforces that at compile time, by
+            // the typed `group` field and the static_assert over acabVendorGroupsInRange - so
+            // acabVendorGroupMask cannot return 0 and acabVendorSlotGroup cannot fall through to
+            // VG_N. The header still returns VG_N for an empty mask so the pure decision is
+            // total; a future caller that can pass 0 must check before indexing.
+            const uint8_t g = acabVendorSlotGroup(groups);
+            VendorTable* tab = &gVendorTab[g];
+            AcabVendorRec* v = vendorFind(tab, mac);
             const uint32_t nowMs = millis();
             bool emit;
             if (v) {
                 v->n++;
                 if ((int8_t)rssi > v->best) v->best = (int8_t)rssi;
+                const uint8_t hitsBefore = v->hits;
                 v->hits |= hit;
-                // First sighting always, then throttled: a radio in a patrol car parked next to
-                // you would otherwise print continuously and bury everything else in the capture.
-                emit = (v->n == 1) || (nowMs - v->lastLogMs >= VENDOR_LOG_EVERY_MS);
+                // First sighting always, a change to the row's mask always, everything else
+                // throttled: a radio in a car parked next to you would otherwise print on every
+                // advert and bury the rest of the capture. The mask-change term is what guarantees
+                // the row's FINAL state reaches the log - a time-only test dropped an identifier
+                // gained inside the window unless the MAC was heard again after it, and nothing
+                // dumps the tables at capture end. The decision is pure and host-tested; the
+                // reasoning, and the bound that keeps this off the hot path (hits only gains bits,
+                // so at most one extra line per identifier per row for the whole boot), are in
+                // acabVendorShouldEmit in vendor_capture.h.
+                emit = acabVendorShouldEmit(v->n, hitsBefore, v->hits, nowMs, v->lastLogMs,
+                                            VENDOR_LOG_EVERY_MS);
                 if (emit) v->lastLogMs = nowMs;
             } else {
                 // TABLE FULL. This branch used to leave emit at its `true` initialiser, so the one
@@ -1205,12 +1172,27 @@ void acabScannerIngestBLE(const uint8_t mac[6], const uint8_t* payload, size_t p
                 emit = false;   // the notice above replaces the per-device line
             }
             if (emit) {
-                // TWO masks, deliberately. `packet=` is what THIS advert carried; `seen=` is every
-                // identifier this MAC has ever shown. They differ constantly, because a device
-                // routinely splits its company ID, its service UUIDs and its name across separate
-                // adverts. Rendering only the packet mask (as this did) meant the co-occurrence
-                // this capture exists to find could never appear in the log even when the firmware
-                // had already accumulated it.
+                // TWO masks, deliberately. `packet=` is what THIS advert carried; `seen=` is this
+                // table's row for the MAC (AcabVendorRec::hits), every identifier from the adverts
+                // that routed to THIS table since the row opened. It is not every identifier the
+                // MAC has shown: an advert from the same MAC whose lowest group is a different one
+                // lands in that group's table, so the MAC can hold a row there as well, and this
+                // line shows only this row (GROUP ROUTING in vendor_capture.h). The two masks
+                // differ when this advert lacks an identifier that an earlier advert in the row
+                // carried, for example a company ID in one and a service UUID in the next.
+                // Rendering only the packet mask (as this did) meant the co-occurrence this
+                // capture exists to find could never appear in the log even when the firmware had
+                // already accumulated it. The emit rule above is the other half of that: every
+                // change to `seen=` prints, so a row's final mask is always in the log. That does
+                // NOT make a second line for one MAC proof of a new identifier: the rule's third
+                // term is the plain VENDOR_LOG_EVERY_MS throttle, unguarded by any mask condition,
+                // so a device that only dwells in range prints again once the window passes.
+                // `seen=` is what separates the two when reading a log back - a mask that grew is
+                // new evidence, an identical mask is the throttle. Bounded, though: sn below holds
+                // 64 bytes and the loop stops while fewer than 14 remain, so about four identifiers
+                // render. A row already printing four can gain a fifth and print a byte-identical
+                // `seen=`. Only the TEXT is capped; acabVendorShouldEmit tests the mask, so the
+                // line still prints. Widening sn (and pk) is the fix if a row ever holds five.
                 char pk[64]; int q = 0; pk[0] = 0;
                 for (size_t k = 0; k < VENDOR_BLE_ID_N && q < (int)sizeof(pk) - 14; k++) {
                     if (!(hit & (1u << k))) continue;

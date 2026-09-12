@@ -8,19 +8,22 @@ name: Firmware CI
 # iOS has its own macOS test and unsigned Release-build gate in ios-ci.yml.
 #
 # THE PATH LIST REACHES OUTSIDE firmware/ ON PURPOSE. check-signature-drift.py below is the only
-# automated runner of the cross-platform guards, and the files those guards read live in the two
-# APP trees: faq-content.json is duplicated verbatim into both, the relatedHelp key list is derived
-# from the two DeviceType enums, SHARED_CONSTANTS pins the CSV column list and pairing hint, and
-# the privacy guard reads each app's link plus the canonical web policy. With a firmware-only
-# filter, the one commit shape those guards
-# exist to catch - an app-tree-only edit that changes one copy - never triggered them, and neither
-# ios-ci.yml nor android-release.yml runs the script. Both DeviceType files tell maintainers this
-# script "FAILS the build"; the app-tree paths in both lists are what makes that sentence true.
+# CI runner of the cross-platform guards (release.sh also runs it at a release cut), and many of
+# the files those guards read live in the two APP trees: the two faq-content.json copies, the two
+# DeviceType enums, the files behind every SHARED_CONSTANTS, SHARED_SHAPES and per-arm table row,
+# and each app's privacy link beside the canonical web policy. With a firmware-only filter, the one
+# commit shape those guards exist to catch, an app-tree-only edit that changes one copy, never
+# triggered them, and no other workflow runs the script. Both DeviceType files tell maintainers
+# this script "FAILS the build"; the app-tree paths in both lists are what makes that sentence true.
 #
-# THE COST, STATED: an edit to any of them spends a cached PlatformIO build. AcabBleManager.kt is
-# the highest-churn file in that list, so this is not free. A guard that does not run on the commit
-# it exists to catch is worth less than the runner minutes, and cancel-in-progress below stops a
-# superseded push from spending them twice.
+# THE LIST IS CHECKED, NOT TRUSTED. The script's last check, check_ci_trigger_paths, records every
+# file the run read and fails when one is missing from the push list or the pull_request list, so a
+# pin added on a new file fails its own commit until that path is in BOTH lists below.
+#
+# THE COST, STATED: an edit to any of them spends a cached PlatformIO build, and several are large
+# screens and managers that change often, so this is not free. A guard that does not run on the
+# commit it exists to catch is worth less than the runner minutes, and cancel-in-progress below
+# stops a superseded push from spending them twice.
 on:
   push:
     branches: [main]
@@ -38,6 +41,24 @@ on:
       - 'android/app/src/main/java/tech/acab/app/ble/AcabBleManager.kt'
       - 'ios/Beacons/Views/SettingsView.swift'
       - 'android/app/src/main/java/tech/acab/app/ui/DeviceScreen.kt'
+      - 'ios/Beacons/Views/RootView.swift'
+      - 'ios/Beacons/Views/ConnectView.swift'
+      - 'android/app/src/main/java/tech/acab/app/ui/AcabApp.kt'
+      - 'ios/Beacons/Views/DashboardView.swift'
+      - 'ios/Beacons/Models/DashboardPresentation.swift'
+      - 'ios/Beacons/Models/BeaconPresentation.swift'
+      - 'ios/Beacons/Views/Components.swift'
+      - 'android/app/src/main/java/tech/acab/app/ui/StatusScreen.kt'
+      - 'ios/Beacons/Views/DetectionsView.swift'
+      - 'android/app/src/main/java/tech/acab/app/ui/LogScreen.kt'
+      - 'android/app/src/main/java/tech/acab/app/ui/MainScreen.kt'
+      - 'ios/Beacons/Views/MapTabView.swift'
+      - 'android/app/src/main/java/tech/acab/app/ui/MapScreen.kt'
+      - 'android/app/src/main/java/tech/acab/app/ui/MapProjection.kt'
+      - 'ios/Beacons/Views/DetectionDetailView.swift'
+      - 'android/app/src/main/java/tech/acab/app/ui/DetailScreen.kt'
+      - 'ios/Beacons/Models/OUIVendors.swift'
+      - 'android/app/src/main/java/tech/acab/app/model/OuiVendors.kt'
       - 'web/privacy.html'
   pull_request:
     paths:
@@ -54,6 +75,24 @@ on:
       - 'android/app/src/main/java/tech/acab/app/ble/AcabBleManager.kt'
       - 'ios/Beacons/Views/SettingsView.swift'
       - 'android/app/src/main/java/tech/acab/app/ui/DeviceScreen.kt'
+      - 'ios/Beacons/Views/RootView.swift'
+      - 'ios/Beacons/Views/ConnectView.swift'
+      - 'android/app/src/main/java/tech/acab/app/ui/AcabApp.kt'
+      - 'ios/Beacons/Views/DashboardView.swift'
+      - 'ios/Beacons/Models/DashboardPresentation.swift'
+      - 'ios/Beacons/Models/BeaconPresentation.swift'
+      - 'ios/Beacons/Views/Components.swift'
+      - 'android/app/src/main/java/tech/acab/app/ui/StatusScreen.kt'
+      - 'ios/Beacons/Views/DetectionsView.swift'
+      - 'android/app/src/main/java/tech/acab/app/ui/LogScreen.kt'
+      - 'android/app/src/main/java/tech/acab/app/ui/MainScreen.kt'
+      - 'ios/Beacons/Views/MapTabView.swift'
+      - 'android/app/src/main/java/tech/acab/app/ui/MapScreen.kt'
+      - 'android/app/src/main/java/tech/acab/app/ui/MapProjection.kt'
+      - 'ios/Beacons/Views/DetectionDetailView.swift'
+      - 'android/app/src/main/java/tech/acab/app/ui/DetailScreen.kt'
+      - 'ios/Beacons/Models/OUIVendors.swift'
+      - 'android/app/src/main/java/tech/acab/app/model/OuiVendors.kt'
       - 'web/privacy.html'
   workflow_dispatch:
 

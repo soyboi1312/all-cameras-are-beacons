@@ -26,6 +26,53 @@
 // field above 1023 is therefore un-shippable over the air: the apps compare unclamped, would keep offering
 // the update, and the board would refuse it forever. Bump the MINOR when the patch field runs out.
 //
+// 2.0.8: closes the OTA key rotation, and reworks the capture-only vendor table. THE SHIPPING
+//        IMAGE IS A NO-OP: apart from the version bump itself, the OTA signing-key file and the
+//        release tooling, every source change in this cut sits inside ACAB_CAPTURE_BUILD, so no
+//        code change reaches a production build of beacon-board or beacon-board-revb. Same
+//        flash size, same RAM, identical in every code byte. The .bin is NOT byte-identical to
+//        2.0.7: the version string is baked at three sites (esp_app_desc.version, written by
+//        tools/stamp_app_desc.py; the boot banner in beacon-board main.cpp; the literal the BLE
+//        status fwbuf in acab_ble_service.cpp reads), and the ELF sha256 field of esp_app_desc,
+//        the image checksum and the appended image sha256 follow from that. Measured with cmp -l
+//        against the published 2.0.7 images: 68 bytes in five ranges on the rev-A beacon-board,
+//        mesh-detect and mesh-detect-ch1 (the same three sites: oui-spy builds src/beacon-board/
+//        and prints the other branch of that banner pair, the mesh-detect images print their own
+//        in src/mesh-detect/main.cpp); 67 in five on beacon-board-revb, where the new ELF sha256
+//        starts with the old byte and shortens that run; and 67 in six on oui-spy, where a byte
+//        inside the trailing checksum-and-sha256 run matches and splits it. Nothing else differs.
+//        The version moves so firmware and both apps stay aligned; there is no detection or
+//        behavior change for a user who takes the update.
+//        OTA TRUST ROOT: the transition is over. release_tools.OTA_ROTATION is back to None, so
+//        the signer must equal the baked root again, and ota_signing/beacon_ota_pub.der now
+//        holds the PRODUCTION key (SPKI SHA-256 c5d86430...99e9) in place of the retired
+//        development key (39e03b15...3df1). 2.0.7 was the one cut allowed to differ. A board
+//        that never installed 2.0.7 still trusts the development key and CANNOT verify a
+//        production-signed image, so the 2.0.7 transition build has to stay reachable; see
+//        tools/RELEASE.md.
+//        CAPTURE ROUTING: the per-vendor table no longer infers its group from the tag's first
+//        letter. That inference ("A" meant Axon, anything else Motorola) held only while the
+//        list carried exactly two vendors with different initials, and the first row outside
+//        that pair would have landed in the Motorola table and inflated moto_ble - a counter
+//        whose ZERO is a result worth quoting. Each row now states its VendorGroup. Routing is
+//        per advert: a packet naming more than one group is COUNTED under each and slotted once,
+//        into the lowest-numbered group present. It is not per device: a device that splits its
+//        identifiers across packets can hold a row in more than one table (vendor_capture.h,
+//        GROUP ROUTING).
+//        CAPTURE TABLE: adds SIG company ID 0x087F as a third group with its own 8-slot
+//        reservation and a pcam_ble counter on the wifi_diag line. The registrant was unknown
+//        when the row was written; it resolves to Phillips Connect Technologies LLC, a trailer
+//        telematics vendor, corroborated inside our own drive data by a PCTGW_ device sharing
+//        the population. The advertised "PCAM_" name is a vendor-chosen label and is NOT
+//        evidence of a camera. Capture-only: it logs and counts, never classifies, never fills
+//        AcabDetection, never reaches the apps. Whether the family belongs in the list at all is
+//        an open product question, not a settled one.
+//        TESTABILITY: the table, the group routing, the identifier scan and the per-MAC
+//        reservation moved to lib/acab_core/vendor_capture.h, which the host suite can compile
+//        without Arduino or NimBLE (tools/host-tests/test_vendor_capture.cpp, same reasoning as
+//        sink_claim.h). Adds a static_assert that the table fits the uint8_t hit mask, and one
+//        that every row's group is below VG_N (the scanner indexes gVendorTab with it); both are
+//        evaluated by the host suite as well as by the capture build.
 // 2.0.7: network-camera table expansion and a Flock grading correction.
 //        NETCAM: 14 more registry-verified MA-L blocks (Blink x6 under its own "Blink by Amazon"
 //        registrations, Night Owl, SkyBell, Juan OEM x4, Ezviz 38:F2:5D, Uniview 14:BA:88; the
@@ -125,7 +172,7 @@
 // 2.0.0: the Colonel Panic builds pick up the full v2 detection set the beacon board ships
 // with (offline buffer, watchlist/custom category, ignore list, refreshed OUIs, glasses).
 #ifndef ACAB_FW_VERSION
-#define ACAB_FW_VERSION "2.0.7"
+#define ACAB_FW_VERSION "2.0.8"
 #endif
 
 #endif // ACAB_VERSION_H

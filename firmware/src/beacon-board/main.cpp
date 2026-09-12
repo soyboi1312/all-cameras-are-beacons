@@ -1457,7 +1457,7 @@ void loop() {
         Serial.printf("[diag] wifi_diag sent=%lu dropped=%lu app=%d bufen=%d buf=%lu"
 #ifdef ACAB_CAPTURE_BUILD
                       " watch_data=%lu falcon_data=%lu falcon_mgmt=%lu falcon_macs=%lu falcon_full=%lu"
-                      " axon_ble=%lu moto_ble=%lu vendor_macs=%lu vendor_full=%lu"
+                      " axon_ble=%lu moto_ble=%lu pcam_ble=%lu vendor_macs=%lu vendor_full=%lu"
                       " alpr_ble=%lu alpr_wifi=%lu alpr_macs=%lu alpr_full=%lu"
 #endif
                       "\n",
@@ -1474,6 +1474,7 @@ void loop() {
                       , (unsigned long)acabScannerFalconTableFull()
                       , (unsigned long)acabScannerVendorAxon()
                       , (unsigned long)acabScannerVendorMoto()
+                      , (unsigned long)acabScannerVendorPcam()
                       , (unsigned long)acabScannerVendorMacs()
                       , (unsigned long)acabScannerVendorFull()
                       , (unsigned long)acabScannerAlprCandidateBleSeen()

@@ -118,6 +118,24 @@ def declare_versions(firmware: Path, shared: str, beacon: str) -> None:
     )
 
 
+class CurrentSourceReleasePolicyTests(unittest.TestCase):
+    """A version bump must keep the actual source and release gates in agreement."""
+
+    def test_source_versions_agree_without_a_stale_rotation_exception(self) -> None:
+        shared, beacon = declared_versions(TOOLS.parent)
+        self.assertEqual(shared, beacon)
+        # Raises if a previous transition exception was left behind during a version bump.
+        rotation = ota_rotation_for_versions(shared, beacon)
+        if rotation is not None:
+            self.assertEqual(rotation["release"], shared)
+
+    def test_current_versions_have_an_explicit_content_canary_policy(self) -> None:
+        verifier = load_verifier()
+        for version in set(declared_versions(TOOLS.parent)):
+            with self.subTest(version=version):
+                self.assertIn(version, verifier.CANARIES)
+
+
 class OtaSigningKeyIdentityTests(unittest.TestCase):
     """The signer must be the baked root, except in the ONE declared rotation cut.
 

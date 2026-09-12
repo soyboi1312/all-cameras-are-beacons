@@ -50,13 +50,9 @@ OTA_FIRMWARE_BASE_URL = "https://soyboi.tech/firmware/"
 # so set OTA_ROTATION back to None when the version after "release" is cut. Keep the name:
 # ota_rotation_for_versions reads it, and the tests patch it by name.
 #
-# 2.0.7 retires the development key, which signed every image through 2.0.6, for the offline
-# production key. Both fingerprints are SHA-256 over SubjectPublicKeyInfo DER.
-OTA_ROTATION: Optional[dict] = {
-    "release": "2.0.7",
-    "trust_root_sha256": "c5d86430652e89c02dc357a1ee15601f95ea18726dbeed486d9b98f57c0399e9",
-    "signer_sha256": "39e03b1581db574822be12631df557ac136a3c5b9c00b8e32e07dc4a9b6d3df1",
-}
+# 2.0.7 was the development-to-production transition cut. Starting with 2.0.8, the
+# signer must match the baked production trust root; the retiring-key exception is closed.
+OTA_ROTATION: Optional[dict] = None
 
 
 class ReleaseToolError(RuntimeError):

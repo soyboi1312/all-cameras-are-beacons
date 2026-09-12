@@ -74,8 +74,15 @@ there explains why they are not independent of each other.
 
 ## Detections (notify)
 
-One compact-JSON object per sighting. Emitted on first detection and again each
-time the device is re-seen after the 60 s dedup window (`new` distinguishes them).
+One compact-JSON object per sighting. For every category except nearby devices and network
+cameras, that means one notify per decoded frame that reaches the sink, on every sighting, inside
+or outside the dedup window. `new` marks only the first sighting and each re-sighting after the
+60 s dedup window; it does not gate delivery. The two per-frame firehose sources are the exception,
+because a single streaming device could otherwise produce one notify per frame: an
+`ACAB_NEARBY_DEVICE` row under Desert mode and an `ACAB_NETCAM` row are dropped from the notify
+path when they are repeat sightings inside the dedup window, and new ones are capped at
+`ACAB_DESERT_MAX_NOTIFY_PER_SEC` (20 per second, one shared bucket). Offline buffering is not
+gated by that cap. See `desertNotifyAllowed` and the `deliver` flag in `acab_scanner.cpp`.
 
 ```json
 {"t":1,"s":0,"meth":2,"c":80,"mac":"d4:ad:fc:11:22:33","rssi":-67,

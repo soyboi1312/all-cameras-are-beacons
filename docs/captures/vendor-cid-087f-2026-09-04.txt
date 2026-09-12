@@ -1,0 +1,185 @@
+SIG company ID 0x087F ("PCAM-CID") capture extract, 2026-09-04
+Source: firmware/tools/detection logs/drive_home_9-4.log, a 391,005-line / 34 MB run of
+firmware/tools/capture-log.py. That directory is gitignored by the .gitignore pattern
+"firmware/tools/detection logs/", and so is every *.log in the tree by the "*.log" pattern in the
+same file, so nothing in the raw file can be checked from the repo. This extract is the evidence
+base for the { 0, 0x087F, "PCAM-CID", VG_PCAM } row in firmware/lib/acab_core/vendor_capture.h and
+is committed so that row can be re-checked without the raw files: every raw 0x087F advert line from
+the three cited logs that carry advert bytes at all (drive_home_9-4, aug-9-drive2, compare-dual),
+plus the name-only sightings from the two that do not (camarillo_drive, santabarbara).
+Board: rev-A beacon board on /dev/cu.usbmodem101, ACAB capture build. Local wall clock:
+"capture start" 10:11:40, last data line 14:20:23, "capture end" 14:20:24.
+
+HOW THE LINES WERE SELECTED
+Every line carrying "adv=" was hex-decoded and walked as AD structures (length byte, type byte,
+payload; stop on a zero length byte), and a line was kept only when a walked AD type 0xFF carried
+0x7F 0x08 as its first two payload bytes, which is company ID 0x087F little-endian on the wire. A
+substring search for "7F08" inside the advert hex returns 31 lines in drive_home_9-4.log; the walk
+returns 27. The four extra are the reason the walk matters, and they are listed at the bottom of
+this file: three are Apple 0x004C manufacturer payloads that happen to contain the byte pair, and
+one is a 0x16 service-data structure under UUID 0xFCF1. None is a 0x087F device.
+
+1. POPULATION IN drive_home_9-4.log
+19 distinct MACs carry company ID 0x087F. 10 advertise a PCAM_ name, 9 do not:
+  PCAM_       C6:51:A8:0D:11:F5 PCAM_0D11F5   C8:09:13:18:0C:74 PCAM_180C74
+              CB:5C:F1:BE:B2:C7 PCAM_BEB2C7   CC:FE:BA:21:16:72 PCAM_211672
+              D2:B7:CE:78:C7:B1 PCAM_78C7B1   DE:BA:CE:16:73:C3 PCAM_1673C3
+              E2:1E:64:34:EC:78 PCAM_34EC78   E9:25:71:01:36:95 PCAM_013695
+              EC:C8:37:F5:AA:FC PCAM_F5AAFC   FE:C4:93:EA:6A:81 PCAM_EA6A81
+  other       C6:56:5A:7C:67:DA CFQU722350    C9:DB:70:63:7D:8D GV2600099
+              D2:D1:C2:1E:ED:11 CFQU722248    D3:4A:5E:84:65:8A F11123
+              E1:23:38:1C:C3:68 GV2600975     F1:66:59:C5:27:C1 CFQU522189
+              F9:5F:9B:74:BA:AC GV2501334     FB:5C:D3:64:7B:DB W26466
+              FD:03:F2:59:96:4B PCTGW_83955
+The vendor_capture.h row comment SAID "Ten devices on the 2026-09-04 drive alone" when this extract
+was written. Ten is the PCAM_ count, not the 0x087F count: nineteen devices on that drive carry the
+company ID. The header's EVIDENCE BASE paragraph has since been corrected from this file and
+now reads "24 distinct MACs across the three logs that record advert bytes (drive_home_9-4
+holds 19 of them)", so the two agree.
+Two more logs add 5 devices, so 24 distinct MACs total: aug-9-drive2 has EF:19:4C:DE:76:BF
+PCAM_DE76BF, F3:81:10:17:E7:58 HV2302850 and E9:A1:91:46:2F:F1 HV2600317; compare-dual has
+FA:2C:9B:29:B8:8D PCAM_29B88D and F3:65:DC:39:A8:E1 5525002.
+
+2. TWO ADVERT SHAPES, NOT ONE
+The population splits cleanly, 12 devices each across the three logs.
+  shape A  02 01 06 | 09 FF 7F08 0A 01 <4 varying> | 0C 09 "PCAM_" + last 3 MAC bytes in hex
+  shape B  02 01 06 | 0E FF 7F08 00 00 00 <8 BCD bytes> | <len> 09 <name>
+In drive_home_9-4.log that is 17 shape-A lines and 10 shape-B lines. The name rule holds for all 12
+shape-A devices with no exceptions: the Complete Local Name is exactly "PCAM_" plus the last three
+address bytes uppercase. No shape-B name restates its address. The shape-B name length varies with
+the name, so the name AD length byte is 0x07 to 0x0C, and only the manufacturer structure is fixed
+width there. The 8 trailing shape-B bytes are BCD-valid in every nibble for all 12 devices (16
+digits) and always start 08. Their leading 8 digits cluster the devices into four runs: 08643950
+(5 devices), 08669610 (4), 08608710 (2), 08618360 (1).
+The vendor_capture.h row comment recorded shape A only and called the field shape "byte-identical in
+every sighting" when this extract was written. Shape B is a second, longer manufacturer structure
+under the same company ID. The header's FIELD SHAPE block has since been rewritten from this
+extract: it now lists BOTH shapes with these byte sketches and states the bytes are NOT
+byte-identical across sightings, so the two agree.
+
+3. THE LENGTH BYTE SAYS FOUR VARYING BYTES, NOT THREE
+Shape A manufacturer structure, in full: 09 FF 7F 08 0A 01 xx xx xx xx.
+The AD length byte counts every byte after itself: 0x09 = 9. One of those is the AD type (0xFF), two
+are the company ID (7F 08), two are the 0A 01 lead-in. 9 - 1 - 2 - 2 = 4. Four varying bytes follow
+0x0A 0x01, and the raw lines below show four: 21 1A EE 51, 27 1B 22 5B, 1E 1B 17 3C and so on. The
+whole shape-A advert is 26 bytes, 3 + 10 + 13, which is the 52 hex characters printed per line.
+The vendor_capture.h comment wrote "<3 varying bytes>" when this extract was written. That was
+off by one and the length byte is what settles it. The header's FIELD SHAPE block has since
+been corrected and now sketches "<4 varying>" and says the 0x09 length byte settles the count
+at FOUR, which is also what test_vendor_capture.cpp's PCAM fixture NOTE says, so all three
+agree.
+Those four bytes are also not constant per device. EF:19:4C:DE:76:BF advertised 0A 01 27 1B 67 16 at
+483.0 s and 0A 01 28 1B 67 16 at 483.8 s in aug-9-drive2.log, 0.8 s apart. Byte 0 ranges 0x1E-0x2D
+across the population and is the only one seen to move; bytes 2 and 3 were stable for every device
+that was heard more than once. So the retired "byte-identical in every sighting" wording was wrong
+even inside one device, which is why the header now says the bytes are NOT byte-identical across
+sightings.
+
+4. WHICH LOGS ACTUALLY CARRY 0x087F ADVERT BYTES
+  drive_home_9-4.log   49,245 "[ble] ... adv=" lines   27 raw 0x087F lines, 19 devices
+  aug-9-drive2.log      9,952                           4 raw 0x087F lines,  3 devices
+  compare-dual.log      7,001                           3 raw 0x087F lines,  2 devices
+  camarillo_drive.log       0                           0
+  santabarbara.log          0                           0
+camarillo_drive and santabarbara contain no "[ble] ... adv=" lines at all. They were logged by the
+product image, which prints no BLE payload, so neither log can corroborate a byte-level claim about
+this or any other advert. What they do have is name-only classifier lines, reproduced below: five
+PCAM_ plus two CFQU BLE sightings in camarillo, one PCAM_ in santabarbara. camarillo also has a WiFi
+SSID "PCAM26A" on a randomized MAC (de:22:79:3e:6b:b2). That is a WiFi SSID string, not a BLE
+company ID, and it is not evidence about 0x087F.
+The vendor_capture.h comment cited five logs for a shape claim "byte-identical in every sighting
+across five drive logs" when this extract was written. Only three of the five contain any advert
+bytes. The header's EVIDENCE BASE paragraph has since been narrowed to those three and now says
+camarillo_drive and santabarbara "cannot support a byte-level claim", so the two agree.
+Read counts as a floor, not a census. 171 "[ble] ... adv=" lines in drive_home_9-4.log are truncated
+by serial drops and 9 more fail the AD walk, so 49,065 of 49,245 decode cleanly. None of the damaged
+lines contains 7F08.
+
+5. BEST RSSI
+-56 dBm, CC:FE:BA:21:16:72 (PCAM_211672), drive_home_9-4.log at 7898.6 s / 12:23:19. That device was
+heard 6 times in 13 s on a rising ramp, -93 -86 -80 -74 -63 -56, which reads as a close pass. The
+-56 dBm figure in vendor_capture.h is correct. No other device in the population beat -78 dBm.
+
+6. ADDRESS TYPE
+All 24 addresses are BLE random-static: the top two bits of the first octet are set in every case.
+Sorted, the 24 first octets are C6 C6 C8 C9 CB CC D2 D2 D3 DE E1 E2 E9 E9 EC EF F1 F3 F3 F9 FA FB FD
+FE, and the lowest of them is 0xC6, so every one is >= 0xC0. The vendor_capture.h claim holds, 24 of
+24.
+There is no OUI in this population to look up, which is the point of carrying the company ID.
+
+REGISTRY NOTE, NOT CAPTURE EVIDENCE
+This paragraph is not derived from the logs. It comes from an external copy of the Bluetooth SIG
+published company_identifiers list, where 0x087F (decimal 2175) resolves to Phillips Connect
+Technologies LLC, a trailer-telematics vendor. The tree's own data is consistent with that: one
+device in the same 0x087F population advertises PCTGW_83955, which reads as Phillips Connect
+Technologies GateWay. Treat this as a lead only. Re-confirm it directly against the SIG
+assigned-numbers list before the row is promoted anywhere out of capture, because nothing in this
+repo holds a copy of that list to check against. vendor_capture.h said the registrant was unresolved
+when this extract was written; the row comment, acab_version.h's 2.0.8 block, acab_scanner.h's
+vendor-counter comment and docs/signatures.md have all since been updated to name Phillips
+Connect Technologies with this same re-confirm caveat, so none of them still calls the family
+unattributed.
+Separately: "PCAM" is a vendor-chosen advertised name and is not evidence of a camera. A name string
+costs a vendor nothing to pick, this project has already paid once for reading a product out of a
+broadcast label, and trailer telematics is a better fit for the observed data than any imaging
+device. The name is logged, not believed, and it must not enter a category decision.
+
+RAW LINES, drive_home_9-4.log, all 27
+[  4575.1s  11:27:55] [ble] DE:BA:CE:16:73:C3 rssi=-90 name="PCAM_1673C3" adv=02010609FF7F080A01211AEE510C095043414D5F313637334333
+[  4725.4s  11:30:26] [ble] D2:B7:CE:78:C7:B1 rssi=-88 name="PCAM_78C7B1" adv=02010609FF7F080A01271B225B0C095043414D5F373843374231
+[  4726.7s  11:30:27] [ble] D2:B7:CE:78:C7:B1 rssi=-82 name="PCAM_78C7B1" adv=02010609FF7F080A01271B225B0C095043414D5F373843374231
+[  5616.2s  11:45:16] [ble] E1:23:38:1C:C3:68 rssi=-86 name="GV2600975" adv=0201060EFF7F0800000008643950647923500A09475632363030393735
+[  5616.6s  11:45:17] [ble] EC:C8:37:F5:AA:FC rssi=-88 name="PCAM_F5AAFC" adv=02010609FF7F080A01241B4C630C095043414D5F463541414643
+[  6852.2s  12:05:52] [ble] FD:03:F2:59:96:4B rssi=-91 name="PCTGW_83955" adv=0201060EFF7F0800000008643950665839550C0950435447575F3833393535
+[  6854.6s  12:05:55] [ble] E2:1E:64:34:EC:78 rssi=-88 name="PCAM_34EC78" adv=02010609FF7F080A01211BBE100C095043414D5F333445433738
+[  6896.2s  12:06:36] [ble] C6:56:5A:7C:67:DA rssi=-88 name="CFQU722350" adv=0201060EFF7F0800000008608710516610180B0943465155373232333530
+[  6897.5s  12:06:38] [ble] F1:66:59:C5:27:C1 rssi=-88 name="CFQU522189" adv=0201060EFF7F0800000008608710515837900B0943465155353232313839
+[  7885.4s  12:23:06] [ble] CC:FE:BA:21:16:72 rssi=-93 name="PCAM_211672" adv=02010609FF7F080A011E1B173C0C095043414D5F323131363732
+[  7887.6s  12:23:08] [ble] CC:FE:BA:21:16:72 rssi=-86 name="PCAM_211672" adv=02010609FF7F080A011E1B173C0C095043414D5F323131363732
+[  7897.3s  12:23:17] [ble] CC:FE:BA:21:16:72 rssi=-80 name="PCAM_211672" adv=02010609FF7F080A011E1B173C0C095043414D5F323131363732
+[  7897.3s  12:23:18] [ble] FB:5C:D3:64:7B:DB rssi=-87 name="W26466" adv=0201060EFF7F0800000008643950659438530709573236343636
+[  7897.8s  12:23:18] [ble] CC:FE:BA:21:16:72 rssi=-74 name="PCAM_211672" adv=02010609FF7F080A011E1B173C0C095043414D5F323131363732
+[  7898.3s  12:23:18] [ble] CC:FE:BA:21:16:72 rssi=-63 name="PCAM_211672" adv=02010609FF7F080A011E1B173C0C095043414D5F323131363732
+[  7898.6s  12:23:19] [ble] CC:FE:BA:21:16:72 rssi=-56 name="PCAM_211672" adv=02010609FF7F080A011E1B173C0C095043414D5F323131363732
+[  7900.5s  12:23:21] [ble] FB:5C:D3:64:7B:DB rssi=-78 name="W26466" adv=0201060EFF7F0800000008643950659438530709573236343636
+[  8321.0s  12:30:21] [ble] D2:D1:C2:1E:ED:11 rssi=-88 name="CFQU722248" adv=0201060EFF7F0800000008618360598026990B0943465155373232323438
+[  8624.0s  12:35:24] [ble] E9:25:71:01:36:95 rssi=-91 name="PCAM_013695" adv=02010609FF7F080A011E1C864E0C095043414D5F303133363935
+[  8624.4s  12:35:25] [ble] E9:25:71:01:36:95 rssi=-85 name="PCAM_013695" adv=02010609FF7F080A011E1C864E0C095043414D5F303133363935
+[  8638.9s  12:35:39] [ble] D3:4A:5E:84:65:8A rssi=-88 name="F11123" adv=0201060EFF7F0800000008643950660594360709463131313233
+[  9419.6s  12:48:40] [ble] C8:09:13:18:0C:74 rssi=-91 name="PCAM_180C74" adv=02010609FF7F080A011F1AFF2A0C095043414D5F313830433734
+[ 10570.4s  13:07:51] [ble] FE:C4:93:EA:6A:81 rssi=-88 name="PCAM_EA6A81" adv=02010609FF7F080A01211BD0080C095043414D5F454136413831
+[ 10571.5s  13:07:52] [ble] F9:5F:9B:74:BA:AC rssi=-89 name="GV2501334" adv=0201060EFF7F0800000008669610632622610A09475632353031333334
+[ 11296.3s  13:19:56] [ble] CB:5C:F1:BE:B2:C7 rssi=-92 name="PCAM_BEB2C7" adv=02010609FF7F080A01221BE90C0C095043414D5F424542324337
+[ 12137.6s  13:33:58] [ble] C9:DB:70:63:7D:8D rssi=-90 name="GV2600099" adv=0201060EFF7F0800000008669610698100630A09475632363030303939
+[ 12138.2s  13:33:58] [ble] C6:51:A8:0D:11:F5 rssi=-85 name="PCAM_0D11F5" adv=02010609FF7F080A011E1B24060C095043414D5F304431314635
+
+RAW LINES, aug-9-drive2.log, all 4
+[   483.0s  11:59:35] [ble] EF:19:4C:DE:76:BF rssi=-88 name="PCAM_DE76BF" adv=02010609FF7F080A01271B67160C095043414D5F444537364246
+[   483.5s  11:59:36] [ble] F3:81:10:17:E7:58 rssi=-84 name="HV2302850" adv=0201060EFF7F0800000008669610632926150A09485632333032383530
+[   483.8s  11:59:36] [ble] EF:19:4C:DE:76:BF rssi=-82 name="PCAM_DE76BF" adv=02010609FF7F080A01281B67160C095043414D5F444537364246
+[   735.9s  12:03:48] [ble] E9:A1:91:46:2F:F1 rssi=-89 name="HV2600317" adv=0201060EFF7F0800000008643950658535320A09485632363030333137
+
+RAW LINES, compare-dual.log, all 3 (this log timestamps as bare seconds, no wall clock)
+  873.97 [ble] FA:2C:9B:29:B8:8D rssi=-88 name="PCAM_29B88D" adv=02010609FF7F080A012D1A66000C095043414D5F323942383844
+  875.62 [ble] FA:2C:9B:29:B8:8D rssi=-81 name="PCAM_29B88D" adv=02010609FF7F080A012D1A66000C095043414D5F323942383844
+  875.86 [ble] F3:65:DC:39:A8:E1 rssi=-83 name="5525002" adv=0201060EFF7F080000000866961065472827080935353235303032
+
+NAME-ONLY SIGHTINGS, camarillo_drive.log and santabarbara.log (no advert bytes, product image)
+[   404.5s  11:44:48] [ACAB] Nearby device    BLE  ec:fe:6d:80:46:88 rssi=-89 conf=0 CFQU622519hardware OUI
+[   580.2s  11:47:44] [ACAB] Nearby device    BLE  f2:8a:f5:c4:f1:de rssi=-88 conf=0 PCAM_C4F1DErandomized MAC
+[   719.0s  11:50:03] [ACAB] Nearby device    BLE  f2:dc:da:a7:86:5e rssi=-85 conf=0 PCAM_A7865Erandomized MAC
+[  3111.2s  12:29:55] [ACAB] Nearby device    BLE  cd:e5:9c:57:f8:8c rssi=-91 conf=0 PCAM_57F88Chardware OUI
+[  4970.1s  13:00:54] [ACAB] Nearby device    BLE  e9:4f:bb:9f:71:d9 rssi=-82 conf=0 PCAM_9F71D9hardware OUI
+[  5569.3s  13:10:53] [ACAB] Nearby device    BLE  cd:0b:ec:4e:a9:f3 rssi=-88 conf=0 CFQU319178hardware OUI
+[  5599.4s  13:11:23] [ACAB] Nearby device    WiFi de:22:79:3e:6b:b2 rssi=-91 conf=0 PCAM26Arandomized MAC
+[  1109.5s  16:58:08] [ACAB] Nearby device    BLE  d3:7e:64:85:ad:ab rssi=-90 conf=0 PCAM_85ADABrandomized MAC
+Four of those eight addresses are labelled "hardware OUI" while carrying random-static addresses of
+exactly the same form as the four labelled "randomized MAC". That is the locally-administered-bit
+test failing to tell a random-static address from a public one, the defect vendor_capture.h already
+records. It is visible here because the same family lands on both sides of it.
+
+SUBSTRING FALSE POSITIVES IN drive_home_9-4.log, rejected by the AD walk
+[  2586.2s  10:54:46] [ble] E8:14:78:C0:5E:81 rssi=-86 name="" adv=1EFF4C0012190092892F2F7597A117491A639D06593D13B507F08FD6A70000
+[  5417.2s  11:41:57] [ble] 1F:E1:5A:0C:52:45 rssi=-89 name="" adv=0201021716F1FC04F9807F081489C3005BFA241624BAC81BFC4BDE
+[  6466.8s  11:59:27] [ble] 45:6E:80:BD:EE:58 rssi=-90 name="" adv=02011A020A0C0CFF4C001007721F6091907F08
+[ 13279.4s  13:53:00] [ble] 78:4F:7D:24:9F:03 rssi=-87 name="" adv=02011A020A0C0CFF4C001007341FEAD06B7F08

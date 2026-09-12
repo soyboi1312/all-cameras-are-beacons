@@ -93,6 +93,10 @@ CANARIES = {
     # as a canary because it is short enough to false-pass on an unrelated run of bytes). The
     # Flock change in this cut alters confidence arithmetic only and introduces no literal.
     "2.0.7": ["Juan OEM", "Night Owl"],
+    # 2.0.8's capture instrumentation is capture-only; the app/UI work introduces no new
+    # literal shared by production firmware images. Keep descriptor and provenance checks
+    # authoritative rather than using the version string itself as a circular content proof.
+    "2.0.8": None,
 }
 
 HERE = os.path.dirname(os.path.abspath(__file__))

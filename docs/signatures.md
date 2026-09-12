@@ -616,6 +616,110 @@ Technologies** (a network-firewall vendor), a different company from WatchGuard 
 in-car / body camera brand now folded into Motorola Solutions), so they are not body-cam
 signals and stay off the table.
 
+### Capture-only SIG vendor identifiers: Axon, Motorola Solutions, PCAM (2.0.8)
+
+The field-capture firmware also matches Bluetooth SIG assigned numbers, listed in
+`firmware/lib/acab_core/vendor_capture.h`. Every hit is logged, counted, and bracketed by the
+marker windows. These rows never enter a detector, never create an `AcabDetection`, and never
+reach either phone app. Only `beacon-board-capture` and `beacon-board-revb-capture` compile them:
+`acab_scanner.cpp` includes the header inside its `ACAB_CAPTURE_BUILD` guard, and every use of the
+table and its routines sits inside the same guarded regions, so no production translation unit
+references any of it. The table has internal linkage and every routine is inline, so an include
+that references nothing emits nothing; the guard is what keeps capture code out of a shipping
+image by construction, rather than trusting the linker to discard it.
+
+| Vendor group | Exact SIG registrant | Assigned number | Value | Runtime tag |
+|---|---|---|---|---|
+| Axon / TASER | TASER International | company ID | `0x034D` | `AXON-CID` |
+| Axon / TASER | Axon Enterprise | 16-bit service UUID | `0xFC81` | `AXON-SVC` |
+| Axon / TASER | TASER International | 16-bit service UUID | `0xFE6B` | `AXON-SVC` |
+| Axon / TASER | TASER International | 16-bit service UUID | `0xFE6C` | `AXON-SVC` |
+| Motorola Solutions | Motorola Solutions | company ID | `0x04EC` | `MOTO-CID` |
+| Motorola Solutions | Motorola Solutions | 16-bit service UUID | `0xFD8E` | `MOTO-SVC` |
+| Motorola Solutions | Motorola Solutions | 16-bit service UUID | `0xFE04` | `MOTO-SVC` |
+| PCAM | see the `0x087F` note below | company ID | `0x087F` | `PCAM-CID` |
+
+A SIG assigned number is a better class of evidence than the MAC OUIs most of this file leans on.
+An OUI names whoever made the radio module and is shared across millions of unrelated devices; a
+SIG company ID or a 16-bit service UUID is issued to the product vendor, so a match says "this is
+that company's equipment" with far less ambiguity.
+
+What it still does not say is WHICH product. Axon's identifiers span body cameras, holster
+sensors, vehicle gear, and TASER handles and batteries. Motorola Solutions' span two-way radios,
+cameras, and in-car video, and the same identifiers are carried by unrelated fire, EMS, security,
+and retail hardware. So the eventual shipping label would be "<vendor> equipment, device type
+unknown", never a named product. The advertised local name is logged beside every hit because it
+is the only field likely to separate one product of a vendor's from another.
+
+Solicitation is held apart from confirmation. AD `0x02` / `0x03` (the 16-bit service UUID lists)
+and AD `0x16` (service data) are a device saying what it is. AD `0x14` is service solicitation: a
+peripheral inviting centrals that PROVIDE the named service. An Axon UUID in `0x14` is therefore a
+device looking FOR Axon equipment, plausibly a bystander's handset running Axon's app, and it must
+never count as vendor equipment. Only a confirmed identifier opens a vendor record; a
+solicitation-only advert is still carried into the marker window and rendered on its own axis.
+
+Group routing is decided per ADVERT, from the identifiers that packet carries. Every group the
+advert names is counted, and the advert is then slotted into ONE table, the lowest-numbered group
+present (Axon, then Motorola Solutions, then PCAM), so a single packet takes at most one slot and a
+Motorola-only or PCAM-only advert never touches the Axon table. One row per DEVICE is not
+enforced: nothing looks a MAC up across tables before slotting it, so the table an advert reaches
+depends on its lowest group alone. Adverts from one MAC that share a lowest group reach the same
+table and, once the MAC holds a row there, the same row: a company ID in one advert and the same
+vendor's service UUID in the next accumulate in that row when neither advert also carries a lower
+group's identifier. A row's `hits` mask, printed as `seen=` on the `[vendor]` line, holds the
+identifiers from THAT MAC's adverts that reached its table, and its `n`, printed as `n=`, counts
+those adverts. That line is throttled per row so a parked radio cannot bury the capture, but any
+change to `seen=` prints straight away (`acabVendorShouldEmit` in `vendor_capture.h` owns that
+rule), so a row's final mask always reaches the log as a printed LINE. A second line for one MAC is
+not by itself a new identifier, though: the throttle still expires on its own, so a device that
+only stays in range prints again once the window (5 s) has passed. Compare the two lines' `seen=`
+masks to tell those apart - a mask that grew is the row learning something, an identical mask is
+the throttle and the device showed nothing new. One limit on that comparison: the field is rendered
+into a 64-byte buffer and each entry costs about 14 bytes, so it holds roughly four identifiers.
+A row that already prints four can gain a fifth and print a byte-identical `seen=`, which reads as
+a heartbeat. The emit decision itself is unaffected, since it tests the mask rather than the text. Adverts from one MAC whose
+lowest groups differ (an Axon identifier in one, only a Motorola one in the next) reach different
+tables, and the MAC holds a row in each of them that
+still had a free slot when it first reached that table, so the `vendor_macs` figure, summed over
+the three tables, counts rows rather than distinct devices. The tables hold 12 (Axon), 8 (Motorola
+Solutions), and 8 (PCAM) distinct MACs,
+with no eviction and no ageing, so the first arrivals own a table for the whole boot and a group
+that sees more distinct MACs than it has slots loses the aggregate row for every device after the
+last one that fitted. Those adverts are still counted, and the overflow prints as an explicit
+`TABLE FULL (<group>, <n> slots) dropped=<n> - this capture is INCOMPLETE` notice.
+Read `dropped=<n>` as REFUSED ADVERTS, not devices: it is bumped on every call that finds no free
+slot, and no refused MAC is remembered, so one unslotted device on a long dwell can account for
+the whole figure. While `vendor_full` is 0 no table has refused a MAC, so `vendor_macs` is never
+below the distinct-MAC count; once `vendor_full` is above 0, `vendor_macs` is only a floor on the
+rows the capture needed and bounds the distinct-MAC count in neither direction, and no counter
+records how many MACs got no row at all.
+
+**The `0x087F` row is the one whose registrant was unknown when it was added.** It asks a
+different question from the two vendors above: not which of a known company's products carry an
+identifier, but who makes a device family that keeps turning up and cannot be attributed at all.
+Every address seen so far is BLE random-static, so there is no OUI to look up and the company ID
+is the only durable vendor evidence these devices emit. `0x087F` (2175) resolves to **Phillips
+Connect Technologies LLC** in the Bluetooth SIG published company-identifier list, and the
+project's own drive data corroborates that from inside the same device population: a device in
+`docs/captures/vendor-cid-087f-2026-09-04.txt`, extracted from a drive log that is not in this
+repository, advertises the local name `PCTGW_83955`, i.e.
+Phillips Connect Technologies GateWay, under that same company ID. Phillips Connect is a
+trailer-telematics vendor.
+
+Three limits on that, all load-bearing. The attribution is an external-registry resolution and has
+to be re-confirmed against the SIG assigned-numbers list before it is quoted anywhere else. The
+`PCAM` advertised name is a label the vendor chose for itself and is NOT evidence of a camera;
+reading a product out of a broadcast string is a mistake this project has already paid for once,
+so the name is logged, not believed. And whether a trailer-telematics family belongs in this list
+at all is an open product decision, not a settled one.
+
+src: Bluetooth SIG Assigned Numbers (company identifiers + 16-bit UUIDs); own field capture, with
+the `0x087F` working notes in `docs/captures/vendor-cid-087f-2026-09-04.txt`. The table, the
+identifier scan, the confirmation-versus-solicitation split, the group routing, and the per-MAC
+reservation are host-tested in `firmware/tools/host-tests/test_vendor_capture.cpp`. The ingest site
+in `acab_scanner.cpp` is not host-compiled, so no host test would catch a cross-table lookup added
+there.
+
 ## BLE trackers
 
 | Tracker | Match on | Value | Public source |

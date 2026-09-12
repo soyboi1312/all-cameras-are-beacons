@@ -1,0 +1,176 @@
+September 11 capture review
+
+Source: firmware/tools/detection logs/911.log
+SHA-256: 37b5e33f1163dd7ba742a561deeb7ff9ed496b8e9cb8f14fbfadeb3279188660
+497,982 newline-delimited lines; 12:13:30-16:06:37 local (3h53m07s).
+Line references below count LF bytes, matching rg -n and the editor. A stray CR
+in the capture shifts later references if a parser uses universal-newline mode.
+
+Result: two new Remote ID identities, a repeat FS Ext Battery signature, and
+one new but unconfirmed Falcon-OUI probe candidate. No new camera signature
+can be promoted on this evidence. The most useful classifier counterexamples
+are two Quest-named glasses alerts and an OsmoAction6-named drone fallback.
+
+"New" means absent from the other 25 .log/.csv files in the detection-logs
+directory and the three root-level .log files, for the identities explicitly
+compared below. It does not mean newly installed hardware or a new protocol.
+"Confirmed" is limited to recorded broadcast evidence: there are no operator
+ground-truth markers or logged coordinates, and no physical-device validation.
+
+1. STRONGEST DETECTIONS
+
+Remote ID A -- new MAC and new advertised UAS serial
+  MAC: 8C:1E:D9:39:8E:A3
+  SSID: RID-1581F895C25AM007KD3J
+  13:00:16-13:04:46; 100 parsed Wi-Fi observation rows; peak -70 dBm at 13:01:23.
+  First raw row L87668, classifier L87669, peak L90291, last raw row L97454.
+  Classifier: Drone / RID / conf=99.
+
+Remote ID B -- new MAC and new advertised UAS serial
+  MAC: 8C:1E:D9:17:93:A8
+  SSID: RID-1581F7K3C24C700AY71R
+  15:14:09-15:15:04; 17 parsed Wi-Fi observation rows; peak -73 dBm at 15:14:41.
+  First raw row L370857, classifier L370858, peak L372500, last raw row L373395.
+  Classifier: Drone / RID / conf=99.
+
+Both identities are absent from the comparison logs. These are the strongest
+drone results, unlike the four vendor-only fallback alerts. The current
+drone_detect.cpp sets SRC_REMOTEID/conf=99 after decoding useful ODID data;
+it does not classify an SSID beginning RID- by itself. This text capture keeps
+the SSIDs and classifier decisions, not the full Wi-Fi frames, so the decoded
+RID payload cannot be independently replayed from this file. Repeated Wi-Fi
+rows corroborate reception, but are not 117 separate decoded RID messages.
+
+FS Ext Battery -- exact repeat of September 7
+  12:24:37, 04:0D:84:4C:73:66, one BLE row, -91 dBm, conf=80.
+  Raw L15873; classifier L15874.
+  adv=0201060F094653204578742042617474657279
+  Complete Local Name is exactly "FS Ext Battery".
+  drive_to_camarillo_9-7.log L176573/L176574 contains the same MAC, name and
+  complete advertisement at 20:15:09, also -91 dBm.
+  This reinforces the recurring Flock external-battery signature. It does not
+  independently establish an associated camera, a camera model or a location.
+
+2. FALCON CANDIDATE -- NEW ADDRESS, STILL UNCONFIRMED
+
+  15:16:26, 24:B2:B9:E7:14:6B, conf=72, "Falcon probe (OUI)".
+  L375659-L375665: two probe observations at -85/-88 dBm, each logged twice:
+    ssid="fwnote:falcon-oui-probe"
+    ssid="FAL-MGMT t=0x40 n=1 st=0x0010" (then n=2)
+  Classifier L375661. Address absent from the comparison logs.
+
+The two ssid= strings are firmware-generated diagnostic labels, not advertised
+network names. The evidence is a probe request from the shared Liteon prefix
+24:B2:B9, which the existing detector maps to a Falcon candidate. There is no
+Flock-specific name, Flock-owned OUI or ground-truth marker to corroborate it.
+Count two probe observations, not four independent packets or a confirmed ALPR.
+
+3. EVIDENCE OF CATEGORY FALSE POSITIVES
+
+Quest 3 under Recording glasses
+  L215753/L215754, 14:02:44, 4F:48:BF:CD:CE:7F, -83 dBm, conf=45.
+  L299238/L299239, 14:44:31, 55:F3:81:86:01:5F, -92 dBm, conf=45.
+  Both raw payloads: 0201020809517565737420330303B8FE
+  AD 08 09 carries "Quest 3"; AD 03 03 carries service UUID 0xFEB8.
+  Neither carries a manufacturer-data element. The ungated 0xFEB8 service
+  rule in glasses_signatures.h is sufficient to generate the glasses label.
+  These are strong broadcast-level counterexamples to treating 0xFEB8 as
+  eyewear-specific. Do not count these as confirmed recording glasses.
+  This is corroboration, not the first occurrence: earlier captures contain
+  Quest 3/3S names with 0xFEB8, including drive_to_camarillo_9-7.log L61486.
+  Two addresses do not by themselves establish two physical headsets.
+
+OsmoAction6 under Drone
+  L376924/L376925, 15:16:54, 9C:5A:8A:4E:C6:EC, -86 dBm, conf=60.
+  name="OsmoAction6-C6EB"
+  adv=11094F736D6F416374696F6E362D4336454205120C001400
+  The name identifies itself as an Osmo Action device; the classifier says
+  "DJI gear, no Remote ID" because it matched the vendor OUI.
+  This is new named evidence of the drone category admitting an action-camera
+  candidate. Physical model identity is not independently verified.
+
+The other DJI fallback addresses, 0C:9A:E6:AB:E4:17 and 8C:58:23:62:5C:8A,
+have no local name and no decoded RID. The latter has five raw BLE rows and
+peaks at -63 dBm; signal strength does not settle the product type.
+The Parrot fallback, 90:3A:E6:15:B9:E3 at 16:02:12, only has probe observations
+and no RID. It is a repeat address: root compare-dual.log L13580 already
+contains it. None of these vendor-only results confirms a flying drone.
+
+4. FULL CLASSIFIER CENSUS
+
+  Kind / evidence                     conf   emitted rows   distinct addresses
+  Drone / decoded RID                   99          2                   2
+  ALPR / FS Ext Battery                 80          1                   1
+  ALPR / Falcon probe OUI                72          1                   1
+  Drone / DJI vendor OUI                 60          3                   3
+  Drone / Parrot vendor OUI              60          1                   1
+  Glasses / shared Meta identifiers      45         17                  17
+  Tracker / Apple Find My offline        85         97                  83
+  Tracker / Tile service data            65         16                  10
+  TOTAL                                           138
+
+The 138 parsed events equal the independent count of all lines with conf>0.
+The 17 glasses addresses split into 15 with manufacturer ID 0x01AB and two
+Quest-named 0xFEB8 broadcasts. None contains META_RB_GLASS in either byte
+order, and no stronger glasses result appears. Raw matching of a shared ID
+does not settle product type for the other 15 addresses either.
+
+Tracker address counts are not device counts and do not establish unwanted
+tracking. F9:C7:9D:6C:B1:9A alone appears in 833 parsed BLE rows from 12:13:38
+to 16:03:02, peak -48 dBm; that is a persistent presence across most of the
+capture, not hundreds of separate tags. Ownership/movement cannot be inferred
+from this log. The two other particularly strong Find My addresses each have
+12:15-12:29 windows and include both nearby and offline advertisement formats.
+
+There are 15 Find Hub near-owner diagnostics (0x40), with no 0x41 separated
+result. These are deliberately excluded by the existing tracker classifier.
+
+5. CAPTURE-ONLY VENDOR RESEARCH
+
+Company ID 0x087F: 30 structurally decoded advertisements, 21 addresses,
+including seven PCAM_-named addresses. These are the existing excluded
+vendor family, not 21 camera detections. Refer to the existing 0x087F evidence
+note and its registry caveat before quoting any external vendor attribution.
+
+One new advertisement shape in the compared raw logs:
+  L103084 and L103089, 13:07:26, E5:7E:20:B9:05:2F, name="LMPCHK".
+  adv=0201060BFF7F08034200000BC0400007094C4D5043484B
+  Manufacturer data has 10 bytes including CID, prefix 7F08 0342.
+  This is useful additional vendor-format evidence, with no camera implication.
+
+The unnamed E6:B9:C0:F6:64:09 (L152000/L152027) also carries a 26-byte
+manufacturer element, prefix 7F08 0189. A 26-byte element starting 7F08 01CA
+already occurs in the September 7 log at L164584; do not present the long
+format itself as newly discovered here. Existing notes discussing only two
+formats do not describe the whole expanded archive.
+
+Final diagnostic counters at L497850:
+  axon_ble=0 moto_ble=0 pcam_ble=30 vendor_macs=8 vendor_full=16
+  falcon_data=0 falcon_mgmt=2 falcon_macs=1 falcon_full=0
+  alpr_ble=0 alpr_wifi=0 alpr_macs=0 alpr_full=0
+
+The PCAM table fills at L178997; its overflow omits 16 advertisements from
+the aggregate table, not necessarily 16 devices. All 30 matching raw BLE
+advertisements remain parseable, allowing the 21-address count above.
+alpr_* counters cover the separate capture-only ALPR candidate table, so
+their zero does not contradict the two production ALPR classifier results.
+
+No body-camera or Raven classifier events. Structural decoding found no
+Axon/TASER or Motorola identifiers from vendor_capture.h, no Raven-specific
+0x3100-0x3500 services, and no BWCDEVICE in either byte order. This is absence
+of recorded supporting evidence, not proof that no such devices were nearby.
+
+6. METHOD AND LIMITS
+
+All 497,982 lines were inspected programmatically. BLE manufacturer IDs and
+16-bit services were read by walking length/type/data elements, not searching
+for a hex substring inside unrelated payloads. 59,304 BLE and 277,073 Wi-Fi
+records parsed into complete expected log fields. Among parsed BLE records,
+35 have invalid/truncated hex or incomplete AD elements; damaged serial output
+also leaves some records outside the expected format. These are recorded
+observations, not a complete census of every radio packet the board received.
+
+All principal evidence lines quoted above are intact. Wi-Fi full frames and
+flight coordinates are unavailable in this text format. Confidence numbers
+are firmware evidence grades, not measured probabilities. No firmware,
+signature rules, or false-positive classifications were changed for this review.

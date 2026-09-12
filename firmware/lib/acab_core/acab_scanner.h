@@ -9,8 +9,11 @@
  * in with -DACAB_ACTIVE_SCAN, which the #error below refuses to compile without an
  * explicit -DACAB_CAPTURE_BUILD; a shipped image never transmits a SCAN_REQ.
  *
- * De-dupes by (type, dedup key) and calls the firmware-supplied sink once per new
- * sighting (and again on refresh after the dedup window). The key is the MAC for
+ * De-dupes by (type, dedup key) and calls the firmware-supplied sink on EVERY sighting of
+ * every category except the two per-frame firehoses (nearby device under Desert, netcam),
+ * which are dropped inside the dedup window and rate-capped when new; `isNew` marks only the
+ * first sighting and each re-sighting after the dedup window, it does not gate delivery. See
+ * desertNotifyAllowed and the `deliver` flag in acab_scanner.cpp. The key is the MAC for
  * everything except a Remote ID drone that broadcasts a UAS ID: drones rotate MACs across
  * both radios, so those are keyed by a hash of the UAS ID instead - see dedup_key.h. The
  * two builds (OUI-Spy, Mesh-Detect) differ only in the sink they register.
@@ -212,13 +215,46 @@ uint32_t acabScannerFalconData();
 uint32_t acabScannerFalconMgmt();
 uint32_t acabScannerFalconMacs();
 uint32_t acabScannerFalconTableFull();
-// Official vendor BLE identifiers (Bluetooth SIG assigned numbers), counted per advert. Axon/TASER
-// and Motorola Solutions are tallied separately because they are on different tracks: Axon is the
-// first field-validation target, Motorola rides along in capture only. vendor_full > 0 means the
-// per-MAC table overflowed and vendor_macs is a floor, not a count.
+// Official vendor BLE identifiers (Bluetooth SIG assigned numbers), counted per advert. The three
+// groups are tallied separately because they sit on different tracks: Axon/TASER is the first
+// field-validation target, Motorola Solutions rides along in capture only, and PCAM (company ID
+// 0x087F) was added to learn whose a recurring device family was. That is answered: it resolves
+// to Phillips Connect Technologies, a trailer-telematics vendor, and whether the family belongs
+// in the list at all is an open product question; the 0x087F row in vendor_capture.h carries the
+// evidence. A ZERO in any of them is a result in its own right, which is why they are never
+// summed into one number.
 uint32_t acabScannerVendorAxon();
 uint32_t acabScannerVendorMoto();
+uint32_t acabScannerVendorPcam();
+// vendor_macs counts table ROWS in use, summed over the three tables, not distinct MACs. Routing
+// is per advert and no lookup spans the tables (GROUP ROUTING in vendor_capture.h). Adverts from
+// one MAC that share a lowest group reach one table and, once the MAC holds a row there, share
+// that row. A MAC whose adverts have different lowest groups can hold a row in each table they
+// reach, and is then counted once for every row it holds.
+// While vendor_full is 0 no table has refused a MAC, so every MAC the vendor scan confirmed holds
+// at least one row and the total is never below the distinct-MAC count. Once vendor_full > 0 at
+// least one table has refused one, so the total is only a floor on the rows the capture needed
+// and bounds the distinct-MAC count in neither direction. No counter records how many MACs got no
+// row at all: vendor_full, below, counts refused adverts, not MACs. This comment owns the rule.
+// These places restate it and a correction here has to reach all of them, deliberately with no
+// count in front of the list so that adding a site cannot make this sentence false: the PER-MAC
+// RESERVATION and GROUP ROUTING blocks in vendor_capture.h, the VendorTable comment in
+// acab_scanner.cpp, reservation() in test_vendor_capture.cpp, and docs/signatures.md. The 2.0.8
+// notes in acab_version.h are deliberately NOT on that list, and the reason is WHAT THEY SAY, not
+// that they are old: they restate the per-advert ROUTING, which the GROUP ROUTING block in
+// vendor_capture.h owns, and never state the rows-versus-distinct-MACs floor rule this comment
+// owns, so a correction here has nothing to reach there. A release-note paragraph is pinned to
+// its cut only once that version is tagged, so a ROUTING correction landing while its own cut is
+// still open (2.0.8 was, when this was written) belongs in that paragraph as well.
 uint32_t acabScannerVendorMacs();
+// vendor_full is the SUM of the per-table overflow counts across all three groups, so a non-zero
+// value says capture is incomplete but NOT which table lost rows. The only per-table signal is the
+// throttled serial line "[vendor] TABLE FULL (<table>, N slots) dropped=N" that the ingest path
+// prints; read that to learn which group overflowed, and expect it to be MISSING for an overflow
+// inside the first VENDOR_LOG_EVERY_MS of uptime: the throttle compares against a per-table stamp
+// that starts at 0, so a table that fills early and is never asked again leaves vendor_full above
+// 0 with no notice anywhere in the log. dropped=N counts refused ADVERTS, not devices: one
+// unslotted device heard N times accounts for all of it.
 uint32_t acabScannerVendorFull();
 // Exact-width ALPR vendor-prefix annotations. These counters describe capture instrumentation,
 // not detections: no candidate enters handleDetection or reaches an app. alpr_full > 0 means the

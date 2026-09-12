@@ -1,0 +1,142 @@
+Camarillo drive capture assessment, 2026-09-07
+Source: firmware/tools/detection logs/drive_to_camarillo_9-7.log, 205,026 lines / 17 MB from
+firmware/tools/capture-log.py. That directory is gitignored by the "firmware/tools/detection logs/"
+pattern in .gitignore, and every *.log is gitignored by the "*.log" pattern in the same file, so
+nothing below can be re-checked from the repo alone. This file is the committed evidence extract.
+Board: /dev/cu.usbmodem101 at 115200, ACAB capture build (raw adv= bytes are logged).
+Local wall clock: "capture start" 17:56:51, last data line 20:24:46, "capture end" 20:24:46.
+Volume: 20,784 raw [ble] lines, 147,113 raw [wifi] lines.
+
+Every line number below is the RAW advertisement line. The classifier's [ACAB] line is always the
+next line down.
+
+
+1. FULL DETECTION CENSUS
+Everything the classifier returned above conf=0, for the whole 2h28m run:
+
+  31  Tracker            conf=85  Apple Find My (offline)
+   7  Recording glasses  conf=45  Meta: possible recording glasses or Quest
+   3  Tracker            conf=65  Tile
+   2  Drone              conf=99  Remote ID
+   1  Recording glasses  conf=70  Snap Spectacles: recording glasses
+   1  ALPR camera        conf=80  FS Ext Battery
+
+Nothing else fired. There are no body-cam, network-camera or Falcon-WiFi detections in this run.
+
+
+2. DRONE REMOTE ID  (conf=99, the highest-confidence result in the log)
+
+  L31727  18:16:11  60:60:1F:13:A2:8C  ssid="RID-1581F4Z4324C5006T00T"  14 sightings, peak -82
+  L76454  19:00:56  8C:1E:D9:71:29:EC  ssid="RID-1581F8LQC25CT0027F7Z"  52 sightings, peak -60
+
+Both broadcast a UAS serial in the clear in the SSID, in ANSI/CTA-2063-A form. This is a
+self-declared identifier, not an inference from a vendor prefix or an advertised name, which is why
+it scores 99 and why it is the strongest evidence in this capture.
+
+The second is a complete flyby profile: 19:00:56 at -85, monotonic approach to -60 at 19:01:16,
+then recede to -90 by 19:01:39. 43 seconds, 52 sightings, one address. That curve is corroborating
+evidence in its own right; a static false positive does not produce it.
+
+
+3. ALPR / FS Ext Battery
+
+  L176573  20:15:09  04:0D:84:4C:73:66  rssi=-91  name="FS Ext Battery"
+           adv=0201060F094653204578742042617474657279
+           AD 0F 09 -> complete local name, 14 bytes, "FS Ext Battery"
+  L176574  [ACAB] ALPR camera BLE 04:0d:84:4c:73:66 rssi=-91 conf=80 FS Ext Battery
+
+Matches the FLOCK_NAME_LITERAL row in flock_signatures.h:142 (credited there to ryanohoro).
+flock_detect.cpp:282 states this is the only literal that ranks strong on its own, so conf=80 from
+a single frame is by design.
+
+Scope: ONE frame, at -91 dBm, in 2h28m. It identifies the external-battery signature. It does not
+establish an associated camera, and this run has no ground-truth marker to pair with it.
+
+
+4. SNAP SPECTACLES
+
+  L79903  19:04:23  FA:F1:72:0E:9F:D3  rssi=-85  name=".... Specs"
+          adv=02010608FFC203E0819EA7C50B09F09F988E205370656373
+          08 FF C2 03 -> manufacturer specific, company ID 0x03C2 (little-endian on the wire)
+          0B 09 F0 9F 98 8E 20 53 70 65 63 73 -> complete local name, emoji + " Specs"
+  L79904  [ACAB] Recording glasses BLE conf=70 Snap Spectacles: recording glasses
+
+Two independent pieces of evidence in one frame, company ID and advertised name. The log's own
+name= field renders the emoji as dots because of the ASCII clamp; the name is recovered from the
+hex, not read from that field.
+
+Context for this row: the glasses category fired 8 times. The other 7 are Meta at conf=45
+("possible recording glasses or Quest"), at L54144, L61487, L78187, L99792, L114618, L138005,
+L141455. One address (45:7b:65:e8:94:84) appears twice, 12 minutes apart. The Spectacles hit is the
+only glasses result above 45 in the run.
+
+
+5. APPLE FIND MY  -- 31 records / 25 addresses, but NOT 25 devices
+
+31 detections, 25 distinct addresses, all conf=85. First at L19079, 18:02:26, -37 dBm, payload
+1EFF4C001219003B57... = Apple 0x004C, type 0x12, length 0x19, the offline (separated) format.
+
+TEN OF THE 25 ADDRESSES ARE ONE DEVICE RIDING IN THE VEHICLE:
+
+  E5:A7:7D:5B:76:5F   18:00:00 -> 18:14:43   55 adv   -45..-39
+  C3:D3:D1:06:69:4F   18:15:00 -> 18:29:51   54 adv   -42..-44
+  E5:07:8C:47:CD:D1   18:30:00 -> 18:44:47   54 adv   -54..-41
+  E8:9C:FA:18:54:FA   18:45:00 -> 18:59:50   53 adv   -45..-39
+  EB:32:F3:5C:F3:F8   19:00:00 -> 19:14:47   54 adv   -41..-39
+  C6:53:6E:63:5D:97   19:15:00 -> 19:29:59   55 adv   -42..-40
+  F7:EA:86:B4:17:07   19:30:00 -> 19:44:38   48 adv   -41..-45
+  F1:8C:0F:EA:85:A4   19:45:00 -> 19:59:51   55 adv   -49..-39
+  D5:55:CE:67:3A:AD   20:00:00 -> 20:14:49   47 adv   -39..-42
+  C9:C9:15:61:1C:AD   20:15:00 -> 20:24:37   40 adv   -42..-43
+
+Four things make this conclusive, not suggestive:
+  a. Every window OPENS on an exact wall-clock 15-minute boundary, to the second.
+  b. The windows are contiguous and non-overlapping. Each closes ~14m50s in, seconds before the
+     next opens. The chain runs unbroken from the first boundary after capture start to capture end.
+  c. Within a window the payload holds once its format settles: nine of the ten addresses carry
+     ONE constant payload for their entire window, and the first carries two, the nearby format
+     for its first 5 adverts and then the offline format for the remaining 50 (see the format
+     note below). Every hand-off to a new address comes with a new payload.
+  d. 40-55 sightings each at a steady -39..-54 for 2h28m. Nothing passed on a road does that.
+
+This is one Apple device rotating its RPA and ephemeral key on a 15-minute timer. Note the first
+window opens in the NEARBY format (07FF4C0012020002, type 0x12 length 0x02) and the rest are in the
+offline format, i.e. it lost its owner's network during the run.
+
+Consequences:
+  - The external population is 21 detections across 15 addresses, not 31 across 25.
+  - Every one of the 10 is strong-signal (-39..-54). The 15 external addresses are almost all weak
+    (-79..-91), consistent with passing traffic. Signal strength separates the two populations
+    cleanly here.
+  - This is a self/companion detection reaching the classifier at conf=85. Worth a filter, and
+    worth remembering before any future count of "trackers seen on a drive".
+
+
+6. TILE
+
+  L53094  18:32:38..18:39:40  D4:68:39:32:26:51  7 raw adv, 3 detections, conf=65
+          adv=0201060D16EDFE...0303EDFE -> service data + service UUID 0xFEED
+
+Static public address (not a random one), so repeat sightings are the same physical tag. The
+service data payload CHANGED mid-window (0200CB18A76AE4521A4D -> 020099EA393997DF23E9) on the same
+address, which is normal Tile rotation of the payload but not the MAC.
+
+The dwell is 7 minutes at a flat -87..-92. On a moving drive that is long. It fits a stop or slow
+traffic better than a pass, and there is no GPS in this run to settle it.
+
+
+7. CAVEATS THAT APPLY TO THE WHOLE RUN
+
+  - NO GPS AND NO GROUND TRUTH. The log has zero lat= lines and zero operator markers, though
+    capture-log.py offers marker drops at L2. Nothing here has a position or a visual confirmation.
+    The hedge stated on the ALPR row applies to every row above.
+  - NO FLOCK ON WIFI. Final diag counters: falcon_data=0 falcon_mgmt=0 falcon_macs=0 falcon_full=0,
+    axon_ble=0, moto_ble=0. The single ALPR result is BLE-only.
+  - CAPTURE VENDOR TABLE SATURATED. Final counters vendor_macs=8 vendor_full=29: the table filled
+    its 8 slots and dropped 29 further entries. Same undersizing seen on the 9-4 drive.
+  - pcam_ble=39 IS NOT A CAMERA COUNT. Company ID 0x087F is Phillips Connect Technologies trailer
+    telematics, resolved 2026-09-05; see captures/vendor-cid-087f-2026-09-04.txt.
+  - SERIAL LINE COLLISIONS. Output interleaves in places ("Nearby devicf LaserJet"). None of the
+    lines cited above are affected, but an automated parse of this file must tolerate them.
+  - NEGATIVE CONTROL WORTH KEEPING. At 18:16:11 the capture holds SSIDs "falcon" and "falcon-guest"
+    (consumer APs). Neither produced a detection. The name is not what the Falcon path matches on.
