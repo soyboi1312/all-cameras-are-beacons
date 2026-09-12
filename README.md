@@ -132,15 +132,17 @@ pio device monitor -b 115200
 | [firmware/](firmware/) | shared detector engine, board entry points, tests, and release tools |
 | [ios/](ios/) and [android/](android/) | native apps and system widgets |
 | [web/](web/) | browser flashers and DIY release manifests |
-| [docs/](docs/) | app guide, radio coverage, signature evidence, protocol, and mesh setup |
+| [docs/](docs/) | app guide, radio coverage, signature evidence, protocol, mesh setup, and map performance checks |
 
-start with the [BLE protocol](docs/ble-protocol.md) for app integration, [signature reference](docs/signatures.md) for detector work, and [release guide](firmware/tools/RELEASE.md) for signing and publication checks. the companion nRF firmware and beacon hardware design files are not published in this repository.
+start with the [BLE protocol](docs/ble-protocol.md) for app integration, [signature reference](docs/signatures.md) for detector work, and [release guide](firmware/tools/RELEASE.md) for signing and publication checks. [map performance checks](docs/map-performance.md) defines the shared map regression workload and the benchmark tests on both platforms, and the [false-positive log](docs/false-positives.md) records vendor matches that turned out to be other hardware. the companion nRF firmware and beacon hardware design files are not published in this repository.
 
 ## where things stand
 
-the current source version is **2.0.7** for the ESP32-S3 firmware and both apps. public distribution can lag the source tree; check the app's firmware update screen and store listings for available releases.
+the current source version is **2.0.8** for the ESP32-S3 firmware and both apps. public distribution can lag the source tree; check the app's firmware update screen and store listings for available releases.
 
-the detector, mesh path, apps, and update flows have been exercised on real hardware. field validation remains ongoing, especially for capture candidates. update sequencing is documented in the [OTA protocol](docs/ble-protocol.md#firmware-update-ota), and the 2.0.7 transition requirements are in the [key-rotation guide](firmware/tools/RELEASE.md#ota-key-rotation).
+the detector, mesh path, apps, and update flows have been exercised on real hardware. field validation remains ongoing, especially for capture candidates. update sequencing is documented in the [OTA protocol](docs/ble-protocol.md#firmware-update-ota).
+
+2.0.7 was the one-time OTA key-rotation transition release; the source tree signs with the production key alone from 2.0.8 on. a board that installed the transition release needs nothing further. a board still running 2.0.6 or older trusts the retiring key and cannot verify a production-signed image, so read the [key-rotation guide](firmware/tools/RELEASE.md#ota-key-rotation) before publishing or before updating a board that has been offline since the transition.
 
 ## licensing
 
