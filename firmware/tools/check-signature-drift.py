@@ -68,6 +68,8 @@ IOS_DETECTIONS_VIEW = "ios/Beacons/Views/DetectionsView.swift"
 AND_LOG_SCREEN = "android/app/src/main/java/tech/acab/app/ui/LogScreen.kt"
 AND_MAIN_SCREEN = "android/app/src/main/java/tech/acab/app/ui/MainScreen.kt"
 IOS_COMPONENTS = "ios/Beacons/Views/Components.swift"
+IOS_THEME = "ios/Beacons/Views/Theme.swift"
+AND_COMPONENTS = "android/app/src/main/java/tech/acab/app/ui/Components.kt"
 IOS_OUI_VENDORS = "ios/Beacons/Models/OUIVendors.swift"
 AND_OUI_VENDORS = "android/app/src/main/java/tech/acab/app/model/OuiVendors.kt"
 IOS_BEACON_PRESENTATION = "ios/Beacons/Models/BeaconPresentation.swift"
@@ -1354,6 +1356,30 @@ _FAQ_DESERT_PROMISES = (
 )
 
 SHARED_SHAPES = (
+    {
+        "what": "kicker captions may always wrap (neither side hugs its ideal width)",
+        "why": "a kicker is drawn inside rows that cannot refuse an oversized child, and several"
+               " are fed RUNTIME strings: the Beacon tab's Scan radios row prints"
+               " radioPresentation.scanLabel, 14-25 chars in every steady state but 39 while a"
+               " firmware update runs and 39 again while the link is reconnecting. iOS hugged its"
+               " ideal width and the whole Beacon page went wider than the screen mid-update,"
+               " clipped on BOTH edges, because the .frame(maxWidth: .infinity) above it CENTERS"
+               " an oversized child instead of clamping it. That hug has now broken the layout"
+               " twice, once along font size and once along string length, so neither platform"
+               " may reintroduce a width hug or a single-line clamp on this component",
+        "sides": (
+            ("iOS", IOS_THEME, None,
+             (("kicker wraps rather than hugging",
+               r"^\s*\.fixedSize\(horizontal: false, vertical: true\)"),
+              # Anchored at the start of a code line so the cautionary comment above it, which
+              # quotes the banned modifier verbatim, is not itself read as a reintroduction.
+              ("no width hug", r"^\s*\.fixedSize\(horizontal: (?:true|!)", 0),
+              ("no single-line clamp", r"^\s*\.lineLimit\(", 0))),
+            ("Android", AND_COMPONENTS, r"(fun Kicker\(text: String.*?\n\})",
+             (("no single-line clamp", r"\bmaxLines\b", 0),
+              ("wrapping left on", r"\bsoftWrap\s*=\s*false", 0))),
+        ),
+    },
     {
         "what": "Motorola vendor-proxy default (OFF on every board; absent key means pre-split, on)",
         "why": "both Beacon tabs seed the sub-toggle before the first status frame; a seed that"

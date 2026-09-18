@@ -351,28 +351,41 @@ struct Kicker: View {
     var color: Color = ACABTheme.faint
     init(_ text: String, color: Color = ACABTheme.faint) { self.text = text; self.color = color }
 
-    /// Dynamic Type only started reaching this label when ACABTheme.mono gained `relativeTo:`.
-    /// Before that, Font.custom(_:size:) was frozen at the literal point size, so the
-    /// `fixedSize(horizontal: true)` below could never do any harm. Once the text actually scaled,
-    /// that modifier - which means "never compress me, take my ideal width" - made every row
-    /// carrying a Kicker wider than the screen, and the Device page ran off the left edge.
-    @Environment(\.dynamicTypeSize) private var dynamicTypeSize
-
-    /// True at any size above the system default. The threshold is deliberately "larger than
-    /// default" rather than "accessibility size": the overflow starts well before the
-    /// accessibility range, and the point is that DEFAULT layout is byte-for-byte what it was.
-    private var scaled: Bool { dynamicTypeSize > .large }
-
     var body: some View {
         Text(text)
             .font(ACABTheme.mono(10.5, weight: .medium))
             .tracking(1.6)
             .foregroundStyle(color)
-            // At default size: one line, hug the content, exactly as before. Above it: let the
-            // label WRAP instead of forcing its row past the screen edge. A kicker is a short
-            // uppercase caption, so two lines at large text reads fine; a row you cannot see the
-            // left half of does not.
-            .lineLimit(scaled ? nil : 1)
-            .fixedSize(horizontal: !scaled, vertical: true)
+            // NEVER `fixedSize(horizontal: true)`, and never `lineLimit(1)` without it. That
+            // modifier means "do not compress me, take my ideal width", and a Kicker sits inside
+            // rows that have no way to refuse. It has broken the layout TWICE, along two
+            // different axes, and the second time is why this now reads as a flat "may wrap".
+            //
+            // 1. FONT SIZE. Dynamic Type only started reaching this label when ACABTheme.mono
+            //    gained `relativeTo:`; before that Font.custom(_:size:) was frozen at the literal
+            //    point size so the hug was harmless. Once the text scaled, every row carrying a
+            //    Kicker grew wider than the screen and the Beacon page ran off the left edge.
+            //    That round gated the hug on `dynamicTypeSize > .large`, which fixed the symptom
+            //    it was looking at and left the real one open.
+            // 2. STRING LENGTH, which the size gate does nothing about. `foldRow` feeds this a
+            //    RUNTIME string: the Scan radios row prints `radioPresentation.scanLabel`, 14-25
+            //    characters in every steady state but 39 while a firmware update runs
+            //    ("UPDATING FIRMWARE \u{00B7} DETECTION MAY PAUSE") and 45 on the co-processor leg.
+            //    At 10.5pt mono with 1.6 tracking that is ~7.9pt per character, so 39 characters
+            //    is ~308pt of label in a column with ~245pt to give. Reported from a device
+            //    2026-09-12: the whole Beacon page went wider than the screen mid-update and was
+            //    clipped on BOTH edges, because `.frame(maxWidth: .infinity)` upstream CENTERS an
+            //    oversized child rather than clamping it (a maxWidth frame only clamps a SMALLER
+            //    child). It healed itself when the update ended and the string got short again.
+            //    The reconnect arm is 39 characters too, so an ordinary link drop reaches it.
+            //
+            // A wrapping Text that is offered more width than it needs draws identically to a
+            // hugging one, so every short kicker is unchanged. Do NOT reintroduce the hug behind
+            // a length threshold: several steady strings already run past any sane cutoff
+            // ("WAITING FOR BEACON \u{00B7} COUNTS VISIBLE" is 35, "UPDATE BLOCKED \u{00B7} REVISION
+            // MISMATCH" 34), and a character count cannot see the width it is actually offered.
+            // Pinned by check-signature-drift.py. TWIN: android Components.kt's Kicker sets no
+            // maxLines and no softWrap, so Compose has always wrapped; Android never had this.
+            .fixedSize(horizontal: false, vertical: true)
     }
 }
