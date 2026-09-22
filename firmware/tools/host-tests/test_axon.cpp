@@ -105,11 +105,23 @@ static void addSvcFill(std::vector<uint8_t>& a, uint8_t adType, uint8_t byte, ui
     for (uint8_t i = 0; i < n; i++) a.push_back(byte);
 }
 
-// MACs. Every OUI in both tables starts with 0x00, so all of these are public addresses except
-// MAC_RANDOM, whose locally-administered bit is set.
+// MACs. Every OUI in the Utility table and Axon's registry block starts with 0x00, so those are
+// plainly public addresses; MAC_RANDOM has its locally-administered bit set.
+//
+// MAC_AXON_FIELD (D8:1F:65) needs its own note, because 0xD8 LOOKS like a random address and is
+// not. BLE random-static addresses carry 11 in the top two bits, and 0xD8 is 1101_1000, so the
+// prefix falls inside that range. What settles it is the LOCALLY-ADMINISTERED bit (0x02), which is
+// CLEAR here: this is a globally-administered unicast address, i.e. a real allocated block, and
+// the address TYPE field (not the bytes) is what tells a public address from a random one on air.
+// The field evidence agrees: nine distinct MACs shared these exact three bytes across two captures
+// six weeks apart in different cities, which no random-address generator produces. See the
+// AXON_OUI_BWC_FIELD block in axon_signatures.h.
 static const uint8_t MAC_AXON[6]      = {0x00,0x25,0xdf,0x11,0x22,0x33};   // Axon Enterprise
 static const uint8_t MAC_AXON_LO[6]   = {0x00,0x25,0xde,0x11,0x22,0x33};   // neighbouring block
 static const uint8_t MAC_AXON_HI[6]   = {0x00,0x25,0xe0,0x11,0x22,0x33};   // neighbouring block
+static const uint8_t MAC_AXON_FIELD[6]= {0xd8,0x1f,0x65,0x04,0xa2,0x57};   // field-observed Axon block
+static const uint8_t MAC_AXFIELD_LO[6]= {0xd8,0x1f,0x64,0x04,0xa2,0x57};   // neighbouring block
+static const uint8_t MAC_AXFIELD_HI[6]= {0xd8,0x1f,0x66,0x04,0xa2,0x57};   // neighbouring block
 static const uint8_t MAC_UTIL_A[6]    = {0x00,0x09,0xbc,0x0a,0x0b,0x0c};   // Utility Inc.
 static const uint8_t MAC_UTIL_B[6]    = {0x00,0x16,0xed,0x0a,0x0b,0x0c};   // Utility Inc.
 static const uint8_t MAC_UTIL_NEAR[6] = {0x00,0x16,0xee,0x0a,0x0b,0x0c};   // one byte off Utility
@@ -194,6 +206,14 @@ int main() {
     chkInt("UTIL_BWC_OUI[0] is 00:09:bc", (UTIL_BWC_OUI[0][0]<<16)|(UTIL_BWC_OUI[0][1]<<8)|UTIL_BWC_OUI[0][2], 0x0009bc);
     chkInt("UTIL_BWC_OUI[1] is 00:16:ed", (UTIL_BWC_OUI[1][0]<<16)|(UTIL_BWC_OUI[1][1]<<8)|UTIL_BWC_OUI[1][2], 0x0016ed);
     chkInt("tag constant is exactly \"BWCDEVICE\"", strcmp(AXON_BWC_PAYLOAD, "BWCDEVICE"), 0);
+    // Lock the two Axon OUI macros the same way. These are the values the shipped signature is
+    // built from, so an edit to either changes what the board matches in the field.
+    { const uint8_t reg[3] = AXON_OUI_REGISTERED;
+      chkInt("AXON_OUI_REGISTERED is 00:25:df", (reg[0]<<16)|(reg[1]<<8)|reg[2], 0x0025df); }
+    { const uint8_t fld[3] = AXON_OUI_BWC_FIELD;
+      chkInt("AXON_OUI_BWC_FIELD is d8:1f:65", (fld[0]<<16)|(fld[1]<<8)|fld[2], 0xd81f65);
+      chkInt("  ^ and its locally-administered bit is CLEAR (a public block, not a random addr)",
+             fld[0] & 0x02, 0); }
 
     // -- BLE: the shipped registry candidate (OUI 00:25:DF) ---------------------------------
     printf("\n-- BLE: Axon OUI 00:25:df --\n");
@@ -209,6 +229,40 @@ int main() {
       chk("neighbour OUI 00:25:de -> NO hit", runBLE(MAC_AXON_LO, a), false); }
     { std::vector<uint8_t> a;
       chk("neighbour OUI 00:25:e0 -> NO hit", runBLE(MAC_AXON_HI, a), false); }
+
+    // -- BLE: the field-observed Axon block (OUI D8:1F:65) ----------------------------------
+    // Added 2026-09-19 on nine distinct MACs carrying two independent Axon identifiers; the
+    // provenance, and what is still unverified about it, are in axon_signatures.h.
+    printf("\n-- BLE: Axon OUI d8:1f:65 (field-observed block) --\n");
+    { std::vector<uint8_t> a;
+      bool h = runBLE(MAC_AXON_FIELD, a);
+      chk("field OUI hit, empty advert", h, true, d.confidence, 75, d.detail, "Axon OUI");
+      chkInt("  ^ method is M_OUI", d.method, M_OUI);
+      chkInt("  ^ type is ACAB_AXON_BODYCAM", d.type, ACAB_AXON_BODYCAM); }
+    { std::vector<uint8_t> a;
+      chk("neighbour OUI d8:1f:64 -> NO hit", runBLE(MAC_AXFIELD_LO, a), false); }
+    { std::vector<uint8_t> a;
+      chk("neighbour OUI d8:1f:66 -> NO hit", runBLE(MAC_AXFIELD_HI, a), false); }
+    // THE CASE THIS ENTRY EXISTS FOR, replayed from the real advert. d8:1f:65:04:a2:57 in
+    // aug-9-flock-o.log sends no BWCDEVICE tag - it carries Axon's own SIG service UUID 0xFE6B
+    // (AD 0x16) with ASCII "D01AT522D" - and so scored conf 0 "hardware OUI" before this block
+    // landed. Byte-for-byte the service data from that capture.
+    { std::vector<uint8_t> a;
+      static const uint8_t sd[] = {0x6b,0xfe,0x02,0x02,0xa3,0x1e,0x95,0xc4,0x70,0x98,0xbd,0x76,
+                                   0x96,0x02,0x00,0x00,0x44,0x30,0x31,0x41,0x54,0x35,0x32,0x32,0x44};
+      a.push_back((uint8_t)(1 + sizeof(sd))); a.push_back(0x16);
+      for (size_t i = 0; i < sizeof(sd); i++) a.push_back(sd[i]);
+      bool h = runBLE(MAC_AXON_FIELD, a);
+      chk("real FE6B advert on the field block now classifies", h, true,
+          d.confidence, 75, d.detail, "Axon OUI"); }
+    // ...and the same advert on a MAC in no table stays invisible, which proves the line above is
+    // carried by the OUI and not by something incidental in the payload.
+    { std::vector<uint8_t> a;
+      static const uint8_t sd[] = {0x6b,0xfe,0x02,0x02,0xa3,0x1e,0x95,0xc4,0x70,0x98,0xbd,0x76,
+                                   0x96,0x02,0x00,0x00,0x44,0x30,0x31,0x41,0x54,0x35,0x32,0x32,0x44};
+      a.push_back((uint8_t)(1 + sizeof(sd))); a.push_back(0x16);
+      for (size_t i = 0; i < sizeof(sd); i++) a.push_back(sd[i]);
+      chk("  ^ same advert on a foreign MAC -> still NO hit", runBLE(MAC_PHONE, a), false); }
     { std::vector<uint8_t> a; addName(a, "AXON BODY 3");
       // CONCERN (asserted as-is): the advertised name is NOT a match source in the shipped
       // signature, so an Axon-branded name on a foreign MAC is invisible. Deliberate: names are

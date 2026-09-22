@@ -34,18 +34,29 @@ static const AxonSignature AXON_PLACEHOLDER = {
     /* baseConfidence*/ 40,
 };
 
-// Axon Enterprise's only IEEE OUI, 00:25:DF (cited in axon_signatures.h).
-// FIELD-VALIDATED 2026-06-17: real Axon body cams advertise on this public OUI.
-// Re-confirmed repeatedly since, always via the BWCDEVICE service-data tag at conf 90:
-// two airports 2026-07-21, three more 2026-07-23 (SAN/DFW/Destin), and two again on the
-// 2026-07-23 San Diego capture. This is the single best-evidenced signature in the tree.
+// TWO Axon OUIs, and they carry different kinds of evidence - both cited in axon_signatures.h,
+// which is where the provenance for each lives. Read that file before touching either value.
+//   AXON_OUI_REGISTERED (00:25:DF) is the block the IEEE registry attributes to Axon by name.
+//     FIELD-VALIDATED 2026-06-17, and observed since on 8 distinct MACs across four captures.
+//   AXON_OUI_BWC_FIELD (D8:1F:65) is a block the registry lists only as "Private", so it can never
+//     name a registrant. Attribution rests on 9 distinct MACs carrying two independent Axon
+//     identifiers (the BWCDEVICE tag on eight, Axon's SIG service UUID 0xFE6B on the ninth),
+//     across 2026-08-09 and 2026-09-19, five owner-confirmed by eye at the later capture. It
+//     exists to catch Axon gear that sends no BWCDEVICE tag, which the tag path misses by
+//     construction, and across every capture to date that is exactly ONE device (04:a2:57).
+// The BWCDEVICE service-data tag remains the primary, MAC-independent signature at conf 90, and is
+// the single best-evidenced signature in the tree: re-confirmed at two airports 2026-07-21, three
+// more 2026-07-23 (SAN/DFW/Destin), two on the 2026-07-23 San Diego capture, three on 2026-08-09,
+// and five owner-confirmed on 2026-09-19.
 // OUI-only is the loose match (could be any Axon product); classify() also checks
 // for the "BWCDEVICE" service-data tag, and when it's there, confirms body cam and
 // raises confidence. Set usePayload=true here to REQUIRE the tag (strictest match).
+// Both OUIs share this signature's single baseConfidence: the struct has no per-OUI confidence, so
+// an OUI-only hit on either reports 75. Splitting them needs a struct change, not a table edit.
 static const AxonSignature AXON_REGISTRY_CANDIDATE = {
     /* useMfgId      */ false, /* mfgId */ 0x0000,
     /* useMfgPrefix  */ false, /* mfgPrefix */ {0}, /* mfgPrefixLen */ 0,
-    /* useOui        */ true,  /* oui */ {{0x00,0x25,0xdf}}, /* ouiCount */ 1,
+    /* useOui        */ true,  /* oui */ {AXON_OUI_REGISTERED, AXON_OUI_BWC_FIELD}, /* ouiCount */ 2,
     /* useName       */ false, /* namePatterns */ {nullptr,nullptr,nullptr,nullptr}, /* nameCount */ 0,
     /* usePayload    */ false, /* payload */ nullptr,
     /* baseConfidence*/ 75,

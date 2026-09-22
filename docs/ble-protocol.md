@@ -331,7 +331,7 @@ offline-buffer write, and nothing else.
 ```
 
 Every key in that frame is emitted on every Status update. The conditional keys (`pairw`,
-`bufall`, `bufsat`, `buferr`, `wiping`, `ledon`, `nbb`, `bat`, and the dual-radio
+`bufall`, `bufsat`, `bufrl`, `buferr`, `wiping`, `ledon`, `nbb`, `bat`, and the dual-radio
 block) are absent here on purpose: each is emitted only when it has something to say, and
 absent means the default.
 
@@ -366,6 +366,7 @@ reachable Status document strictly under that guard as a hard ceiling.
 | `keymis` | present + `true` only when this authenticated session offered a different key for a nonempty or untrusted log generation. The board preserved the existing key/rows and denied sync; surface an ownership-conflict notice requiring explicit log clear before replacement. Absent = false. Session-only and rebuilt at authentication, so it cannot carry from phone B into phone A's next link |
 | `bufall` | record-everything mode is on. **Sent only when true**; absent means off (saves MTU, same idiom as `ledon`). Not parsed by either app today (the feature has no app-side switch yet) |
 | `bufsat` | Stationary/record-all mode reached ring capacity, so later uncategorized nearby rows **may have been omitted**. Set on the exact transition to full (and when `bufall` is enabled on an already-full ring), sent only when true, persisted across reboots, and cleared by `clearlog`. It is a capacity/censoring-risk flag, not proof that a refusal already happened; `bufdrops` is the current boot's actual-refusal counter. Both apps surface it beside the evidence in Logbook and repeat it at the Offline Buffer control: a full capture cannot prove whether power stopped immediately after the exact-fill row or listening continued after capacity |
+| `bufrl` | the board's signature-row **flood limit refused at least one row**, so some real detections **may be missing** from the offline log. Every buffered row except an uncategorized nearby one spends a token from a bucket of 256 that refills one per 10 s (`DET_LOG_RATE_*` in `det_log.h`, which carries the evidence for those numbers), and whose last 32 tokens are kept for devices heard for at least 10 s, so a transmitter minting fake Flock/Remote ID/netcam identities can no longer overwrite the ring in minutes (a sustained flood needs about 67.6 hours to overwrite all 24,576 slots) or starve a real camera that keeps transmitting. Raised on the first refusal, sent only when true, **persisted across reboots**, and cleared by `clearlog` (and by any other wipe of the log, at exactly the points that clear `bufsat`). The current boot's refused-append count is on the `{"diag":true}` serial line (`flood=`). **Never sent in the same frame as `wiping`**: the builder emits it as the `else` arm of `wiping`, a status-budget trade (the worst-case frame had 3 bytes spare) that loses nothing, because a sweep is erasing the rows the flag qualifies and ends by clearing it. Both apps show `DETECTION FLOOD REFUSED` beside the evidence in Logbook and at the Offline Buffer control, ordered after `OFFLINE LOG INCOMPLETE` and before `CAPTURE REACHED CAPACITY` |
 | `wiping` | present + `true` **only while** a deferred buffer erase is still sweeping (an explicit `clearlog`/authorized ownership transfer or an automatic lifecycle wipe runs the flash erase one block per pass so the radios stay live). While set, the board writes no new records; absent = idle. The app can gate a "clearing…" state on it and knows a fresh `sync` won't capture anything until it clears |
 | `ledon` | onboard LED enabled. **Omitted when on** (the default), so an absent key means on; sent as `false` only in lights-out mode |
 | `tracker` | BLE item-tracker detector enabled |
@@ -379,7 +380,7 @@ For `buferr`, the `0x01` read bit also covers an unavailable or invalid raw-ring
 shipping targets require that partition, so absent/too-small geometry is a storage failure, not an
 empty buffer or a normal long-running `wiping` state.
 
-**`bufall` and `bufsat` are sent only when true, so ABSENT MEANS FALSE, in every fresh
+**`bufall`, `bufsat` and `bufrl` are sent only when true, so ABSENT MEANS FALSE, in every fresh
 status frame, not just the first.** Latch them per frame, never cumulatively, or a stale
 saturation warning survives a `clearlog` forever and tells the user a complete log is truncated.
 
@@ -735,7 +736,11 @@ safe replay rather than an omission. Legacy firmware without `gen` retains the o
 ### Threat model
 
 This buffer defends against a passive RF eavesdropper (the link is bonded + encrypted)
-and a casual finder (opt-in, encrypted at rest, auto-wipe, easy erase). It does **not**
+and a casual finder (opt-in, encrypted at rest, auto-wipe, easy erase). Against an active
+transmitter that floods fake signature hits to push real rows out of the FIFO ring, it
+bounds the damage and reports it rather than preventing it: the flood limit (`bufrl` above)
+stretches a full overwrite from minutes to about 67.6 hours and raises a persisted flag on
+the first refused row. It does **not**
 on its own defend against a forensic adversary with physical possession beyond the
 encryption: ESP32 flash dumps over USB/JTAG, and `clearlog` needs the bonded phone in
 hand. Treat a board that buffered sensitive locations as sensitive until it's drained
@@ -954,6 +959,7 @@ Permitted phrasing either way:
 
 - no new `sdBuf`
 - `bufsat == false`
+- `bufrl == false`: the flood limit refused nothing during the deployment
 - no new `hOver`, the per-record account of a fully trimmed replay attempt that blocked
 - clean replay: `hist:begin.n == hist:end.n == records actually received`, no sequence gaps, no
   accepted-after-retry-cap state
@@ -1006,7 +1012,8 @@ Three structural reasons:
 
 Honest coverage for unattended capture needs **persisted, deployment-scoped latches**: a
 buffer-bearing enqueue loss occurred, a co-processor or radio-health gap occurred, the buffer
-saturated (`bufsat` already is one), and the boot changed during the deployment.
+saturated (`bufsat` already is one), the flood limit refused a row (`bufrl` already is one), and
+the boot changed during the deployment.
 
 ### Why the replay check needs all three numbers
 

@@ -281,10 +281,12 @@ static void scanRealAdverts() {
 static void reservation() {
     printf("\n== per-MAC reservation ==\n");
 
-    // The PCAM table is eight slots. Distinct MACs beyond that get no row, and the overflow is
-    // COUNTED rather than silent - that count is what says a table's rows are only a floor on the
-    // distinct MACs that reached it, never a count of them (acabScannerVendorMacs in acab_scanner.h
-    // owns that rule).
+    // EIGHT SLOTS HERE IS THE TEST'S OWN ARRAY, not the shipped size. acabVendorFind takes the
+    // capacity as a parameter, so the decision under test is size-independent and 8 keeps the
+    // fixture small; the scanner's PCAM table is 32 (widened 2026-09-19, see acab_scanner.cpp).
+    // Distinct MACs beyond capacity get no row, and the overflow is COUNTED rather than silent -
+    // that count is what says a table's rows are only a floor on the distinct MACs that reached
+    // it, never a count of them (acabScannerVendorMacs in acab_scanner.h owns that rule).
     AcabVendorRec rec[8];
     memset(rec, 0, sizeof rec);
     uint32_t full = 0;
@@ -311,11 +313,12 @@ static void reservation() {
           "...and keeps its original firstMs (the row is not reset)");
     check(full == 0, "...and counts no overflow");
 
-    // The ninth DISTINCT MAC is where a table this size falls short: 19 devices carried 0x087F
-    // on the 2026-09-04 drive, and against 8 slots 11 of them would get no aggregate row. That is
-    // a projection, not a drive result - the build on that drive had no PCAM row, so nothing
-    // overflowed. There is no eviction by design, so the ninth is refused rather than displacing
-    // an earlier device.
+    // The ninth DISTINCT MAC is where a table this size falls short. This is no longer a
+    // projection: on the 2026-09-19 Los Angeles drive 12 distinct MACs carried 0x087F against the
+    // then-8-slot table and it overflowed for real, printing TABLE FULL three times and refusing
+    // the day's strongest sighting (-80 dBm) because it arrived ninth. That drive is why the
+    // shipped table is now 32. There is no eviction by design, so the ninth is refused rather
+    // than displacing an earlier device.
     macFor(200, mac);
     AcabVendorRec* ninth = acabVendorFind(rec, 8, mac, 6000, &full);
     check(ninth == nullptr, "the 9th distinct MAC gets no slot (no eviction, by design)");
@@ -388,6 +391,55 @@ static void reservation() {
 // ---------------------------------------------------------------------------------------------
 // PER-ROW EMIT DECISION
 // ---------------------------------------------------------------------------------------------
+static void overflowNoticeDecision() {
+    printf("\n== table-full notice decision ==\n");
+
+    // THE DEFECT THIS PINS. The notice used to be a plain time throttle against a per-table stamp
+    // that starts at 0, so `nowMs - 0 >= everyMs` was FALSE for the whole first everyMs of uptime
+    // and a refusal inside that window was swallowed. If the table was never asked again, nothing
+    // in the log ever named it: vendor_full sat non-zero while the reader could not tell WHICH
+    // table lost rows. A dense environment that fills a table in its first seconds is exactly
+    // where the notice matters most, so that was the wrong case to drop. The first check below is
+    // the one that fails if the rule goes back to time-only.
+    const uint32_t every = 5000;   // the scanner's VENDOR_LOG_EVERY_MS
+
+    check(acabVendorShouldLogFull(1, 1200, 0, every),
+          "a table's FIRST refusal prints even inside the opening window");
+    check(!acabVendorShouldLogFull(2, 1300, 1200, every),
+          "...and the second, 100 ms later, is throttled");
+    check(acabVendorShouldLogFull(9, 6200, 1200, every),
+          "a later refusal prints once the window has passed");
+    check(!acabVendorShouldLogFull(9, 6199, 1200, every),
+          "...and not one millisecond before it");
+
+    // full == 1 is the table's first refusal, not the first advert: a table that never overflows
+    // never reaches this decision at all, and one that does reaches it with full already bumped.
+    check(acabVendorShouldLogFull(1, 0, 0, every),
+          "the first refusal prints even at t=0, where the time term cannot fire");
+
+    // Unsigned subtraction, same as the per-row rule, so the notice survives the millis() wrap at
+    // 49.7 days rather than going silent or printing on every refused advert.
+    check(acabVendorShouldLogFull(40, 3000, 0xFFFFF000u, every),
+          "the window still expires across the millis() wrap (7096 ms elapsed)");
+    check(!acabVendorShouldLogFull(40, 500, 0xFFFFF000u, every),
+          "...and an unexpired window across the wrap is still throttled (4596 ms)");
+
+    // The notice is throttled, the COUNT is not: dropped=N keeps rising while the throttle is
+    // shut, so the last printed value lags the final vendor_full. This is why the header tells the
+    // reader to take the total from vendor_full and the notice as a per-table signal plus a
+    // sample. Walk 30 refusals inside one window and confirm only the first ever prints.
+    int printed = 0;
+    uint32_t stamp = 0, full = 0;
+    for (int i = 0; i < 30; i++) {
+        full++;                                   // acabVendorFind bumps before the caller asks
+        uint32_t now = 1000 + (uint32_t)i * 100;  // 100 ms apart: all inside one 5 s window
+        if (acabVendorShouldLogFull(full, now, stamp, every)) { printed++; stamp = now; }
+    }
+    check(printed == 1, "30 refusals inside one window print exactly one notice");
+    check(full == 30, "...while the count still reaches 30 (dropped=N lags the notice)");
+}
+
+// ---------------------------------------------------------------------------------------------
 static void emitDecision() {
     printf("\n== per-row emit decision ==\n");
 
@@ -451,6 +503,7 @@ int main() {
     scanRealAdverts();
     reservation();
     emitDecision();
+    overflowNoticeDecision();
     printf("\n  %s (%d failures)\n\n", failures ? "FAILURES" : "all good", failures);
     return failures ? 1 : 0;
 }

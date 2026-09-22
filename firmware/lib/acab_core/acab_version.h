@@ -26,6 +26,21 @@
 // field above 1023 is therefore un-shippable over the air: the apps compare unclamped, would keep offering
 // the update, and the board would refuse it forever. Bump the MINOR when the patch field runs out.
 //
+// 2.0.9: adds a SECOND Axon OUI, D8:1F:65, beside the registry block 00:25:DF. UNLIKE 2.0.8 THIS
+//        CUT IS NOT A PRODUCTION NO-OP: axon_detect.cpp's signature goes ouiCount 1 -> 2, so a
+//        shipping build now matches that prefix on both paths: at the signature's confidence 75 on
+//        BLE, and at the WiFi path's fixed 65. The block was attributed from field capture rather than the registry,
+//        which lists its holder only as "Private" - nine MACs carrying two independent Axon
+//        identifiers, five of them owner-confirmed by eye on 2026-09-19. Provenance and the
+//        standing module-maker caveat are in axon_signatures.h (AXON_OUI_BWC_FIELD).
+//        SECOND PRODUCTION CHANGE: the opt-in offline buffer gains a flood limit (det_log.h
+//        DET_LOG_RATE_*): a token bucket on signature rows, a persisted "bufrl" Status key when it
+//        refuses one, and a {"diag":true} line with this boot's refusal counts.
+//        beacon-board with both changes: RAM 78460 bytes (78428 before the flood limit, which was
+//        byte-identical to 2.0.8), flash 1038925 bytes.
+//        Capture-only: the 0x087F vendor table grows 8 -> 32 slots and its TABLE FULL notice now
+//        names the refused MAC and always prints a table's first refusal. That part sits inside
+//        ACAB_CAPTURE_BUILD and reaches no product image.
 // 2.0.8: closes the OTA key rotation, and reworks the capture-only vendor table. THE SHIPPING
 //        IMAGE IS A NO-OP: apart from the version bump itself, the OTA signing-key file and the
 //        release tooling, every source change in this cut sits inside ACAB_CAPTURE_BUILD, so no
@@ -172,7 +187,7 @@
 // 2.0.0: the Colonel Panic builds pick up the full v2 detection set the beacon board ships
 // with (offline buffer, watchlist/custom category, ignore list, refreshed OUIs, glasses).
 #ifndef ACAB_FW_VERSION
-#define ACAB_FW_VERSION "2.0.8"
+#define ACAB_FW_VERSION "2.0.9"
 #endif
 
 #endif // ACAB_VERSION_H

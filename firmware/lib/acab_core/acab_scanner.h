@@ -249,12 +249,14 @@ uint32_t acabScannerVendorPcam();
 uint32_t acabScannerVendorMacs();
 // vendor_full is the SUM of the per-table overflow counts across all three groups, so a non-zero
 // value says capture is incomplete but NOT which table lost rows. The only per-table signal is the
-// throttled serial line "[vendor] TABLE FULL (<table>, N slots) dropped=N" that the ingest path
-// prints; read that to learn which group overflowed, and expect it to be MISSING for an overflow
-// inside the first VENDOR_LOG_EVERY_MS of uptime: the throttle compares against a per-table stamp
-// that starts at 0, so a table that fills early and is never asked again leaves vendor_full above
-// 0 with no notice anywhere in the log. dropped=N counts refused ADVERTS, not devices: one
-// unslotted device heard N times accounts for all of it.
+// throttled serial line "[vendor] TABLE FULL (<table>, N slots) dropped=N refused=<mac>" that the
+// ingest path prints; read that to learn which group overflowed and to recover one address it
+// turned away. A table's FIRST refusal always prints (acabVendorShouldLogFull passes full == 1
+// through the throttle), so an early overflow can no longer leave vendor_full above 0 with no
+// notice anywhere in the log. dropped=N counts refused ADVERTS, not devices: one unslotted device
+// heard N times accounts for all of it. It also LAGS - the count keeps rising while the throttle
+// is shut - so vendor_full here is the authoritative total and the notice is the per-table signal
+// plus a sample, never a complete list of what was lost.
 uint32_t acabScannerVendorFull();
 // Exact-width ALPR vendor-prefix annotations. These counters describe capture instrumentation,
 // not detections: no candidate enters handleDetection or reaches an app. alpr_full > 0 means the

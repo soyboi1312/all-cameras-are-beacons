@@ -27,7 +27,10 @@
  *   4. the HEALTHY-REACHABLE document is publishable: pairing window open, LED switched off,
  *      buffer-all armed, a saturated ring, a wipe sweeping, an nRF DFU running and a charger
  *      attached, all at once, on a board with nothing wrong.
- *   5. the WORST CASE - the latched-flash-fault key on top of all of that - is publishable too.
+ *   5. the WORST CASE - the latched-flash-fault key and the flood-limit flag on top of all of
+ *      that - is publishable too. The flood flag (bufrl) is the builder's else-if arm of wiping,
+ *      so the two never share a frame; the documents count the wider of that pair, and only after
+ *      main() has found the else-if in the source (see KeyBudget::exclusiveWith).
  *      This is the HARD CEILING: every document the builder can produce, at the top of every
  *      declared domain, serializes strictly under STATUS_JSON_MAX, so the runtime overflow guard
  *      is defense in depth against a width this table missed, never an expected path.
@@ -71,6 +74,12 @@ struct KeyBudget {
     int         width;
     Tier        tier;
     const char* domain;
+    // A key the builder can NEVER emit in the same document as `exclusiveWith`, because it is the
+    // `else if` arm directly after that key's `if` in acabBleUpdateStatus. The documents below
+    // then count only the wider of the pair. The exclusion is not taken on trust: main() finds
+    // that exact else-if in the source and fails if it is gone, so deleting the else would fail
+    // this test rather than quietly overflow the ceiling.
+    const char* exclusiveWith = nullptr;
 };
 
 static const KeyBudget BUDGET[] = {
@@ -108,6 +117,10 @@ static const KeyBudget BUDGET[] = {
     { "buferr",    3, FAULT,   "DET_LOG_FAULT_* bitmask, 5 bits defined, so 31 max" },
     { "wiping",    4, HEALTHY, "emitted only as true; a wipe still sweeping - one the user asked"
                                " for, or the boot-count auto-wipe" },
+    // bufrl bought its bytes from wiping: the worst case had 3 B spare, and ,"bufrl":true is 13.
+    // FAULT tier because it is raised only once the signature flood limit has refused a row.
+    { "bufrl",     4, FAULT,   "emitted only as true (flood limit refused a row); never beside"
+                               " wiping, see exclusiveWith", "wiping" },
     { "desert",    5, ALWAYS,  "bool" },
     { "ign",       3, ALWAYS,  "ignore list caps at 256" },
     { "wat",       3, ALWAYS,  "watchlist caps at 256" },
@@ -155,11 +168,40 @@ static std::string slurp(const char* path) {
     return s;
 }
 
+static int keyCost(const KeyBudget* k) { return (int)strlen(k->key) + 3 + k->width; }
+
+// Drop the narrower member of every exclusive pair that is present together, so a document never
+// counts two keys the builder cannot emit at once. Ties keep the partner (the older key). Only a
+// pair whose declaring key is in `proven` (its else-if was found in the source) is honoured; an
+// unproven pair is counted in full, so a lost else-if also shows up as an over-budget document.
+static std::vector<const KeyBudget*> applyExclusions(const std::vector<const KeyBudget*>& in,
+                                                     const std::vector<std::string>& proven) {
+    auto isProven = [&](const KeyBudget* k) {
+        for (const std::string& p : proven) if (p == k->key) return true;
+        return false;
+    };
+    std::vector<const KeyBudget*> out;
+    for (const KeyBudget* k : in) {
+        bool drop = false;
+        for (const KeyBudget* o : in) {
+            if (o == k) continue;
+            const bool pair =
+                (k->exclusiveWith && strcmp(k->exclusiveWith, o->key) == 0 && isProven(k)) ||
+                (o->exclusiveWith && strcmp(o->exclusiveWith, k->key) == 0 && isProven(o));
+            if (!pair) continue;
+            const bool kIsSecond = k->exclusiveWith && strcmp(k->exclusiveWith, o->key) == 0;
+            if (keyCost(k) < keyCost(o) || (keyCost(k) == keyCost(o) && kIsSecond)) drop = true;
+        }
+        if (!drop) out.push_back(k);
+    }
+    return out;
+}
+
 // Compact-JSON length of an object built from these keys: {"k":v,"k":v} .
 static int docLen(const std::vector<const KeyBudget*>& keys) {
     if (keys.empty()) return 2;
     int n = 2 + (int)keys.size() - 1;                 // braces + separating commas
-    for (const KeyBudget* k : keys) n += (int)strlen(k->key) + 3 + k->width;   // "key": + value
+    for (const KeyBudget* k : keys) n += keyCost(k);   // "key": + value
     return n;
 }
 
@@ -647,9 +689,41 @@ int main() {
         if (BUDGET[i].tier == ALWAYS)  { always.push_back(&BUDGET[i]); healthy.push_back(&BUDGET[i]); }
         if (BUDGET[i].tier == HEALTHY) { healthy.push_back(&BUDGET[i]); }
     }
-    const int alwaysLen  = docLen(always);
-    const int healthyLen = docLen(healthy);
-    const int worstLen   = docLen(all);
+    // Exclusive pairs: prove each one from the builder source BEFORE counting it as one slot.
+    // The emit of `exclusiveWith` must be followed, as the very next statement, by
+    // `else if (...) doc["<key>"]`. Anything else (the else deleted, the arms reordered, the key
+    // emitted a second time elsewhere) fails here.
+    std::vector<std::string> provenExclusions;
+    for (size_t i = 0; i < BUDGET_N; i++) {
+        if (!BUDGET[i].exclusiveWith) continue;
+        char msg[200];
+        snprintf(msg, sizeof(msg), "\"%s\" is the else-if arm of \"%s\" in acabBleUpdateStatus",
+                 BUDGET[i].key, BUDGET[i].exclusiveWith);
+        const std::string partnerEmit = std::string("doc[\"") + BUDGET[i].exclusiveWith +
+                                        "\"] = true;";
+        const std::string ownEmit = std::string("doc[\"") + BUDGET[i].key + "\"]";
+        const size_t fn = src.find("void acabBleUpdateStatus()");
+        const size_t end = fn == std::string::npos ? fn : src.find("len = serializeJson(", fn);
+        const size_t at = fn == std::string::npos ? fn : src.find(partnerEmit, fn);
+        bool proven = false;
+        if (at != std::string::npos && end != std::string::npos && at < end) {
+            size_t next = at + partnerEmit.size();
+            while (next < src.size() && (src[next] == ' ' || src[next] == '\n')) next++;
+            const size_t stmtEnd = src.find(';', next);
+            const bool elseIf = src.compare(next, 8, "else if ") == 0;
+            const size_t own = src.find(ownEmit, next);
+            // exactly one emit of this key in the builder, and it is that else-if arm
+            const size_t again = own == std::string::npos ? own : src.find(ownEmit, own + 1);
+            proven = elseIf && own != std::string::npos && own < stmtEnd &&
+                     (again == std::string::npos || again > end);
+        }
+        ok(msg, proven);
+        if (proven) provenExclusions.push_back(BUDGET[i].key);
+    }
+
+    const int alwaysLen  = docLen(applyExclusions(always, provenExclusions));
+    const int healthyLen = docLen(applyExclusions(healthy, provenExclusions));
+    const int worstLen   = docLen(applyExclusions(all, provenExclusions));
 
     // The largest frame that can actually be PUBLISHED. The guard rejects `len >= STATUS_JSON_MAX`
     // rather than `> `, because the scratch is declared one byte larger so truncation is

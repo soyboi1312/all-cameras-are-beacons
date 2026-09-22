@@ -158,6 +158,11 @@ int main() {
         detLogAppendReleasesClaim(DET_LOG_APPEND_NOT_ARMED), false);
     chk("capacity refusal keeps the scanner claim consumed",
         detLogAppendReleasesClaim(DET_LOG_APPEND_CAPACITY_DROP), false);
+    // A flood-limit refusal is the one deliberate refusal that DOES release: a real device that
+    // keeps transmitting must get another chance once a token refills. The hot loop that release
+    // would otherwise open is closed by det_log's ingest gate (test_det_log.cpp covers it).
+    chk("flood-limit refusal releases the scanner claim",
+        detLogAppendReleasesClaim(DET_LOG_APPEND_RATE_LIMITED), true);
 
     // THE ABA CASE. Slot evicted under table pressure, same device re-admitted, its newer sighting
     // claimed successfully - then our stale failure arrives. Rolling back here would re-arm a

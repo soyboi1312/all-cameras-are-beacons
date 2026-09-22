@@ -335,10 +335,114 @@ enum DetLogAppendResult : uint8_t {
     DET_LOG_APPEND_RETRY,           // transient refusal; caller should release its capture claim
     DET_LOG_APPEND_NOT_ARMED,       // stable off/link/key/storage refusal; claim stays consumed
     DET_LOG_APPEND_CAPACITY_DROP,   // intentional full-ring nearby refusal; claim stays consumed
+    DET_LOG_APPEND_RATE_LIMITED,    // signature-row flood limit refused it; claim is RELEASED so a
+                                    // device that keeps transmitting gets another chance once a
+                                    // token refills (see the flood limit below)
 };
 inline bool detLogAppendReleasesClaim(DetLogAppendResult result) {
-    return result == DET_LOG_APPEND_RETRY;
+    // RATE_LIMITED releases the claim, which on its own would let every later advert of the same
+    // device re-enqueue a doomed append. What stops that hot loop is detLogRateGate(), which the
+    // scanner reads BEFORE claiming: a refusal closes the gate for its tier until the bucket is
+    // due back over that tier's floor.
+    return result == DET_LOG_APPEND_RETRY || result == DET_LOG_APPEND_RATE_LIMITED;
 }
+
+// --- FLOOD LIMIT on signature rows (every type except ACAB_NEARBY_DEVICE) ---
+// THE ATTACK. The ring is strictly FIFO and type-blind, and the scanner writes each fresh dedup
+// key once per capture generation. A nearby transmitter that mints fresh identities (beacon frames
+// SSID "Flock-..." from random BSSIDs, Flock-named BLE adverts from random addresses, Remote ID
+// with random UAS IDs, netcam-OUI data frames from random source MACs) at ~100/s used to overwrite
+// all 24,576 slots, the real deployment's Flock/Axon rows included, in about four minutes, with
+// nothing to show for it. The precondition is the deploy-and-leave case itself: buffer on, phone
+// away.
+//
+// THE LIMIT. A token bucket inside appendLocked, under gIoMutex, which is the one place a row
+// reaches storage. Each stored signature row spends one token. NEARBY rows never touch it: their
+// existing full-ring cap (bufsat) already keeps them from evicting anything.
+//
+// THE NUMBERS, from the densest real signature scenes committed to the repo:
+//   - docs/captures/lvt-2026-08-03-summary.txt, netcam ON, residential streets (Ring, Swann, Wyze,
+//     Reolink, eufy OUIs). Unique signature first sightings, which is what the ring stores: 83 in
+//     one 47-minute segment, at most 34 in any 10 minutes, 10 in any 60 s, 4 in any 1 s.
+//   - docs/radio-coverage.md, the c5-lvt capture: 67 camera-vendor MACs in ~27 minutes, 48 of them
+//     on 2.4 GHz (the only band the board hears).
+//   - docs/captures/drive-to-camarillo-2026-09-07.txt: 45 detections in 2h28m, netcam off.
+//   - docs/captures/911-2026-09-11.txt (3h53m): its strongest results are two Remote ID drones
+//     and one FS Ext Battery row, beside a handful of low-confidence alerts.
+//   The refill, 1 row per DET_LOG_RATE_REFILL_MS = 10 s (60 per 10 minutes), is 1.76x the densest
+//   10-minute window above, and the burst absorbs everything the window does not.
+//   The burst is DET_LOG_RATE_BURST = 256 rather than a smaller number because of one real event
+//   that is denser than any drive: every disconnect bumps the capture generation, which re-arms
+//   EVERY entry in the scanner's dedup table at once, and that table holds ACAB_DEDUP_MAX = 256
+//   entries (acab_scanner.cpp). Walking away from a board parked beside a camera-heavy building
+//   therefore enqueues up to 256 signature rows within seconds, all real. A burst of 256 covers a
+//   table full of them (test_det_log.cpp checks the two constants stay in step). 256 slots is 1%
+//   of the ring, so the attacker's free burst buys nothing.
+//
+// WORST CASE, STATED: a sustained flood gets the full burst, then one row per 10 s. Overwriting all
+// 24,576 slots takes 256 + (24,576 - 256) x 10 s = 243,200 s, about 67.6 hours (2 days 19.6 h),
+// instead of about four minutes. The flood is not silent either: see detLogRateLimited() below.
+//
+// WHERE THE LIMIT CAN BITE A REAL SCENE, stated rather than hidden. Stationary capture (bufall)
+// re-arms every device each REBUFFER_AFTER_MS (15 min in acab_scanner.cpp), so N signature devices
+// permanently in range cost N rows per window against 90 refills per window. Up to N = 90 the
+// bucket never drains. Above it the bucket drains by (N - 90) per window and, once empty, some
+// devices miss a window's re-arm row (they are released, not lost, and the next window re-arms
+// them) and the marker is raised. Nothing captured so far comes near 90 concurrently audible
+// 2.4 GHz netcams (see the density above). If a real deployment does, the fix is a separate bucket
+// per type (netcam being the only type with that volume), not a larger shared one.
+//
+// FAIRNESS: one-shot random identities must not starve a real device. The last
+// DET_LOG_RATE_RESERVE tokens are spendable only by a PERSISTENT row (detLogRatePersistent: seen
+// at least twice, first-to-last sighting at least DET_LOG_RATE_PERSIST_MS apart). A real camera
+// keeps refreshing its dedup entry, and dedupFind evicts least-recently-seen first, so it survives
+// a fresh-identity flood that recycles the table; a one-shot identity is never seen twice. A flood
+// of fresh identities therefore drains the bucket only down to the reserve, and a real device that
+// was refused while fresh is admitted from the reserve as soon as it has dwelt 10 s. An attacker
+// can also make identities persistent by repeating them; that buys them the reserve, and then
+// real devices STARVE: a repeating flood (~20 identities/s, each resent once 10 s later, stays
+// under the 256-entry dedup table) holds the bucket at zero, and each reopening's single token
+// goes to whichever persistent row reaches the sink first, almost always an attacker row. The
+// refill rate still bounds what they can OVERWRITE (the ~67.6 h figure holds), and bufrl makes the
+// loss visible, but under that attack real rows are refused, not recorded. Per-type buckets or a
+// stricter persistence rule are the next lever if a field capture ever shows this shape.
+static const uint32_t DET_LOG_RATE_BURST      = 256;
+static const uint32_t DET_LOG_RATE_REFILL_MS  = 10000;
+static const uint32_t DET_LOG_RATE_RESERVE    = 32;
+static const uint32_t DET_LOG_RATE_PERSIST_MS = 10000;
+
+// The persistence rule, shared by the scanner's ingest gate and appendLocked so the two cannot
+// disagree about which tier a row is in. Both feed it the dedup entry's own values: count after
+// this sighting, and lastSeen - firstSeen (unsigned, so it is millis()-wrap safe).
+inline bool detLogRatePersistent(uint16_t count, uint32_t dwellMs) {
+    return count >= 2 && dwellMs >= DET_LOG_RATE_PERSIST_MS;
+}
+
+// LOCK-FREE ingest gate, read on the per-advert radio path BEFORE a buffer claim is made. It never
+// takes gIoMutex (held across multi-ms flash erases): it compares millis() with two volatile
+// "closed until" stamps that appendLocked publishes only when it actually refuses a row. So the
+// gate closes only after a refusal has already been counted and marked, and it reopens by time
+// once the bucket is due back over that tier's floor (one refill for the persistent tier, up to
+// RESERVE + 1 refills for the fresh one). A closed gate means "do not claim yet": the device's
+// loggedGen stays unclaimed, so an advert after the reopening tries again. While the fresh tier is
+// shut, a genuinely one-shot real row (one frame, never seen again) is not claimed at all; that is
+// the price of the flood case, and the marker has already been raised by then. Without this, RATE_LIMITED releasing the claim
+// would turn a streaming netcam (hundreds of data frames/s) into hundreds of doomed sink items.
+struct DetLogRateGate {
+    bool freshOpen;        // a non-persistent row may try to claim
+    bool persistentOpen;   // a persistent row may try to claim
+};
+DetLogRateGate detLogRateGate(uint32_t nowMs);
+
+// FLOOD MARKER. Raised on the first rate refusal, PERSISTED to NVS ("bufrl") so it survives the
+// reboots a deployment sees, and cleared only where bufsat is cleared (the clearlog/key-rotation/
+// auto-wipe arm and the wipe's retirement). Status sends "bufrl":true only while it is set.
+// detLogRateDrops() is the this-boot count of refused appends for the [diag] line. It counts rows
+// refused AT THE RING; adverts the ingest gate deferred while closed are not rows and are not
+// counted. The marker does NOT block further appends: a failed NVS write is retried from the loop
+// tick (and latches DET_LOG_FAULT_NVS) instead of stopping evidence capture.
+bool     detLogRateLimited();
+uint32_t detLogRateDrops();
 DetLogAppendResult detLogAppend(const AcabDetection& d,
                                 const DetLogGpsStamp* gps = nullptr);
 DetLogAppendResult detLogAppendClaimed(const AcabDetection& d,

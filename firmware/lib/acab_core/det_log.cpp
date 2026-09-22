@@ -194,6 +194,21 @@ static volatile bool gBufferAll = false;   // "record everything" deploy mode; s
 static bool              gSaturated = false;
 static bool              gSaturationPersistencePending = false;
 static volatile uint32_t gSatDrops  = 0;
+// Signature-row flood limit (see DET_LOG_RATE_* in det_log.h). The bucket is RAM-only and starts
+// full at every boot; gRateLastMs is the millis() the last whole token was credited at, so partial
+// progress toward the next token survives across appends. All three are gIoMutex-owned.
+static uint32_t          gRateTokens = DET_LOG_RATE_BURST;
+static uint32_t          gRateLastMs = 0;
+static bool              gRateClockStarted = false;
+// The flood marker, persisted as "bufrl" and reset at exactly the points that reset bufsat.
+static bool              gRateLimited = false;
+static bool              gRateLimitPersistencePending = false;
+static volatile uint32_t gRateDrops = 0;
+// The ingest gate's "closed until" stamps. Written only under gIoMutex at a refusal, read
+// LOCK-FREE by detLogRateGate() on the radio path; each is one aligned 32-bit word, so a read
+// cannot tear, and a one-advert-stale read only defers or admits one claim.
+static volatile uint32_t gRateFreshClosedUntil = 0;
+static volatile uint32_t gRatePersistentClosedUntil = 0;
 static uint32_t gFaults = DET_LOG_FAULT_NONE;
 static bool     gFaultPersistencePending = false;
 static uint8_t  gKey[32];
@@ -500,6 +515,7 @@ static bool keyFingerprint(const uint8_t key[32], uint8_t out[8]);
 static bool retryConfigPersistenceLocked();
 static void markSaturatedLocked();
 static bool persistSaturationLocked();
+static bool persistRateLimitedLocked();
 
 // Restore the durable coredump-wipe token without ever interpreting an NVS-open failure as the
 // default zero. This is called once during setup and retried from the loop-side pending read.
@@ -791,6 +807,7 @@ static bool restoreStartupConfigLocked() {
     bool bufferAll = p.getBool("bufall", false);
     bool saturated = p.getBool("bufsat", false);
     bool saturationRepairPending = false;
+    const bool rateLimited = p.getBool("bufrl", false);
     const uint32_t storedFaults = p.getUInt("fault", DET_LOG_FAULT_NONE);
     uint8_t keyFp[sizeof(gKeyFp)] = {};
     bool haveKeyFp = p.getBytesLength("keyfp") == sizeof(keyFp) &&
@@ -1040,6 +1057,9 @@ static bool restoreStartupConfigLocked() {
     gBufferAll = bufferAll;
     gSaturated = saturated;
     gSaturationPersistencePending = saturationRepairPending;
+    // OR, never overwrite: appends stay RETRY until this transaction publishes, so no refusal can
+    // precede it today, but a RAM marker must never be lowered by a stale read if that changes.
+    gRateLimited = gRateLimited || rateLimited;
     gFaults |= storedFaults;
     memset(gKey, 0, sizeof(gKey));
     if (haveKey) memcpy(gKey, key, sizeof(gKey));
@@ -1240,6 +1260,61 @@ static void markSaturatedLocked() {
     persistSaturationLocked();
 }
 
+// The flood marker's NVS write. Unlike bufsat it gates nothing: bufsat must land before
+// on=false/bufall=false because startup can otherwise rebuild it from raw geometry, and no such
+// fallback exists (or is needed) here. A failure latches the NVS fault bit and detLogEraseTick
+// retries it; appends carry on, because blocking them would turn an NVS hiccup into lost evidence.
+static bool persistRateLimitedLocked() {
+    if (!gRateLimitPersistencePending) return true;
+    Preferences p;
+    if (!p.begin(NVS_NS, false)) {
+        latchFaultLocked(DET_LOG_FAULT_NVS);
+        return false;
+    }
+    const bool stored = p.putBool("bufrl", true) == sizeof(bool);
+    p.end();
+    if (!stored) {
+        latchFaultLocked(DET_LOG_FAULT_NVS);
+        return false;
+    }
+    gRateLimitPersistencePending = false;
+    return true;
+}
+
+static void markRateLimitedLocked() {
+    if (gRateLimited) return;
+    gRateLimited = true;
+    gRateLimitPersistencePending = true;
+    persistRateLimitedLocked();
+}
+
+// Credit whole tokens for the time since the last credit. Unsigned subtraction keeps this correct
+// across the 49.7-day millis() wrap for any gap shorter than that; a longer gap with no append at
+// all can under-credit by at most one wrap's worth, which only matters if the bucket was empty
+// when the board then went quiet for 49 days, and costs one refill interval.
+static void rateRefillLocked(uint32_t now) {
+    if (!gRateClockStarted) {
+        gRateClockStarted = true;
+        gRateLastMs = now;
+        return;
+    }
+    if (gRateTokens >= DET_LOG_RATE_BURST) {
+        gRateTokens = DET_LOG_RATE_BURST;
+        gRateLastMs = now;   // a full bucket banks no credit toward the next token
+        return;
+    }
+    const uint32_t earned = (now - gRateLastMs) / DET_LOG_RATE_REFILL_MS;
+    if (earned == 0) return;
+    const uint32_t room = DET_LOG_RATE_BURST - gRateTokens;
+    if (earned >= room) {
+        gRateTokens = DET_LOG_RATE_BURST;
+        gRateLastMs = now;
+    } else {
+        gRateTokens += earned;
+        gRateLastMs += earned * DET_LOG_RATE_REFILL_MS;
+    }
+}
+
 static bool persistLastConnectionLocked() {
     Preferences p;
     if (!p.begin(NVS_NS, false)) {
@@ -1356,12 +1431,15 @@ static bool persistRingWipeArmLocked() {
                                 p.putUInt("lastconn", gWipeArmBoot) == sizeof(uint32_t);
     const bool saturationStored = lastConnStored &&
                                   p.putBool("bufsat", false) == sizeof(bool);
-    const bool generationResolved = saturationStored &&
+    // The flood marker describes the generation this arm condemns, exactly like bufsat above.
+    const bool rateLimitStored = saturationStored &&
+                                 p.putBool("bufrl", false) == sizeof(bool);
+    const bool generationResolved = rateLimitStored &&
                                     p.putBool("wipeneed", false) == sizeof(bool);
     p.end();
     if (!generationIntentStored || !cryptoIntentStored || !wipeStored || !bootStored ||
         !generationStored || !cryptoStored ||
-        !lastConnStored || !saturationStored || !generationResolved) {
+        !lastConnStored || !saturationStored || !rateLimitStored || !generationResolved) {
         latchFaultLocked(DET_LOG_FAULT_NVS);
         return false;
     }
@@ -1393,6 +1471,16 @@ static void publishRingWipeArmLocked() {
     gSaturated = false;
     gSaturationPersistencePending = false;
     gSatDrops = 0;
+    gRateLimited = false;
+    gRateLimitPersistencePending = false;
+    gRateDrops = 0;
+    // A clear starts a clean log, so it also starts a full bucket. Without this, a drained bucket
+    // from the last deployment would refuse the re-armed dedup entries at the next disconnect and
+    // raise bufrl on a log nothing has flooded yet. The owner triggers a clear, never an attacker.
+    gRateTokens = DET_LOG_RATE_BURST;
+    gRateClockStarted = false;
+    gRateFreshClosedUntil = 0;
+    gRatePersistentClosedUntil = 0;
     gWipeNext = 0;
     gWipePending = true;
     gWipeStalled = false;
@@ -1862,6 +1950,40 @@ uint32_t detLogSatDrops() {
     const uint32_t value = gSatDrops;
     ioUnlock();
     return value;
+}
+
+// Flood marker (persisted "bufrl") and this boot's refused-append count. Same locking idiom as the
+// saturation pair above: the status builder calls these once per build, never per advert.
+bool detLogRateLimited() {
+    if (!ioLock()) return gRateLimited;
+    const bool value = gRateLimited;
+    ioUnlock();
+    return value;
+}
+uint32_t detLogRateDrops() {
+    if (!ioLock()) return gRateDrops;
+    const uint32_t value = gRateDrops;
+    ioUnlock();
+    return value;
+}
+
+// PER-ADVERT, LOCK-FREE (see DetLogRateGate in det_log.h). A stamp closes its tier only while it
+// lies in (now, now + its longest real closure]: RESERVE + 1 refills for the fresh tier, one for
+// the persistent tier, the most appendLocked ever stamps. The upper bound costs nothing real and
+// makes a stale stamp harmless: after a quiet stretch the signed difference eventually wraps
+// positive again (every ~49.7 days), and without the bound that would shut the gate for up to
+// 24.8 days. With it, a stale stamp can defer claims for at most one such closure once per wrap,
+// and a deferral only means "claim on a later advert".
+static const int32_t RATE_FRESH_MAX_CLOSED_MS =
+    (int32_t)((DET_LOG_RATE_RESERVE + 1) * DET_LOG_RATE_REFILL_MS);
+static const int32_t RATE_PERSISTENT_MAX_CLOSED_MS = (int32_t)DET_LOG_RATE_REFILL_MS;
+DetLogRateGate detLogRateGate(uint32_t nowMs) {
+    const int32_t fresh = (int32_t)(gRateFreshClosedUntil - nowMs);
+    const int32_t persistent = (int32_t)(gRatePersistentClosedUntil - nowMs);
+    DetLogRateGate gate;
+    gate.freshOpen = !(fresh > 0 && fresh <= RATE_FRESH_MAX_CLOSED_MS);
+    gate.persistentOpen = !(persistent > 0 && persistent <= RATE_PERSISTENT_MAX_CLOSED_MS);
+    return gate;
 }
 
 static void clearKeyLocked() {
@@ -2346,7 +2468,8 @@ static DetLogAppendResult appendLocked(const AcabDetection& d, const DetLogGpsSt
         return DET_LOG_APPEND_RETRY;
     }
     // ONCE THE RING IS FULL, UNCATEGORIZED ROWS STOP APPENDING. Signature hits still append and
-    // still evict oldest-first as always; only ACAB_NEARBY_DEVICE is capped.
+    // still evict oldest-first; only ACAB_NEARBY_DEVICE is capped here. (Signature rows have their
+    // own guard, the flood limit just below, which bounds their RATE rather than their count.)
     //
     // The ring is strictly FIFO and type-blind (see the gOldest advance below), unlike the dedup
     // table, which deliberately evicts the oldest NEARBY_DEVICE first. acab_scanner.cpp says both
@@ -2378,6 +2501,41 @@ static DetLogAppendResult appendLocked(const AcabDetection& d, const DetLogGpsSt
         markSaturatedLocked();      // normally already set by the exact-fill transition
         ioUnlock();
         return DET_LOG_APPEND_CAPACITY_DROP;
+    }
+    // FLOOD LIMIT on signature rows (DET_LOG_RATE_* in det_log.h for the attack, the numbers and
+    // their evidence). Checked HERE, after every arming check, so only a row that would otherwise
+    // have been written spends or is refused a token; the token itself is spent only once the
+    // flash write succeeds, below. NEARBY rows are exempt: the full-ring guard above is theirs.
+    //
+    // A refusal is never silent: it counts toward gRateDrops (the [diag] line), raises the
+    // persisted "bufrl" marker (status), and closes the scanner's ingest gate for this row's tier
+    // until the bucket is due back over that tier's floor, which is what keeps the released claim
+    // from becoming a hot retry loop on the per-advert path.
+    const bool rateBound = d.type != ACAB_NEARBY_DEVICE;
+    if (rateBound) {
+        const uint32_t now = millis();
+        rateRefillLocked(now);
+        const bool persistent =
+            detLogRatePersistent(d.count, (uint32_t)(d.lastSeen - d.firstSeen));
+        const uint32_t tokenFloor = persistent ? 0 : DET_LOG_RATE_RESERVE;
+        if (gRateTokens <= tokenFloor) {
+            gRateDrops++;
+            markRateLimitedLocked();
+            // Reopen each tier when the bucket will next be over that tier's floor. The bucket is
+            // below full here, so rateRefillLocked has left gRateLastMs at the last whole credit
+            // (never in the future) and token k lands at gRateLastMs + k * REFILL. Every refusal
+            // has gRateTokens <= RESERVE (a fresh one by its floor, a persistent one at zero), so
+            // the fresh tier needs RESERVE + 1 - tokens more, at most RESERVE + 1 refills away,
+            // and a persistent refusal needs exactly one. A persistent refusal therefore shuts
+            // BOTH tiers. If persistent rows spend reserve tokens after a fresh closure was
+            // stamped, that closure reopens early; the cost is one more refused row, which
+            // re-stamps it.
+            gRateFreshClosedUntil =
+                gRateLastMs + (DET_LOG_RATE_RESERVE + 1 - gRateTokens) * DET_LOG_RATE_REFILL_MS;
+            if (persistent) gRatePersistentClosedUntil = gRateLastMs + DET_LOG_RATE_REFILL_MS;
+            ioUnlock();
+            return DET_LOG_APPEND_RATE_LIMITED;
+        }
     }
     // gHead is only a candidate until every flash operation succeeds. Advancing it first makes
     // a failed write look like a stored record in count/status and creates a hole in replay.
@@ -2432,6 +2590,7 @@ static DetLogAppendResult appendLocked(const AcabDetection& d, const DetLogGpsSt
         gHead = seq + 1;
         if (gHead - gOldest > gSlots) gOldest = gHead - gSlots;
         if (gBufferAll && countLocked() >= gSlots) markSaturatedLocked();
+        if (rateBound && gRateTokens > 0) gRateTokens--;   // > 0 always holds: checked above
     }
     ioUnlock();
     // prepare/write failures latch a raw blocking fault. Releasing the scanner claim would only
@@ -2776,6 +2935,9 @@ static bool retryConfigPersistenceLocked() {
 void detLogEraseTick() {
     if (!ioLock()) { gFaults |= DET_LOG_FAULT_LOCK; return; }
     if (gFaultPersistencePending) persistFaultsLocked();
+    // Ahead of every early return below: the flood marker must reach NVS even while startup or a
+    // wipe is still pending, since it is the only durable trace of refused evidence.
+    if (gRateLimitPersistencePending) persistRateLimitedLocked();
     retrySensitiveErasePersistenceLocked();
     if (gAnchorsLoadPending && !anchorsLoadLocked()) { ioUnlock(); return; }
 
@@ -3005,7 +3167,9 @@ void detLogEraseTick() {
         // the fresh generation is already durable.
         const bool saturationCleared =
             p.putBool("bufsat", false) == sizeof(bool);
-        const bool faultCleared = saturationCleared &&
+        const bool rateLimitCleared = saturationCleared &&
+            p.putBool("bufrl", false) == sizeof(bool);
+        const bool faultCleared = rateLimitCleared &&
             p.putUInt("fault", DET_LOG_FAULT_NONE) == sizeof(uint32_t);
         // Retire the pending generation marker while wipe=true still blocks scans/appends. If the
         // final level write then fails, reboot resumes the already-published loggen rather than
@@ -3017,7 +3181,7 @@ void detLogEraseTick() {
         const bool retired = generationRetired &&
                              p.putBool("wipe", false) == sizeof(bool);
         p.end();
-        if (!saturationCleared || !faultCleared || !cryptoTargetRetired ||
+        if (!saturationCleared || !rateLimitCleared || !faultCleared || !cryptoTargetRetired ||
             !generationRetired || !retired) {
             latchFaultLocked(DET_LOG_FAULT_NVS);
             ioUnlock();
@@ -3032,6 +3196,9 @@ void detLogEraseTick() {
         gSaturated = false;
         gSaturationPersistencePending = false;
         gSatDrops = 0;
+        gRateLimited = false;
+        gRateLimitPersistencePending = false;
+        gRateDrops = 0;
         gFaults = DET_LOG_FAULT_NONE;
         gFaultPersistencePending = false;
     }
@@ -3191,6 +3358,14 @@ void detLogHostResetRuntime() {
     gSaturated = false;
     gSaturationPersistencePending = false;
     gSatDrops = 0;
+    gRateTokens = DET_LOG_RATE_BURST;
+    gRateLastMs = 0;
+    gRateClockStarted = false;
+    gRateLimited = false;
+    gRateLimitPersistencePending = false;
+    gRateDrops = 0;
+    gRateFreshClosedUntil = 0;
+    gRatePersistentClosedUntil = 0;
     gFaults = DET_LOG_FAULT_NONE;
     gFaultPersistencePending = false;
     memset(gKey, 0, sizeof(gKey));

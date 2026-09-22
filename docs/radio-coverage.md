@@ -185,4 +185,10 @@ radio belongs in the product, in a companion, or stays a bench tool.
 
 the single-radio settings and scan loop are in `acabScannerBegin` and `bleScanTask` in [acab_scanner.cpp](../firmware/lib/acab_core/acab_scanner.cpp). the dual-radio selection is defined by `ACAB_DUAL_RADIO` in [platformio.ini](../firmware/platformio.ini) and `setup` in [main.cpp](../firmware/src/beacon-board/main.cpp).
 
+## offline log admission
+
+hearing a device is not the same as keeping it. while the phone is away, the offline log stores matched devices at a limited rate: a burst of 256, then one every 10 seconds, with the last 32 of those kept for devices heard for at least 10 seconds. this stops a nearby transmitter that invents fake camera or drone identities from overwriting the log in minutes; a full overwrite now takes about 67.6 hours. the densest real scenes captured so far sit well inside the limit (at most 34 new matched devices in any 10 minutes, on a residential drive with network cameras on). if the limit ever turns a detection away, the board keeps a flag that survives reboots, and the app shows `DETECTION FLOOD REFUSED` until the buffer is cleared.
+
+the numbers and their evidence are in `DET_LOG_RATE_*` in [det_log.h](../firmware/lib/acab_core/det_log.h).
+
 return to [how much does it actually hear?](../README.md#how-much-does-it-actually-hear).

@@ -12,7 +12,9 @@
 #include <cstddef>
 #include <cstdio>
 #include <cstring>
+#include <cstdlib>
 #include <mutex>
+#include <string>
 #include <thread>
 #include <vector>
 
@@ -120,6 +122,15 @@ static bool savedKeyExists(const char* key) {
     const bool exists = p.isKey(key);
     p.end();
     return exists;
+}
+
+static void seedBool(const char* key, bool value) {
+    Preferences p;
+    if (!p.begin("acab-buf", false) || p.putBool(key, value) != sizeof(bool)) {
+        std::printf("  seedBool: failed to seed %s\n", key);
+        failures++;
+    }
+    p.end();
 }
 
 static std::vector<uint8_t> savedBlob(const char* key) {
@@ -1890,6 +1901,177 @@ int main() {
     detLogSetBufferAll(true);          // contradictory {buffer:false,bufall:true} field ordering
     check("disabled config cannot persist a contradictory Stationary-capture posture",
           !detLogEnabled() && !detLogBufferAll() && !savedBool("bufall"));
+
+    // ---- signature-row FLOOD LIMIT (DET_LOG_RATE_* in det_log.h) ----
+    // A 1024-slot ring so the bucket, not ring capacity, is what these cases hit.
+    {
+        // One-shot identity: seen once, the shape a flooder mints. Persistent: a device that has
+        // kept transmitting for 20 s. Both are built from the scanner's own fields.
+        auto oneShot = [](uint32_t n, AcabDeviceType type = ACAB_FLOCK_CAMERA) {
+            AcabDetection d = detection(n, type);
+            d.count = 1;
+            d.firstSeen = d.lastSeen = millis();
+            return d;
+        };
+        auto persistentRow = [](uint32_t n) {
+            AcabDetection d = detection(n, ACAB_FLOCK_CAMERA);
+            d.count = 40;
+            d.lastSeen = millis();
+            d.firstSeen = d.lastSeen - (DET_LOG_RATE_PERSIST_MS + 10000);
+            return d;
+        };
+        const uint32_t freshBudget = DET_LOG_RATE_BURST - DET_LOG_RATE_RESERVE;
+
+        fresh(64 * 1024);
+        uint32_t stored = 0;
+        for (uint32_t n = 1; n <= freshBudget; n++)
+            if (detLogAppend(oneShot(n)) == DET_LOG_APPEND_STORED) stored++;
+        check("flood: the burst admits every one-shot row down to the reserve",
+              stored == freshBudget && detLogCount() == freshBudget && !detLogRateLimited() &&
+              detLogRateDrops() == 0 && !savedBool("bufrl"));
+        const DetLogRateGate openBefore = detLogRateGate(millis());
+        check("flood: the ingest gate is open before any refusal",
+              openBefore.freshOpen && openBefore.persistentOpen);
+        const uint32_t writesBeforeRefusal = acabHostWriteCalls;
+        const DetLogAppendResult refused = detLogAppend(oneShot(freshBudget + 1));
+        check("flood: the next one-shot row is refused with a claim-releasing result",
+              refused == DET_LOG_APPEND_RATE_LIMITED && detLogAppendReleasesClaim(refused) &&
+              detLogCount() == freshBudget && acabHostWriteCalls == writesBeforeRefusal);
+        check("flood: a refusal is never silent (marker, NVS key, this-boot counter)",
+              detLogRateLimited() && savedBool("bufrl") && detLogRateDrops() == 1);
+        const DetLogRateGate afterFresh = detLogRateGate(millis());
+        check("flood: a fresh refusal shuts the fresh tier only",
+              !afterFresh.freshOpen && afterFresh.persistentOpen);
+        check("flood: NEARBY rows are exempt (their full-ring cap is unchanged)",
+              detLogAppend(detection(9000, ACAB_NEARBY_DEVICE)) == DET_LOG_APPEND_STORED);
+        check("flood: a real device that kept transmitting still gets the reserve",
+              detLogAppend(persistentRow(1)) == DET_LOG_APPEND_STORED);
+        for (uint32_t n = 2; n <= DET_LOG_RATE_RESERVE; n++) detLogAppend(persistentRow(n));
+        check("flood: persistent rows drain the reserve to zero, then are refused",
+              detLogAppend(persistentRow(1000)) == DET_LOG_APPEND_RATE_LIMITED &&
+              detLogRateDrops() == 2);
+        const DetLogRateGate afterPersistent = detLogRateGate(millis());
+        check("flood: an empty bucket shuts both tiers",
+              !afterPersistent.freshOpen && !afterPersistent.persistentOpen);
+
+        // Refill: one token per DET_LOG_RATE_REFILL_MS, reopening the persistent tier first.
+        acabHostSetMillis(millis() + DET_LOG_RATE_REFILL_MS - 1);
+        check("refill: one tick short of a token keeps the persistent tier shut",
+              !detLogRateGate(millis()).persistentOpen &&
+              detLogAppend(persistentRow(1001)) == DET_LOG_APPEND_RATE_LIMITED);
+        acabHostSetMillis(millis() + 1);
+        check("refill: the token lands on time and reopens the persistent tier",
+              detLogRateGate(millis()).persistentOpen &&
+              detLogAppend(persistentRow(1002)) == DET_LOG_APPEND_STORED &&
+              detLogAppend(persistentRow(1003)) == DET_LOG_APPEND_RATE_LIMITED);
+        check("refill: one-shot rows stay shut out until the bucket is over the reserve",
+              !detLogRateGate(millis()).freshOpen &&
+              detLogAppend(oneShot(5000)) == DET_LOG_APPEND_RATE_LIMITED);
+        acabHostSetMillis(millis() + (DET_LOG_RATE_RESERVE + 1) * DET_LOG_RATE_REFILL_MS);
+        check("refill: once over the reserve, one-shot rows are admitted again",
+              detLogRateGate(millis()).freshOpen &&
+              detLogAppend(oneShot(5001)) == DET_LOG_APPEND_STORED &&
+              detLogAppend(oneShot(5002)) == DET_LOG_APPEND_RATE_LIMITED);
+
+        // The worst case the header states: after the burst, a sustained one-shot flood stores
+        // exactly one row per refill interval. Ten minutes of 100 rows/s stores 60 rows.
+        fresh(64 * 1024);
+        for (uint32_t n = 1; n <= DET_LOG_RATE_BURST; n++) detLogAppend(oneShot(n));
+        const uint32_t afterBurst = detLogCount();
+        const uint32_t startMs = millis();
+        uint32_t n = 100000;
+        for (uint32_t t = 10; t <= 600000; t += 10) {   // 100 rows/s for the next 600 s
+            acabHostSetMillis(startMs + t);
+            detLogAppend(oneShot(n++));
+        }
+        char floodNote[120];
+        std::snprintf(floodNote, sizeof(floodNote),
+                      "flood: 60,000 one-shot rows in 10 min store %u (expect 60)",
+                      (unsigned)(detLogCount() - afterBurst));
+        check(floodNote, afterBurst == freshBudget && detLogCount() - afterBurst == 60);
+
+        // Persistence: the marker survives a reboot; the counter and the bucket are per boot.
+        detLogHostResetRuntime();
+        detLogBegin();
+        check("marker: bufrl survives a reboot; the refusal counter restarts",
+              detLogRateLimited() && detLogRateDrops() == 0);
+        check("marker: the bucket starts full after a reboot",
+              detLogAppend(oneShot(1)) == DET_LOG_APPEND_STORED);
+
+        // Reset: clearlog drops it at the wipe arm, in RAM and NVS, and it stays down at retirement.
+        detLogClear();
+        check("marker: clearlog clears bufrl at the wipe arm",
+              !detLogRateLimited() && !savedBool("bufrl") && detLogRateDrops() == 0);
+        for (int i = 0; i < 64 && detLogWipePending(); i++) detLogEraseTick();
+        check("marker: stays clear once the wipe retires", !detLogWipePending() &&
+              !detLogRateLimited() && !savedBool("bufrl"));
+
+        // A clear also refills the bucket: a drained bucket from the last deployment must not
+        // refuse the first rows of a clean log (and raise bufrl on it) at the next disconnect.
+        fresh(64 * 1024);
+        for (uint32_t k = 1; k <= freshBudget + 1; k++) detLogAppend(oneShot(k));
+        detLogClear();
+        for (int i = 0; i < 64 && detLogWipePending(); i++) detLogEraseTick();
+        {
+            bool allStored = detLogRateGate(millis()).freshOpen;
+            for (uint32_t k = 1; k <= freshBudget; k++)
+                allStored = allStored && detLogAppend(oneShot(20000 + k)) == DET_LOG_APPEND_STORED;
+            check("refill: clearlog starts a full bucket (a whole fresh budget stores, no bufrl)",
+                  allStored && !detLogRateLimited());
+        }
+
+        // The wipe arm is one NVS transaction: a refused bufrl=false keeps the clear pending.
+        fresh(64 * 1024);
+        for (uint32_t k = 1; k <= freshBudget + 1; k++) detLogAppend(oneShot(k));
+        Preferences::failNextPutBool("acab-buf", "bufrl");
+        detLogClear();
+        check("marker: a failed bufrl reset holds the wipe arm (no half-cleared generation)",
+              detLogRateLimited() && savedBool("bufrl"));
+        for (int i = 0; i < 64 && (detLogWipePending() || detLogRateLimited()); i++)
+            detLogEraseTick();
+        check("marker: the retried arm clears it and the wipe retires",
+              !detLogWipePending() && !detLogRateLimited() && !savedBool("bufrl"));
+
+        // Retirement writes bufrl=false too (the boot-resumed wipe never ran the arm).
+        fresh(64 * 1024);
+        detLogClear();
+        seedBool("bufrl", true);
+        for (int i = 0; i < 64 && detLogWipePending(); i++) detLogEraseTick();
+        check("marker: wipe retirement clears a durable bufrl",
+              !detLogWipePending() && !savedBool("bufrl"));
+
+        // A failed marker write is retried by the loop tick and never blocks evidence.
+        fresh(64 * 1024);
+        for (uint32_t k = 1; k <= freshBudget; k++) detLogAppend(oneShot(k));
+        Preferences::failNextPutBool("acab-buf", "bufrl");
+        detLogAppend(oneShot(freshBudget + 1));
+        check("marker: a failed NVS write still raises it in RAM and latches the NVS fault",
+              detLogRateLimited() && !savedBool("bufrl") &&
+              (detLogFaults() & DET_LOG_FAULT_NVS) != 0);
+        check("marker: a pending marker write does not block admission",
+              detLogAppend(persistentRow(1)) == DET_LOG_APPEND_STORED);
+        detLogEraseTick();
+        check("marker: the loop tick lands the pending write", savedBool("bufrl"));
+
+        // The burst must cover a disconnect re-arm of a dedup table full of signature entries.
+        std::FILE* sf = std::fopen("../../lib/acab_core/acab_scanner.cpp", "rb");
+        std::string scanner;
+        if (sf) {
+            char buf[8192]; size_t got;
+            while ((got = std::fread(buf, 1, sizeof(buf), sf)) > 0) scanner.append(buf, got);
+            std::fclose(sf);
+        }
+        const size_t dm = scanner.find("#define ACAB_DEDUP_MAX");
+        const long dedupMax = dm == std::string::npos ? -1 :
+            std::strtol(scanner.c_str() + dm + std::strlen("#define ACAB_DEDUP_MAX"), nullptr, 10);
+        check("burst covers a full dedup table re-armed at disconnect (ACAB_DEDUP_MAX)",
+              dedupMax > 0 && (long)DET_LOG_RATE_BURST >= dedupMax);
+        check("scanner consults the ingest gate before claiming, by the shared tier rule",
+              scanner.find("detLogRateGate(now)") != std::string::npos &&
+              scanner.find("detLogRatePersistent(e->count, now - e->firstSeen)") !=
+                  std::string::npos &&
+              scanner.find("? rateGate.persistentOpen : rateGate.freshOpen") != std::string::npos);
+    }
 
     // Optional anchors retry transient exact-size read failures, but a permanently unreadable blob
     // is quarantined after a bound so valid rows replay honestly as approximate rather than hanging

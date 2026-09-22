@@ -714,7 +714,9 @@ SHARED_CONSTANTS = (
         "kind": "string",
         "why": "the file a share sheet hands out is named the same on both phones; the slug"
                " words below are appended to it",
-        "ios": (IOS_BLE_MANAGER, r'appendingPathComponent\("(acab-detections)\\\(slug\)'),
+        # iOS names the prefix once (ExportTempCache.logExportPrefix) so Clear log's sweep and the
+        # writer cannot disagree; the writer interpolates that constant ahead of the slug.
+        "ios": (IOS_BLE_MANAGER, r'static let logExportPrefix = "(acab-detections)"'),
         "android": (AND_LOG_SCREEN, r'File\(dir, "(acab-detections)\$slug'),
     },
     {
@@ -793,7 +795,9 @@ SHARED_CONSTANTS = (
         "kind": "string",
         "why": "the empty search field's hint reads the same on both phones",
         "ios": (IOS_DETECTIONS_VIEW, r'TextField\("((?:[^"\\]|\\.)*)", text: \$searchText\)'),
-        "android": (AND_LOG_SCREEN, r'placeholder = \{[^{}]*?Text\("((?:[^"\\]|\\.)*)"'),
+        # The literal lives in LOG_SEARCH_PLACEHOLDER, which the fit rule measures and the
+        # placeholder slot draws (Text(LOG_SEARCH_PLACEHOLDER, ...)); pin the constant.
+        "android": (AND_LOG_SCREEN, r'internal const val LOG_SEARCH_PLACEHOLDER = "((?:[^"\\]|\\.)*)"'),
     },
     {
         "what": "phone-notification dead-switch warning",

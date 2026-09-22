@@ -435,6 +435,9 @@ static void sinkTask(void*) {
                 // token prevents a late sink result from undoing a newer successful ABA claim.
                 rollbackBufferClaim(it.claim);
             }
+            // RATE_LIMITED also lands in the release above (detLogAppendReleasesClaim); the ingest
+            // gate in handleDetection, closed by that same refusal, is what stops the next advert
+            // from re-enqueueing it before a token is due.
             // CAPACITY_DROP is intentional Stationary-mode censorship: keep the claim consumed or
             // every advert would hammer the full ring and inflate bufdrops indefinitely.
         }
@@ -527,6 +530,9 @@ static void handleDetection(AcabDetection& d, bool isReplay = false) {
     // inside portENTER_CRITICAL, and this is the last place that should acquire the habit of
     // calling into another module with interrupts disabled.
     const bool bufferAll = detLogBufferAll();
+    // det_log's signature-row flood gate, read OFF the lock for the same reason: it is two
+    // volatile loads and a compare, never gIoMutex. See the shouldBuffer term that consumes it.
+    const DetLogRateGate rateGate = detLogRateGate(now);
 
     portENTER_CRITICAL(&gDedupMux);
     DedupEntry* e = dedupFind(d.type, key, bucket, now);
@@ -583,9 +589,23 @@ static void handleDetection(AcabDetection& d, bool isReplay = false) {
     // left is close to the most interesting thing this mode could catch, and it was the single
     // class it structurally could not. The debounce's own comment says it is a BUZZER gate plus
     // a density argument, and this change already decided the density argument inverts here.
+    // FLOOD GATE (last term). det_log refuses signature rows past its token bucket and returns
+    // DET_LOG_APPEND_RATE_LIMITED, which RELEASES this claim so a real device that keeps
+    // transmitting is recorded once a token refills instead of being marked done for the whole
+    // generation. Released claims plus a per-advert path would be a hot loop (a streaming netcam
+    // is hundreds of frames/s), so after a refusal det_log closes the gate for that row's tier
+    // until the bucket is due back over that tier's floor, and a closed gate means DO NOT CLAIM:
+    // loggedGen is left alone and nothing is enqueued, so the device simply tries again on a
+    // later advert. The tier uses
+    // the same detLogRatePersistent rule, on the same entry values, that appendLocked applies to
+    // d.count / d.lastSeen - d.firstSeen, which are copied from this entry just below. NEARBY rows
+    // are not rate-limited and skip the gate.
     bool shouldBuffer = (!debouncing || bufferAll)
                      && (d.type != ACAB_NEARBY_DEVICE || bufferAll)
-                     && (e->loggedGen != gCaptureGen);
+                     && (e->loggedGen != gCaptureGen)
+                     && (d.type == ACAB_NEARBY_DEVICE ||
+                         (detLogRatePersistent(e->count, now - e->firstSeen)
+                              ? rateGate.persistentOpen : rateGate.freshOpen));
     // Claim bookkeeping for the rollback path at the enqueue below. The claim is committed HERE,
     // ~50 lines before the item actually reaches the sink queue, so if that send fails the claim
     // has to be undoable - otherwise the device reads as "already buffered this generation" with
@@ -873,23 +893,41 @@ static const uint32_t VENDOR_LOG_EVERY_MS = 5000;
 // is for. That is decided per advert, not per device: no lookup spans the tables, so a MAC whose
 // adverts route to two groups can hold a row in each (GROUP ROUTING in vendor_capture.h).
 //
-// PCAM gets its own reservation on the same argument. IT IS CURRENTLY UNDERSIZED, AND THE MEASURED
-// COUNT SAYS SO: eight slots were sized from ten PCAM_-NAMED devices, but the row matches the
-// COMPANY ID, and 19 distinct MACs carried 0x087F on the 2026-09-04 drive alone. With no eviction
-// the first eight own the table for the whole boot and the other eleven get no aggregate row -
-// including the -56 dBm best sighting, which arrives ninth. Sizing this to the population the row
-// actually matches is a PENDING DECISION, not an oversight to fix silently; the counts are in
-// docs/captures/vendor-cid-087f-2026-09-04.txt.
+// PCAM gets its own reservation on the same argument, and it is now sized to the population the
+// row ACTUALLY MATCHES rather than to the one its name suggested. The original eight slots were
+// sized from ten PCAM_-NAMED devices, but the row matches the COMPANY ID, which is a much larger
+// family. That undersizing was recorded here as a pending decision and was taken on 2026-09-19.
+//
+// THE MEASURED COUNT, distinct MACs carrying 0x087F per capture, counted across every log that
+// records advert bytes (the five PRODUCT-image logs carry no adv= hex and can never contribute):
+//     drive_to_camarillo_9-7  23        911  21        drive_home_9-4  19
+//     913                     16        los_angeles (2026-09-19)  12   aug-9-drive2  3
+// 32 slots covers every drive in the archive with room to spare; the worst observed is 23. This is
+// capture-build-only storage (the whole block sits under ACAB_CAPTURE_BUILD), so the 24 extra rows
+// cost 672 bytes that never ship in a product image.
+//
+// NO EVICTION IS STILL THE RULE, and widening is not a substitute for it. First-fit with no ageing
+// is what keeps captures comparable across a drive, and it is also why arrival order decides who
+// gets a row: a device heard late is refused however close it passes. On 2026-09-19 that cost the
+// day's strongest 0x087F sighting (-80 dBm, ca:ba:18:bb:d8:0c, refused ninth). Widening buys
+// headroom, not fairness; if the family keeps growing, the next lever is the reservation argument
+// itself, not another literal bump.
+//     counts: docs/captures/vendor-cid-087f-2026-09-04.txt
 //
 // The reservation still earns its place meanwhile: it is what stops a PCAM cluster from eating the
 // Axon rows the drive was made for. Overflow is not silent - vendorFind counts it per table and the
-// ingest path prints a throttled "[vendor] TABLE FULL (pcam, 8 slots) dropped=N - this capture is
-// INCOMPLETE". Read that notice to see WHICH table overflowed: each table keeps its own `full`, but
+// ingest path prints a throttled "[vendor] TABLE FULL (pcam, 32 slots) dropped=N refused=<MAC> - this
+// capture is INCOMPLETE". Read that notice to see WHICH table overflowed: each table keeps its own `full`, but
 // the wifi_diag line carries only vendor_full, their sum across all three tables, and no accessor
-// returns one table's count. THE NOTICE CAN BE ABSENT while vendor_full is non-zero: fullLastLogMs
-// starts at 0, so a refusal inside the first VENDOR_LOG_EVERY_MS of uptime is throttled away, and
-// if that table is never asked again nothing ever names it. Seeding the stamp so the first refusal
-// always prints is a behaviour change, not a comment fix. dropped=N counts refused ADVERTS, not
+// returns one table's count. A TABLE'S FIRST REFUSAL ALWAYS PRINTS: acabVendorShouldLogFull passes
+// full == 1 through the throttle, which closes the hole where fullLastLogMs starting at 0 swallowed
+// any refusal inside the first VENDOR_LOG_EVERY_MS of uptime and left vendor_full non-zero with no
+// notice naming the table. The notice also carries the MAC of the advert that triggered it, so a
+// refused device can be recovered from the log instead of by re-walking the raw capture.
+// dropped=N STILL LAGS: the count keeps rising while the throttle is shut, so the last printed
+// value can sit below the final vendor_full, and refusals arriving just behind a printed one are
+// never named. Read vendor_full for the total and the notice for WHICH table and a SAMPLE of what
+// it refused. dropped=N counts refused ADVERTS, not
 // devices: acabVendorFind bumps it on every call that finds no free slot and remembers no refused
 // MAC, so one unslotted device on a long dwell can account for all of N. Once any table has
 // refused an advert (vendor_full > 0), vendor_macs is only a floor on the rows the capture needed
@@ -912,7 +950,7 @@ struct VendorTable {
 #define VENDOR_SLOTS(arr) (sizeof(arr) / sizeof((arr)[0]))
 static AcabVendorRec gVendorAxRec[12];
 static AcabVendorRec gVendorMoRec[8];
-static AcabVendorRec gVendorPcRec[8];
+static AcabVendorRec gVendorPcRec[32];   // sized to the measured 0x087F population, see above
 static VendorTable gVendorTab[VG_N] = {
     { gVendorAxRec, VENDOR_SLOTS(gVendorAxRec), 0, 0, "axon" },
     { gVendorMoRec, VENDOR_SLOTS(gVendorMoRec), 0, 0, "moto" },
@@ -1163,11 +1201,25 @@ void acabScannerIngestBLE(const uint8_t mac[6], const uint8_t* payload, size_t p
                 // device that could not get a slot was the only device printed on EVERY advert -
                 // the throttle inverted, and the untracked device burying the tracked ones. Throttle
                 // the overflow notice itself, and say plainly that the log is now incomplete.
-                emit = (nowMs - tab->fullLastLogMs >= VENDOR_LOG_EVERY_MS);
+                //
+                // NAME THE REFUSED MAC. `mac` is in scope here and is precisely the address that
+                // got no row, so printing it costs nothing and turns an unrecoverable loss into a
+                // recoverable one: without it, recovering which devices were dropped means
+                // re-walking the raw capture, and on a product image (no raw adverts logged) it
+                // cannot be done at all. This brings the vendor arm level with the Falcon and
+                // watchlist arms below, which already carry their refused MAC in the diag item.
+                // It names ONE address per printed line, not the whole refused set - nothing
+                // stores that (see the no-eviction block in vendor_capture.h).
+                //
+                // The first-refusal term in acabVendorShouldLogFull is what stops a table that
+                // fills inside the first VENDOR_LOG_EVERY_MS from overflowing silently.
+                emit = acabVendorShouldLogFull(tab->full, nowMs, tab->fullLastLogMs,
+                                               VENDOR_LOG_EVERY_MS);
                 if (emit) {
                     tab->fullLastLogMs = nowMs;
-                    Serial.printf("[vendor] TABLE FULL (%s, %u slots) dropped=%lu - this capture is INCOMPLETE\n",
-                                  tab->what, (unsigned)tab->n, (unsigned long)tab->full);
+                    Serial.printf("[vendor] TABLE FULL (%s, %u slots) dropped=%lu refused=%02X:%02X:%02X:%02X:%02X:%02X - this capture is INCOMPLETE\n",
+                                  tab->what, (unsigned)tab->n, (unsigned long)tab->full,
+                                  mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
                 }
                 emit = false;   // the notice above replaces the per-device line
             }

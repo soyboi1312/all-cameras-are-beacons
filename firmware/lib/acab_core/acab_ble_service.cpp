@@ -986,12 +986,13 @@ class CfgCb : public NimBLECharacteristicCallbacks {
         // request can never be mistaken for a settings change.
         if (doc["diag"].is<bool>() && doc["diag"].as<bool>()) acabBleSendDiag();
 
-        // Body-cam detector (Axon 00:25:DF). Accept both the new "bodycam" key and
-        // the legacy "axon" key, so older app builds keep working.
+        // Body-cam detector (Axon OUIs 00:25:DF and D8:1F:65, plus the BWCDEVICE tag; the
+        // table and its per-value provenance live in axon_signatures.h). Accept both the new
+        // "bodycam" key and the legacy "axon" key, so older app builds keep working.
         if (doc["bodycam"].is<bool>() || doc["axon"].is<bool>()) {
             bool on = doc["bodycam"].is<bool>() ? doc["bodycam"].as<bool>()
                                                 : doc["axon"].as<bool>();
-            if (on) axonUseRegistryCandidate();   // load 00:25:DF so it actually fires
+            if (on) axonUseRegistryCandidate();   // load the Axon OUI table so it actually fires
             axonSetEnabled(on);
             // NOTE: deliberately does NOT touch policeSetEnabled. The broad Motorola
             // match is a SUB-toggle ({"motorola"}) underneath this category, so the
@@ -1210,7 +1211,7 @@ class CfgCb : public NimBLECharacteristicCallbacks {
             gSessionKeyReplacementApproved = true;
             clearReplayLog();
             Serial.println("[ACAB] Offline buffer erased");
-            statusDirty = true;   // "buf" -> 0, "wiping" -> true, "bufsat" cleared
+            statusDirty = true;   // "buf" -> 0, "wiping" -> true, "bufsat"/"bufrl" cleared
         }
         if (doc["key"].is<const char*>()) {            // 64 hex chars -> 32-byte at-rest key
             uint8_t k[32] = {};
@@ -2188,6 +2189,11 @@ void acabBleSendDiag() {
                   (unsigned)acabBleNotifyElidedCount(), (unsigned)acabBleNotifyOverCapCount(),
                   (unsigned)gDrainTrimmed.load(), (unsigned)gDrainOverCap.load(),
                   (unsigned)gPeerMtu, (unsigned)notifyCap());
+    // Offline-buffer refusals THIS BOOT, the counters the persisted status flags point at:
+    // bufdrops = full-ring nearby refusals (behind "bufsat"), flood = signature rows refused by
+    // the rate limit (behind "bufrl"). Serial only, so they cost the diag notify no bytes.
+    Serial.printf("[diag] offline buffer refused: bufdrops=%u flood=%u\n",
+                  (unsigned)detLogSatDrops(), (unsigned)detLogRateDrops());
 }
 
 // Rebuild the status JSON and update the characteristic (notify if connected).
@@ -2251,7 +2257,17 @@ void acabBleUpdateStatus() {
     // Latched flash fault bitmask. A nonzero value means the ring stopped accepting writes rather
     // than pretending evidence was stored; only a fully successful physical wipe clears it.
     if (uint32_t faults = detLogFaults()) doc["buferr"] = faults;
-    if (detLogWipePending()) doc["wiping"] = true;   // deferred buffer erase still sweeping; absent = idle
+    // Deferred buffer erase still sweeping; absent = idle.
+    // "bufrl": the board refused signature rows past its flood limit, so some real rows may be
+    // missing (det_log.h, DET_LOG_RATE_*). Persisted, sent only when true, absent = false.
+    // The two are EXCLUSIVE BY THIS else-if, and that is a deliberate status-budget trade, not a
+    // tidy-up: the worst-case document had 3 B spare under STATUS_JSON_MAX and no key fits in 3 B.
+    // test_acab_ble_service.cpp counts the pair as one slot only because it finds this exact
+    // else-if. It loses nothing: a sweep is erasing the very rows bufrl qualifies, and it ends by
+    // clearing the marker (an explicit clear also drops it when the wipe is armed), so while one
+    // runs the only true statement about that log is "clearing".
+    if (detLogWipePending()) doc["wiping"] = true;
+    else if (detLogRateLimited()) doc["bufrl"] = true;
     doc["desert"] = desertIsEnabled();      // Desert mode (report every device in range)
     doc["ign"]    = acabScannerIgnoreCount();  // ignore-list size, for app reconciliation
     doc["wat"]    = acabScannerWatchCount();    // watchlist size, for app reconciliation

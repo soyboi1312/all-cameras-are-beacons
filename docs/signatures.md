@@ -558,10 +558,39 @@ by an EVO or another Autel aircraft.
 
 | Signature | Match on | Value | Public source |
 |---|---|---|---|
-| MAC OUI | exact | `00:25:DF` (Axon Enterprise, ex-TASER; sole IEEE block) | IEEE / maclookup.app |
+| MAC OUI | exact | `00:25:DF` (Axon Enterprise, ex-TASER; their registered IEEE block) | IEEE / maclookup.app |
+| MAC OUI | exact | `D8:1F:65` (Axon; **field-attributed, registry lists holder as Private**) | own field capture, 2026-08-09 + 2026-09-19 |
 | BLE payload | service bytes contain (no space!) | `BWCDEVICE` (Axon) | own field capture, 2026-06; **field-validated 2026-07-19** |
 | BLE name | contains | `BodyWorn Remote` (Utility Inc. BodyWorn) | nite-oui-collection capture, 2025-08 |
 | MAC OUI | exact | `00:09:BC` / `00:16:ED` (Utility Inc.; weak fallback) | IEEE / nite-oui-collection |
+
+**The two Axon OUIs carry different kinds of evidence, and the difference is about who vouches for
+them, not about whether they show up.** Both are well observed: 8 distinct MACs on `00:25:DF`
+(across `aug-9-drive4`, `aug-9-flock-o`, `drive_home_9-4` and `lvt-lot1`, several firing conf 90 on
+the tag) and 9 on `D8:1F:65`. The difference is that the registry names Axon for the first and
+names nobody for the second:
+
+- **Nine distinct MACs, zero non-Axon devices ever seen on the block.** Eight carry the `BWCDEVICE`
+  tag (five at Adams Ave Street Fair, San Diego, 2026-09-19, **all five owner-confirmed by eye**;
+  three in `aug-9-flock-o.log`, 2026-08-09). The ninth, `D8:1F:65:04:A2:57`, carries Axon's own SIG
+  service UUID `0xFE6B` (AD 0x16, ASCII `D01AT522D`) and no `BWCDEVICE` tag, so before this block
+  landed it scored conf 0 "hardware OUI" - a missed detection, and the case the entry exists for.
+- Two independent vendor identifiers on one block clears the "two independent vendor co-signals"
+  rung of the confidence ladder, which is why this is not a bare-OUI add.
+- **The registrant is unknowable from the registry, and that is a finished answer.** Checked
+  2026-09-19: the IEEE CSV row is `MA-L,D81F65,Private,` - a real allocation whose holder withheld
+  their name, one of 107 "Private" rows in 40,180. Do not re-run the lookup. There is no MA-M or
+  MA-S subdivision, so the full 24-bit prefix has one holder and a bare 24-bit entry is correct.
+  The module-maker risk can therefore only ever be closed by more field ground truth: if a non-Axon
+  device appears on this block, it is the Liteon trap and the entry must come out.
+- **What it buys is one device**, `D8:1F:65:04:A2:57`. The other eight already fire at conf 90 on
+  the MAC-independent tag. Do not oversell the entry.
+- `0xD8` looks like a BLE random-static prefix (top two bits set) but its locally-administered bit
+  is clear, so it is a globally-administered block. Nine MACs sharing three bytes across two cities
+  six weeks apart is not something a random-address generator produces.
+
+Both OUIs share one `baseConfidence` (75) because `AxonSignature` has no per-OUI confidence field;
+splitting them would be a struct change, not a table edit.
 
 The Axon payload needle is `BWCDEVICE` with NO space: the on-wire capture is the
 little-endian-reversed `AXJANUSBWCDEVICE`, and the matcher (`axon_signatures.h` via
@@ -682,14 +711,23 @@ lowest groups differ (an Axon identifier in one, only a Motorola one in the next
 tables, and the MAC holds a row in each of them that
 still had a free slot when it first reached that table, so the `vendor_macs` figure, summed over
 the three tables, counts rows rather than distinct devices. The tables hold 12 (Axon), 8 (Motorola
-Solutions), and 8 (PCAM) distinct MACs,
+Solutions), and 32 (PCAM) distinct MACs,
 with no eviction and no ageing, so the first arrivals own a table for the whole boot and a group
 that sees more distinct MACs than it has slots loses the aggregate row for every device after the
-last one that fitted. Those adverts are still counted, and the overflow prints as an explicit
-`TABLE FULL (<group>, <n> slots) dropped=<n> - this capture is INCOMPLETE` notice.
+last one that fitted. The PCAM table was widened from 8 to 32 on 2026-09-19: the row matches the
+company ID rather than the `PCAM_` name it was sized from, and the measured population runs 12 to
+23 distinct MACs per capture (worst: 23 on `drive_to_camarillo_9-7`). This is capture-build-only
+storage, so the extra rows never ship in a product image. Widening buys headroom, not fairness -
+arrival order still decides who gets a row, which on 2026-09-19 refused the day's strongest 0x087F
+sighting at -80 dBm.
+Those adverts are still counted, and the overflow prints as an explicit
+`TABLE FULL (<group>, <n> slots) dropped=<n> refused=<mac> - this capture is INCOMPLETE` notice.
+A table's FIRST refusal always prints, so an early overflow can no longer pass silently, and the
+`refused=` address lets one turned-away device be recovered straight from the log.
 Read `dropped=<n>` as REFUSED ADVERTS, not devices: it is bumped on every call that finds no free
-slot, and no refused MAC is remembered, so one unslotted device on a long dwell can account for
-the whole figure. While `vendor_full` is 0 no table has refused a MAC, so `vendor_macs` is never
+slot, and only the MAC that triggered each printed notice is named, so one unslotted device on a
+long dwell can account for the whole figure. The count also lags the throttle, which makes
+`vendor_full` the authoritative total and the notice a per-table signal plus a sample. While `vendor_full` is 0 no table has refused a MAC, so `vendor_macs` is never
 below the distinct-MAC count; once `vendor_full` is above 0, `vendor_macs` is only a floor on the
 rows the capture needed and bounds the distinct-MAC count in neither direction, and no counter
 records how many MACs got no row at all.

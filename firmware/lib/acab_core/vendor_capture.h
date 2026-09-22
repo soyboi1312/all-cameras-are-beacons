@@ -299,9 +299,11 @@ inline uint8_t acabVendorSlotGroup(uint8_t groupMask) {
 // the aggregate row for every device after the Nth. The per-advert group counter still counts
 // them, the raw [ble] line still records them under ACAB_DIAG, and the table's `full` count
 // records that it happened. READ `full` AS REFUSED ADVERTS, NOT DEVICES: it increments on every
-// call that finds no free slot, and nothing remembers which MACs were refused, so one unslotted
+// call that finds no free slot, and THIS FUNCTION remembers no refused MAC, so one unslotted
 // device heard thirty times adds thirty. The scanner prints it as `dropped=N` on its TABLE FULL
-// notice. A non-zero value says THIS table's rows are only a floor on the distinct MACs that
+// notice, and names the MAC of the advert that TRIGGERED that notice - one refused address per
+// printed line, never the whole refused set, because nothing here stores one. A non-zero value
+// says THIS table's rows are only a floor on the distinct MACs that
 // reached it, and that the row total summed over the tables bounds the distinct-MAC count in
 // neither direction: a refused MAC holds no row anywhere, and a MAC whose adverts have different
 // lowest groups holds one in every table that had a slot for it. Nothing records how many MACs
@@ -363,6 +365,30 @@ inline bool acabVendorShouldEmit(uint32_t n, uint8_t hitsBefore, uint8_t hitsAft
     return n == 1                                  // first sighting of this MAC in this table
         || hitsAfter != hitsBefore                 // the row learned an identifier: render it
         || (nowMs - lastLogMs) >= everyMs;         // otherwise the noise throttle
+}
+
+// ---------------------------------------------------------------------------------------------
+// WHEN THE TABLE-FULL NOTICE PRINTS
+//
+// Same shape as the rule above, and for the same reason: the FIRST event always renders, the rest
+// are throttled. `full` is the table's running count of refused adverts and the caller bumps it
+// before asking, so full == 1 is the table's very first refusal.
+//
+// THE FIRST TERM FIXES A REAL HOLE. With a plain time throttle the stamp starts at 0, so
+// `nowMs - 0 >= everyMs` is FALSE for the whole first everyMs of uptime and a refusal inside that
+// window was swallowed. If the table was never asked again, nothing in the log ever named it and
+// vendor_full sat non-zero with no notice anywhere - the reader could see that SOMETHING
+// overflowed but not which table. A capture that fills a table in its first seconds is exactly the
+// dense environment where the notice matters most, so that was the wrong case to lose.
+//
+// It does NOT make dropped=N a complete tally. The count keeps rising while the throttle is shut,
+// so the LAST printed notice lags the final `full`, and refusals arriving a fraction of a second
+// behind a printed one are never named. The authoritative total is vendor_full on the wifi_diag
+// line; read the notice for WHICH table and for a sample of WHAT was refused, not for how many.
+inline bool acabVendorShouldLogFull(uint32_t full, uint32_t nowMs, uint32_t lastLogMs,
+                                    uint32_t everyMs) {
+    return full == 1                               // this table's first refusal: always name it
+        || (nowMs - lastLogMs) >= everyMs;         // otherwise the same unsigned-safe throttle
 }
 
 #endif // ACAB_VENDOR_CAPTURE_H
