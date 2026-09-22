@@ -633,7 +633,7 @@ internal fun alertRestoreIsOffered(demoMode: Boolean, pending: AlertMode?): Bool
 
 /** Latest published beacon-board firmware; last-resort offline fallback for an unrecognized
  *  board label (known boards read their per-board version from the manifest). Bump on release. */
-private const val LATEST = "2.0.8"
+private const val LATEST = "2.0.9"
 
 /** Which config drawer section is open. Exactly one at a time (proposal 1g). */
 private enum class ConfigSection { NONE, FIRMWARE, RADIOS, DETECTORS, ALERTS, NOTIFY, DISPLAY, DRIVE, DESERT, LED }

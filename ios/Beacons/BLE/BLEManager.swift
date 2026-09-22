@@ -6368,7 +6368,7 @@ final class BLEManager: NSObject, ObservableObject {
         // dimmed - the demo forces motorolaSupported precisely to introduce that control, and a
         // dimmed sub-toggle under an off parent defeats the tour. Matches the Android seed.
         demoStatusPayload = [
-            "fw": "beacon board 2.0.8", "up": 4920, "total": 6, "ble": true, "wifi": true,
+            "fw": "beacon board 2.0.9", "up": 4920, "total": 6, "ble": true, "wifi": true,
             "axon": true, "tracker": true, "glasses": true, "ncam": true,
             "buzzer": true, "vol": 70, "gps": true, "bat": 82,
         ]
