@@ -43,7 +43,7 @@ settings:
     # clobbered by the next `xcodegen generate` AND it only touches the app target, leaving
     # BeaconsWidget behind -> "extension version must match parent app". Both targets read
     # $(CURRENT_PROJECT_VERSION), so setting it HERE and regenerating keeps them in lockstep.
-    CURRENT_PROJECT_VERSION: "0"   # 2.0.9 build 0, set 2026-09-18. No 2.0.9 build has uploaded yet;
+    CURRENT_PROJECT_VERSION: "1"   # 2.0.9 build 1, set 2026-09-21. No 2.0.9 build has uploaded yet;
                                    # the last 2.0.8 upload was build 3.
     SWIFT_VERSION: "5.0"
     CODE_SIGN_STYLE: Automatic
