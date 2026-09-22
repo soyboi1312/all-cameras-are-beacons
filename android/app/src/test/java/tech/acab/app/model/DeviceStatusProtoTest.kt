@@ -64,6 +64,7 @@ class DeviceStatusProtoTest {
     fun `buffer health fields default off on every fresh status`() {
         val s = status("""{"fw":"x","buf":9,"bufon":true}""")
         assertFalse(s.bufferSaturated)
+        assertFalse("absent bufrl must decode false on every fresh frame", s.bufferRateLimited)
         assertEquals(0L, s.bufferFaults)
         assertFalse(s.bufferKeyMismatch)
         assertEquals(emptyList<BufferHealthNotice>(), s.bufferHealthNotices)
@@ -109,6 +110,38 @@ class DeviceStatusProtoTest {
         val s = status("""{"fw":"x","buferr":2147483648}""")
         assertEquals(0x8000_0000L, s.bufferFaults)
         assertEquals(listOf(BufferHealthNotice.STORAGE_FAILED), s.bufferHealthNotices)
+    }
+
+    // The flood marker. Twin: iOS testFloodRefusalBecomesAUserVisibleWarning in
+    // DeviceStatusProtoTests.swift, which pins the SAME literals; the two apps must render identically.
+    @Test
+    fun `flood refusal becomes a user-visible warning`() {
+        val s = status("""{"fw":"x","buf":9,"bufrl":true}""")
+        assertTrue(s.bufferRateLimited)
+        assertEquals(listOf(BufferHealthNotice.FLOOD_REFUSED), s.bufferHealthNotices)
+        assertEquals("DETECTION FLOOD REFUSED", s.bufferHealthNotices.single().title)
+        assertEquals(
+            "the board refused a burst of detections that looked like a flood, so some real rows may be missing from the offline log. export what synced, then clear the board buffer to reset this warning.",
+            s.bufferHealthNotices.single().detail,
+        )
+        assertFalse(s.bufferHealthNotices.single().critical)
+        // An explicit false is the same as absent.
+        assertFalse(status("""{"fw":"x","bufrl":false}""").bufferRateLimited)
+    }
+
+    @Test
+    fun `flood refusal orders after storage failure and before capacity`() {
+        val s = status("""{"fw":"x","bufsat":true,"bufrl":true,"buferr":100,"keymis":true}""")
+        assertEquals(
+            listOf(
+                BufferHealthNotice.KEY_NOT_ACCEPTED,
+                BufferHealthNotice.STORAGE_FAILED,
+                BufferHealthNotice.FLOOD_REFUSED,
+                BufferHealthNotice.CAPACITY_REACHED,
+                BufferHealthNotice.PERSISTENCE_ERROR_RECORDED,
+            ),
+            s.bufferHealthNotices,
+        )
     }
 
     @Test

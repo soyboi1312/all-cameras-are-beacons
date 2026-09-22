@@ -79,6 +79,11 @@ struct DeviceStatus: Equatable {
     /// Stationary/record-all capture reached the raw-ring capacity. Sent only while true and
     /// retained until a successful clear; absence on each fresh frame therefore means false.
     let bufferSaturated: Bool
+    /// The board's signature-row flood limit refused at least one row ("bufrl"), so some real
+    /// detections may be missing from the offline log. Persisted by the board until a successful
+    /// clear and sent only while true, so absence on each fresh frame means false, exactly like
+    /// `bufsat`. Twin: Android DeviceStatus.bufferRateLimited (Models.kt).
+    let bufferRateLimited: Bool
     /// Latched offline-buffer fault mask ("buferr"). Bits 0x01...0x10 are raw-ring failures,
     /// 0x20 is an offline-buffer metadata load/save failure (generation, anchors, privacy lifecycle,
     /// and diagnostic state), and 0x40 is a cryptography failure. Firmware retries eligible work,
@@ -137,6 +142,7 @@ extension DeviceStatus: Decodable {
         case vol         // firmware sends "vol"; we call it `volume`
         case ledon       // onboard LED master; the board omits it when on, so absent = on
         case buf, bufon, bufsat, buferr, keymis  // offline buffer state, faults and key mismatch
+        case bufrl       // flood limit refused a row; the board emits it only while true
         case desert      // Desert mode (report every device)
         case ign         // board ignore-list count
         case wat         // board watch-list count
@@ -176,6 +182,7 @@ extension DeviceStatus: Decodable {
         bufCount    = (try? k.decode(Int.self, forKey: .buf)) ?? 0
         bufferingOn = (try? k.decode(Bool.self, forKey: .bufon)) ?? false
         bufferSaturated = (try? k.decode(Bool.self, forKey: .bufsat)) ?? false
+        bufferRateLimited = (try? k.decode(Bool.self, forKey: .bufrl)) ?? false
         bufferFaults = max(0, (try? k.decode(Int.self, forKey: .buferr)) ?? 0)
         bufferKeyMismatch = (try? k.decode(Bool.self, forKey: .keymis)) ?? false
         desertMode  = (try? k.decode(Bool.self, forKey: .desert)) ?? false
@@ -198,6 +205,7 @@ extension DeviceStatus: Decodable {
 enum BufferHealthNotice: Hashable {
     case keyNotAccepted
     case storageFailed
+    case floodRefused
     case capacityReached
     case persistenceErrorRecorded
 
@@ -205,6 +213,9 @@ enum BufferHealthNotice: Hashable {
         switch self {
         case .keyNotAccepted: return "BUFFER KEY NOT ACCEPTED"
         case .storageFailed: return "OFFLINE LOG INCOMPLETE"
+        // Twin: Android BufferHealthNotice.FLOOD_REFUSED (Models.kt). Title and detail must stay
+        // byte-identical; both suites pin the full literals.
+        case .floodRefused: return "DETECTION FLOOD REFUSED"
         case .capacityReached: return "CAPTURE REACHED CAPACITY"
         case .persistenceErrorRecorded: return "BUFFER METADATA ERROR RECORDED"
         }
@@ -216,6 +227,8 @@ enum BufferHealthNotice: Hashable {
             return "This phone’s buffer key was not accepted. Existing history was preserved and was not replayed. Sync with the originating phone, or explicitly clear the board buffer to transfer."
         case .storageFailed:
             return "Offline logging encountered a storage or encryption failure. Some offline detections may be missing or unavailable. Clear the offline buffer after reviewing or exporting it to reset this warning."
+        case .floodRefused:
+            return "the board refused a burst of detections that looked like a flood, so some real rows may be missing from the offline log. export what synced, then clear the board buffer to reset this warning."
         case .capacityReached:
             return "Stationary capture filled the board. Later nearby detections may be missing. Export what synced, then clear the board buffer before another deployment."
         case .persistenceErrorRecorded:
@@ -233,6 +246,8 @@ extension DeviceStatus {
         var result: [BufferHealthNotice] = []
         if bufferKeyMismatch { result.append(.keyNotAccepted) }
         if bufferFaults & ~0x20 != 0 { result.append(.storageFailed) }
+        // Ahead of capacity: a flood can cost signature rows, capacity only costs nearby ones.
+        if bufferRateLimited { result.append(.floodRefused) }
         if bufferSaturated { result.append(.capacityReached) }
         if bufferFaults & 0x20 != 0 { result.append(.persistenceErrorRecorded) }
         return result

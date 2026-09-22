@@ -69,20 +69,30 @@ struct DetectionRow: View {
 
     /// At accessibility sizes, fixed one-line metadata would either vanish or squeeze the title
     /// to a few characters. Give every fact its own vertical room and keep signal at the trailing
-    /// edge of the final row.
+    /// edge of the final row. The name leaves the glyph row too: beside the 40pt glyph and the
+    /// chevron it broke mid-word at the largest size on a 390pt phone ("FlockSafet" / "y").
+    /// DashboardView nearestCard stacks the same way; keep the two in step.
+    /// TWIN: Android StackedDetectionRow in LogScreen.kt, which DetectionRow draws from its own
+    /// measured font scale (DETECTION_ROW_STACK_FONT_SCALE). Chip order follows each platform's
+    /// compact row, so MUTED comes after OFFLINE here and before EXP there.
     private var accessibilityLayout: some View {
         VStack(alignment: .leading, spacing: 10) {
-            HStack(alignment: .top, spacing: 12) {
+            HStack(spacing: 12) {
                 CatGlyph(type: d.type, size: 40, filled: true)
-                Text(d.displayName)
-                    .font(ACABTheme.display(15, weight: .semibold))
-                    .foregroundStyle(ACABTheme.text)
-                    .fixedSize(horizontal: false, vertical: true)
-                Spacer(minLength: 4)
+                Spacer(minLength: 0)
+                // Hidden: up here it would be spoken before the name.
                 Image(systemName: "chevron.right")
                     .font(.system(size: 11, weight: .semibold)).foregroundStyle(ACABTheme.faint)
                     .accessibilityHidden(true)
             }
+
+            // No lineLimit or scale factor: a cap would cut a long name short. At full row width
+            // a name of words wraps between them; a single token wider than the row (a drone's
+            // Remote ID serial) still has to wrap inside itself.
+            Text(d.displayName)
+                .font(ACABTheme.display(15, weight: .semibold))
+                .foregroundStyle(ACABTheme.text)
+                .fixedSize(horizontal: false, vertical: true)
 
             VStack(alignment: .leading, spacing: 7) {
                 Text("NODE \(d.nodeName)")

@@ -112,7 +112,11 @@ struct ConnectView: View {
             }
             if old == .scanning, new != .scanning {
                 let ranFull = scanStartedAt.map { Date().timeIntervalSince($0) >= 40 } ?? false
-                scanCameUpEmpty = ranFull && ble.discovered.isEmpty
+                // pickerEntries, not discovered: the remembered row stays on screen with no
+                // advertisement (the later firmware drops the service UUID from its advert once
+                // bonded and outside its pair window, so the filtered scan never sees it), so
+                // "no beacons found" above "your beacon" would contradict the row the user can tap.
+                scanCameUpEmpty = ranFull && ble.pickerEntries.isEmpty
                 scanStartedAt = nil
                 if scanCameUpEmpty {
                     postAccessibilityAnnouncement(
@@ -308,7 +312,9 @@ struct ConnectView: View {
     /// Pre-permission rationale + the primary scan CTA, then the discovered boards. Bluetooth is
     /// requested by the scan CTA; optional Location is requested later from the feature that needs it.
     private var scanPanel: some View {
-        VStack(spacing: 14) {
+        // Computed once per render: a pure merge of two cached BLEManager properties.
+        let entries = ble.pickerEntries
+        return VStack(spacing: 14) {
             if let hint = ble.connectHint,
                hint != handledConnectHint,
                ble.connectionState != .scanning {
@@ -316,7 +322,7 @@ struct ConnectView: View {
             }
             // The 45s scan window closed with nothing found: name the outcome and the fix.
             // Sits above the CTA so it is the first thing read after the timeout.
-            if scanCameUpEmpty, ble.discovered.isEmpty { noBoardsPanel }
+            if scanCameUpEmpty, entries.isEmpty { noBoardsPanel }
             if btGranted {
                 scanCTA
                 pairWindowNote
@@ -345,15 +351,16 @@ struct ConnectView: View {
                 securePairingNote
             }
 
-            // one tappable row per board we've found
-            ForEach(ble.discovered) { dev in
+            // One tappable row per board: the remembered board first (even with no advertisement),
+            // then every scanned board. The merge folds a scanned sighting of the remembered board
+            // into its row, so one board is never two rows.
+            ForEach(entries) { entry in
                 Button {
                     handledConnectHint = nil
-                    ble.connect(dev)
-                } label: { boardRow(dev) }
+                    ble.connect(pickerEntryID: entry.id)
+                } label: { boardRow(entry) }
                     .buttonStyle(.plain)
-                    .accessibilityLabel("\(dev.name), \(beaconSignalDescription(rssi: dev.rssi)) signal, connects securely"
-                        + (dev.firmware.map { ", firmware \($0)" } ?? ""))
+                    .accessibilityLabel(boardRowAccessibilityLabel(entry))
                     .accessibilityHint("activate to connect. iOS may show a pairing request")
             }
         }
@@ -420,8 +427,7 @@ struct ConnectView: View {
             Image(systemName: symbol)
                 .font(.system(size: 15)).foregroundStyle(ACABTheme.accent)
                 .frame(width: 20)
-            (Text(lead).font(ACABTheme.mono(11.5, weight: .bold)).foregroundStyle(ACABTheme.text)
-                + Text(" \(rest)").font(ACABTheme.mono(11.5)).foregroundStyle(ACABTheme.dim))
+            Text("\(Text(lead).font(ACABTheme.mono(11.5, weight: .bold)).foregroundStyle(ACABTheme.text))\(Text(" \(rest)").font(ACABTheme.mono(11.5)).foregroundStyle(ACABTheme.dim))")
                 .fixedSize(horizontal: false, vertical: true)
             Spacer(minLength: 0)
         }
@@ -538,29 +544,52 @@ struct ConnectView: View {
         .padding(.top, 10)
     }
 
-    private func boardRow(_ dev: DiscoveredDevice) -> some View {
+    private func boardRow(_ entry: BoardPickerEntry) -> some View {
         HStack(spacing: 12) {
             Image(systemName: "cpu").foregroundStyle(ACABTheme.accent)
             VStack(alignment: .leading, spacing: 2) {
                 HStack(spacing: 6) {
-                    Text(dev.name).font(ACABTheme.mono(14, weight: .semibold))
-                    if let fw = dev.firmware {
+                    Text(entry.isRemembered ? RememberedBoardCopy.label : entry.name)
+                        .font(ACABTheme.mono(14, weight: .semibold))
+                    if let fw = entry.firmware {
                         Text("v\(fw)").font(ACABTheme.mono(9, weight: .bold))
                             .foregroundStyle(ACABTheme.accentText)
                             .padding(.horizontal, 5).padding(.vertical, 1)
                             .background(ACABTheme.accent.opacity(0.15), in: Capsule())
                     }
                 }
-                Text("tap to pair securely").font(ACABTheme.mono(10))
+                Text(boardRowSubtitle(entry)).font(ACABTheme.mono(10))
                     .foregroundStyle(ACABTheme.dim)
+                    .fixedSize(horizontal: false, vertical: true)
             }
             Spacer()
-            SignalBars(bars: Detection.signalBars(rssi: dev.rssi))
-            Text(beaconSignalDescription(rssi: dev.rssi))
-                .font(ACABTheme.mono(10.5)).foregroundStyle(ACABTheme.dim)
+            if let rssi = entry.rssi {
+                SignalBars(bars: Detection.signalBars(rssi: rssi))
+                Text(beaconSignalDescription(rssi: rssi))
+                    .font(ACABTheme.mono(10.5)).foregroundStyle(ACABTheme.dim)
+            }
         }
         .foregroundStyle(ACABTheme.ink)
         .panel()
+    }
+
+    /// A scanned row keeps its first-pair wording. The remembered row names the board it
+    /// remembers and says whether an advertisement is live; with no advertisement the tap still
+    /// works: the connect is the same 15 s bounded attempt, and CoreBluetooth completes it for a
+    /// bonded board that is on and in range whether or not it is advertising the service UUID.
+    private func boardRowSubtitle(_ entry: BoardPickerEntry) -> String {
+        guard entry.isRemembered else { return "tap to pair securely" }
+        let state = entry.rssi == nil ? RememberedBoardCopy.noSignal : RememberedBoardCopy.seen
+        return entry.name.isEmpty ? state : "\(entry.name) \u{00B7} \(state)"
+    }
+
+    private func boardRowAccessibilityLabel(_ entry: BoardPickerEntry) -> String {
+        let signal = entry.rssi.map { "\(beaconSignalDescription(rssi: $0)) signal" } ?? "no live signal"
+        let lead = entry.isRemembered
+            ? RememberedBoardCopy.label + (entry.name.isEmpty ? "" : ", \(entry.name)")
+            : entry.name
+        return "\(lead), \(signal), connects securely"
+            + (entry.firmware.map { ", firmware \($0)" } ?? "")
     }
 
     private func message(_ title: String, _ body: String, _ symbol: String) -> some View {

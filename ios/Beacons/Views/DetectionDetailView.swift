@@ -1,4 +1,5 @@
 import SwiftUI
+import Combine   // Timer.publish(...).autoconnect(): Xcode 27 warns when the file relies on SwiftUI's re-export
 import MapKit
 import UIKit
 import UniformTypeIdentifiers   // UTType for the localOnly/expiring pasteboard item
@@ -539,9 +540,7 @@ struct DetectionDetailView: View {
             // flatly false, and would have contradicted a row now titled "Hikvision" on the
             // same screen. What stays open is which of that maker's products this is.
             if let m = d.maker {
-                return Text("Matched ")
-                    + Text(m).font(ACABTheme.mono(11, weight: .semibold))
-                    + Text("'s own registered MAC block. That names the maker, not which of their products this is.")
+                return Text("Matched \(Text(m).font(ACABTheme.mono(11, weight: .semibold)))'s own registered MAC block. That names the maker, not which of their products this is.")
             }
             // No maker: the block really does name a chipset vendor, which Flock shares with
             // plenty of consumer gear, so spell out how thin the evidence is.
@@ -549,9 +548,7 @@ struct DetectionDetailView: View {
             let part = isFlock ? "a part Flock shares with routers and home cameras"
                                : "a part shared with routers and home cameras"
             if let vendor = d.ouiVendor {
-                return Text("Only the radio chipset matched: ")
-                    + Text(vendor).font(ACABTheme.mono(11, weight: .semibold))
-                    + Text(", \(part). The name and service IDs didn't match.")
+                return Text("Only the radio chipset matched: \(Text(vendor).font(ACABTheme.mono(11, weight: .semibold))), \(part). The name and service IDs didn't match.")
             }
             return Text("Only the radio chipset matched, \(part). The name and service IDs didn't match.")
         case .name:        return Text("The name this device broadcasts matched a known signature.")
@@ -575,16 +572,16 @@ struct DetectionDetailView: View {
         let name = Text(sig.rawValue).font(ACABTheme.mono(11, weight: .semibold))
         switch sig {
         case .axonPayload:
-            return Text("Matched ") + name + Text(", the tag Axon body cams broadcast about themselves. It rides in the advertisement rather than in the address, so it holds even when the device randomizes its MAC. This is the strongest body cam signature the board carries.")
+            return Text("Matched \(name), the tag Axon body cams broadcast about themselves. It rides in the advertisement rather than in the address, so it holds even when the device randomizes its MAC. This is the strongest body cam signature the board carries.")
         case .axonOUI:
-            return Text("Matched ") + name + Text(" only. The address block is Axon Enterprise's, but the broadcast body cam tag never appeared, so this is Axon-made gear of some kind. They ship other products on the same block.")
+            return Text("Matched \(name) only. The address block is Axon Enterprise's, but the broadcast body cam tag never appeared, so this is Axon-made gear of some kind. They ship other products on the same block.")
         case .utility:
             if d.method == .name {
-                return Text("Matched ") + name + Text(" by broadcast name. The device announced itself as part of Utility's body cam system, which is a deliberate self-identification and a solid match, though a name is easy for anything to copy.")
+                return Text("Matched \(name) by broadcast name. The device announced itself as part of Utility's body cam system, which is a deliberate self-identification and a solid match, though a name is easy for anything to copy.")
             }
-            return Text("Matched ") + name + Text(" by address block only. The block is Utility Inc's, but the broadcast name didn't match and Utility ships other gear on it, so treat this as a maybe.")
+            return Text("Matched \(name) by address block only. The block is Utility Inc's, but the broadcast name didn't match and Utility ships other gear on it, so treat this as a maybe.")
         case .motorola:
-            return Text("Matched ") + name + Text(", a vendor proxy rather than a body cam signature. The block is Motorola Solutions' own, so the maker is right, but they also sell two-way radios, docks, and site infrastructure on it. Read this as their equipment nearby, not a confirmed camera.")
+            return Text("Matched \(name), a vendor proxy rather than a body cam signature. The block is Motorola Solutions' own, so the maker is right, but they also sell two-way radios, docks, and site infrastructure on it. Read this as their equipment nearby, not a confirmed camera.")
         }
     }
 

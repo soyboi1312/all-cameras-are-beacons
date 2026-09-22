@@ -1,12 +1,13 @@
 import SwiftUI
+import Combine   // Timer.publish(...).autoconnect(): Xcode 27 warns when the file relies on SwiftUI's re-export
 
 /// Status / home: the at-a-glance "how much is watching me right now" screen.
 /// Built around the radar scope, fed by live BLE detections.
 struct DashboardView: View {
     @EnvironmentObject var ble: BLEManager
     var onOpenDetectors: () -> Void = {}
-    // Accessibility text sizes reflow the six-across tile strip into a grid and pad the scroll
-    // bottom; read once here so every consumer keys off the same threshold.
+    // Accessibility text sizes pad the scroll bottom. The tile strip measures itself instead
+    // (CategoryStripLayout), so it does not read this.
     @Environment(\.dynamicTypeSize) private var dynamicTypeSize
     // SF Symbols have different intrinsic bounds (the wide tracker radio waves are taller than
     // the glasses, for example), so the icon sits in a fixed frame. Under it every tile has the
@@ -16,7 +17,9 @@ struct DashboardView: View {
     // changes the card's outer height. The value/caption metrics follow the same Dynamic Type
     // curves as the matching ACABTheme fonts below.
     @ScaledMetric(relativeTo: .title) private var categoryValueLineHeight: CGFloat = 22
-    @ScaledMetric(relativeTo: .caption) private var categoryCaptionLineHeight: CGFloat = 10
+    // 13, not 10: the tile label and OFF line are 10pt JetBrains Mono (was 8pt), whose line is
+    // about 13pt. .caption is the curve ACABTheme.mono(10) scales along (scaleAnchor).
+    @ScaledMetric(relativeTo: .caption) private var categoryCaptionLineHeight: CGFloat = 13
 
     // Staleness moves with the clock, not with @Published state, so nothing would invalidate
     // this screen as rows go quiet: without the tick the count freezes at its last-publish
@@ -403,7 +406,7 @@ struct DashboardView: View {
         // accessibility sizes and overlapped each other and the count. The scope's real content
         // (the count) still scales, and RadarScope speaks a full summary for VoiceOver.
         Text(text)
-            .font(Font.custom("JetBrainsMono-Medium", fixedSize: 7.5))
+            .font(ACABTheme.monoFixed(7.5))
             .tracking(1)
             .foregroundStyle(ACABTheme.text.opacity(opacity))
     }
@@ -411,19 +414,16 @@ struct DashboardView: View {
     /// One strip of compact per-category counts, matching the Log tiles and Map chips
     /// (ALPR, DRONE, BODY, TRACKER, GLASSES, plus Network camera). Six compact tiles share the
     /// row width evenly, so Status surfaces the netcam count the same way Log and Map already do.
-    /// At accessibility text sizes six-across leaves each tile ~55pt while its label quadruples,
-    /// so the strip reflows into a 3x2 grid; the default layout is untouched.
-    @ViewBuilder
+    /// The strip reflows into rows of three as soon as the widest label no longer fits a
+    /// six-across tile, and into rows of two after that (CategoryStripLayout measures it), which
+    /// keeps every label whole through the largest accessibility size on a 390pt iPhone.
     private func categoryTiles(_ snapshot: DashboardSnapshot) -> some View {
-        if dynamicTypeSize.isAccessibilitySize {
-            LazyVGrid(columns: Array(repeating: GridItem(.flexible(), spacing: 6), count: 3),
-                      spacing: 6) { tileSet(snapshot) }
-        } else {
-            HStack(spacing: 6) { tileSet(snapshot) }
+        CategoryStripLayout(preferred: DashboardSnapshot.stripTiles.count, spacing: 6) {
+            tileSet(snapshot)
         }
     }
 
-    /// The six tiles themselves, shared by both containers above. Which tiles, in what order,
+    /// The six tiles themselves, laid out by categoryTiles. Which tiles, in what order,
     /// drawn and spoken as what, and counting which types, is the presentation's
     /// (DashboardSnapshot.stripTiles, where the Android twin is named); this only draws them.
     @ViewBuilder
@@ -463,7 +463,7 @@ struct DashboardView: View {
                     .lineLimit(1)
                     .frame(height: categoryValueLineHeight)
                 Text(t.label)
-                    .font(ACABTheme.mono(8, weight: .semibold))
+                    .font(ACABTheme.mono(10, weight: .semibold))
                     .tracking(0.8)
                     .foregroundStyle(off || n == 0 ? ACABTheme.faint : type.textTint)
                     .lineLimit(1)
@@ -473,7 +473,7 @@ struct DashboardView: View {
                 // Dim, not amber: the user switched this detector off, nothing is faulty. The
                 // empty string keeps the slot, so an OFF tile is no taller than its neighbours.
                 Text(off ? "OFF" : "")
-                    .font(ACABTheme.mono(8, weight: .semibold))
+                    .font(ACABTheme.mono(10, weight: .semibold))
                     .foregroundStyle(ACABTheme.dim)
                     .lineLimit(1)
                     .frame(height: categoryCaptionLineHeight)
@@ -505,48 +505,90 @@ struct DashboardView: View {
             NavigationLink {
                 DetectionDetailView(detection: d)
             } label: {
-                HStack(spacing: 12) {
-                    CatGlyph(type: d.type, size: 40, filled: true)
-                    VStack(alignment: .leading, spacing: 3) {
-                        Text(d.displayName)
-                            .font(ACABTheme.display(15, weight: .semibold))
-                            .foregroundStyle(ACABTheme.text)
-                            .lineLimit(2)
-                            .fixedSize(horizontal: false, vertical: true)
-                        // THE FOUR LINES ARE SHARED, line for line, with android StatusScreen.kt
-                        // NearestCard: the name, `inlineCategory · NODE xxxx`, the last-heard age
-                        // on its own dim line, then `source · seen N×` faint. The age stands alone
-                        // so neither line has to wrap beside the glyph and the dBm column.
-                        //
-                        // The inline category, the brand rule everywhere else on Status
-                        // ("body cam", "ALPR"), not the title-case type label. Lowercase except
-                        // where an initialism or proper noun keeps its casing, which is why this
-                        // reads DeviceType.inlineCategory instead of lowercasing `category` here:
-                        // that spelled the ALPR initialism "alpr".
-                        Text("\(d.type.inlineCategory) · NODE \(d.nodeName)")
-                            .font(ACABTheme.mono(10, weight: .medium))
-                            .foregroundStyle(ACABTheme.dim)
-                        Text(dashboardLastHeardLabel(sighting.lastHeard, now: tick, isDemoMode: ble.demoMode))
-                            .font(ACABTheme.mono(10.5)).foregroundStyle(ACABTheme.dim)
-                        Text("\(d.source.label) · seen \(d.count)×")
-                            .font(ACABTheme.mono(10.5)).foregroundStyle(ACABTheme.faint)
+                // At accessibility sizes the dBm column kept its width beside the text and
+                // squeezed the text to about one short word per line, so words broke mid-word
+                // ("FlockS" / "afety"). There the card stacks like the Log's
+                // DetectionRow.accessibilityLayout: a glyph row with only the glyph and the
+                // chevron, the name and the facts at full width, then the signal at the trailing
+                // edge of its own last row. The name stays out of the glyph row on both: beside a
+                // 40pt glyph and the chevron, "FlockSafety" would break at the largest size on a
+                // 390pt phone.
+                //
+                // No Android twin: StatusScreen.kt NearestCard keeps its one row, because at
+                // font scale 2.0 on a 411dp phone every word of it still fits whole.
+                Group {
+                    if dynamicTypeSize.isAccessibilitySize {
+                        VStack(alignment: .leading, spacing: 10) {
+                            HStack(spacing: 12) {
+                                CatGlyph(type: d.type, size: 40, filled: true)
+                                Spacer(minLength: 0)
+                                // Hidden like the Log row's: up here it would be spoken before the name.
+                                nearestChevron.accessibilityHidden(true)
+                            }
+                            nearestText(sighting)
+                            HStack { Spacer(); nearestSignal(d) }
+                        }
+                    } else {
+                        HStack(spacing: 12) {
+                            CatGlyph(type: d.type, size: 40, filled: true)
+                            nearestText(sighting)
+                            Spacer()
+                            nearestSignal(d)
+                            nearestChevron
+                        }
                     }
-                    Spacer()
-                    VStack(alignment: .trailing, spacing: 5) {
-                        Text("\(d.rssi)")
-                            .font(ACABTheme.mono(15, weight: .semibold))
-                            .foregroundStyle(ACABTheme.accentText)
-                        Text("dBm").font(ACABTheme.mono(9)).foregroundStyle(ACABTheme.dim)
-                        SignalBars(bars: d.signalBars, tint: d.type.tint)
-                    }
-                    Image(systemName: "chevron.right")
-                        .font(.system(size: 13, weight: .semibold))
-                        .foregroundStyle(ACABTheme.faint)
                 }
                 .panel(strong: true)
             }
             .buttonStyle(.plain)
         }
+    }
+
+    /// The name and the lines under it, one stack for both nearestCard layouts.
+    private func nearestText(_ sighting: DashboardSighting) -> some View {
+        let d = sighting.detection
+        return VStack(alignment: .leading, spacing: 3) {
+            Text(d.displayName)
+                .font(ACABTheme.display(15, weight: .semibold))
+                .foregroundStyle(ACABTheme.text)
+                // No cap at accessibility sizes: there the name has the full card width, and
+                // two lines of it can still cut a long name short.
+                .lineLimit(dynamicTypeSize.isAccessibilitySize ? nil : 2)
+                .fixedSize(horizontal: false, vertical: true)
+            // THE FOUR LINES ARE SHARED, line for line, with android StatusScreen.kt
+            // NearestCard: the name, `inlineCategory · NODE xxxx`, the last-heard age
+            // on its own dim line, then `source · seen N×` faint. The age stands alone
+            // so neither line has to wrap beside the glyph and the dBm column.
+            //
+            // The inline category, the brand rule everywhere else on Status
+            // ("body cam", "ALPR"), not the title-case type label. Lowercase except
+            // where an initialism or proper noun keeps its casing, which is why this
+            // reads DeviceType.inlineCategory instead of lowercasing `category` here:
+            // that spelled the ALPR initialism "alpr".
+            Text("\(d.type.inlineCategory) · NODE \(d.nodeName)")
+                .font(ACABTheme.mono(10, weight: .medium))
+                .foregroundStyle(ACABTheme.dim)
+            Text(dashboardLastHeardLabel(sighting.lastHeard, now: tick, isDemoMode: ble.demoMode))
+                .font(ACABTheme.mono(10.5)).foregroundStyle(ACABTheme.dim)
+            Text("\(d.source.label) · seen \(d.count)×")
+                .font(ACABTheme.mono(10.5)).foregroundStyle(ACABTheme.faint)
+        }
+    }
+
+    private func nearestSignal(_ d: Detection) -> some View {
+        VStack(alignment: .trailing, spacing: 5) {
+            Text("\(d.rssi)")
+                .font(ACABTheme.mono(15, weight: .semibold))
+                .foregroundStyle(ACABTheme.accentText)
+            Text("dBm").font(ACABTheme.mono(9)).foregroundStyle(ACABTheme.dim)
+            SignalBars(bars: d.signalBars, tint: d.type.tint)
+        }
+    }
+
+    private var nearestChevron: some View {
+        Image(systemName: "chevron.right")
+            .font(.system(size: 13, weight: .semibold))
+            .foregroundStyle(ACABTheme.faint)
     }
 
     // Fake-but-stable bearing hashed from the MAC, we only have RSSI, not a real one.

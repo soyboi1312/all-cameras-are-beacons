@@ -18,8 +18,9 @@ enum OUIVendors {
         "001885": "Motorola Solutions",
         "001f92": "Motorola Solutions",
         "00236c": "Apple",
-        // Axon's sole IEEE block. Named here so the honest per-signature vendor below
-        // never has to guess on an Axon OUI hit.
+        // Axon's IEEE-registered block. Named here so the honest per-signature vendor below
+        // never has to guess on an Axon OUI hit. Real Axon body cams turn up on BOTH this and
+        // d81f65 further down; the registry names Axon for this one and nobody for that one.
         "0025df": "Axon Enterprise",
         "00f48d": "Liteon",
         "040d84": "Silicon Labs",
@@ -74,6 +75,11 @@ enum OUIVendors {
         "cc50e3": "Espressif",
         "d03957": "Liteon",
         "d411d6": "ShotSpotter",
+        // A second block real Axon body cams sit on, attributed from field capture because the
+        // IEEE registry lists its holder only as "Private" and so can never name one. Nine MACs
+        // carrying two independent Axon identifiers, five owner-confirmed 2026-09-19. Twin:
+        // OuiVendors.kt. Provenance in firmware/lib/acab_core/axon_signatures.h (AXON_OUI_BWC_FIELD).
+        "d81f65": "Axon Enterprise",
         "d8a01d": "Espressif",
         "d8f3bc": "Liteon",
         "dc5475": "Espressif",

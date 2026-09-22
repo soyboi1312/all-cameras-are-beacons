@@ -121,7 +121,8 @@ struct DetectionsView: View {
     // Never set at compact width, so the phone-portrait path is untouched.
     @State private var selectedDetail: Detection?
     @Environment(\.horizontalSizeClass) private var hSize
-    // Accessibility text sizes reflow the tile strip into a grid and pad the scroll bottom.
+    // Accessibility text sizes pad the scroll bottom and stack the select bar. The tile strip
+    // measures itself instead (CategoryStripLayout), so it does not read this.
     @Environment(\.dynamicTypeSize) private var dynamicTypeSize
 
     /// Three-way status scope over the feed: everything, only-new (after the seen
@@ -540,7 +541,7 @@ struct DetectionsView: View {
             } message: {
                 Text(ble.demoMode
                      ? "This clears only the sample rows. Your saved detection log stays unchanged."
-                     : "This deletes the log on this phone and can't be undone. If this is evidence, export it first.")
+                     : "This deletes the log on this phone, including the app's copies of earlier exports, and can't be undone. If this is evidence, export it first and save or send it somewhere else. Only a copy outside the app survives.")
             }
     }
 
@@ -570,9 +571,10 @@ struct DetectionsView: View {
     /// Labeled action chips under the title row (replaces the old anonymous
     /// icon buttons). Clear lives in the filter row (statusFilter), always reachable.
     private var actionChips: some View {
-        // Horizontally scrollable because this row is now FOUR chips, and a filtered label
-        // ("EXPORT BODY CAM CSV") is far wider than the unfiltered one. Android's twin got the
-        // same treatment; without it the last chip is clipped with no way to reach it.
+        // Horizontally scrollable so no chip is ever clipped out of reach: the row holds up to
+        // three chips (SELECT, EXPORT, MARK SEEN), and a filtered EXPORT label ("EXPORT BODY CAM")
+        // is far wider than the plain one. It held four until CSV and GPX folded into the one
+        // EXPORT menu. Android's twin (LogScreen action row) scrolls for the same reason.
         ScrollView(.horizontal, showsIndicators: false) {
         HStack(spacing: 8) {
             actionChip("checkmark.circle", "SELECT") { resumeFeed(); selecting = true }   // bulk-mute acts on retained Log rows
@@ -606,6 +608,15 @@ struct DetectionsView: View {
 
     /// Search and sort name the current lens explicitly. Counts describe detections, never the
     /// number of visible lazy rows, and a query is also honored by CSV/GPX exports.
+    ///
+    /// DELIBERATE PLATFORM DIFFERENCE, kept since 2.0.8: here search sits above the category
+    /// tiles and the sort shares the lens-summary row; on Android (LogScreen.kt, the search/sort
+    /// item) both sit below the ALL/NEW/OFFLINE chips and share ONE row whenever the whole
+    /// placeholder still fits beside the wider sort chip. That side-by-side form is not copied
+    /// here on purpose: judged with the wider label ("Strongest signal") so the layout cannot
+    /// jump when the sort changes, placeholder plus sort does not fit an iPhone in portrait at
+    /// the default text size or larger (both faces follow Dynamic Type, so the smallest sizes
+    /// could fit on the largest phones; not worth a layout that changes with text size).
     private func searchAndSort(_ snap: LogSnapshot) -> some View {
         VStack(alignment: .leading, spacing: 8) {
             HStack(spacing: 10) {
@@ -690,26 +701,15 @@ struct DetectionsView: View {
 
     /// A strip of compact category tiles, one per category that has a detection this session;
     /// tapping one toggles it as a filter for the list. Dynamic so the row scales as categories
-    /// grow and a zero-count (useless) filter never takes up space. At accessibility text sizes
-    /// the strip reflows into a 3-wide grid: up to six-across tiles get ~55pt each while the
-    /// labels quadruple, and the row became unreadable. Default layout untouched.
-    @ViewBuilder
+    /// grow and a zero-count (useless) filter never takes up space. The same rule as the Status
+    /// strip (CategoryStripLayout): rows of three as soon as the widest label no longer fits.
+    /// Seven categories prefer four across, so they fill two readable rows instead of leaving a
+    /// mostly empty third row that pushes the Log below the fold.
     private func summaryTiles(_ snap: LogSnapshot) -> some View {
-        if dynamicTypeSize.isAccessibilitySize || shownCategories(snap).count > 6 {
-            // Seven categories fit two readable rows at ordinary sizes; accessibility text
-            // gets wider tiles. Avoid a mostly empty third row pushing the Log below the fold.
-            let columns = dynamicTypeSize.isAccessibilitySize ? 3 : 4
-            LazyVGrid(columns: Array(repeating: GridItem(.flexible(), spacing: 8), count: columns),
-                      spacing: 8) {
-                ForEach(shownCategories(snap)) { c in
-                    tile(c.type, c.key, c.tileLabel, count: snap.counts[c.key] ?? 0)
-                }
-            }
-        } else {
-            HStack(spacing: 8) {
-                ForEach(shownCategories(snap)) { c in
-                    tile(c.type, c.key, c.tileLabel, count: snap.counts[c.key] ?? 0)
-                }
+        let shown = shownCategories(snap)
+        return CategoryStripLayout(preferred: shown.count > 6 ? 4 : shown.count, spacing: 8) {
+            ForEach(shown) { c in
+                tile(c.type, c.key, c.tileLabel, count: snap.counts[c.key] ?? 0)
             }
         }
     }
@@ -733,12 +733,16 @@ struct DetectionsView: View {
                 Image(systemName: type.symbol)
                     .font(.system(size: 14, weight: .medium))
                     .foregroundStyle(n == 0 ? ACABTheme.faint : type.tint)
+                    // The Status tile's icon box. Glyphs differ in height (the glasses are
+                    // short, the webcam tall), and without a fixed box the tiles in a row
+                    // come out uneven and the labels miss a common line.
+                    .frame(width: 22, height: 18)
                 Text("\(n)")
                     .font(ACABTheme.display(18, weight: .bold))
                     .foregroundStyle(n == 0 ? ACABTheme.faint : ACABTheme.text)
                     .monospacedDigit()
                 Text(label)
-                    .font(ACABTheme.mono(8, weight: .semibold))
+                    .font(ACABTheme.mono(10, weight: .semibold))
                     .tracking(0.8)
                     .foregroundStyle(n == 0 ? ACABTheme.faint : type.textTint)
             }

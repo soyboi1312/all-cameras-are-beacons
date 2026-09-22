@@ -281,7 +281,7 @@ final class BufferKeyDurabilityTests: XCTestCase {
         // enqueue call nor the later OTA CCCD callback may dispatch through the post-SYNC pause.
         var queue = ["clear"]
         var postSyncPaused = true
-        var inFlight: String?
+        let inFlight: String? = nil
 
         func nextDispatch() -> String? {
             guard configWriteDispatchAllowed(

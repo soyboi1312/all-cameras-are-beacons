@@ -2369,9 +2369,12 @@ struct DeviceView: View {
     /// they only fire while the app is foregrounded, which is why this string adds the scope
     /// qualifier and the Live Mode pointer. Android's haptic fires in AcabBleManager.alertHaptic
     /// on the detection ingest path, and it does buzz with the screen locked while Live Mode's
-    /// foreground service keeps ingest alive - so the qualifier would be wrong there. The
-    /// alert-modes paragraph in README.md records the difference. Sync the other two strings
-    /// freely; do not converge this one without changing the behaviour first.
+    /// foreground service keeps ingest alive - so the qualifier would be wrong there. Only the
+    /// iOS half is in the user docs: the "choose alerts" section of docs/app-guide.md and the
+    /// q-sounds answer in both faq-content.json copies say iPhone haptics play while the app is
+    /// open. Neither doc says Android's haptic also fires with the screen locked under Live Mode.
+    /// Sync the other two strings freely; do not converge this one without changing the
+    /// behaviour first.
     private var alertModeCaption: String {
         switch ble.alertMode {
         case .buzzer:  return "board beeps when it spots gear"
@@ -2623,17 +2626,19 @@ struct DeviceView: View {
     // "always use higher contrast": OFF follows the iOS Increase Contrast setting, ON forces the
     // higher-contrast palette. Named that way, rather than "higher contrast", so a user whose
     // iOS setting is on understands why turning this off changes nothing. The palette itself
-    // lives in ACABTheme; this card only flips the window trait (ContrastPreference).
+    // lives in ACABTheme; this card only flips the window trait (ContrastPreference). The trait
+    // also reaches type: TypePrefs.highContrast bumps every themed font one cut heavier, which
+    // is iOS-only (Android's platform restyles text itself).
     // Android twin: DisplayCard in DeviceScreen.kt.
     private var displayCard: some View {
         VStack(alignment: .leading, spacing: 14) {
             Kicker("DISPLAY")
             radioToggle("always use higher contrast",
-                        "brighter secondary text and clearer control edges \u{00B7} off follows the system contrast settings",
+                        "brighter secondary text, heavier type and clearer control edges \u{00B7} off follows the system contrast settings",
                         isOn: $contrast.alwaysHigher)
             Text(contrast.systemIncreased
                  ? "iOS increase contrast is on, so higher contrast stays on while this switch is off."
-                 : "text size and bold text follow the iOS settings.")
+                 : "text size follows the iOS settings, and iOS bold text adds weight on top of this.")
                 .font(ACABTheme.mono(10.5)).foregroundStyle(ACABTheme.faint)
                 .fixedSize(horizontal: false, vertical: true)
         }

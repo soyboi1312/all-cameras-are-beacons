@@ -49,7 +49,7 @@ permanent mutes are copied to the board and silence that device's alerts with th
 
 ## choose alerts
 
-**buzzer** uses the board's speaker. **vibrate** mutes its detection sounds and uses category-specific phone haptics; glasses use a double tap and body cams use a repeating pattern. **silent** suppresses those detection alerts. iPhone haptics work while the app is open and defer to Focus when Focus status access is allowed. Android haptics defer to Do Not Disturb.
+**buzzer** uses the board's speaker. **vibrate** mutes its detection sounds and uses category-specific phone haptics; glasses use a double tap and body cams use a repeating pattern. **silent** suppresses those detection alerts. iPhone haptics work while the app is open, including during a Focus. Android haptics defer to Do Not Disturb.
 
 vibrate and silent also suppress the startup jingle. deliberate shutdown and battery-model press-and-hold start cues can still sound; master volume at zero silences those too. lights are controlled separately. tracker-category detections never beep on the board, including when starred. a star adds watched-device alerts only when no built-in signature matches.
 
@@ -68,10 +68,10 @@ add the home-screen widget through your system's widget picker. it shows today's
 
 ## accessibility and your data
 
-key controls and status surfaces include VoiceOver or TalkBack descriptions, and layouts support larger text. the palette follows supported system contrast settings; **Beacon > Display > always use higher contrast** forces higher contrast on.
+key controls and status surfaces include VoiceOver or TalkBack descriptions, and layouts support larger text. the palette follows supported system contrast settings; on iPhone higher contrast also sets type one weight heavier. **Beacon > Display > always use higher contrast** forces higher contrast on.
 
 ALPR map callouts and legends use solid dark backgrounds and bright, wrapping text so the map underneath cannot wash out their contrast. mapped-camera attribution and the distinction from live detections remain visible.
 
-offline buffering is optional and encrypted, but the enabled board stores its key too, so it is not protection against forensic access to a captured board. offline pins may use the phone's last shared fix; they do not track the board's movement. the board also advertises a fixed Bluetooth address, allowing observers to correlate it over time. see the [BLE privacy and buffer details](ble-protocol.md).
+offline buffering is optional and encrypted, but the enabled board stores its key too, so it is not protection against forensic access to a captured board. offline pins may use the phone's last shared fix; they do not track the board's movement. the board also advertises a fixed Bluetooth address, allowing observers to correlate it over time. the board limits how fast it buffers recognized detections (a burst of 256, then about one every 10 seconds), so a flood of fake identities cannot overwrite the buffer in minutes; if that limit turns rows away, the Log and the offline buffer control show **DETECTION FLOOD REFUSED** until the board buffer is erased. clearing the phone's Log does not erase the board buffer; use **ERASE** under the offline buffer control. see the [BLE privacy and buffer details](ble-protocol.md).
 
-exports can include observation, aircraft, and operator locations. review them before sharing. detections are not automatically uploaded; map tiles, firmware updates, and the optional camera dataset require ordinary network requests. see the [privacy policy](../web/privacy.html), [getting-started guide](https://soyboi.tech/getting-started), or [FAQ](https://soyboi.tech/faq) for more help.
+exports can include observation, aircraft, and operator locations. review them before sharing. the app's own copy of each export or improve detection share is temporary: once it is more than an hour old, the app deletes it at the next launch (on Android, also at the next export). clearing the Log deletes all of those copies at once and removes the app's detection notifications; on Android it also deletes the cached map tiles, which the app keeps only in its private internal storage. iPhone maps use Apple Maps, and the app keeps no tile cache of its own. detections are not automatically uploaded; map tiles, firmware updates, and the optional camera dataset require ordinary network requests. see the [privacy policy](../web/privacy.html), [getting-started guide](https://soyboi.tech/getting-started), or [FAQ](https://soyboi.tech/faq) for more help.

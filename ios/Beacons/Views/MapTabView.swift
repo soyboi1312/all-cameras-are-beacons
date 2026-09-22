@@ -1,4 +1,5 @@
 import SwiftUI
+import Combine   // the file-scope Timer.publish(...).autoconnect() relies on SwiftUI's re-export; Xcode 27 warns on the @State form of it elsewhere
 import MapKit
 import os
 

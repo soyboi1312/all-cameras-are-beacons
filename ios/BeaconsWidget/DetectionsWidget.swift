@@ -48,7 +48,6 @@ private enum WidgetTheme {
     static let tracker = Color(red: 0x49 / 255, green: 0xC5 / 255, blue: 0xB1 / 255)
     static let glasses = Color(red: 0xB0 / 255, green: 0x7C / 255, blue: 0xFF / 255)
     static let netcam  = Color(red: 0x3D / 255, green: 0x8B / 255, blue: 0xFF / 255)
-    static let clear   = Color(red: 0x5A / 255, green: 0xD0 / 255, blue: 0x8A / 255)  // "all clear" green
 
     /// Display face for digits: Space Grotesk Bold.
     static func digits(_ size: CGFloat) -> Font { .custom("SpaceGrotesk-Bold", size: size) }
@@ -190,8 +189,9 @@ private struct WidgetHeader: View {
     }
 }
 
-/// The last-detection line (category + "3m ago"), or an honest empty state. Uses a
-/// self-updating relative Text so "ago" stays fresh between the 15-minute reloads.
+/// The last-detection line (category + "3m ago"), or an honest empty state (WidgetEmptyState:
+/// neutral half shield, dim ink, never an all-clear check). Uses a self-updating relative Text so
+/// "ago" stays fresh between the 15-minute reloads.
 private struct LastHitLine: View {
     let entry: DetectionsEntry
     var compact: Bool
@@ -203,9 +203,7 @@ private struct LastHitLine: View {
                 Image(systemName: look.symbol)
                     .font(.system(size: compact ? 10 : 12))
                     .foregroundStyle(look.tint)
-                (Text(entry.lastType + " ")
-                    + Text(at, style: .relative)
-                    + Text(" ago"))
+                Text("\(entry.lastType) \(at, style: .relative) ago")
                     .font(WidgetTheme.mono(compact ? 9.5 : 11))
                     .foregroundStyle(.white.opacity(0.55))
                     .lineLimit(1)
@@ -213,10 +211,10 @@ private struct LastHitLine: View {
             }
         } else {
             HStack(spacing: 5) {
-                Image(systemName: "checkmark.shield.fill")
+                Image(systemName: WidgetEmptyState.symbol)
                     .font(.system(size: compact ? 10 : 12))
-                    .foregroundStyle(WidgetTheme.clear)
-                Text(entry.connected ? "no detections" : "not connected")
+                    .foregroundStyle(.white.opacity(0.45))
+                Text(WidgetEmptyState.text(connected: entry.connected))
                     .font(WidgetTheme.mono(compact ? 9.5 : 11))
                     .foregroundStyle(.white.opacity(0.45))
                 Spacer(minLength: 0)
@@ -337,16 +335,8 @@ struct DetectionsWidget: Widget {
 
     var body: some WidgetConfiguration {
         StaticConfiguration(kind: kind, provider: DetectionsProvider()) { entry in
-            Group {
-                if #available(iOS 17.0, *) {
-                    DetectionsWidgetView(entry: entry)
-                        .containerBackground(Color.black.opacity(0.92), for: .widget)
-                } else {
-                    DetectionsWidgetView(entry: entry)
-                        .padding()
-                        .background(Color.black.opacity(0.92))
-                }
-            }
+            DetectionsWidgetView(entry: entry)
+                .containerBackground(Color.black.opacity(0.92), for: .widget)
         }
         .configurationDisplayName("beacons")
         .description("Today's detections at a glance.")

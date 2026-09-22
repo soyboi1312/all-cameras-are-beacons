@@ -47,6 +47,8 @@ class DetectionNotifier(private val ctx: Context) {
 
     companion object {
         const val CHANNEL_ID = "acab_detections"
+        /** Tag on every detection alert (one id per MAC). [cancelPostedAlerts] cancels by it. */
+        const val NOTIFICATION_TAG = "acab.det"
         private const val PREFS = "acab"
         private const val KEY_PREFIX = "notify_"
 
@@ -197,7 +199,11 @@ class DetectionNotifier(private val ctx: Context) {
         lastAt.set(now)
         pruneCooldowns(now)
 
-        val who = d.displayName.ifBlank { d.type.label }
+        // The name is radio-controlled: any nearby device can broadcast newlines, control
+        // characters or bidi overrides to reshape or spoof the banner, so it is stripped here
+        // (notification text only; the log rows render the raw name). A name that strips to
+        // nothing falls back to the category label.
+        val who = notificationSafeName(d.displayName).ifBlank { d.type.label }
         val body = if (who == d.type.label) "Detected nearby, ${d.confidence}% confidence."
                    else "$who detected, ${d.confidence}% confidence."
 
@@ -228,7 +234,7 @@ class DetectionNotifier(private val ctx: Context) {
         try {
             // Per-MAC id so a repeat REPLACES rather than stacks. Tagged so it cannot collide with
             // the foreground-service notification's own id space.
-            NotificationManagerCompat.from(ctx).notify("acab.det", d.mac.hashCode(), b.build())
+            NotificationManagerCompat.from(ctx).notify(NOTIFICATION_TAG, d.mac.hashCode(), b.build())
         } catch (_: SecurityException) {
             // Permission revoked between the check above and the post. The next enable re-requests.
         }
@@ -239,9 +245,58 @@ class DetectionNotifier(private val ctx: Context) {
         lastByMac.entries.removeAll { now - it.value >= PER_DEVICE_COOLDOWN_MS }
     }
 
+    /**
+     * The real Clear log: cancel this app's posted detection alerts, which otherwise keep device
+     * names in the notification shade after the history is gone. Scoped by [NOTIFICATION_TAG], so
+     * the ongoing AcabLinkService notification (untagged, its own id) and anything else survive.
+     * Binder IPC to the notification service: call it off the main thread. A post racing this
+     * call can survive it; the next alert for that device replaces it by id anyway. Not for a
+     * sample-mode Clear.
+     *
+     * iOS twin: ios/Beacons/BLE/DetectionNotifier.swift removeDetectionNotifications.
+     */
+    fun cancelPostedAlerts() {
+        val nm = ctx.getSystemService(Context.NOTIFICATION_SERVICE) as? NotificationManager ?: return
+        runCatching {
+            nm.activeNotifications
+                .filter { it.tag == NOTIFICATION_TAG }
+                .forEach { nm.cancel(it.tag, it.id) }
+        }
+    }
+
     /** Drop cooldown state so a genuinely new session can alert on the same devices again. */
     fun reset() {
         lastByMac.clear()
         lastAt.set(0L)
     }
+}
+
+/**
+ * [name] with every character that can reshape a notification removed: C0 controls
+ * (U+0000-001F, which includes CR/LF/tab), DEL and C1 controls (U+007F-009F), the line and
+ * paragraph separators (U+2028-2029), and the bidi marks, embeddings, overrides and isolates
+ * (U+061C, U+200E-200F, U+202A-202E, U+2066-2069). Then trimmed. Pure, and used only for the
+ * notification body; the UI rows render the raw name.
+ *
+ * iOS twin: ios/Beacons/BLE/DetectionNotifier.swift notificationSafeName, same character set.
+ * Iterates code points, so an astral character (emoji) is kept whole.
+ */
+internal fun notificationSafeName(name: String): String {
+    val out = StringBuilder(name.length)
+    var i = 0
+    while (i < name.length) {
+        val cp = name.codePointAt(i)
+        if (!isBannerUnsafe(cp)) out.appendCodePoint(cp)
+        i += Character.charCount(cp)
+    }
+    // Kotlin's trim() drops Unicode space separators (Zs), matching Swift's .whitespaces.
+    return out.toString().trim()
+}
+
+private fun isBannerUnsafe(cp: Int): Boolean = when (cp) {
+    in 0x00..0x1F, in 0x7F..0x9F -> true               // C0, DEL, C1
+    0x2028, 0x2029 -> true                              // line / paragraph separator
+    0x061C, 0x200E, 0x200F -> true                      // ALM, LRM, RLM
+    in 0x202A..0x202E, in 0x2066..0x2069 -> true        // embeddings, overrides, isolates
+    else -> false
 }

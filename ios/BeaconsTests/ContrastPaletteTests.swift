@@ -8,6 +8,36 @@ import XCTest
 /// against that same surface (WCAG 2.x relative luminance). Android twin: AcabPaletteTest.
 final class ContrastPaletteTests: XCTestCase {
 
+    // MARK: type weight
+
+    /// Higher contrast has to reach TYPE, not only colour. The palette swap lifts colour alone,
+    /// so before TypePrefs.highContrast existed the switch left every glyph exactly as thin as
+    /// it was, which is what a user reported as "toggling contrast changes nothing". The two
+    /// inputs (iOS Bold Text, higher contrast) each bump one cut and never stack, because that
+    /// is the whole weight vocabulary Space Grotesk and JetBrains Mono ship here.
+    @MainActor
+    func testHigherContrastBumpsTypeWeightLikeBoldTextDoes() {
+        let prefs = TypePrefs.shared
+        let bold = prefs.bold, contrast = prefs.highContrast
+        defer { prefs.bold = bold; prefs.highContrast = contrast }
+
+        prefs.bold = false; prefs.highContrast = false
+        XCTAssertEqual(prefs.effectiveWeight(.regular), .regular, "neither input: unchanged")
+        XCTAssertEqual(prefs.effectiveWeight(.medium), .medium)
+
+        prefs.highContrast = true
+        XCTAssertEqual(prefs.effectiveWeight(.regular), .medium, "contrast alone must bump")
+        XCTAssertEqual(prefs.effectiveWeight(.medium), .semibold)
+        XCTAssertEqual(prefs.effectiveWeight(.semibold), .bold)
+        XCTAssertEqual(prefs.effectiveWeight(.bold), .bold, "already the heaviest cut bundled")
+
+        prefs.bold = true
+        XCTAssertEqual(prefs.effectiveWeight(.regular), .medium, "both inputs still bump one cut")
+
+        prefs.highContrast = false
+        XCTAssertEqual(prefs.effectiveWeight(.regular), .medium, "bold alone is unchanged")
+    }
+
     // MARK: WCAG maths
 
     private func channel(_ c: Double) -> Double {
@@ -174,8 +204,13 @@ final class ContrastPaletteTests: XCTestCase {
     @MainActor
     func testBoldTextStepsEveryWeightUpOneCut() {
         let prefs = TypePrefs.shared
-        let before = prefs.bold
-        defer { prefs.bold = before }
+        let before = prefs.bold, contrastBefore = prefs.highContrast
+        defer { prefs.bold = before; prefs.highContrast = contrastBefore }
+        // Pin BOTH inputs. This singleton seeds itself from the real install (the in-app switch
+        // and the iOS Increase Contrast setting), and a hosted test inherits whatever the host
+        // app's container and the simulator happen to hold, which is exactly how this test
+        // started failing the moment higher contrast became a second weight input.
+        prefs.highContrast = false
         prefs.bold = false
         XCTAssertEqual(prefs.effectiveWeight(.regular), .regular)
         prefs.bold = true

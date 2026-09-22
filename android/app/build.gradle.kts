@@ -33,8 +33,10 @@ android {
         // Device and Detail, orientation changes, the Drive foreground service, and large-screen
         // layout all need eyes on a real 16 device.
         targetSdk = 36
-        versionCode = 28
-        versionName = "2.0.8"
+        // versionCode is INDEPENDENT of versionName and must climb on every Play upload; Play
+        // rejects a re-upload at a used code. 28 shipped as 2.0.8.
+        versionCode = 29
+        versionName = "2.0.9"
     }
 
     signingConfigs {

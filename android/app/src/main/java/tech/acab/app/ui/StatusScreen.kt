@@ -33,6 +33,7 @@ import androidx.compose.material.icons.filled.ChevronRight
 import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.Star
 import androidx.compose.material.icons.filled.WarningAmber
+import androidx.compose.material3.LocalTextStyle
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
@@ -819,14 +820,16 @@ fun StatusScreen(
         // is named); this only draws them. Network Cam rides the same strip as Log and Map so
         // Status shows every category the other tabs do (netcamTone + CameraOutdoor come from the
         // type's own tone()/icon(), like every other tile here). Each tile deep-links to the Log
-        // with that category's filter, so a count is one tap from its rows. Six-across squeezes
-        // to slivers at large font scales, so past 1.5x the strip wraps to two rows of three.
+        // with that category's filter, so a count is one tap from its rows. The strip wraps to
+        // rows of three as soon as the widest label no longer fits a six-across tile, and to rows
+        // of two after that (rememberCategoryTilesPerRow measures it), so labels stay whole at
+        // every Android font scale.
         BoxWithConstraints(Modifier.fillMaxWidth()) {
-            val perRow = if (maxWidth < 360.dp || LocalDensity.current.fontScale >= 1.5f) 3
-                else STATUS_STRIP_TILES.size
-            Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+            val perRow = rememberCategoryTilesPerRow(STATUS_STRIP_TILES.map { it.label }, maxWidth,
+                STATUS_STRIP_TILES.size)
+            Column(verticalArrangement = Arrangement.spacedBy(CategoryTileGap)) {
                 STATUS_STRIP_TILES.chunked(perRow).forEach { rowTiles ->
-                    Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(CategoryTileGap)) {
                         rowTiles.forEach { t ->
                             val n = t.counted.sumOf { count(it) }
                             // null before the first frame: not off, not on, just unknown.
@@ -1349,8 +1352,9 @@ private fun CountTile(
             .semantics(mergeDescendants = true) {
                 contentDescription = presentation.contentDescription
             }
-            .padding(10.dp),
+            .padding(horizontal = CategoryTileSidePadding, vertical = CategoryTileEndPadding),
         verticalArrangement = Arrangement.spacedBy(5.dp),
+        horizontalAlignment = Alignment.CenterHorizontally,
     ) {
         // null: the tile is ONE merged clickable node and the label Text below already names
         // it; a contentDescription here made TalkBack read the category twice per tile.
@@ -1361,13 +1365,12 @@ private fun CountTile(
         Text(presentation.visibleCount, color = if (n == 0) Acab.faint else Acab.text,
             fontSize = 18.sp, fontWeight = FontWeight.Bold)
         Text(label, color = if (off || n == 0) Acab.faint else type.textTone(),
-            fontSize = 8.sp, letterSpacing = 1.sp, fontWeight = FontWeight.Medium,
-            fontFamily = Acab.mono, maxLines = 1)
+            style = LocalTextStyle.current.merge(CategoryTileLabelStyle), maxLines = 1)
         // ONE OFF TREATMENT ON BOTH PHONES: the count stays, and OFF is a dim fourth line under
         // the label (iOS DashboardView.tile draws the same line). Dim, not amber: the user
         // switched this detector off, nothing is faulty. The empty string keeps the line's
         // height, so an OFF tile is no taller than its neighbours.
-        Text(if (off) "OFF" else "", color = Acab.dim, fontSize = 8.sp,
+        Text(if (off) "OFF" else "", color = Acab.dim, fontSize = 10.sp,
             fontWeight = FontWeight.SemiBold, fontFamily = Acab.mono, maxLines = 1)
     }
 }

@@ -299,16 +299,21 @@ final class BeaconPresentationTests: XCTestCase {
         XCTAssertFalse(unlisted.offersBrowserFlasher)
     }
 
-    func testIdleFirmwareStatusScopesLatestClaimToCurrentCatalog() {
+    /// The healthy row is one short sentence: the card prints "v2.0.8 INSTALLED" and
+    /// "v2.0.8 LATEST KNOWN" directly above it, so repeating either the version or the catalog
+    /// caveat there is noise. The caveats live on the arms that need them (no status, or a board
+    /// the catalog does not list), which the tests above pin.
+    func testIdleFirmwareStatusSaysUpToDateWithoutRepeatingTheRowAboveIt() {
         let current = beaconFirmwareStatusPresentation(
             hasCurrentStatus: true,
             installedVersion: "2.0.8",
             catalogHasBoard: true,
             latestVersion: "2.0.8",
             outdated: false)
-        XCTAssertEqual(
-            current.detail,
-            "No newer board firmware is listed in this app's current catalog. Installed v2.0.8.")
+        XCTAssertEqual(current.detail, "firmware is up to date.")
+        XCTAssertFalse(current.detail.contains("2.0.8"), "the row above already says the version")
+        XCTAssertFalse(current.detail.lowercased().contains("catalog"),
+                       "the catalog caveat belongs to the unlisted and no-status arms")
         XCTAssertEqual(current.tone, .accent)
         XCTAssertFalse(current.offersBrowserFlasher)
 

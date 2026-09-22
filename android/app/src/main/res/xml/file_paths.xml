@@ -1,5 +1,9 @@
 <?xml version="1.0" encoding="utf-8"?>
-<!-- Exposes the app cacheDir so the exported detections CSV can be shared. -->
+<!-- Exposes ONLY the two export-package folders (ui/ExportCache.kt EXPORT_PACKAGE_FAMILIES):
+     Log exports (LogScreen) and contribution shares (ContributeScreen). Nothing else in cacheDir
+     is shareable: the nRF DFU zip there is handed to the DFU service by absolute path, never
+     through this provider. A new export family must be added here and in ExportCache.kt. -->
 <paths>
-    <cache-path name="exports" path="." />
+    <cache-path name="log-exports" path="log-exports/" />
+    <cache-path name="contribution-shares" path="contribution-shares/" />
 </paths>

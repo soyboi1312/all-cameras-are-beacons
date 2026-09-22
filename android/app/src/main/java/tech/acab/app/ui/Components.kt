@@ -31,7 +31,13 @@ import androidx.compose.runtime.Composable
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.vector.ImageVector
+import androidx.compose.material3.LocalTextStyle
+import androidx.compose.runtime.remember
 import androidx.compose.ui.platform.LocalDensity
+import androidx.compose.ui.text.AnnotatedString
+import androidx.compose.ui.text.TextStyle
+import androidx.compose.ui.text.rememberTextMeasurer
+import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
@@ -344,5 +350,73 @@ fun LinkChip(
         Box(Modifier.size(7.dp).background(tone, CircleShape))
         Spacer(Modifier.size(6.dp))
         Kicker(label, color = labelTone)
+    }
+}
+
+
+// ---- category tile strips (Status CountTile, Log CategoryTile) ----
+
+/** The label style BOTH category-tile strips draw, and the one [rememberCategoryTilesPerRow]
+ *  measures, so the fit test and the drawn label cannot disagree. 10sp since 2026-09-20 (was
+ *  8sp, the hardest text on Status to read outdoors); iOS uses 10pt. */
+internal val CategoryTileLabelStyle = TextStyle(
+    fontSize = 10.sp, letterSpacing = 1.sp, fontWeight = FontWeight.Medium, fontFamily = Acab.mono,
+)
+
+/** Side padding of a category tile, measured against by [rememberCategoryTilesPerRow]. 4dp, not
+ *  the 10dp the tile still uses top and bottom: a 10sp NETCAM is about 42dp, and a six-across
+ *  tile on a 411dp phone is about 55dp wide, so 10dp sides (a ~35dp label box) would have wrapped
+ *  the strip on every common phone at the default text size. The tile centers its content, as
+ *  iOS does, so the narrow sides do not read as cramped. */
+internal val CategoryTileSidePadding = 4.dp
+
+/** Top and bottom padding of a category tile. */
+internal val CategoryTileEndPadding = 10.dp
+
+/** Gap between tiles in both strips. */
+internal val CategoryTileGap = 8.dp
+
+/** How many tiles go on one row so every label stays on one line: [preferred] (all six on
+ *  Status, or the Log's own choice) when the widest label fits a tile at that count, otherwise
+ *  three, otherwise two. Two is the floor: a label wider than a half-row tile would still clip,
+ *  which no phone reaches at Android's own font scales (the 10sp NETCAM is about 83dp at 2.0,
+ *  and a 360dp phone's three-across label box is about 93dp).
+ *
+ *  This replaced a fixed rule (three per row below 360dp or at font scale 1.5 and up). With the
+ *  old 8sp labels and 10dp side padding, a six-across label box on a 411dp phone was about 35dp
+ *  and the NETCAM label already filled it at the default scale, so at Android's own 1.15 and 1.3
+ *  text sizes the tile read "NETCA", "NETC" and "DRON" (seen on an emulator, 2026-09-20).
+ *  Measuring the real label covers every width and scale, including the two the old rule named.
+ *
+ *  TWIN: iOS Views/Components.swift `CategoryStripLayout` (DashboardView.categoryTiles and
+ *  DetectionsView.summaryTiles), the same rule measured on the whole tile. iOS tiles pad only
+ *  vertically, so its share subtracts no padding; each side derives its own numbers. */
+internal fun categoryTilesPerRow(
+    stripWidthPx: Float, gapPx: Float, tilePaddingPx: Float, widestLabelPx: Float, preferred: Int,
+): Int {
+    fun fits(n: Int) = widestLabelPx <= (stripWidthPx - gapPx * (n - 1)) / n - 2 * tilePaddingPx
+    return listOf(preferred, 3, 2).filter { it <= preferred }.firstOrNull { it <= 2 || fits(it) }
+        ?: preferred
+}
+
+/** [categoryTilesPerRow] for a strip of [stripWidth] holding tiles labelled [labels]. The
+ *  measurement reruns only when the labels or the density (which carries the font scale)
+ *  change, so the ~3 Hz Status recomposition pays a list comparison, not a text layout. */
+@Composable
+internal fun rememberCategoryTilesPerRow(labels: List<String>, stripWidth: Dp, preferred: Int): Int {
+    val measurer = rememberTextMeasurer()
+    val density = LocalDensity.current
+    val style = LocalTextStyle.current.merge(CategoryTileLabelStyle)
+    val widest = remember(labels, density, style) {
+        labels.maxOfOrNull {
+            measurer.measure(AnnotatedString(it), style = style, softWrap = false, maxLines = 1).size.width
+        } ?: 0
+    }
+    // Gap and padding as the layout draws them: spacedBy and Modifier.padding round each to whole
+    // px (4dp is 10.5px at 420dpi, drawn as 11), so the fractional toPx() would test a box a pixel
+    // wider than the one the label gets.
+    return with(density) {
+        categoryTilesPerRow(stripWidth.toPx(), CategoryTileGap.roundToPx().toFloat(),
+            CategoryTileSidePadding.roundToPx().toFloat(), widest.toFloat(), preferred)
     }
 }

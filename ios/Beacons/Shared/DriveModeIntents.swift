@@ -87,7 +87,11 @@ struct EndDriveModeIntent: LiveActivityIntent {
 /// foregrounded (openAppWhenRun brings it forward, and perform() then runs in-app).
 struct ToggleDriveModeIntent: SetValueIntent {
     static var title: LocalizedStringResource = "Live Mode"
+    /// iOS 18, the deployment floor, reads this; iOS 26 deprecated it in favour of supportedModes,
+    /// which says the same thing. Both stay until the deployment target passes 26.
     static var openAppWhenRun = true
+    @available(iOS 26.0, *)
+    static var supportedModes: IntentModes { .foreground }
 
     @Parameter(title: "On") var value: Bool
 

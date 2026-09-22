@@ -252,8 +252,8 @@ private data class Summary(
                 connected = prefs.getBoolean(BeaconsWidgetProvider.KEY_CONNECTED, false),
                 // The stale-day rule covers the TODAY count and category strip only. The last hit
                 // survives midnight ("body cam · 8h ago" is still true at 00:30), matching iOS
-                // readEntry; gating it here swaps in the green no-detections shield at the first
-                // post-midnight re-render.
+                // readEntry; gating it here swaps in the neutral no-detections line
+                // (widgetLastLine's empty state) at the first post-midnight re-render.
                 lastType = prefs.getString(BeaconsWidgetProvider.KEY_LAST_TYPE, "") ?: "",
                 lastAt = prefs.getLong(BeaconsWidgetProvider.KEY_LAST_AT, 0L),
                 categories = BeaconsWidgetProvider.CAT_TOKENS.mapNotNull { token ->
@@ -270,7 +270,6 @@ private data class WidgetPalette(
     val text: ColorProvider,
     val dim: ColorProvider,
     val accent: ColorProvider,
-    val okay: ColorProvider,
 )
 
 // Every color goes through the day/night ColorProvider overload so the launcher re-resolves
@@ -282,7 +281,6 @@ private val palette = WidgetPalette(
     text = ColorProvider(day = Color(0xFF271F21), night = Color(0xFFF4EEF0)),
     dim = ColorProvider(day = Color(0xFF685E61), night = Color(0xFFA99EA1)),
     accent = ColorProvider(day = Color(0xFFD52D25), night = Color(0xFFFF4B40)),
-    okay = ColorProvider(day = Color(0xFF217A45), night = Color(0xFF65DA93)),
 )
 
 @Composable
@@ -337,28 +335,47 @@ private fun WidgetContent(context: Context, summary: Summary) {
         if (showLast) {
             Spacer(GlanceModifier.height(if (short) 4.dp else 8.dp))
             Row(verticalAlignment = Alignment.Vertical.CenterVertically) {
-                val hasLiveHit = summary.lastType.isNotEmpty() && summary.lastAt > 0
+                val line = widgetLastLine(summary.lastType, summary.lastAt, summary.connected,
+                    System.currentTimeMillis())
                 Image(
-                    provider = ImageProvider(if (hasLiveHit) lastIcon(summary.lastType) else R.drawable.ic_w_ok),
+                    provider = ImageProvider(line.icon),
                     contentDescription = null,
                     modifier = GlanceModifier.size(16.dp),
                     // The checked-in vectors are white. Tint is required on the light palette or
                     // the glyph disappears against the widget background.
-                    colorFilter = ColorFilter.tint(if (hasLiveHit) colors.accent else colors.okay),
+                    colorFilter = ColorFilter.tint(if (line.isHit) colors.accent else colors.dim),
                 )
                 Spacer(GlanceModifier.width(7.dp))
-                val last = when {
-                    hasLiveHit ->
-                        "${summary.lastType.lowercase()} · ${relativeAgo(summary.lastAt)}"
-                    summary.connected -> "no detections"
-                    else -> "open the app to connect"
-                }
-                Text(last, style = TextStyle(color = if (hasLiveHit) colors.dim else colors.okay,
-                    fontSize = 11.sp))
+                Text(line.text, style = TextStyle(color = colors.dim, fontSize = 11.sp))
             }
         }
     }
 }
+
+/** The widget's bottom line: the last hit, or an honest empty state.
+ *
+ *  NEUTRAL WHEN THERE IS NO HIT: the half shield ic_w_shield in the dim ink, never a check mark
+ *  and never green. The empty state covers a connected empty store, a real disconnect, and the
+ *  cold-process face (Summary.read returns an empty Summary when no manager is in the process,
+ *  which after a reboot or a process kill is the face most people see). None of those proves the
+ *  area is clear ("quiet does not mean clear"), and until 2026-09-20 all three drew a green
+ *  check shield with green text. A hit with an unrecognized category also gets the shield, in
+ *  the accent ink, instead of the old check-mark fallback.
+ *
+ *  TWIN: iOS BeaconsWidget/DetectionsWidget.swift LastHitLine, whose empty state is
+ *  Shared/WidgetEmptyState.swift (the SF Symbol shield.lefthalf.filled, dim). The disconnected
+ *  words differ on purpose and predate this: "open the app to connect" here, because this
+ *  widget cannot tell a cold process from a disconnect, and "not connected" on iOS. */
+internal data class WidgetLastLine(val icon: Int, val isHit: Boolean, val text: String)
+
+internal fun widgetLastLine(lastType: String, lastAt: Long, connected: Boolean, nowMs: Long): WidgetLastLine =
+    when {
+        lastType.isNotEmpty() && lastAt > 0 ->
+            WidgetLastLine(lastIcon(lastType), isHit = true,
+                text = "${lastType.lowercase()} · ${relativeAgo(lastAt, nowMs)}")
+        connected -> WidgetLastLine(R.drawable.ic_w_shield, isHit = false, text = "no detections")
+        else -> WidgetLastLine(R.drawable.ic_w_shield, isHit = false, text = "open the app to connect")
+    }
 
 private fun lastIcon(cat: String): Int = when (cat) {
     "ALPR" -> R.drawable.ic_w_alpr
@@ -368,11 +385,11 @@ private fun lastIcon(cat: String): Int = when (cat) {
     "GLASSES" -> R.drawable.ic_w_glasses
     "CAMERA" -> R.drawable.ic_w_netcam
     "WATCHED" -> R.drawable.ic_w_star
-    else -> R.drawable.ic_w_ok
+    else -> R.drawable.ic_w_shield
 }
 
-private fun relativeAgo(atMs: Long): String {
-    val secs = ((System.currentTimeMillis() - atMs) / 1000).coerceAtLeast(0)
+private fun relativeAgo(atMs: Long, nowMs: Long): String {
+    val secs = ((nowMs - atMs) / 1000).coerceAtLeast(0)
     return when {
         secs < 5 -> "now"
         secs < 60 -> "${secs}s ago"

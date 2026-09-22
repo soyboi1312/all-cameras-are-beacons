@@ -3,7 +3,6 @@ import CoreBluetooth
 import CoreLocation
 import Combine
 import UIKit
-import Intents
 import ActivityKit
 import WidgetKit
 import Security
@@ -561,6 +560,95 @@ enum PersistedDetectionClearCommit: Equatable {
     case unavailable
 }
 
+/// The temp files that Log exports and contribution shares leave in `temporaryDirectory`, and the
+/// two bounds on how long they live: the real "Clear log" deletes every one of them, and a launch
+/// sweep deletes any older than `maxAge`. They are not deleted as soon as the share sheet closes,
+/// because a receiving activity (Mail draft, AirDrop, a file provider) can still read the URL
+/// after our callback returns. Without these bounds a Clear left full copies of the history
+/// (MACs, phone GPS, times) behind until iOS reclaimed tmp.
+///
+/// PRECISE BY NAME, NEVER A BLANKET WIPE OF tmp. Other code stages files there: the nRF DFU leg
+/// writes a loose `beacon-nrf-dfu-<version>-<UUID>.zip` (BLEManager+NrfDFU), and NordicDFU may use
+/// tmp itself. So an entry qualifies only as:
+///  - a directory named by a UUID, directly under the root, that is non-empty and holds ONLY leaf
+///    names this app's export writers produce (`writeDetections`, ContributeView's file share), or
+///  - (launch sweep only) a loose contribution photo file: `beacons-observation-<UUID>.jpg` or
+///    `beacons-photo-source-<UUID>`. Clear leaves these alone: they are the photo a live
+///    contribution flow may still hold, not detection history.
+/// A UUID directory with any foreign or half-written entry is skipped rather than guessed at.
+///
+/// Android twin: android/app/src/main/java/tech/acab/app/ui/ExportCache.kt sweepExportPackages
+/// (clearLog deletes every UUID package inside the log-exports and contribution-shares cache dirs,
+/// keeping the two family dirs; a startup sweep uses the same 1-hour age).
+enum ExportTempCache {
+    /// Launch-sweep age bound. Identical on Android (ExportCache.kt).
+    static let maxAge: TimeInterval = 60 * 60
+
+    /// Leaf names inside a per-share UUID directory. ContributeView writes these exact names, so
+    /// renaming one there without updating it here would strand the files past Clear.
+    static let contributionCSVLeaf = "beacons-observation.csv"
+    static let contributionPhotoLeaf = "beacons-observation.jpg"
+    static let logExportPrefix = "acab-detections"   // + optional "-<category slug>" + .csv/.gpx
+
+    static func isExportLeaf(_ name: String) -> Bool {
+        if name == contributionCSVLeaf || name == contributionPhotoLeaf { return true }
+        guard name.hasPrefix(logExportPrefix),
+              name.hasSuffix(".csv") || name.hasSuffix(".gpx") else { return false }
+        let stem = name.dropFirst(logExportPrefix.count).dropLast(4)
+        return stem.isEmpty || stem.hasPrefix("-")
+    }
+
+    /// Loose (root-level) contribution photo files: ContributeView's loadPhoto output and the
+    /// picker's private source copy.
+    static func isLooseContributionFile(_ name: String) -> Bool {
+        for (prefix, suffix) in [("beacons-observation-", ".jpg"), ("beacons-photo-source-", "")] {
+            guard name.hasPrefix(prefix), name.hasSuffix(suffix) else { continue }
+            let middle = name.dropFirst(prefix.count).dropLast(suffix.count)
+            if UUID(uuidString: String(middle)) != nil { return true }
+        }
+        return false
+    }
+
+    /// Deletes the qualifying entries under `root` and returns what it removed. `olderThan: nil`
+    /// is the Clear-log form (every export dir, regardless of age, and no loose photos); a value is
+    /// the launch-sweep form (export dirs and loose photos whose NEWEST modification date is older
+    /// than that). Pure over the directory it is given, so tests run it on a temp dir they own.
+    /// Does file I/O: never call it on the main thread or a hot path.
+    @discardableResult
+    static func sweep(root: URL, olderThan age: TimeInterval?, now: Date = Date(),
+                      fileManager fm: FileManager = .default) -> [URL] {
+        let keys: [URLResourceKey] = [.isDirectoryKey, .contentModificationDateKey]
+        guard let entries = try? fm.contentsOfDirectory(at: root, includingPropertiesForKeys: keys)
+        else { return [] }
+        func mtime(_ url: URL) -> Date {
+            (try? url.resourceValues(forKeys: [.contentModificationDateKey]))?
+                .contentModificationDate ?? .distantPast
+        }
+        func isOld(_ newest: Date) -> Bool {
+            guard let age else { return true }
+            return now.timeIntervalSince(newest) > age
+        }
+        var removed: [URL] = []
+        for entry in entries {
+            let name = entry.lastPathComponent
+            let isDir = (try? entry.resourceValues(forKeys: [.isDirectoryKey]))?.isDirectory ?? false
+            if isDir {
+                guard UUID(uuidString: name) != nil,
+                      let children = try? fm.contentsOfDirectory(at: entry,
+                                                                 includingPropertiesForKeys: keys),
+                      !children.isEmpty,
+                      children.allSatisfy({ isExportLeaf($0.lastPathComponent) }) else { continue }
+                let newest = ([entry] + children).map(mtime).max() ?? .distantPast
+                guard isOld(newest) else { continue }
+                if (try? fm.removeItem(at: entry)) != nil { removed.append(entry) }
+            } else if age != nil, isLooseContributionFile(name), isOld(mtime(entry)) {
+                if (try? fm.removeItem(at: entry)) != nil { removed.append(entry) }
+            }
+        }
+        return removed
+    }
+}
+
 /// A real clear may transition the visible store only after one of two durable boundaries: either
 /// its write-ahead tombstone is confirmed flushed, or the condemned file is already confirmed
 /// absent. If both operations fail, keeping the rows visible makes the failed action honest and
@@ -1066,6 +1154,17 @@ final class BLEManager: NSObject, ObservableObject {
     /// user-facing copy the two apps must not diverge.
     static let pairWindowHint = "turn the beacon off and on, then connect within two minutes."
     @Published private(set) var discovered: [DiscoveredDevice] = []
+    /// The owner's board, remembered after a secure ready session so the picker can offer it
+    /// without an advertisement (see RememberedBoard.swift for why). Read from `defaults` ONCE in
+    /// init(defaults:) and cached here; written only by rememberSecureReadyBoard and
+    /// forgetRememberedBoardIfBondGone. Never read UserDefaults for this in a view body or the
+    /// status path.
+    @Published private(set) var rememberedBoard: RememberedBoard?
+    /// CoreBluetooth's handle for `rememberedBoard`, from retrievePeripherals on .poweredOn (or the
+    /// live session that remembered it). Nil while the radio is not on: a power cycle invalidates
+    /// peripheral objects, so it is fetched again every .poweredOn. Retrieving is a local lookup,
+    /// not a radio emission, and it never connects anything by itself.
+    @Published private(set) var rememberedPeripheral: CBPeripheral?
     @Published private(set) var detections: [Detection] = []
     /// Evidence/log projection. Active mute rules hide rows elsewhere, not from prior history.
     @Published private(set) var logDetections: [Detection] = []
@@ -1350,11 +1449,12 @@ final class BLEManager: NSObject, ObservableObject {
         resumeDriveModeIfWanted()
     }
 
-    /// Watchdog for a FRESH scan-connect. central.connect has no OS timeout and didFailToConnect
-    /// never fires for a board that simply is not there (powered off since discovery, or claimed
-    /// by another phone), so without this a tapped stale row pins connectionState at .connecting
-    /// forever. One-shot, armed only by connect(_:); the unexpected-drop auto-reconnect stays
-    /// deliberately indefinite and never runs it.
+    /// Watchdog for a FRESH picker connect (a scanned row or the remembered row). central.connect
+    /// has no OS timeout and didFailToConnect never fires for a board that simply is not there
+    /// (powered off since discovery, or claimed by another phone), so without this a tapped stale
+    /// row pins connectionState at .connecting forever. One-shot, armed only by
+    /// connect(peripheral:), which both connect(_:) and connect(pickerEntryID:) route through; the
+    /// unexpected-drop auto-reconnect stays deliberately indefinite and never runs it.
     private var connectTimeoutTimer: Timer?
     private let connectTimeoutInterval: TimeInterval = 15
 
@@ -1734,7 +1834,16 @@ final class BLEManager: NSObject, ObservableObject {
     private let liveNearbyRefreshInterval: TimeInterval = 5
 
     /// What `shared` calls, so the app always runs on the standard store.
-    override convenience init() { self.init(defaults: .standard) }
+    override convenience init() {
+        self.init(defaults: .standard)
+        // Launch sweep of export/share temp dirs older than ExportTempCache.maxAge (see there).
+        // Here and not in init(defaults:) so a test-built manager never sweeps the host's tmp.
+        // A utility-queue hop keeps directory enumeration off the cold-start main thread.
+        let tmp = FileManager.default.temporaryDirectory
+        DispatchQueue.global(qos: .utility).async {
+            ExportTempCache.sweep(root: tmp, olderThan: ExportTempCache.maxAge)
+        }
+    }
 
     /// BeaconsTests passes a throwaway suite here, so the preferences listed on the `defaults`
     /// property are neither read from nor written to the real install.
@@ -1742,6 +1851,7 @@ final class BLEManager: NSObject, ObservableObject {
         self.defaults = defaults
         persistedDetectionClearTombstone = PersistedDetectionClearTombstone(defaults: defaults)
         super.init()
+        rememberedBoard = RememberedBoardStore(defaults: defaults).load()
         enabledPhoneNotificationTypes = Set(DetectionNotifier.notifiableTypes
             .filter { DetectionNotifier.isEnabled($0) }
             .map(\.rawValue))
@@ -1863,7 +1973,6 @@ final class BLEManager: NSObject, ObservableObject {
         // Location state has not been acted on; reconcileDriveMode owns adoption after both gates.
         notifier.refreshAuthorization()   // trust the system's answer, not our own last request
         alertMode = AlertMode(rawValue: defaults.string(forKey: alertModeKey) ?? "") ?? .buzzer
-        if alertMode == .vibrate { requestFocusAuthIfNeeded() }
         // Republish a restore offer left over from a previous run, so a Desert run the board ended
         // behind our back does not become a silence with nothing on screen saying why. Assigning
         // the mirror directly, NOT through desertAlertModeState: this is a read of what is already
@@ -2007,6 +2116,14 @@ final class BLEManager: NSObject, ObservableObject {
     }
 
     func connect(_ device: DiscoveredDevice) {
+        connect(peripheral: device.peripheral)
+    }
+
+    /// The one fresh-connect path, shared by a scanned row and the remembered row. central.connect
+    /// is a pending connect that completes whenever the board is in range, advertising or not; the
+    /// 15 s connectTimeoutTimer below bounds it exactly as it bounds a scanned row, so a remembered
+    /// board that is off lands on the timeout hint instead of an indefinite silent pending connect.
+    private func connect(peripheral target: CBPeripheral) {
         guard let central else { return }
         cancelUpdatesForLinkTeardown(
             reason: "The prior update was stopped before connecting to another board.")
@@ -2020,14 +2137,75 @@ final class BLEManager: NSObject, ObservableObject {
         setSessionReady(false)   // a fresh session hasn't reached ready until its CCCD subscribe lands
         retireSessionCharacteristics()
         connectionState = .connecting
-        peripheral = device.peripheral
+        peripheral = target
         peripheral?.delegate = self
-        central.connect(device.peripheral, options: nil)
+        central.connect(target, options: nil)
         connectTimeoutTimer?.invalidate()
         connectTimeoutTimer = Timer.scheduledTimer(withTimeInterval: connectTimeoutInterval,
                                                    repeats: false) { [weak self] _ in
             self?.connectTimedOut()
         }
+    }
+
+    // MARK: Remembered board (rules in RememberedBoard.swift; Android twin in AcabBleManager.kt)
+
+    /// The connect picker's rows: the remembered board first (with or without an advertisement),
+    /// then every other scanned board in scan order. Pure merge over two cached properties, no
+    /// UserDefaults, so ConnectView's body can call it.
+    var pickerEntries: [BoardPickerEntry] {
+        mergeBoardPickerEntries(
+            remembered: rememberedBoard,
+            rememberedRetrieved: rememberedPeripheral?.identifier == rememberedBoard?.id,
+            scanned: discovered.map {
+                BoardPickerEntry(id: $0.id, name: $0.name, rssi: $0.rssi,
+                                 firmware: $0.firmware, isRemembered: false)
+            })
+    }
+
+    /// A picker tap. Resolves the row to its CBPeripheral (the scan's handle if the board is
+    /// advertising, otherwise the retrieved one) and takes the same bounded connect path.
+    func connect(pickerEntryID id: UUID) {
+        if let scanned = discovered.first(where: { $0.id == id }) {
+            connect(scanned)
+        } else if let remembered = rememberedPeripheral, remembered.identifier == id {
+            connect(peripheral: remembered)
+        }
+    }
+
+    /// Fetch the handle for the remembered board. A local lookup: no scan, no connect, so calling
+    /// it at every .poweredOn adds no new automatic behavior. An identifier CoreBluetooth no longer
+    /// knows yields no row rather than a dead one.
+    private func refreshRememberedPeripheral() {
+        guard let central, central.state == .poweredOn, let board = rememberedBoard else {
+            rememberedPeripheral = nil
+            return
+        }
+        rememberedPeripheral = central.retrievePeripherals(withIdentifiers: [board.id]).first
+    }
+
+    /// REMEMBER. Called only from finishReadyAfterBufferHandshake. Writes `defaults` only when
+    /// the board or its name changed, so the OTA reboot reconnect's second ready is free.
+    private func rememberSecureReadyBoard(_ board: CBPeripheral) {
+        rememberedPeripheral = board
+        guard let next = rememberedBoardAfterSecureReady(
+            current: rememberedBoard, readyID: board.identifier,
+            readyName: board.name ?? ACABProfile.advertisedName) else { return }
+        rememberedBoard = next
+        RememberedBoardStore(defaults: defaults).save(next)
+    }
+
+    /// FORGET, when a failure from the remembered board means the bond is gone. There is no
+    /// in-app forget screen, so this is the only forget path. Returns whether it forgot.
+    @discardableResult
+    private func forgetRememberedBoardIfBondGone(_ board: CBPeripheral, error: Error?) -> Bool {
+        guard shouldForgetRememberedBoard(rememberedID: rememberedBoard?.id,
+                                          failingID: board.identifier, error: error) else {
+            return false
+        }
+        rememberedBoard = nil
+        rememberedPeripheral = nil
+        RememberedBoardStore(defaults: defaults).save(nil)
+        return true
     }
 
     /// The fresh connect never resolved. Cancel it and show a specific retry, instead of silently
@@ -2239,6 +2417,21 @@ final class BLEManager: NSObject, ObservableObject {
             // if retirement itself cannot flush, leaving it pending is conservative and launch will
             // simply confirm absence again.
             _ = persistedDetectionClearTombstone.retire()
+        }
+        // The log file is not the only copy. Delivered detection notifications carry device names
+        // in Notification Center, and every Log export / contribution share left a CSV or GPX in
+        // tmp. Real path only: a sample Clear must not touch real notifications or exports.
+        notifier.removeDetectionNotifications()
+        // Off main (directory enumeration is file I/O). Within one window no share sheet can be
+        // up while Clear is tapped: the Log's share sheet and ContributeView's share and mail
+        // sheets are all modal `.sheet`s that block the Clear control (a second iPad window is
+        // the uncovered edge, and Clear wins there too). An activity that kept the URL after its
+        // sheet closed (a Mail draft, an AirDrop still sending) can lose the file; the user asked
+        // for the history to be gone, so Clear wins. An export whose write is still in flight on
+        // its own queue can land after this sweep; the launch sweep bounds that file to 1 hour.
+        let tmp = FileManager.default.temporaryDirectory
+        DispatchQueue.global(qos: .utility).async {
+            ExportTempCache.sweep(root: tmp, olderThan: nil)
         }
         if driveModeOn { liveActivity.update(liveState()) }
         writeWidgetSummary(force: true)   // count is now 0; reflect it on the home widget
@@ -4178,12 +4371,13 @@ final class BLEManager: NSObject, ObservableObject {
             // A share extension may read the URL long after this callback returns. A fixed temp
             // filename lets a second export overwrite the bytes behind the first open share sheet
             // or mail draft. Give every export an immutable UUID parent while preserving the
-            // human-readable leaf name recipients see. Successful dirs intentionally live until
-            // iOS reclaims temporaryDirectory; deleting them here or on sheet dismissal can race
-            // an activity that retained the file provider URL.
+            // human-readable leaf name recipients see. Successful dirs are NOT deleted here or on
+            // sheet dismissal (that can race an activity that retained the file provider URL);
+            // the real Clear log and the 1-hour launch sweep delete them (ExportTempCache, which
+            // matches this leaf name, so keep the two in step).
             let dir = FileManager.default.temporaryDirectory
                 .appendingPathComponent(UUID().uuidString, isDirectory: true)
-            let url = dir.appendingPathComponent("acab-detections\(slug).\(format.ext)")
+            let url = dir.appendingPathComponent("\(ExportTempCache.logExportPrefix)\(slug).\(format.ext)")
             // write as Data with completeFileProtection: the GPS+MAC file must stay unreadable while
             // the phone is locked. String.write(to:atomically:encoding:) applies NO data protection,
             // so it was readable on a seized locked phone. The strict class is fine here (unlike the
@@ -4545,7 +4739,7 @@ final class BLEManager: NSObject, ObservableObject {
         // drone (see alertHaptic), i.e. the common case, and it was never being prepared - an
         // unprepared generator still fires but with enough latency to feel like a miss on a
         // single medium tap.
-        if m == .vibrate { notifHaptic.prepare(); impactHaptic.prepare(); requestFocusAuthIfNeeded() }
+        if m == .vibrate { notifHaptic.prepare(); impactHaptic.prepare() }
     }
 
     /// Take the alert mode the app is offering back after a Desert run it did not end. This is the
@@ -4589,19 +4783,6 @@ final class BLEManager: NSObject, ObservableObject {
         case .flockCamera, .flockRaven, .drone: notifHaptic.notificationOccurred(.error)
         default:                                impactHaptic.impactOccurred()
         }
-    }
-
-    /// Ask once for Focus access, so vibrate alerts can defer to Do Not Disturb.
-    private func requestFocusAuthIfNeeded() {
-        if INFocusStatusCenter.default.authorizationStatus == .notDetermined {
-            INFocusStatusCenter.default.requestAuthorization { _ in }
-        }
-    }
-
-    /// True when a Focus (or Do Not Disturb) is on, so vibrate alerts stay quiet.
-    /// If we can't read Focus (never authorized), treat it as off so alerts still fire.
-    private var focusActive: Bool {
-        INFocusStatusCenter.default.focusStatus.isFocused == true
     }
 
     /// Buzzer loudness, 0...100. `preview: true` also has the board beep once at that
@@ -5695,9 +5876,14 @@ final class BLEManager: NSObject, ObservableObject {
         // connected, so nothing else is holding this session.)
         if !d.isHistory { scheduleLiveCheckpoint() }
         // Live sightings buzz, past their per-device cooldown; replayed history never does.
-        // `hapticDue` RECORDS, so it stays LAST: the cheap gates short-circuit ahead of it, and a
-        // buzz suppressed by Focus must not start the cooldown that suppressed it.
-        if !d.isHistory, alertMode == .vibrate, !focusActive, hapticDue(d.mac) { alertHaptic(for: d.type) }
+        // `hapticDue` RECORDS, so it stays LAST: the cheap gates short-circuit ahead of it, so a
+        // buzz they suppress never starts a cooldown. There is no Focus gate on iPhone: Apple scopes
+        // Focus status (INFocusStatusCenter) to communication apps, and on 2026-09-18 an iOS 27
+        // phone read isFocused false through 300+ readings with a Focus on, although the build
+        // carried the Communication Notifications entitlement, Focus access was granted, Share
+        // Focus Status was on and the app was not in that Focus's allowed list. Android's twin
+        // gate, AcabBleManager.focusSuppressed, reads Do Not Disturb, which needs no capability.
+        if !d.isHistory, alertMode == .vibrate, hapticDue(d.mac) { alertHaptic(for: d.type) }
         // Phone notification, per category, opt-in. Deliberately INDEPENDENT of alertMode: that
         // governs the board's buzzer, and choosing a silent board is not the same as choosing a
         // silent phone. Ignored devices never reach here (dropped above), so one cannot notify.
@@ -5707,7 +5893,6 @@ final class BLEManager: NSObject, ObservableObject {
         // again and could never notify. The notifier owns the dedup via its per-device cooldown,
         // which is what the settings copy actually promises.
         if !d.isHistory, DetectionNotifier.anyEnabled {
-            notifier.silenceForeground = (alertMode != .buzzer) && focusActive
             notifier.notifyIfNeeded(d)
         }
         // Drive mode: push the live count to the Dynamic Island / Lock Screen. History never
@@ -6315,7 +6500,11 @@ final class BLEManager: NSObject, ObservableObject {
         loadPersistedDetections()
         if let radioState = central?.state {
             switch radioState {
-            case .poweredOn:    connectionState = .idle
+            case .poweredOn:
+                connectionState = .idle
+                // centralManagerDidUpdateState returns early in demo, so a .poweredOn that landed
+                // during the tour never fetched the remembered row.
+                refreshRememberedPeripheral()
             case .poweredOff:   connectionState = .poweredOff
             case .unauthorized: connectionState = .unauthorized
             default:            connectionState = .unknown
@@ -6347,6 +6536,9 @@ extension BLEManager: CBCentralManagerDelegate {
         if demoMode { return }      // demo mode pins us as connected
         switch central.state {
         case .poweredOn:
+            // Before any branch below can break out: the remembered row must be offered on every
+            // .poweredOn, including a cold launch that lands on .idle with no scan.
+            refreshRememberedPeripheral()
             // A live session only predates this callback via a redundant .poweredOn while still
             // connected, so leave that alone. Otherwise the radio just came back: land on a clean
             // .idle, the same place a cold launch starts. The old code preserved the prior state
@@ -6392,13 +6584,16 @@ extension BLEManager: CBCentralManagerDelegate {
             // user made in a session that has read "bluetooth is off" ever since.
             scanWhenCentralIsReady = false
             clearConnection()
+            rememberedPeripheral = nil   // invalidated with the radio; re-fetched on .poweredOn
             connectionState = .poweredOff
         case .unauthorized:
             scanWhenCentralIsReady = false
             clearConnection()
+            rememberedPeripheral = nil
             connectionState = .unauthorized
         default:
             clearConnection()
+            rememberedPeripheral = nil
             connectionState = .unknown
         }
         stopLocationIfIdle()   // after the state assign, so needsLocation reads the settled value
@@ -6597,7 +6792,11 @@ extension BLEManager: CBCentralManagerDelegate {
         resetConfigWriteQueue()
         retireSessionCharacteristics()
         connectionState = .idle
-        connectHint = beaconConnectionRecovery(.transport)
+        // A bond-gone refusal from the remembered board is a pairing problem, not a radio one:
+        // forget the row and show the existing secure-pairing guidance instead of "keep it nearby".
+        connectHint = forgetRememberedBoardIfBondGone(peripheral, error: error)
+            ? beaconConnectionRecovery(.securePairing)
+            : beaconConnectionRecovery(.transport)
         self.peripheral = nil
     }
 
@@ -6687,6 +6886,10 @@ extension BLEManager: CBCentralManagerDelegate {
             // moment the board re-advertises). Fail to the resting screen instead, exactly like
             // Android's sessionWasReady gate; the user retries with a tap when they're ready.
             reconnectTarget = nil
+            // The board dropping a remembered phone during setup with peerRemovedPairingInformation
+            // means it no longer holds our keys: forget the row. A drop with no such error could
+            // be range or power, so the row stays.
+            forgetRememberedBoardIfBondGone(peripheral, error: error)
             if connectHint == nil {
                 connectHint = beaconConnectionRecovery(.securePairing)
             }
@@ -6829,6 +7032,9 @@ extension BLEManager: CBPeripheralDelegate {
             // Identity-guarded: if the board already dropped us (its own reaction to the refused
             // encryption) the teardown ran and a second disconnect would be redundant.
             if characteristic.uuid == ACABProfile.detections {
+                // An ATT insufficient-encryption/authentication refusal from the remembered board
+                // means the bond is gone on one side: forget the row before tearing down.
+                forgetRememberedBoardIfBondGone(peripheral, error: error)
                 connectHint = beaconConnectionRecovery(.securePairing)
                 disconnect()
             } else if characteristic.uuid == ACABProfile.status,
@@ -6892,6 +7098,10 @@ extension BLEManager: CBPeripheralDelegate {
     private func finishReadyAfterBufferHandshake() {
         guard !sessionWasReady, peripheral?.state == .connected else { return }
         setSessionReady(true)
+        // REMEMBER here and nowhere earlier: the encrypted Detections CCCD succeeded (so the link
+        // is encrypted with a bond) and the ACAB service answered the ACK-gated key/epoch/sync
+        // handshake (so the board is genuine). Demo never reaches this (no real peripheral).
+        if let peripheral { rememberSecureReadyBoard(peripheral) }
         connectHint = nil   // link is usable; the hint no longer applies
         connectionState = .connected
         startLocationIfNeeded()   // an existing grant can now stamp detections; this never prompts

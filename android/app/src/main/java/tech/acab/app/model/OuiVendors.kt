@@ -21,8 +21,9 @@ val OUI_VENDORS: Map<String, String> = mapOf(
     "001885" to "Motorola Solutions",
     "001f92" to "Motorola Solutions",
     "00236c" to "Apple",
-    // Axon's sole IEEE block. Named here so an Axon OUI hit reads the real vendor instead
-    // of falling back to the body-cam category's three-maker guess.
+    // Axon's IEEE-registered block. Named here so an Axon OUI hit reads the real vendor instead
+    // of falling back to the body-cam category's three-maker guess. Real Axon body cams turn up on
+    // BOTH this and d81f65 further down; the registry names Axon for this one and nobody for that.
     "0025df" to "Axon Enterprise",
     "00f48d" to "Liteon",
     "040d84" to "Silicon Labs",
@@ -80,6 +81,11 @@ val OUI_VENDORS: Map<String, String> = mapOf(
     "cc50e3" to "Espressif",
     "d03957" to "Liteon",
     "d411d6" to "ShotSpotter",
+    // A second block real Axon body cams sit on, attributed from field capture because the
+    // IEEE registry lists its holder only as "Private" and so can never name one. Nine MACs
+    // carrying two independent Axon identifiers, five owner-confirmed 2026-09-19. Twin:
+    // OUIVendors.swift. Provenance in firmware/lib/acab_core/axon_signatures.h (AXON_OUI_BWC_FIELD).
+    "d81f65" to "Axon Enterprise",
     "d8a01d" to "Espressif",
     "d8f3bc" to "Liteon",
     "dc5475" to "Espressif",

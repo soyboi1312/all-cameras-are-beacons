@@ -240,7 +240,7 @@ struct RadarScope: View {
                     // geometry, where it collided with the count. The count itself (real
                     // content) keeps scaling; the whole scope carries a spoken summary below.
                     Text("TOTAL NEARBY")
-                        .font(Font.custom("JetBrainsMono-Medium", fixedSize: 10.5))
+                        .font(ACABTheme.monoFixed(10.5))
                         .tracking(1.6)
                         .foregroundStyle(ACABTheme.faint)
                 }
@@ -292,8 +292,7 @@ struct PunkLine: View {
     var body: some View {
         // Ornamental brand copy, so it is pinned at its design size: at accessibility text
         // sizes every point it grows is a point stolen from the content around it.
-        (Text("they're watching. ").foregroundStyle(ACABTheme.dim)
-         + Text("watch back.").foregroundStyle(ACABTheme.accentText).italic())
+        Text("\(Text("they're watching. ").foregroundStyle(ACABTheme.dim))\(Text("watch back.").foregroundStyle(ACABTheme.accentText).italic())")
             .font(Font.custom("SpaceGrotesk-Medium", fixedSize: 14))
     }
 }
@@ -443,5 +442,88 @@ private struct MetaTag: View {
             .padding(.horizontal, 5).padding(.vertical, 2)
             .background(ACABTheme.faint.opacity(0.12), in: RoundedRectangle(cornerRadius: 4))
             .overlay(RoundedRectangle(cornerRadius: 4).strokeBorder(ACABTheme.line, lineWidth: 1))
+    }
+}
+
+// MARK: - Category tile strips
+
+/// Lays the Status and Log category tiles out in equal-width columns: `preferred` across while
+/// the widest tile's natural width fits an equal share of the row, otherwise rows of three, then
+/// rows of two. Two is the floor. The 10pt labels need it: at the two largest accessibility
+/// sizes a NETCAM label is wider than a three-across share on a 390pt iPhone.
+/// The widest tile is set by its label (the tiles carry no horizontal padding), so this is the
+/// "does every label still fit on one line" test, made on the real rendered size at the current
+/// Dynamic Type and weight (Bold Text, higher contrast) rather than on a fixed size threshold.
+///
+/// It replaced a fixed rule that wrapped only at accessibility sizes. The labels grew from 8 to
+/// 10pt on 2026-09-20, and a 10pt label reaches its six-across share a few Dynamic Type steps
+/// sooner, so the wrap has to follow the text, not a named size.
+///
+/// TWIN: android ui/Components.kt `categoryTilesPerRow`, the same rule with Android's own
+/// geometry (its tiles pad the sides, so its share subtracts the padding). Each platform derives
+/// its own numbers; the RULE is shared.
+struct CategoryStripLayout: Layout {
+    var preferred: Int
+    var spacing: CGFloat
+
+    /// The decision, apart from any view, so BeaconsTests can pin it. The fit is tested in the
+    /// additive form (n tiles plus n - 1 gaps against the row) so that the ideal width built in
+    /// sizeThatFits round-trips exactly instead of landing a hair under the share.
+    static func columns(widestTile: CGFloat, rowWidth: CGFloat, preferred: Int, count: Int,
+                        spacing: CGFloat) -> Int {
+        let wanted = max(1, min(preferred, count))
+        func fits(_ n: Int) -> Bool {
+            widestTile * CGFloat(n) + spacing * CGFloat(n - 1) <= rowWidth
+        }
+        return [wanted, 3, 2].filter { $0 <= wanted }.first { $0 <= 2 || fits($0) } ?? wanted
+    }
+
+    private func columns(_ width: CGFloat, _ subviews: Subviews) -> Int {
+        let widest = subviews.map { $0.sizeThatFits(.unspecified).width }.max() ?? 0
+        return Self.columns(widestTile: widest, rowWidth: width, preferred: preferred,
+                            count: subviews.count, spacing: spacing)
+    }
+
+    private func columnWidth(_ width: CGFloat, _ columns: Int) -> CGFloat {
+        max(0, (width - spacing * CGFloat(columns - 1)) / CGFloat(columns))
+    }
+
+    private func rowHeights(_ subviews: Subviews, _ columns: Int, _ columnWidth: CGFloat) -> [CGFloat] {
+        stride(from: 0, to: subviews.count, by: columns).map { start in
+            subviews[start..<min(start + columns, subviews.count)]
+                .map { $0.sizeThatFits(ProposedViewSize(width: columnWidth, height: nil)).height }
+                .max() ?? 0
+        }
+    }
+
+    func sizeThatFits(proposal: ProposedViewSize, subviews: Subviews, cache: inout ()) -> CGSize {
+        guard !subviews.isEmpty else { return .zero }
+        let width = proposal.width ?? {
+            let wanted = CGFloat(max(1, min(preferred, subviews.count)))
+            let widest = subviews.map { $0.sizeThatFits(.unspecified).width }.max() ?? 0
+            return widest * wanted + spacing * (wanted - 1)
+        }()
+        let cols = columns(width, subviews)
+        let heights = rowHeights(subviews, cols, columnWidth(width, cols))
+        return CGSize(width: width,
+                      height: heights.reduce(0, +) + spacing * CGFloat(max(heights.count - 1, 0)))
+    }
+
+    func placeSubviews(in bounds: CGRect, proposal: ProposedViewSize, subviews: Subviews,
+                       cache: inout ()) {
+        guard !subviews.isEmpty else { return }
+        let cols = columns(bounds.width, subviews)
+        let colWidth = columnWidth(bounds.width, cols)
+        var y = bounds.minY
+        for (row, height) in rowHeights(subviews, cols, colWidth).enumerated() {
+            for col in 0..<cols {
+                let i = row * cols + col
+                guard i < subviews.count else { break }
+                subviews[i].place(at: CGPoint(x: bounds.minX + CGFloat(col) * (colWidth + spacing), y: y),
+                                  anchor: .topLeading,
+                                  proposal: ProposedViewSize(width: colWidth, height: height))
+            }
+            y += height + spacing
+        }
     }
 }

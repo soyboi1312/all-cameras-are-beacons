@@ -130,12 +130,16 @@ private func detectionCountPhrase(_ count: Int, nearby: Bool = false) -> String 
 /// filter armed (RootView routes the URL, DetectionsView reads the pending flag).
 private let driveModeDeepLink = URL(string: "beacons://log/new")
 
-// TODO(iOS27, wire up after Xcode 27 GM ~Sept 2026; these need the iOS 27 SDK and
-// won't compile on stable Xcode 26.5, so they are intentionally NOT added yet):
-//   • @Environment(\.isDynamicIslandLimitedInWidth) in compactLeading/compactTrailing
-//     -> collapse to icon + number when the Island is width-limited (landscape mount).
-//   • @Environment(\.showsWidgetContainerBackground) in LockScreenView -> paint the
-//     panel edge-to-edge in StandBy (charging + landscape dock).
+// TODO(iOS27): two environment reads are still open.
+//   • @Environment(\.isDynamicIslandLimitedInWidth), iOS 27 only, in compactLeading, compactTrailing
+//     and minimal. The symbol exists only in the iOS 27 SDK, so besides #available(iOS 27, *) it
+//     needs a compile-time guard (for example #if compiler(>=6.4), the Swift that Xcode 27 ships)
+//     for as long as the gating CI lane builds with Xcode 26.6. Those views are already icon +
+//     number, so decide what, if anything, should shrink further on a width-limited (landscape)
+//     Island before wiring it.
+//   • @Environment(\.isActivityFullscreen), iOS 17 and later, in LockScreenView: true when the
+//     activity is shown full screen in StandBy (charging + landscape dock), where the panel should
+//     paint edge-to-edge. Needs a device check.
 // Landscape Dynamic Island rendering itself is automatic on iOS 27, no code needed.
 
 /// The Live Mode detection counter, presented on the Lock Screen and in the
@@ -185,9 +189,7 @@ struct DetectionLiveActivity: Widget {
                                 // many, never "no detections" over real hits.
                                 Text("\(s.total) seen").foregroundStyle(.secondary)
                             } else if s.total > 0 {
-                                Text("last \(s.lastKind) ").foregroundStyle(.secondary)
-                                + Text(s.lastSeen, style: .relative).foregroundStyle(.secondary)
-                                + Text(" ago").foregroundStyle(.secondary)
+                                Text("last \(s.lastKind) \(s.lastSeen, style: .relative) ago").foregroundStyle(.secondary)
                             } else {
                                 Text("no detections").foregroundStyle(.secondary)
                             }
@@ -330,9 +332,7 @@ private struct LockScreenView: View {
                         if state.total > 0 && state.lastKind.isEmpty {
                             Text("\(state.total) seen")
                         } else if state.total > 0 {
-                            Text("last \(state.lastKind) ")
-                            + Text(state.lastSeen, style: .relative)
-                            + Text(" ago")
+                            Text("last \(state.lastKind) \(state.lastSeen, style: .relative) ago")
                         } else {
                             Text("no detections")
                         }

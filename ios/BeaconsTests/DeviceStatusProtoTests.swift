@@ -52,6 +52,7 @@ final class DeviceStatusProtoTests: XCTestCase {
     func testBufferHealthFieldsDefaultOffOnEveryFreshStatus() throws {
         let s = try status(#"{"fw":"x","buf":9,"bufon":true}"#)
         XCTAssertFalse(s.bufferSaturated)
+        XCTAssertFalse(s.bufferRateLimited, "absent bufrl must decode false on every fresh frame")
         XCTAssertEqual(s.bufferFaults, 0)
         XCTAssertFalse(s.bufferKeyMismatch)
         XCTAssertEqual(s.bufferHealthNotices, [])
@@ -82,6 +83,29 @@ final class DeviceStatusProtoTests: XCTestCase {
         XCTAssertTrue(s.bufferHealthNotices[2].detail.contains("may already reflect a successful retry"))
         XCTAssertTrue(s.bufferHealthNotices[2].detail.contains("replay timestamps"))
         XCTAssertTrue(s.bufferHealthNotices[2].detail.contains("Clear the board buffer"))
+    }
+
+    /// The flood marker. Twin: Android `flood refusal becomes a user-visible warning` in
+    /// DeviceStatusProtoTest.kt, which pins the SAME literals; the two apps must render identically.
+    func testFloodRefusalBecomesAUserVisibleWarning() throws {
+        let s = try status(#"{"fw":"x","buf":9,"bufrl":true}"#)
+        XCTAssertTrue(s.bufferRateLimited)
+        XCTAssertEqual(s.bufferHealthNotices, [.floodRefused])
+        XCTAssertEqual(s.bufferHealthNotices[0].title, "DETECTION FLOOD REFUSED")
+        XCTAssertEqual(
+            s.bufferHealthNotices[0].detail,
+            "the board refused a burst of detections that looked like a flood, so some real rows may be missing from the offline log. export what synced, then clear the board buffer to reset this warning."
+        )
+        XCTAssertFalse(s.bufferHealthNotices[0].critical)
+        // An explicit false is the same as absent.
+        XCTAssertFalse(try status(#"{"fw":"x","bufrl":false}"#).bufferRateLimited)
+    }
+
+    func testFloodRefusalOrdersAfterStorageFailureAndBeforeCapacity() throws {
+        let s = try status(#"{"fw":"x","bufsat":true,"bufrl":true,"buferr":100,"keymis":true}"#)
+        XCTAssertEqual(s.bufferHealthNotices,
+                       [.keyNotAccepted, .storageFailed, .floodRefused, .capacityReached,
+                        .persistenceErrorRecorded])
     }
 
     func testNVSRetryAloneIsNotMislabeledAsRawStorageFailure() throws {

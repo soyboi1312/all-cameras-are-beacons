@@ -21,8 +21,30 @@ concurrency:
 
 jobs:
   test-and-release-build:
-    runs-on: macos-15
+    # two lanes. macos-26 is the GA image whose default Xcode 26.6 built the shipped 2.0.8; it is the
+    # lane that gates, and it ships several Xcodes, so its Xcode is pinned by path and an image refresh
+    # that changes the default cannot move the toolchain under the build. xcode-27 is GitHub's preview
+    # image (one major Xcode version per image, macOS 27 base): it is the toolchain the dev Mac now
+    # runs and the one App Store Connect requires for uploads from April 2027, and it is allowed to
+    # fail until GitHub marks it GA. that image carries exactly one Xcode which GitHub replaces in
+    # place (beta 6 became the RC between two refreshes), so the lane follows /Applications/Xcode.app
+    # and records xcodebuild -version instead of pinning an alias that the next refresh deletes.
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-26
+            xcode: /Applications/Xcode_26.6.app
+            required: true
+          - runner: xcode-27
+            xcode: /Applications/Xcode.app
+            required: false
+    name: ${{ matrix.runner }}
+    runs-on: ${{ matrix.runner }}
+    continue-on-error: ${{ !matrix.required }}
     timeout-minutes: 45
+    env:
+      DEVELOPER_DIR: ${{ matrix.xcode }}/Contents/Developer
     steps:
       - uses: actions/checkout@v5
 
@@ -33,18 +55,92 @@ jobs:
         working-directory: ios
         run: xcodegen generate
 
+      # the destination is discovered, never named. a hosted runner can answer with an empty device
+      # list while CoreSimulator is still rebuilding its caches, which is what failed the old
+      # 'iPhone 16 Pro' destination on macos-15 on 2026-09-18, and that model exists on neither
+      # macos-26 nor xcode-27, so the same name would fail every run there. 'xcrun simctl list' is the
+      # warm-up the runner-images maintainers recommend for the empty-list case. when the list is still
+      # empty after the retries but an iOS runtime is installed, a device is created on it; the
+      # platform download is the last resort for an image that ships no iOS runtime at all.
+      - name: Pick a simulator
+        run: |
+          set -o pipefail
+          xcodebuild -version
+          pick() {
+            xcrun simctl list devices available -j | jq -r '
+              .devices | to_entries
+              | map(select(.key | test("SimRuntime\\.iOS-")))
+              | map({rt: .key,
+                     ver: (.key | capture("iOS-(?<M>[0-9]+)-(?<m>[0-9]+)") | ((.M | tonumber) * 100 + (.m | tonumber))),
+                     devs: (.value | map(select(.isAvailable and (.name | startswith("iPhone")))))})
+              | map(select(.devs | length > 0))
+              | sort_by(.ver) | last
+              | if . == null then empty else "\(.devs[0].udid) \(.rt) \(.devs[0].name)" end'
+          }
+          choice=""
+          for attempt in 1 2 3 4 5 6; do
+            xcrun simctl list > /dev/null 2>&1 || true
+            choice=$(pick || true)
+            [ -n "$choice" ] && break
+            echo "attempt $attempt: CoreSimulator listed no available iPhone yet"
+            sleep 15
+          done
+          if [ -z "$choice" ]; then
+            # the newest installed iOS runtime and the newest iPhone it supports (listed first), from the same record
+            pair=$(xcrun simctl list runtimes available -j | jq -r '
+              [.runtimes[] | select(.isAvailable and (.identifier | test("SimRuntime\\.iOS-")))]
+              | sort_by(.version | split(".") | map(tonumber)) | last
+              | if . == null then empty else
+                  "\(.identifier) \(([.supportedDeviceTypes[] | select(.productFamily == "iPhone")] | first | .identifier) // "")"
+                end' || true)
+            read -r runtime devicetype <<< "$pair"
+            if [ -n "$runtime" ] && [ -n "$devicetype" ]; then
+              echo "no iPhone device listed on $runtime; creating one ($devicetype)"
+              xcrun simctl create ci-iphone "$devicetype" "$runtime" || true
+            else
+              echo "no iOS runtime is installed; downloading the platform"
+              xcodebuild -downloadPlatform iOS
+            fi
+            xcrun simctl list > /dev/null 2>&1 || true
+            choice=$(pick || true)
+          fi
+          if [ -z "$choice" ]; then
+            echo "::error::no usable iOS simulator on this runner"
+            xcrun simctl list runtimes
+            xcrun simctl list devices
+            exit 1
+          fi
+          read -r udid rt name <<< "$choice"
+          echo "using $name on $rt ($udid)"
+          xcrun simctl boot "$udid" || true
+          xcrun simctl bootstatus "$udid" -b
+          echo "SIM_UDID=$udid" >> "$GITHUB_ENV"
+
+      # one retry, after the same warm-up. simulator launches on hosted runners still fail
+      # intermittently upstream (actions/runner-images issue 12777), and every report there passed on
+      # a re-run of the same image. a real test failure fails both attempts; each attempt keeps its
+      # own result bundle because xcodebuild refuses to overwrite one.
       - name: Run unit tests
         working-directory: ios
         run: |
           set -o pipefail
-          xcodebuild \
-            -project Beacons.xcodeproj \
-            -scheme Beacons \
-            -configuration Debug \
-            -destination 'platform=iOS Simulator,OS=latest,name=iPhone 16 Pro' \
-            -resultBundlePath "$RUNNER_TEMP/BeaconsTests.xcresult" \
-            CODE_SIGNING_ALLOWED=NO \
-            test
+          for attempt in 1 2; do
+            if xcodebuild \
+                -project Beacons.xcodeproj \
+                -scheme Beacons \
+                -configuration Debug \
+                -destination "platform=iOS Simulator,id=$SIM_UDID" \
+                -destination-timeout 120 \
+                -resultBundlePath "$RUNNER_TEMP/BeaconsTests-$attempt.xcresult" \
+                CODE_SIGNING_ALLOWED=NO \
+                test; then
+              exit 0
+            fi
+            if [ "$attempt" = 2 ]; then exit 1; fi
+            echo "attempt 1 failed; warming CoreSimulator and retrying once"
+            xcrun simctl list > /dev/null 2>&1 || true
+            xcrun simctl bootstatus "$SIM_UDID" -b || true
+          done
 
       - name: Build Release configuration without signing
         working-directory: ios
@@ -58,10 +154,19 @@ jobs:
             CODE_SIGNING_ALLOWED=NO \
             build
 
+      - name: Simulator state on failure
+        if: failure()
+        working-directory: ios
+        run: |
+          xcodebuild -version || true
+          xcrun simctl list runtimes || true
+          xcrun simctl list devices available || true
+          xcodebuild -project Beacons.xcodeproj -scheme Beacons -showdestinations || true
+
       - name: Upload test result bundle
         if: always()
         uses: actions/upload-artifact@v5
         with:
-          name: ios-test-results
-          path: ${{ runner.temp }}/BeaconsTests.xcresult
+          name: ios-test-results-${{ matrix.runner }}
+          path: ${{ runner.temp }}/BeaconsTests-*.xcresult
           if-no-files-found: warn

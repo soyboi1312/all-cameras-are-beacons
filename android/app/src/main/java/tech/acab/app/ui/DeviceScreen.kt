@@ -2578,8 +2578,13 @@ private fun FirmwareCard(
                 color = Acab.dim, fontSize = 11.sp, fontFamily = Acab.mono,
             )
 
+            // TWIN: byte-identical to the healthy arm of iOS beaconFirmwareStatusPresentation.
+            // One short sentence on purpose: the row right above already reads
+            // "v<x> INSTALLED" and "v<x> LATEST KNOWN", so naming the version or the catalog
+            // here repeats it. The two arms above keep their full sentences, because what they
+            // describe (no board status, no listing) is exactly what those rows cannot show.
             else -> Text(
-                "You're on the latest known firmware for this beacon.",
+                "firmware is up to date.",
                 color = Acab.dim, fontSize = 11.sp, fontFamily = Acab.mono,
             )
         }

@@ -82,6 +82,7 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.compose.ui.viewinterop.AndroidView
 import kotlinx.coroutines.delay
+import java.io.File
 import org.osmdroid.config.Configuration
 import org.osmdroid.events.MapListener
 import org.osmdroid.events.ScrollEvent
@@ -188,24 +189,144 @@ private fun hasLocationPerm(context: Context): Boolean =
     ContextCompat.checkSelfPermission(context, Manifest.permission.ACCESS_COARSE_LOCATION) ==
         PackageManager.PERMISSION_GRANTED
 
-/** One-time osmdroid setup, run from composition before the first MapView (both map surfaces
- *  call it). userAgent first: the tile server rejects fetches without one. The tile-cache caps
- *  are set BEFORE load() on purpose: load() ends with a free-space clamp that shrinks the
- *  CURRENT maxBytes when the device is nearly full, and load() does not read the cache-size
- *  fields back from prefs, so this order keeps the 100 MB bound while still letting the clamp
- *  shrink it further. Skipping load() entirely (the old behavior) meant the clamp never ran
- *  and osmdroid grew toward its 600 MB default tile DB in the app's files dir. */
+/** One-time osmdroid setup, run from each MapView factory before the first MapView (both map
+ *  surfaces call it). The tile-cache caps are set BEFORE load() on purpose: load() ends with a
+ *  free-space clamp that shrinks the CURRENT maxBytes when the device is nearly full, and load()
+ *  does not read the cache-size fields back from prefs, so this order keeps the 100 MB bound while
+ *  still letting the clamp shrink it further. Skipping load() entirely (an older behavior) meant
+ *  the clamp never ran and osmdroid grew toward its 600 MB default tile DB.
+ *
+ *  STORAGE IS PINNED to [osmdroidBaseDir] (app-private internal storage). The tile cache is a
+ *  record of every area the user viewed, so it must never land on shared or removable storage.
+ *  Unpinned, osmdroid 6.1.20 picks the writable storage with the most free space, which can be an
+ *  app-specific EXTERNAL files dir. Order matters, because DefaultConfigurationProvider.load()
+ *  (read from the 6.1.20 bytecode) behaves in two ways:
+ *   - When the "osmdroid" prefs hold an `osmdroid.basePath` that still exists on disk, load()
+ *     REPLACES the in-memory base and tile paths with the stored `osmdroid.basePath` /
+ *     `osmdroid.cachePath`, so a value set before load() alone loses to an earlier launch's pick.
+ *   - Otherwise (first run, or the stored dir is gone) it asks getOsmdroidBasePath/TileCache,
+ *     which return a pre-set field without scanning storage, but only if that field's dir EXISTS;
+ *     a missing one makes load() fall back to filesDir/osmdroid and persist THAT path.
+ *  So the tile dir is created first (one mkdirs, which also creates the base), the stored keys
+ *  are rewritten to our dir (apply() updates the in-memory prefs map synchronously, which load()
+ *  then reads), the fields are pre-set, and both are set again after load() in case osmdroid's
+ *  fallback (base unwritable) still chose another dir.
+ *
+ *  The user agent is set AFTER load() for the same reason: load() always overwrites it, with the
+ *  bare package name on first run and with the stored `osmdroid.userAgentValue` afterwards. OSM's
+ *  tile usage policy requires a User-Agent that identifies the application and gives a way to
+ *  make contact; a bare package name satisfies neither.
+ *
+ *  Disk touch on the calling (main) thread is limited to what load() already did plus one
+ *  noBackupFilesDir lookup and one mkdirs (a no-op stat after the first launch). Deleting stale stores is [sweepStaleOsmdroidStores]'s job, off main. */
 internal fun configureOsmdroid(context: Context) {
     if (!osmConfigured.compareAndSet(false, true)) return
     val cfg = Configuration.getInstance()
-    // OSM's tile usage policy requires a User-Agent that identifies the application and gives a
-    // way to make contact; a bare package name satisfies neither and is the shape that gets an app
-    // blocked from the public tile servers. Version comes from BuildConfig so it cannot drift from
-    // build.gradle.kts, which a hardcoded string inevitably would.
-    cfg.userAgentValue = "tech.acab.app/${BuildConfig.VERSION_NAME} (+https://soyboi.tech)"
+    val base = osmdroidBaseDir(context)
+    val tiles = osmdroidTileDir(base)
+    tiles.mkdirs()
+    val prefs = context.getSharedPreferences("osmdroid", Context.MODE_PRIVATE)
+    if (prefs.getString(OSMDROID_PREF_BASE, null) != base.absolutePath ||
+        prefs.getString(OSMDROID_PREF_CACHE, null) != tiles.absolutePath) {
+        prefs.edit()
+            .putString(OSMDROID_PREF_BASE, base.absolutePath)
+            .putString(OSMDROID_PREF_CACHE, tiles.absolutePath)
+            .apply()
+    }
+    cfg.setOsmdroidBasePath(base)
+    cfg.setOsmdroidTileCache(tiles)
     cfg.tileFileSystemCacheMaxBytes = 100L * 1024 * 1024
     cfg.tileFileSystemCacheTrimBytes = 80L * 1024 * 1024
-    cfg.load(context, context.getSharedPreferences("osmdroid", Context.MODE_PRIVATE))
+    cfg.load(context, prefs)
+    cfg.setOsmdroidBasePath(base)
+    cfg.setOsmdroidTileCache(tiles)
+    // Version comes from BuildConfig so it cannot drift from build.gradle.kts, which a hardcoded
+    // string inevitably would.
+    cfg.userAgentValue = "tech.acab.app/${BuildConfig.VERSION_NAME} (+https://soyboi.tech)"
+}
+
+/** The prefs keys DefaultConfigurationProvider.load() reads and writes (osmdroid 6.1.20). */
+private const val OSMDROID_PREF_BASE = "osmdroid.basePath"
+private const val OSMDROID_PREF_CACHE = "osmdroid.cachePath"
+
+/** osmdroid's dir name under whichever root it picks, and SqlTileWriter's subdir (6.1.20). */
+private const val OSMDROID_DIR = "osmdroid"
+private const val OSMDROID_TILES_DIR = "tiles"
+
+/** Pinned osmdroid base: app-private internal storage, never external. noBackupFilesDir rather
+ *  than filesDir: backup is already disabled app-wide (allowBackup=false), but no_backup keeps a
+ *  record of viewed areas out of any backup or device transfer even if that ever changes, and it
+ *  is not cacheDir, so the tile DB does not sit beside the FileProvider-exposed export folders. */
+internal fun osmdroidBaseDir(context: Context): File = File(context.noBackupFilesDir, OSMDROID_DIR)
+
+internal fun osmdroidTileDir(base: File): File = File(base, OSMDROID_TILES_DIR)
+
+/**
+ * Every place an earlier build's unpinned osmdroid could have put its store, given the roots it
+ * chose from, minus [pinnedBase]. osmdroid 6.1.20's StorageUtils lists filesDir, the databases
+ * dir and each mounted getExternalFilesDirs(null) entry, and falls back to
+ * getExternalFilesDir(DIRECTORY_PICTURES); shared storage was never writable (the app has never
+ * held a storage permission). Pure over the roots it is given.
+ */
+internal fun staleOsmdroidStores(roots: List<File?>, pinnedBase: File): List<File> {
+    val pinned = pinnedBase.absoluteFile
+    return roots.filterNotNull()
+        .map { File(it, OSMDROID_DIR).absoluteFile }
+        .filter { it != pinned }
+        .distinct()
+}
+
+/** Recursively delete each of [dirs] that exists and is named like an osmdroid store. The name
+ *  check keeps a wrong root from ever turning this into a wipe of an unrelated folder. Returns
+ *  the dirs removed. File I/O: off the main thread only. */
+internal fun deleteOsmdroidStores(dirs: List<File>): List<File> = dirs.filter { dir ->
+    (dir.name == OSMDROID_DIR || dir.name == OSMDROID_TILES_DIR) && dir.exists() &&
+        runCatching { dir.deleteRecursively() }.getOrDefault(false)
+}
+
+/**
+ * Delete tile stores left outside [osmdroidBaseDir] by builds that did not pin it (possibly on
+ * external storage). Cold path: AcabBleManager's init runs it on Dispatchers.IO at app start. It
+ * never touches the pinned store, so it cannot race a live MapView. getExternalFilesDirs may
+ * create the app-specific external dirs; osmdroid's own storage scan already did that on every
+ * earlier install that opened the map.
+ */
+internal fun sweepStaleOsmdroidStores(context: Context) {
+    val external = runCatching { context.getExternalFilesDirs(null).toList() }.getOrDefault(emptyList())
+    val roots = buildList<File?> {
+        add(context.filesDir)
+        add(File(context.dataDir, "databases"))
+        addAll(external)
+        external.filterNotNull().forEach { add(File(it, android.os.Environment.DIRECTORY_PICTURES)) }
+    }
+    deleteOsmdroidStores(staleOsmdroidStores(roots, osmdroidBaseDir(context)))
+}
+
+/**
+ * The real Clear log's tile wipe: the cached tiles are a record of the areas the user viewed.
+ * File I/O and SQLite: off the main thread only.
+ *
+ * A live MapView survives this. When osmdroid was configured in this process, the rows are purged
+ * through SqlTileWriter's shared connection and that connection is closed (refreshDb) before the
+ * files go, so nothing keeps reading the old data. SqlTileWriter reopens lazily and mkdirs the
+ * tile dir first (getDb), a failed save is caught inside saveFile, and the SQL cache loader
+ * catches Throwable. A tile thread that reopens between refreshDb and the delete holds an
+ * unlinked, already-purged file: its next write fails read-only, which SqlTileWriter's
+ * catchException treats as non-functional and answers with refreshDb, so it costs a few
+ * uncached tiles, never a crash (all per the 6.1.20 bytecode).
+ * The pinned base dir itself is kept (only its tiles subdir goes). Stale stores are swept too.
+ */
+internal fun clearOsmdroidTileCache(context: Context) {
+    if (osmConfigured.get()) {
+        runCatching {
+            org.osmdroid.tileprovider.modules.SqlTileWriter().run {
+                purgeCache()
+                refreshDb()
+            }
+        }
+    }
+    deleteOsmdroidStores(listOf(osmdroidTileDir(osmdroidBaseDir(context))))
+    sweepStaleOsmdroidStores(context)
 }
 
 /** Mirrors iOS clusterable(_:): the types that arrive in volume (ambient nearby devices,

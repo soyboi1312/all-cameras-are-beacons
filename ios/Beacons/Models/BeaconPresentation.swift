@@ -331,9 +331,13 @@ struct BeaconFirmwareStatusPresentation: Equatable {
     let offersBrowserFlasher: Bool
 }
 
-/// Healthy/idle firmware copy is deliberately catalog-relative. A cached or bundled manifest is
-/// useful offline, but neither an absent status frame nor an unlisted board proves that the
-/// installed firmware is globally current.
+/// The healthy arm says plainly that the firmware is up to date, byte-identical to the `else` arm
+/// of android DeviceScreen.kt's firmware card. It used to scope that claim to
+/// "this app's current catalog" and repeat the installed version, which the card already prints
+/// in its own row right above; the owner cut both as noise (2026-09-20). The arms that describe
+/// what this app CANNOT know still say so in full: an absent status frame and a board missing
+/// from the catalog each get their own sentence below, and the fold row's kicker stays
+/// "LATEST KNOWN", so nothing claims global currency on a stale or bundled manifest.
 /// `revisionCompatible` is the belt-and-braces OTA revision gate reaching the copy: when the
 /// listing we would flash from disagrees with the revision the board reports, this card must say
 /// so and must NOT offer a flasher link, because that link goes to the disagreeing listing's own
@@ -377,7 +381,7 @@ func beaconFirmwareStatusPresentation(hasCurrentStatus: Bool,
     }
     return BeaconFirmwareStatusPresentation(
         symbol: "checkmark.seal.fill",
-        detail: "No newer board firmware is listed in this app's current catalog. Installed v\(installedVersion).",
+        detail: "firmware is up to date.",
         tone: .accent,
         offersBrowserFlasher: false)
 }

@@ -590,6 +590,11 @@ data class DeviceStatus(
     // while true and keeps it set until a successful clear, so absent must decode as false on
     // every fresh status frame rather than latching an earlier warning in the app.
     val bufferSaturated: Boolean,
+    // The board's signature-row flood limit refused at least one row ("bufrl"), so some real
+    // detections may be missing from the offline log. Persisted by the board until a successful
+    // clear and sent only while true, so absent decodes as false on every fresh frame, exactly like
+    // bufsat. Twin: iOS DeviceStatus.bufferRateLimited (DeviceStatus.swift).
+    val bufferRateLimited: Boolean,
     // Latched offline-buffer fault mask ("buferr"). 0x01...0x10 are raw-ring failures, 0x20 is
     // an offline-buffer metadata load/save failure (generation, anchors, privacy lifecycle, and
     // diagnostic state), and 0x40 is a cryptography failure. Firmware retries eligible work, but
@@ -683,6 +688,7 @@ data class DeviceStatus(
             bufCount = o.optInt("buf", 0),
             bufOn = o.optBoolean("bufon", false),
             bufferSaturated = o.optBoolean("bufsat", false),
+            bufferRateLimited = o.optBoolean("bufrl", false),
             bufferFaults = o.optLong("buferr", 0L).coerceIn(0L, 0xFFFF_FFFFL),
             bufferKeyMismatch = o.optBoolean("keymis", false),
             desertMode = o.optBoolean("desert", false),
@@ -727,6 +733,13 @@ enum class BufferHealthNotice(
         "Offline logging encountered a storage or encryption failure. Some offline detections may be missing or unavailable. Clear the offline buffer after reviewing or exporting it to reset this warning.",
         true,
     ),
+    // Twin: iOS BufferHealthNotice.floodRefused (DeviceStatus.swift). Title and detail must stay
+    // byte-identical; both suites pin the full literals.
+    FLOOD_REFUSED(
+        "DETECTION FLOOD REFUSED",
+        "the board refused a burst of detections that looked like a flood, so some real rows may be missing from the offline log. export what synced, then clear the board buffer to reset this warning.",
+        false,
+    ),
     CAPACITY_REACHED(
         "CAPTURE REACHED CAPACITY",
         "Stationary capture filled the board. Later nearby detections may be missing. Export what synced, then clear the board buffer before another deployment.",
@@ -746,6 +759,8 @@ val DeviceStatus.bufferHealthNotices: List<BufferHealthNotice>
         if (bufferKeyMismatch) add(BufferHealthNotice.KEY_NOT_ACCEPTED)
         val nonNvsFaults = bufferFaults and 0x20L.inv()
         if (nonNvsFaults != 0L) add(BufferHealthNotice.STORAGE_FAILED)
+        // Ahead of capacity: a flood can cost signature rows, capacity only costs nearby ones.
+        if (bufferRateLimited) add(BufferHealthNotice.FLOOD_REFUSED)
         if (bufferSaturated) add(BufferHealthNotice.CAPACITY_REACHED)
         if (bufferFaults and 0x20L != 0L) add(BufferHealthNotice.PERSISTENCE_ERROR_RECORDED)
     }

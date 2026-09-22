@@ -253,6 +253,17 @@ enum ACABTheme {
         Font.custom(jetBrains(TypePrefs.shared.effectiveWeight(weight)), size: size, relativeTo: scaleAnchor(size))
     }
 
+    /// Mono pinned OFF the Dynamic Type curve, for instrument chrome that lives inside fixed
+    /// geometry (the scope's ring labels and its TOTAL NEARBY caption). It still carries the
+    /// weight rule, so higher contrast and Bold Text reach these too; JetBrains Mono is
+    /// monospaced, so the heavier cut costs no width and cannot push them into the count.
+    /// Use `mono` everywhere else: pinning real content off Dynamic Type is an accessibility
+    /// regression, and these two sites document why they are exceptions.
+    @MainActor
+    static func monoFixed(_ size: CGFloat, weight: Font.Weight = .medium) -> Font {
+        Font.custom(jetBrains(TypePrefs.shared.effectiveWeight(weight)), fixedSize: size)
+    }
+
     /// Which system curve a point size rides as the user's text size changes.
     /// Derived from the size rather than fixed per helper because the curves diverge hard at
     /// accessibility sizes: caption roughly quadruples, largeTitle less than doubles. Putting
@@ -290,8 +301,9 @@ enum ACABTheme {
 /// Kept as an @Observable singleton rather than an environment value because the helpers are
 /// static and called from ~500 sites; Observation tracks the property read wherever it happens
 /// inside a body, so the dependency is registered without threading anything through views.
-/// RootView mirrors `@Environment(\.legibilityWeight)` into `bold` (the SwiftUI-side signal),
-/// and the UIAccessibility notification covers the case where no view has rendered yet.
+/// RootView mirrors `@Environment(\.legibilityWeight)` into `bold` and
+/// `@Environment(\.colorSchemeContrast)` into `highContrast` (the SwiftUI-side signals), and the
+/// UIAccessibility notifications cover the case where no view has rendered yet.
 @Observable
 @MainActor
 final class TypePrefs {
@@ -299,19 +311,40 @@ final class TypePrefs {
 
     var bold: Bool
 
+    /// Higher contrast, from either input: the in-app "always use higher contrast" switch
+    /// (ContrastPreference forces the window trait) or the iOS Increase Contrast setting.
+    /// Weight is the one thing iOS will not brighten for us: the palette swap lifts colour only,
+    /// so on a dark theme the switch used to leave every glyph exactly as thin as before.
+    /// ANDROID DOES NOT MIRROR THIS, on purpose: its system "high contrast text" (API 36) and
+    /// `fontWeightAdjustment` restyle app text in the platform, so bumping weight in the app
+    /// there would double the effect. Android's switch stays palette-only; see ContrastMode.
+    var highContrast: Bool
+
     private init() {
         bold = UIAccessibility.isBoldTextEnabled
+        highContrast = ContrastPreference.shared.alwaysHigher
+            || UIAccessibility.isDarkerSystemColorsEnabled
         NotificationCenter.default.addObserver(
             forName: UIAccessibility.boldTextStatusDidChangeNotification, object: nil, queue: .main
         ) { _ in
             Task { @MainActor in TypePrefs.shared.bold = UIAccessibility.isBoldTextEnabled }
         }
+        NotificationCenter.default.addObserver(
+            forName: UIAccessibility.darkerSystemColorsStatusDidChangeNotification,
+            object: nil, queue: .main
+        ) { _ in
+            Task { @MainActor in
+                TypePrefs.shared.highContrast = ContrastPreference.shared.alwaysHigher
+                    || UIAccessibility.isDarkerSystemColorsEnabled
+            }
+        }
     }
 
-    /// One cut heavier while Bold Text is on. Bold already sits at the heaviest bundled cut
-    /// of both families, so it stays put.
+    /// One cut heavier while Bold Text or higher contrast is on. Bold already sits at the
+    /// heaviest bundled cut of both families, so it stays put, and the two inputs do not stack:
+    /// one step is the whole vocabulary these two families ship.
     func effectiveWeight(_ w: Font.Weight) -> Font.Weight {
-        guard bold else { return w }
+        guard bold || highContrast else { return w }
         switch w {
         case .ultraLight, .thin, .light, .regular: return .medium
         case .medium:                              return .semibold

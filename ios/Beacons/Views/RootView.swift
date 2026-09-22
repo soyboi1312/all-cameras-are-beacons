@@ -85,6 +85,11 @@ struct RootView: View {
     /// Bold Text. Mirrored into TypePrefs (the observable the static font helpers read) so a
     /// change made in Settings reaches every custom-font Text without a relaunch.
     @Environment(\.legibilityWeight) private var legibilityWeight
+    /// Higher contrast, mirrored into TypePrefs beside `bold`: the palette swap is a colour
+    /// change, and this is what also carries it into type weight. Reading the environment (not
+    /// ContrastPreference) covers both inputs at once, because the in-app switch reaches views
+    /// as the same window trait the iOS setting sets.
+    @Environment(\.colorSchemeContrast) private var colorSchemeContrast
     private var hasUsableSession: Bool {
         (ble.sessionReady && ble.connectionState == .connected)
             || (ble.demoMode && ble.connectionState == .connected)
@@ -138,6 +143,9 @@ struct RootView: View {
             }
         }
         .animation(.easeInOut, value: ble.offlineSyncBanner)
+        .onChange(of: colorSchemeContrast, initial: true) { _, c in
+            TypePrefs.shared.highContrast = (c == .increased)
+        }
         .onChange(of: legibilityWeight, initial: true) { _, w in
             TypePrefs.shared.bold = (w == .bold)
         }
@@ -436,12 +444,17 @@ struct MainTabView: View {
     @EnvironmentObject var ble: BLEManager
     @State private var tab: Int
     @State private var openDetectorsToken = 0
+    /// The four .tag values below. An app built with the iOS 27 SDK traps when a TabView selection
+    /// names a tab that is not visible, so every seed that comes from outside the body (the DEBUG
+    /// -tab launch argument and the acab.pendingTab hand-off) is checked against this first.
+    private static let tabTags = 0...3
 
     init() {
         var initial = 0
         #if DEBUG
         let args = ProcessInfo.processInfo.arguments
-        if let i = args.firstIndex(of: "-tab"), i + 1 < args.count, let n = Int(args[i + 1]) { initial = n }
+        if let i = args.firstIndex(of: "-tab"), i + 1 < args.count, let n = Int(args[i + 1]),
+           Self.tabTags.contains(n) { initial = n }
         #endif
         _tab = State(initialValue: initial)
 
@@ -494,7 +507,7 @@ struct MainTabView: View {
         .onAppear {
             if let pending = UserDefaults.standard.object(forKey: "acab.pendingTab") as? Int {
                 UserDefaults.standard.removeObject(forKey: "acab.pendingTab")
-                tab = pending
+                if Self.tabTags.contains(pending) { tab = pending }
             }
         }
         // Warm path: already mounted when the tap arrived; RootView's onOpenURL posts

@@ -48,6 +48,7 @@ import androidx.compose.material.icons.outlined.Circle
 import androidx.compose.material.icons.outlined.FilterAlt
 import androidx.compose.material.icons.outlined.Inbox
 import androidx.compose.material.icons.outlined.RadioButtonChecked
+import androidx.compose.material3.LocalTextStyle
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.DropdownMenu
 import androidx.compose.material3.DropdownMenuItem
@@ -85,6 +86,10 @@ import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalDensity
+import androidx.compose.ui.text.AnnotatedString
+import androidx.compose.ui.text.TextStyle
+import androidx.compose.ui.text.rememberTextMeasurer
+import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.semantics.selected
 import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.semantics
@@ -672,7 +677,9 @@ fun LogScreen(
                 } ?: throw IllegalStateException("this screen is no longer available; try again")
                 activity.startActivity(Intent.createChooser(send, "Export detections"))
                 // A receiving app can keep reading after the chooser closes. Once launch succeeds,
-                // age-pruning owns cleanup; never delete this package in our finally path.
+                // cleanup belongs to the age bound (ExportCache.kt EXPORT_PACKAGE_MAX_AGE_MS, at
+                // the next export and at app start) and to the real Clear log; never delete this
+                // package in our finally path.
                 packageDir = null
             } catch (e: CancellationException) {
                 packageDir?.let { runCatching { it.deleteRecursively() } }
@@ -728,10 +735,10 @@ fun LogScreen(
                 // SEEN would clear the new-dots mid-triage).
                 // Clear lives at the end of the list, not up here with the routine actions.
                 if (!selectMode && detections.isNotEmpty()) {
-                    // horizontalScroll because this row is now FOUR chips: at 411dp phone width
-                    // minus 20dp padding each side there is ~371dp, and SELECT + EXPORT + GPX +
-                    // MARK SEEN exceeds it, so the last chip was clipped with no way to reach it.
-                    // A filtered label ("DRONE CSV") makes it wider still.
+                    // horizontalScroll so no chip is ever clipped out of reach: the row holds up
+                    // to three chips (SELECT, EXPORT, MARK SEEN), and a filtered EXPORT label
+                    // ("EXPORT BODY CAM") is much wider than the plain one. It held four until
+                    // CSV and GPX folded into the one EXPORT menu below.
                     Row(horizontalArrangement = Arrangement.spacedBy(8.dp),
                         modifier = Modifier.horizontalScroll(rememberScrollState())) {
                         ActionChip(Icons.AutoMirrored.Filled.PlaylistAddCheck, "SELECT") {
@@ -820,16 +827,21 @@ fun LogScreen(
             }
         }
 
-        // Search and ordering apply INSIDE the category + ALL/NEW/OFFLINE lens. At large text the
-        // sort control drops under the field rather than squeezing its hint into an unreadable sliver.
+        // Search and ordering apply INSIDE the category + ALL/NEW/OFFLINE lens. They share one row
+        // whenever the field keeps its whole placeholder with the widest sort chip beside it
+        // (rememberLogSearchFitsBesideSort measures both); otherwise the sort drops under the
+        // field rather than squeezing its hint into an unreadable sliver. The old fixed rule
+        // (stack below 380dp) stacked on every ~411dp phone, costing a full row of first screen.
+        // DELIBERATE PLATFORM DIFFERENCE, kept since 2.0.8: here search and sort sit below the
+        // ALL/NEW/OFFLINE chips; on iPhone they sit above the category tiles
+        // (DetectionsView.searchAndSort, which names this file).
         item {
             Column(
                 Modifier.fillMaxWidth().padding(bottom = 16.dp),
                 verticalArrangement = Arrangement.spacedBy(8.dp),
             ) {
                 BoxWithConstraints(Modifier.fillMaxWidth()) {
-                    val stack = maxWidth < 380.dp || LocalDensity.current.fontScale >= 1.3f
-                    if (stack) {
+                    if (!rememberLogSearchFitsBesideSort(maxWidth)) {
                         Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
                             LogSearchField(searchQuery, { searchQuery = it }, Modifier.fillMaxWidth())
                             LogSortControl(sort, { sort = it })
@@ -873,17 +885,14 @@ fun LogScreen(
                 if (it.key == WATCHED_FILTER_KEY) n > 0 else n > 0 || it.key == catFilter
             }
             if (visibleCats.isNotEmpty()) {
-                // At large font scales a six-across strip squeezes each label into a sliver;
-                // wrap to rows of three so the numbers stay legible instead of truncating.
+                // Same rule as the Status strip: rows of three as soon as the widest label no
+                // longer fits (rememberCategoryTilesPerRow measures it), so no label truncates.
                 BoxWithConstraints(Modifier.fillMaxWidth().padding(bottom = 16.dp)) {
-                    val perRow = when {
-                        maxWidth < 360.dp || LocalDensity.current.fontScale >= 1.5f -> 3
-                        visibleCats.size > 6 -> 4
-                        else -> visibleCats.size
-                    }
-                    Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                    val perRow = rememberCategoryTilesPerRow(visibleCats.map { it.label }, maxWidth,
+                        if (visibleCats.size > 6) 4 else visibleCats.size)
+                    Column(verticalArrangement = Arrangement.spacedBy(CategoryTileGap)) {
                         visibleCats.chunked(perRow.coerceAtLeast(1)).forEach { rowCats ->
-                            Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                            Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(CategoryTileGap)) {
                                 rowCats.forEach { c ->
                                     CategoryTile(c.type, c.key, c.label, count(c.key), catFilter, Modifier.weight(1f)) { catFilter = it }
                                 }
@@ -1011,8 +1020,9 @@ fun LogScreen(
                 Text("Clear ${detections.size} detection${if (detections.size == 1) "" else "s"}?", color = Acab.text,
                     fontSize = 18.sp, fontWeight = FontWeight.SemiBold)
                 Text(
-                    "This deletes the log on this phone and can't be undone. " +
-                        "If this is evidence, export it first.",
+                    "This deletes the log on this phone, including the app's copies of earlier exports, " +
+                        "and can't be undone. If this is evidence, export it first and save or send it " +
+                        "somewhere else. Only a copy outside the app survives.",
                     color = Acab.dim, fontSize = 14.sp,
                 )
                 Spacer(Modifier.size(4.dp))
@@ -1192,8 +1202,14 @@ private fun LogSearchField(
             }
         }) else null,
         placeholder = {
-            // TWIN: the iOS search field's placeholder in DetectionsView.searchAndSort.
-            Text("Search name, MAC or vendor", color = Acab.faint, fontSize = 13.sp)
+            // TWIN: the iOS search field's placeholder in DetectionsView.searchAndSort. M3 merges
+            // MaterialTheme.typography.bodyLarge into this slot (its own face and 0.5sp tracking),
+            // which used to override MainActivity's Space Grotesk, so the hint drew in Material's
+            // face. LogSearchPlaceholderStyle pins the face AND the tracking, so the drawn hint is
+            // exactly what rememberLogSearchFitsBesideSort measures; the Space Grotesk face (as on
+            // iPhone) is a deliberate change made with it (2026-09-20).
+            Text(LOG_SEARCH_PLACEHOLDER, color = Acab.faint,
+                style = LocalTextStyle.current.merge(LogSearchPlaceholderStyle))
         },
         textStyle = androidx.compose.ui.text.TextStyle(
             color = Acab.text, fontSize = 14.sp, fontFamily = Acab.mono),
@@ -1208,6 +1224,60 @@ private fun LogSearchField(
             unfocusedContainerColor = Acab.bg2,
         ),
     )
+}
+
+internal const val LOG_SEARCH_PLACEHOLDER = "Search name, MAC or vendor"
+private val LogSearchPlaceholderStyle =
+    TextStyle(fontSize = 13.sp, fontFamily = Acab.display, letterSpacing = 0.sp)
+private val LogSortLabelStyle = TextStyle(
+    fontSize = 10.5.sp, fontFamily = Acab.mono, fontWeight = FontWeight.Bold, letterSpacing = 0.5.sp,
+)
+
+/** Field width that is not placeholder: the M3 leading-icon slot and its gap (52dp, read from the
+ *  laid-out field on a 411dp emulator: the hint starts 52dp in) plus the M3 end padding (16dp). */
+private val LogSearchFieldChrome = 68.dp
+
+/** Sort chip width that is not label: 12dp padding each side, the 15dp icon and its 6dp gap
+ *  (LogSortControl). */
+private val LogSortChipChrome = 45.dp
+
+/** The sort chip's words, shared by LogSortControl and the fit rule so they cannot drift. */
+internal fun logSortChipLabel(sort: LogSort): String =
+    if (sort == LogSort.Newest) "NEWEST" else "STRONGEST"
+
+/** The widest sort chip label under [measure], over every sort the chip can show, so switching
+ *  the sort never flips the layout. Pure apart from [measure], so it is unit-tested. */
+internal fun widestSortChipLabel(measure: (String) -> Int): Int =
+    LogSort.entries.maxOf { measure(logSortChipLabel(it)) }
+
+/** Whether search and sort fit on one row with the whole placeholder showing. Pure, so the rule
+ *  is unit-tested (LogSearchSortFitTest) apart from the measuring below. */
+internal fun logSearchFitsBesideSort(
+    rowWidthPx: Float, placeholderPx: Float, fieldChromePx: Float,
+    gapPx: Float, widestSortLabelPx: Float, sortChromePx: Float,
+): Boolean = rowWidthPx >= placeholderPx + fieldChromePx + gapPx + widestSortLabelPx + sortChromePx
+
+/** [logSearchFitsBesideSort] for this screen. It measures the WIDER sort label, so switching
+ *  between NEWEST and STRONGEST never flips the layout, and it re-measures only when the density
+ *  (which carries the font scale) changes. */
+@Composable
+private fun rememberLogSearchFitsBesideSort(rowWidth: Dp): Boolean {
+    val measurer = rememberTextMeasurer()
+    val density = LocalDensity.current
+    val placeholderStyle = LocalTextStyle.current.merge(LogSearchPlaceholderStyle)
+    val sortStyle = LocalTextStyle.current.merge(LogSortLabelStyle)
+    val widths = remember(density, placeholderStyle, sortStyle) {
+        val hint = measurer.measure(AnnotatedString(LOG_SEARCH_PLACEHOLDER), placeholderStyle,
+            softWrap = false, maxLines = 1).size.width
+        val sort = widestSortChipLabel {
+            measurer.measure(AnnotatedString(it), sortStyle, softWrap = false, maxLines = 1).size.width
+        }
+        hint to sort
+    }
+    return with(density) {
+        logSearchFitsBesideSort(rowWidth.toPx(), widths.first.toFloat(), LogSearchFieldChrome.toPx(),
+            8.dp.toPx(), widths.second.toFloat(), LogSortChipChrome.toPx())
+    }
 }
 
 @Composable
@@ -1228,9 +1298,8 @@ private fun LogSortControl(sort: LogSort, onSort: (LogSort) -> Unit) {
         ) {
             Icon(Icons.AutoMirrored.Filled.Sort, contentDescription = null, tint = Acab.dim,
                 modifier = Modifier.size(15.dp))
-            Text(if (sort == LogSort.Newest) "NEWEST" else "STRONGEST",
-                color = Acab.dim, fontSize = 10.5.sp, fontFamily = Acab.mono,
-                fontWeight = FontWeight.Bold, letterSpacing = 0.5.sp)
+            Text(logSortChipLabel(sort),
+                color = Acab.dim, style = LocalTextStyle.current.merge(LogSortLabelStyle))
         }
         DropdownMenu(
             expanded = open,
@@ -1305,21 +1374,32 @@ private fun CategoryTile(
                 selected = active
                 contentDescription = "$spokenLabel, $n detection${if (n == 1) "" else "s"}"
             }
-            .padding(10.dp),
+            .padding(horizontal = CategoryTileSidePadding, vertical = CategoryTileEndPadding),
         verticalArrangement = Arrangement.spacedBy(5.dp),
+        horizontalAlignment = Alignment.CenterHorizontally,
     ) {
         Icon(type.icon(), contentDescription = null,
             tint = if (n == 0 && !active) Acab.faint else type.tone(), modifier = Modifier.size(14.dp))
         Text("$n", color = if (n == 0) Acab.faint else Acab.text,
             fontSize = 18.sp, fontWeight = FontWeight.Bold)
         Text(label, color = if (active) type.textTone() else if (n == 0) Acab.faint else Acab.dim,
-            fontSize = 8.sp, letterSpacing = 1.sp, fontWeight = FontWeight.Medium,
-            fontFamily = Acab.mono, maxLines = 1)
+            style = LocalTextStyle.current.merge(CategoryTileLabelStyle), maxLines = 1)
     }
 }
 
+/** Font scale from which [DetectionRow] stacks instead of packing name, NODE and chips on one line.
+ *  Measured on the beacon_play_36 AVD (411dp wide) with the sample data, from the laid-out title
+ *  bounds in a uiautomator dump: beside NODE on a row with no other chip the name gets 139dp at
+ *  1.3, 136dp at 1.35, 124dp at 1.5, 101dp at 1.8 and 85dp at 2.0, while the names grow with the
+ *  scale. At 1.3 every sample name except the 14-character drone serial is whole. At 1.35 the
+ *  longest maker name, "Apple Find My", is the first to lose letters; at 1.5 four of the six are
+ *  cut; at 2.0 the Meta row, which also carries EXP, shows only "…". So 1.3 stays compact and
+ *  1.35 up stacks. The stock font-size slider on that AVD steps from 1.3 straight to 1.5. */
+private const val DETECTION_ROW_STACK_FONT_SCALE = 1.35f
+
 /** One log row: glyph, name, source/method, RSSI + bars. Tap opens the dossier, or toggles
- *  the checkbox in select mode. */
+ *  the checkbox in select mode. From [DETECTION_ROW_STACK_FONT_SCALE] up it draws
+ *  [StackedDetectionRow] instead. */
 @Composable
 private fun DetectionRow(
     d: Detection,
@@ -1329,19 +1409,18 @@ private fun DetectionRow(
     checked: Boolean,
     onClick: () -> Unit,
 ) {
-    Row(
-        Modifier.fillMaxWidth().clickable(onClick = onClick)
-            .semantics { if (muted) stateDescription = "Muted, history retained" }
-            .padding(vertical = 11.dp),
-        verticalAlignment = Alignment.CenterVertically,
-    ) {
+    // One outer node for both layouts, so the tap target and the spoken muted state cannot differ
+    // between them.
+    val rowModifier = Modifier.fillMaxWidth().clickable(onClick = onClick)
+        .semantics { if (muted) stateDescription = "Muted, history retained" }
+        .padding(vertical = 11.dp)
+    if (LocalDensity.current.fontScale >= DETECTION_ROW_STACK_FONT_SCALE) {
+        StackedDetectionRow(d, timeBasis, muted, selectMode, checked, rowModifier)
+        return
+    }
+    Row(rowModifier, verticalAlignment = Alignment.CenterVertically) {
         if (selectMode) {
-            Icon(
-                if (checked) Icons.Filled.CheckCircle else Icons.Outlined.Circle,
-                contentDescription = if (checked) "Selected" else "Not selected",
-                tint = if (checked) Acab.accent else Acab.faint,
-                modifier = Modifier.size(22.dp),
-            )
+            SelectMark(checked)
             Spacer(Modifier.size(12.dp))
         }
         CatGlyph(d.type, size = 40)
@@ -1358,70 +1437,148 @@ private fun DetectionRow(
                 // mistaking a buffer replay for a live sighting, so losing them is not cosmetic.
                 // This is how SwiftUI's HStack already behaves on the iOS row; Android needed to
                 // be told, and adding the NODE handle ahead of the chips made it reachable at
-                // ordinary title lengths rather than only absurd ones.
+                // ordinary title lengths rather than only absurd ones. The cost is that the
+                // title is what shrinks as the font grows, which is why large scales stack.
                 Text(d.displayName, color = Acab.text, fontSize = 15.sp,
                     fontWeight = FontWeight.SemiBold, maxLines = 1,
                     overflow = TextOverflow.Ellipsis,
                     modifier = Modifier.weight(1f, fill = false))
-                // NODE handle, matching iOS DetectionRow. Android rendered NOTHING here, which is
-                // why three cameras in a row were LITERALLY identical on this platform and merely
-                // near-identical on iPhone: the last-4 of the MAC is the only per-device text on a
-                // row whose title falls back to a shared label. The comment above claimed a "type
-                // + last-4 label" that had never existed.
-                Text("NODE ${d.mac.replace(":", "").takeLast(4).uppercase()}",
-                    color = Acab.dim, fontSize = 11.sp, fontFamily = Acab.mono)
-                if (muted) MutedTag()
-                if (d.type.isExperimental) ExpTag()
-                if (d.offline) OfflineTag()
-                // A dense row has no space to explain itself, so it flags that this record's
-                // time is derived (or absent) and leaves the explanation to the dossier.
-                // Exact rows get nothing.
-                when (timeBasis) {
-                    is TimeBasis.Reconstructed -> ReconTag()
-                    is TimeBasis.Bracketed -> RangeTag()
-                    is TimeBasis.Unknown -> NoTimeTag()
-                    else -> Unit
-                }
+                DetectionRowBadges(d, timeBasis, muted)
             }
             Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-                // how it was seen, like the iOS row: "BLE · OUI match". When the title leads with
-                // something OTHER than the category (an advertised name, or now the broadcast
-                // maker), the category moves here so it is never absent from the row entirely.
-                // This branch is why the iOS row can afford a maker-led title; Android printed
-                // source·method unconditionally and would have lost the category outright.
                 // weight(fill = false) + maxLines=1, same fix the TITLE row above carries: make
                 // THIS text the flexible child so Compose measures the fixed-size chips (confidence,
                 // the amber GPS-age pill) first and lets the source/method label ellipsize instead.
                 // Without it, a narrow or large-font screen (a Pixel 2 with display size bumped)
                 // overflowed this row: the label wrapped to two lines and the GPS-age pill was
                 // shoved against the RSSI column. The subtitle never got the treatment the title did.
-                Text(if (d.hasName) "${d.type.label} · ${d.methodLabel}"
-                     else "${d.sourceLabel} · ${d.methodLabel}",
+                Text(detectionRowSubtitle(d),
                     color = Acab.faint, fontSize = 11.sp, fontFamily = Acab.mono,
                     maxLines = 1, overflow = TextOverflow.Ellipsis,
                     modifier = Modifier.weight(1f, fill = false))
-                // Confidence, so the list answers "definitely something, or just suspected?"
-                // without opening the dossier. Bands match the dossier's verdict copy exactly
-                // (<50 weak / <80 partial / >=80 strong) and iOS DetectionRow.confidenceTint.
-                // HIDDEN at 0: Desert nearby-devices are confidence 0 by construction (nothing
-                // matched), and a wall of "0%" chips would be noise.
-                if (d.confidence > 0) ConfidenceBadge(d.confidence)
-                // offline / Desert mode: the coordinate came from a stale phone fix
-                d.locationAgeText?.let { GpsAgeBadge(it) }
+                DetectionRowEvidenceChips(d)
             }
         }
         // Guaranteed gutter so the middle column's rightmost chip can never kiss the RSSI, even
         // if its content still runs to the column edge on some future locale/font combination.
         Spacer(Modifier.size(10.dp))
-        Column(horizontalAlignment = Alignment.End, verticalArrangement = Arrangement.spacedBy(5.dp)) {
-            Text("${d.rssi}", color = d.type.textTone(), fontSize = 13.sp,
-                fontWeight = FontWeight.SemiBold, fontFamily = Acab.mono, maxLines = 1)
-            SignalBars(rssiBars(d.rssi), tint = d.type.tone())
-        }
+        DetectionRowSignal(d)
         Spacer(Modifier.size(8.dp))
-        Icon(Icons.Filled.ChevronRight, contentDescription = null, tint = Acab.faint,
-            modifier = Modifier.size(16.dp))
+        DetectionRowChevron()
     }
+}
+
+/** [DetectionRow] at large font scales. The compact row gives the name only what the fixed-width
+ *  NODE handle, chips, RSSI column and chevron leave, so at 2.0 names shrank to "Floc…" and the
+ *  Meta row to a bare "…". Here the name leaves the glyph row and takes the full row width with no
+ *  line cap; NODE, each chip, the subtitle, confidence and the GPS age then get a line each, and
+ *  the RSSI readout sits at the trailing edge of its own last line. The content order, and so the
+ *  TalkBack order, is the compact row's.
+ *  TWIN: iOS DetectionRow.accessibilityLayout, which stacks the same way at its own threshold
+ *  (dynamicTypeSize.isAccessibilitySize). Chip order follows each platform's compact row, so MUTED
+ *  comes before EXP here and after OFFLINE there. */
+@Composable
+private fun StackedDetectionRow(
+    d: Detection,
+    timeBasis: TimeBasis?,
+    muted: Boolean,
+    selectMode: Boolean,
+    checked: Boolean,
+    modifier: Modifier,
+) {
+    Column(modifier, verticalArrangement = Arrangement.spacedBy(10.dp)) {
+        Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+            if (selectMode) {
+                SelectMark(checked)
+                Spacer(Modifier.size(12.dp))
+            }
+            CatGlyph(d.type, size = 40)
+            Spacer(Modifier.weight(1f))
+            DetectionRowChevron()
+        }
+        // No maxLines: a cap would cut a long name short. A name of several words wraps between
+        // them; a single token wider than the row (a drone serial, a rename) wraps inside itself.
+        Text(d.displayName, color = Acab.text, fontSize = 15.sp, fontWeight = FontWeight.SemiBold)
+        Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
+            DetectionRowBadges(d, timeBasis, muted)
+            Text(detectionRowSubtitle(d), color = Acab.faint, fontSize = 11.sp, fontFamily = Acab.mono)
+            DetectionRowEvidenceChips(d)
+        }
+        DetectionRowSignal(d, Modifier.align(Alignment.End))
+    }
+}
+
+/** Select-mode checkbox, spoken as the row's selection state. */
+@Composable
+private fun SelectMark(checked: Boolean) {
+    Icon(
+        if (checked) Icons.Filled.CheckCircle else Icons.Outlined.Circle,
+        contentDescription = if (checked) "Selected" else "Not selected",
+        tint = if (checked) Acab.accent else Acab.faint,
+        modifier = Modifier.size(22.dp),
+    )
+}
+
+/** The NODE handle, then the provenance chips. The compact row lays them in the name's line; the
+ *  stacked row gives each its own line. One list, so neither layout can drop a chip. */
+@Composable
+private fun DetectionRowBadges(d: Detection, timeBasis: TimeBasis?, muted: Boolean) {
+    // NODE handle, matching iOS DetectionRow. Android rendered NOTHING here, which is
+    // why three cameras in a row were LITERALLY identical on this platform and merely
+    // near-identical on iPhone: the last-4 of the MAC is the only per-device text on a
+    // row whose title falls back to a shared label.
+    Text("NODE ${d.mac.replace(":", "").takeLast(4).uppercase()}",
+        color = Acab.dim, fontSize = 11.sp, fontFamily = Acab.mono)
+    if (muted) MutedTag()
+    if (d.type.isExperimental) ExpTag()
+    if (d.offline) OfflineTag()
+    // A log row has no space to explain itself, so it flags that this record's
+    // time is derived (or absent) and leaves the explanation to the dossier.
+    // Exact rows get nothing.
+    when (timeBasis) {
+        is TimeBasis.Reconstructed -> ReconTag()
+        is TimeBasis.Bracketed -> RangeTag()
+        is TimeBasis.Unknown -> NoTimeTag()
+        else -> Unit
+    }
+}
+
+/** How it was seen, like the iOS row: "BLE · OUI match". When the title leads with
+ *  something OTHER than the category (an advertised name, or now the broadcast
+ *  maker), the category moves here so it is never absent from the row entirely.
+ *  This branch is why the iOS row can afford a maker-led title; Android printed
+ *  source·method unconditionally and would have lost the category outright. */
+private fun detectionRowSubtitle(d: Detection): String =
+    if (d.hasName) "${d.type.label} · ${d.methodLabel}" else "${d.sourceLabel} · ${d.methodLabel}"
+
+/** Confidence and the GPS-age pill, after the subtitle in both layouts. */
+@Composable
+private fun DetectionRowEvidenceChips(d: Detection) {
+    // Confidence, so the list answers "definitely something, or just suspected?"
+    // without opening the dossier. Bands match the dossier's verdict copy exactly
+    // (<50 weak / <80 partial / >=80 strong) and iOS DetectionRow.confidenceTint.
+    // HIDDEN at 0: Desert nearby-devices are confidence 0 by construction (nothing
+    // matched), and a wall of "0%" chips would be noise.
+    if (d.confidence > 0) ConfidenceBadge(d.confidence)
+    // offline / Desert mode: the coordinate came from a stale phone fix
+    d.locationAgeText?.let { GpsAgeBadge(it) }
+}
+
+/** RSSI over signal bars, trailing-aligned. */
+@Composable
+private fun DetectionRowSignal(d: Detection, modifier: Modifier = Modifier) {
+    Column(modifier, horizontalAlignment = Alignment.End, verticalArrangement = Arrangement.spacedBy(5.dp)) {
+        Text("${d.rssi}", color = d.type.textTone(), fontSize = 13.sp,
+            fontWeight = FontWeight.SemiBold, fontFamily = Acab.mono, maxLines = 1)
+        SignalBars(rssiBars(d.rssi), tint = d.type.tone())
+    }
+}
+
+/** Decorative: no description, so TalkBack never reads it, not even above the name. */
+@Composable
+private fun DetectionRowChevron() {
+    Icon(Icons.Filled.ChevronRight, contentDescription = null, tint = Acab.faint,
+        modifier = Modifier.size(16.dp))
 }
 
 

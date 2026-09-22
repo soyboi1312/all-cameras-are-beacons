@@ -60,17 +60,13 @@ final class DetectionNotifier: NSObject, UNUserNotificationCenterDelegate {
     // MARK: - Foreground presentation
 
     /// Show the banner even when the app is foregrounded. Without this the alert is dropped
-    /// entirely. The sound is withheld when the user has chosen a silent board and a Focus is
-    /// active, matching what the in-app haptic already does rather than chirping over it.
+    /// entirely.
     func userNotificationCenter(_ center: UNUserNotificationCenter,
                                 willPresent notification: UNNotification,
                                 withCompletionHandler completionHandler:
                                 @escaping (UNNotificationPresentationOptions) -> Void) {
-        completionHandler(silenceForeground ? [.banner, .list] : [.banner, .list, .sound])
+        completionHandler([.banner, .list, .sound])
     }
-
-    /// Set by BLEManager so the delegate can honor the same Focus/alert-mode rule the haptic uses.
-    var silenceForeground = false
 
     /// Tapping the notification opens the Log filtered to new detections, the same destination
     /// Android's contentIntent uses and the same one the offline-sync banner's "view" action
@@ -203,7 +199,11 @@ final class DetectionNotifier: NSObject, UNUserNotificationCenterDelegate {
 
         let content = UNMutableNotificationContent()
         content.title = d.type.label
-        let who = d.hasName ? d.displayName : d.type.label
+        // The name is radio-controlled: any nearby device can broadcast newlines or bidi overrides
+        // to spoof banner text, so it is stripped here (notification text only; rows render the
+        // raw name). A name that strips to nothing falls back to the category label.
+        let safeName = d.hasName ? Self.notificationSafeName(d.displayName) : ""
+        let who = safeName.isEmpty ? d.type.label : safeName
         // Avoid "Tracker / Tracker detected" when the device has no name of its own.
         content.body = who == d.type.label
             ? "Detected nearby, \(d.confidence)% confidence."
@@ -218,7 +218,8 @@ final class DetectionNotifier: NSObject, UNUserNotificationCenterDelegate {
         // matches Android, which no longer uses CATEGORY_ALARM for the same reason.
 
         // Per-MAC identifier so a repeat replaces rather than stacks.
-        let req = UNNotificationRequest(identifier: "acab.det.\(d.mac)", content: content, trigger: nil)
+        let req = UNNotificationRequest(identifier: Self.identifierPrefix + d.mac,
+                                        content: content, trigger: nil)
         UNUserNotificationCenter.current().add(req) { err in
             if let err { print("[ACAB] notification post failed: \(err.localizedDescription)") }
         }
@@ -230,6 +231,57 @@ final class DetectionNotifier: NSObject, UNUserNotificationCenterDelegate {
         guard lastNotifiedByMac.count > 256 else { return }
         lastNotifiedByMac = lastNotifiedByMac.filter {
             now.timeIntervalSince($0.value) < Self.perDeviceCooldown
+        }
+    }
+
+    // MARK: - Clear log
+
+    /// Every detection notification's identifier starts with this (one per MAC, see notifyIfNeeded).
+    static let identifierPrefix = "acab.det."
+
+    /// The detection-notification identifiers among `ids`. Scoped by prefix rather than removing
+    /// everything, so a future notification kind that must outlive a Clear is not collateral.
+    static func detectionNotificationIDs(_ ids: [String]) -> [String] {
+        ids.filter { $0.hasPrefix(identifierPrefix) }
+    }
+
+    /// The real Clear log: remove this app's delivered AND pending detection notifications, which
+    /// otherwise keep device names in Notification Center after the history is gone. Asynchronous
+    /// (the center enumerates off main); a post racing this call can survive it, and the next one
+    /// for that device replaces it by identifier anyway. Not for a sample-mode Clear.
+    /// Android twin: android/app/src/main/java/tech/acab/app/ble/DetectionNotifier.kt cancelPostedAlerts.
+    func removeDetectionNotifications() {
+        let center = UNUserNotificationCenter.current()
+        center.getDeliveredNotifications { delivered in
+            let ids = Self.detectionNotificationIDs(delivered.map(\.request.identifier))
+            if !ids.isEmpty { center.removeDeliveredNotifications(withIdentifiers: ids) }
+        }
+        center.getPendingNotificationRequests { pending in
+            let ids = Self.detectionNotificationIDs(pending.map(\.identifier))
+            if !ids.isEmpty { center.removePendingNotificationRequests(withIdentifiers: ids) }
+        }
+    }
+
+    // MARK: - Banner text safety
+
+    /// `name` with every character that can reshape a notification removed: C0 controls
+    /// (U+0000-001F, which includes CR/LF/tab), DEL and C1 controls (U+007F-009F), the line and
+    /// paragraph separators (U+2028-2029), and the bidi marks, embeddings, overrides and isolates
+    /// (U+061C, U+200E-200F, U+202A-202E, U+2066-2069). Then trimmed. Pure: used only for the
+    /// notification body; the UI rows render the raw name.
+    static func notificationSafeName(_ name: String) -> String {
+        var scalars = String.UnicodeScalarView()
+        for u in name.unicodeScalars where !isBannerUnsafe(u) { scalars.append(u) }
+        return String(scalars).trimmingCharacters(in: .whitespaces)
+    }
+
+    private static func isBannerUnsafe(_ u: Unicode.Scalar) -> Bool {
+        switch u.value {
+        case 0x00...0x1F, 0x7F...0x9F: return true            // C0, DEL, C1
+        case 0x2028, 0x2029: return true                       // line / paragraph separator
+        case 0x061C, 0x200E, 0x200F: return true               // ALM, LRM, RLM
+        case 0x202A...0x202E, 0x2066...0x2069: return true     // embeddings, overrides, isolates
+        default: return false
         }
     }
 

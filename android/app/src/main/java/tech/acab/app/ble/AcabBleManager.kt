@@ -503,7 +503,143 @@ private const val SCAN_ADDR_DEBUG = false
  *  user-visible in the worst possible place: two rows for one board on the screen where a user
  *  who owns exactly one board decides which one to trust. */
 data class FoundBoard(val device: BluetoothDevice, val name: String, val rssi: Int,
-                      val firmware: String? = null, val seenAt: Long = 0L)
+                      val firmware: String? = null, val seenAt: Long = 0L,
+                      /** This is the board this phone last bonded with and reached READY on (see
+                       *  RememberedBoard). Only rows built by mergeRememberedRow carry true. */
+                      val owned: Boolean = false,
+                      /** False only for the remembered row when no advert from it was seen this
+                       *  scan. [rssi] is meaningless then and the row must not render it. */
+                      val advertSeen: Boolean = true)
+
+/** The board this phone last bonded with, remembered so the picker can offer it without an advert.
+ *
+ *  WHY: a later firmware ("Level 1" privacy) stops advertising its name and the acab0100 service UUID
+ *  once it holds a bond and its power-on pair window has closed. The picker scan filters on that UUID
+ *  (ScanFilter.setServiceUuid(AcabProfile.SERVICE) in beginScan), so after an app restart the owner's
+ *  board would never be listed. This app half ships FIRST and behaves identically on today's firmware,
+ *  which still advertises the UUID: the scanned row simply merges into the remembered one.
+ *
+ *  Android keys it on the board's address. That works because the board advertises a stable public
+ *  MAC today (ACAB_BLE_PRIVACY defaults to 0 in acab_ble_service.h and platformio.ini sets it in no
+ *  env). Turning RPA privacy on would need this keying re-verified on hardware before it ships.
+ *
+ *  iOS twin: the remembered-board rules in ios/Beacons/BLE/RememberedBoard.swift. iOS cannot key on a MAC
+ *  (CoreBluetooth never exposes one) and cannot read the bond list, so the key and the forget signal
+ *  differ: iOS forgets on a bond-gone connect failure, Android when bondedDevices no longer holds the
+ *  board. The rest is shared and must match: REMEMBER at a bonded READY on a real link (a different
+ *  board replaces it), SHOW first as one row merged by identity, titled "your beacon" with the
+ *  RememberedBoardCopy subtitle, and CONNECT through the ordinary picked-board path. */
+internal data class RememberedBoard(val address: String, val name: String)
+
+/** SharedPreferences keys (the private "acab" file) for [RememberedBoard]. Named once so the seed
+ *  read, the write and the forget cannot drift onto different spellings. */
+internal const val PREF_REMEMBERED_BOARD_ADDRESS = "remembered_board_address"
+internal const val PREF_REMEMBERED_BOARD_NAME = "remembered_board_name"
+
+/** The row title when neither the link nor the remembered value has a name: the same fallback the
+ *  scan callback uses for a nameless advert. */
+internal const val REMEMBERED_BOARD_FALLBACK_NAME = "ACAB"
+
+/** REMEMBER. What to hold after a link reaches READY. Returns [current] unchanged (same instance)
+ *  when nothing should move, so the caller can skip the write by identity.
+ *
+ *  Only a real, bonded link on a known address qualifies: demo mode never touches it, and a READY the
+ *  phone could not confirm as bonded (a permission race, say) keeps whatever was held. A different
+ *  board replaces the old one. The same board with a new name updates the name; the same board with
+ *  no name keeps the old name. iOS twin: ios/Beacons/BLE/BLEManager.swift. */
+internal fun rememberedBoardAfterReady(
+    current: RememberedBoard?,
+    address: String?,
+    linkName: String?,
+    bonded: Boolean,
+    demoMode: Boolean,
+): RememberedBoard? {
+    if (demoMode || !bonded || address.isNullOrBlank()) return current
+    val sameBoard = current != null && current.address.equals(address, ignoreCase = true)
+    val name = linkName?.takeIf { it.isNotBlank() }
+        ?: current?.name?.takeIf { sameBoard }
+        ?: REMEMBERED_BOARD_FALLBACK_NAME
+    if (sameBoard && current!!.name == name) return current
+    return RememberedBoard(address, name)
+}
+
+/** What a lookup of the remembered board decided. */
+internal enum class RememberedBoardLookup {
+    /** The OS still holds the bond: list the row. */
+    SHOW,
+    /** Cannot tell right now (no permission, radio off, bond in progress, a failed query): keep the
+     *  memory, list nothing. A radio that is off reports BOND_NONE on some stacks, so reading it as
+     *  "the user removed the bond" would erase the owner's board every time Bluetooth was toggled. */
+    HIDE_KEEP,
+    /** The user removed the bond in Android settings: drop the memory, list nothing. */
+    FORGET,
+}
+
+/** FORGET / SHOW. [bondState] is BluetoothDevice.getBondState() for the remembered address, and
+ *  [inBondedSet] is whether BluetoothAdapter.getBondedDevices() lists it; either is null when the
+ *  query failed. The memory is dropped only when BOTH say the bond is gone, so a single flaky binder
+ *  answer cannot erase it. iOS twin: ios/Beacons/BLE/BLEManager.swift. */
+internal fun rememberedBoardLookup(
+    permitted: Boolean,
+    radioOn: Boolean,
+    bondState: Int?,
+    inBondedSet: Boolean?,
+): RememberedBoardLookup = when {
+    !permitted || !radioOn || bondState == null || inBondedSet == null -> RememberedBoardLookup.HIDE_KEEP
+    bondState == BluetoothDevice.BOND_BONDED -> RememberedBoardLookup.SHOW
+    bondState == BluetoothDevice.BOND_NONE && !inBondedSet -> RememberedBoardLookup.FORGET
+    else -> RememberedBoardLookup.HIDE_KEEP
+}
+
+/** SHOW. Fold the remembered row into the scanned list: ONE row per board, never two.
+ *
+ *  The remembered board LEADS the list whether or not the scan heard it: with Level 1 firmware it
+ *  is the only way the owner's board appears at all. If the scan heard it (today's firmware), that
+ *  scanned row is marked owned (via [asOwned]) and moves to the top, carrying its live name and
+ *  RSSI. Every other scanned row keeps its RSSI order. Generic over the row type so the JVM tests
+ *  need no BluetoothDevice. The address compare ignores case (Android reports upper case; a stored
+ *  value is not re-validated).
+ *
+ *  iOS twin: ios/Beacons/BLE/RememberedBoard.swift mergeBoardPickerEntries (same lead rule, same
+ *  live-name rule). */
+internal fun <R> mergeRememberedRow(
+    scanned: List<R>,
+    remembered: R?,
+    rememberedAddress: String?,
+    addressOf: (R) -> String?,
+    asOwned: (R) -> R,
+): List<R> {
+    if (remembered == null || rememberedAddress.isNullOrBlank()) return scanned
+    val hit = scanned.indexOfFirst { addressOf(it)?.equals(rememberedAddress, ignoreCase = true) == true }
+    if (hit < 0) return listOf(remembered) + scanned
+    return listOf(asOwned(scanned[hit])) + scanned.filterIndexed { i, _ -> i != hit }
+}
+
+/** The picker's list: the scan results with the remembered board merged in. A heard board keeps
+ *  its live advertised name; the remembered name fills in only when the advert carried none. */
+internal fun pickerRows(found: List<FoundBoard>, remembered: FoundBoard?): List<FoundBoard> =
+    mergeRememberedRow(
+        scanned = found,
+        remembered = remembered,
+        rememberedAddress = remembered?.let { runCatching { it.device.address }.getOrNull() },
+        addressOf = { runCatching { it.device.address }.getOrNull() },
+        asOwned = { it.copy(name = it.name.ifBlank { remembered?.name ?: it.name }, owned = true) },
+    )
+
+/** Shared picker copy for the remembered row. iOS twin: ios/Beacons/BLE/RememberedBoard.swift
+ *  RememberedBoardCopy, byte-identical. The dot is U+00B7. Lowercase-first, no em-dashes. */
+internal object RememberedBoardCopy {
+    const val LABEL = "your beacon"
+    const val NO_SIGNAL = "no live signal \u00B7 tap to connect"
+    const val SEEN = "tap to connect"
+
+    /** The row's secondary line: "<name> · <state>", or just the state when the name is blank.
+     *  Mirrors ConnectView.boardRowSubtitle. */
+    fun subtitle(name: String, advertSeen: Boolean): String {
+        val state = if (advertSeen) SEEN else NO_SIGNAL
+        return if (name.isBlank()) state else "$name \u00B7 $state"
+    }
+}
 
 /** The most recent LIVE sighting (category + wall-clock last-seen), for the Drive-mode
  *  notification's "last <KIND> <ago>" line. One immutable object per update so a reader
@@ -1614,6 +1750,12 @@ class AcabBleManager(private val context: Context) {
     private val _found = MutableStateFlow<List<FoundBoard>>(emptyList())
     val found: StateFlow<List<FoundBoard>> = _found.asStateFlow()
 
+    /** The remembered board as a picker row (owned, advertSeen = false), or null when there is none
+     *  or the OS no longer holds its bond. Published only by [refreshRememberedBoard], never per
+     *  status or per advert; the picker merges it with [found] through pickerRows. */
+    private val _rememberedRow = MutableStateFlow<FoundBoard?>(null)
+    val rememberedRow: StateFlow<FoundBoard?> = _rememberedRow.asStateFlow()
+
     private val _scanHint = MutableStateFlow<String?>(null)
     val scanHint: StateFlow<String?> = _scanHint.asStateFlow()
 
@@ -1833,6 +1975,18 @@ class AcabBleManager(private val context: Context) {
     val redactLockScreen: StateFlow<Boolean> = _redactLockScreen.asStateFlow()
 
     private val prefs = context.getSharedPreferences("acab", Context.MODE_PRIVATE)
+
+    /** The remembered board (see RememberedBoard), seeded ONCE here from prefs and cached; every later
+     *  read is this field, never prefs. Written from finishReady (a binder thread) and cleared from
+     *  refreshRememberedBoard (main), hence @Volatile. Declared after [prefs] because a property
+     *  initializer that ran before it would read a null file. */
+    @Volatile private var rememberedBoard: RememberedBoard? = run {
+        val address = prefs.getString(PREF_REMEMBERED_BOARD_ADDRESS, null)?.takeIf { it.isNotBlank() }
+        address?.let {
+            RememberedBoard(it, prefs.getString(PREF_REMEMBERED_BOARD_NAME, null)
+                ?.takeIf { n -> n.isNotBlank() } ?: REMEMBERED_BOARD_FALLBACK_NAME)
+        }
+    }
     private fun newManagedListClearIntent(key: String) = ManagedListClearIntent(
         readStored = { prefs.getBoolean("${key}_clear_pending", false) },
         writeStored = { pending ->
@@ -2068,6 +2222,19 @@ class AcabBleManager(private val context: Context) {
         }.onEach { (w, i) ->
             tech.acab.app.model.DeviceNames.rebuild(w, i)
         }.launchIn(scope)
+        // App-start cold path, off main: export packages outlive their share by at most
+        // EXPORT_PACKAGE_MAX_AGE_MS (a receiving app may still be reading a granted URI, so the
+        // newest are kept), and tile stores an unpinned osmdroid left outside its pinned
+        // app-private dir are deleted. This singleton is built once per process, before any
+        // screen can export or open a map. iOS twin of the export sweep: BLEManager's launch
+        // ExportTempCache.sweep, same 1-hour bound.
+        scope.launch(Dispatchers.IO) {
+            runCatching {
+                tech.acab.app.ui.sweepExportPackages(
+                    context.cacheDir, tech.acab.app.ui.EXPORT_PACKAGE_MAX_AGE_MS)
+            }
+            runCatching { tech.acab.app.ui.sweepStaleOsmdroidStores(context) }
+        }
         // Expired mutes must reveal preserved evidence even if no new detection arrives. Timed
         // and place rules are phone-only; maintenance never makes their expiry authoritative over
         // an unknown board list.
@@ -2139,6 +2306,7 @@ class AcabBleManager(private val context: Context) {
             retryPendingDetectionClear(checkpointCurrentStoreOnSuccess = true)
         }
         if (scanPausedInBackground && _state.value == ConnState.SCANNING) beginScan()
+        refreshRememberedBoard()   // back from Android settings: a removed bond drops the row
         syncLocationOwnership()
     }
 
@@ -2574,6 +2742,7 @@ class AcabBleManager(private val context: Context) {
         if (_state.value == ConnState.SCANNING) return
         _scanHint.value = null
         _found.value = emptyList()
+        refreshRememberedBoard()   // a scan is a lookup time: drop a bond removed in Settings
         beginScan()
     }
 
@@ -2624,6 +2793,76 @@ class AcabBleManager(private val context: Context) {
         scanPausedInBackground = false
         runCatching { scanner?.stopScan(scanCb) }
         if (_state.value == ConnState.SCANNING) _state.value = ConnState.DISCONNECTED
+    }
+
+    // ---- remembered board (see RememberedBoard; iOS twin ios/Beacons/BLE/RememberedBoard.swift) ----
+
+    /** Look the remembered board up against the OS bond list and republish [rememberedRow]. The only
+     *  place the row is built. Called at lookup times only: startScan, the app returning to the
+     *  foreground (the usual way back from removing the bond in Android settings), and the picker's
+     *  own effect on connection-state and permission edges. A handful of binder calls, so it must
+     *  stay off the per-status and per-advert paths.
+     *
+     *  Guarded like every other BluetoothDevice call here: without BLUETOOTH_CONNECT (API 31+) and
+     *  the scan permission connect() needs, no row is listed and the memory is kept. */
+    fun refreshRememberedBoard() {
+        val held = rememberedBoard ?: run { _rememberedRow.value = null; return }
+        val permitted = hasConnectPermission() && hasScanPermission()
+        val radioOn = permitted && runCatching { adapter?.isEnabled == true }.getOrDefault(false)
+        val device = if (radioOn) {
+            runCatching { adapter?.getRemoteDevice(held.address) }.getOrNull()
+        } else null
+        val bondState = device?.let { d -> runCatching { d.bondState }.getOrNull() }
+        val inBondedSet = if (device != null) {
+            runCatching {
+                adapter?.bondedDevices?.any { it.address.equals(held.address, ignoreCase = true) }
+            }.getOrNull()
+        } else null
+        when (rememberedBoardLookup(permitted, radioOn, bondState, inBondedSet)) {
+            RememberedBoardLookup.SHOW -> _rememberedRow.value = device?.let {
+                FoundBoard(it, held.name, rssi = Int.MIN_VALUE, owned = true, advertSeen = false)
+            }
+            RememberedBoardLookup.HIDE_KEEP -> _rememberedRow.value = null
+            RememberedBoardLookup.FORGET -> {
+                forgetRememberedBoard(held)
+                _rememberedRow.value = null
+            }
+        }
+    }
+
+    /** Orders the remembered-board read-modify-write between finishReady (binder thread) and a
+     *  lookup (main). Its own monitor, not `this`: the GATT queue holds `this`, and no binder call
+     *  runs under this one. */
+    private val rememberedBoardLock = Any()
+
+    /** Drop [expected] from memory and prefs, unless a newer READY already replaced it. */
+    private fun forgetRememberedBoard(expected: RememberedBoard) = synchronized(rememberedBoardLock) {
+        if (rememberedBoard != expected) return@synchronized
+        rememberedBoard = null
+        prefs.edit()
+            .remove(PREF_REMEMBERED_BOARD_ADDRESS)
+            .remove(PREF_REMEMBERED_BOARD_NAME)
+            .apply()
+    }
+
+    /** REMEMBER, from finishReady: this link is bonded and the ACAB service is confirmed (READY
+     *  needs the Detections + Status subscriptions on AcabProfile.SERVICE to have landed). Writes
+     *  prefs only when the held value actually changes, so an ordinary reconnect to the same board
+     *  (auto-reconnect, the OTA reboot-reconnect) costs one bond-state read and no write. */
+    private fun rememberBoardAtReady(device: BluetoothDevice?, linkName: String?) {
+        val address = device?.let(::safeDeviceAddress)
+        val bonded = device != null &&
+            runCatching { device.bondState == BluetoothDevice.BOND_BONDED }.getOrDefault(false)
+        synchronized(rememberedBoardLock) {
+            val held = rememberedBoard
+            val next = rememberedBoardAfterReady(held, address, linkName, bonded, _demoMode.value)
+            if (next === held || next == null) return
+            rememberedBoard = next
+            prefs.edit()
+                .putString(PREF_REMEMBERED_BOARD_ADDRESS, next.address)
+                .putString(PREF_REMEMBERED_BOARD_NAME, next.name)
+                .apply()
+        }
     }
 
     // ---- connection ----
@@ -3585,6 +3824,9 @@ class AcabBleManager(private val context: Context) {
         handledBondedGeneration = -1L
         sessionWasReady = true   // this session earned an unexpected-drop auto-reconnect
         _connectHint.value = null   // link is usable; the hint no longer applies
+        // Bonded + service confirmed: this is the board the picker offers next time, advert or not.
+        // Before READY publishes, so the picker effect that fires on the READY edge sees it.
+        rememberBoardAtReady(gatt?.device ?: target, _deviceName.value)
         _state.value = ConnState.READY
         syncLocationOwnership()
         // Prime the Status characteristic once the CCCD chain is fully written (all queued
@@ -6287,6 +6529,19 @@ class AcabBleManager(private val context: Context) {
                 }
             }
             PersistedDetectionClearCommit.UNAVAILABLE -> Unit
+        }
+        // The sealed log is not the only copy. Posted detection alerts carry device names in the
+        // shade, every Log export / contribution share left a plaintext CSV or GPX package in
+        // cacheDir, and the osmdroid tile cache records the areas the user viewed. Real path
+        // only: the demo branch above returns before this, so a sample Clear touches none of it.
+        // Off main (binder IPC, file I/O, SQLite). A receiving app still holding an export URI
+        // loses the file; the user asked for the history to be gone, so Clear wins. An export
+        // still being written can land after this sweep; the next export or app start bounds it
+        // to EXPORT_PACKAGE_MAX_AGE_MS. iOS twin: BLEManager.clearDetections.
+        scope.launch(Dispatchers.IO) {
+            runCatching { notifier.cancelPostedAlerts() }
+            runCatching { tech.acab.app.ui.sweepExportPackages(context.cacheDir, olderThanMs = null) }
+            runCatching { tech.acab.app.ui.clearOsmdroidTileCache(context) }
         }
         return true
     }

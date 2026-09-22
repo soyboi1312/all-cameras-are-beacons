@@ -10,8 +10,8 @@ options:
 # Mark the project as reviewed for the current Xcode so it stops nagging
 # "Update to recommended settings" (XcodeGen otherwise defaults this to 1430).
 attributes:
-  LastUpgradeCheck: "2660"
-  LastSwiftUpdateCheck: "2660"
+  LastUpgradeCheck: "2700"
+  LastSwiftUpdateCheck: "2700"
 
 # Nordic's iOS DFU library, for updating the nRF52840 co-processor over BLE. The nRF runs the
 # Adafruit/Seeed bootloader (LEGACY Nordic DFU, service 0x1530), which the library speaks. BSD-3.
@@ -19,11 +19,15 @@ attributes:
 packages:
   NordicDFU:
     url: https://github.com/NordicSemiconductor/IOS-DFU-Library
-    from: "4.13.0"
+    # Exact pin. `from:` let CI resolve 4.17.0 while the store archives and the local test runs
+    # used 4.16.0, so the two never built the same library. 4.17.0 is the version the nRF DFU
+    # leg was last proven on (iOS, a rev-A bench board, co-processor v1 to v2 over BLE,
+    # 2026-09-18); bump it deliberately and smoke-test a board when you do.
+    exactVersion: "4.17.0"
 
 settings:
   base:
-    MARKETING_VERSION: "2.0.8"
+    MARKETING_VERSION: "2.0.9"
     # The build number RESTARTS AT 0 for each new MARKETING_VERSION, and only climbs when a SECOND
     # build of the SAME version has to go up. App Store Connect requires the build to be unique
     # within a version string, NOT across the app, so 0 is always free on a version that has never
@@ -39,13 +43,13 @@ settings:
     # clobbered by the next `xcodegen generate` AND it only touches the app target, leaving
     # BeaconsWidget behind -> "extension version must match parent app". Both targets read
     # $(CURRENT_PROJECT_VERSION), so setting it HERE and regenerating keeps them in lockstep.
-    CURRENT_PROJECT_VERSION: "3"   # 2.0.8 build 3, bumped 2026-09-10. Builds 0, 1 and 2 of 2.0.8
-                                   # are already on App Store Connect, so 3 is the next free number.
+    CURRENT_PROJECT_VERSION: "0"   # 2.0.9 build 0, set 2026-09-18. No 2.0.9 build has uploaded yet;
+                                   # the last 2.0.8 upload was build 3.
     SWIFT_VERSION: "5.0"
     CODE_SIGN_STYLE: Automatic
     DEVELOPMENT_TEAM: "49B9T69XPF"        # baked in so `xcodegen generate` keeps signing
     ENABLE_USER_SCRIPT_SANDBOXING: YES    # Xcode-recommended build setting
-    # Xcode 26.6 "recommended settings" nag. The app has no String Catalog yet, so this is inert;
+    # Xcode "recommended settings" nag (26.6 and 27). The app has no String Catalog yet, so this is inert;
     # it lives here (not in the Xcode dialog) because the xcodeproj is regenerated from this file.
     STRING_CATALOG_GENERATE_SYMBOLS: YES
 
@@ -91,7 +95,6 @@ targets:
         ITSAppUsesNonExemptEncryption: false
         NSBluetoothAlwaysUsageDescription: "This app connects to your beacon over Bluetooth to receive detections."
         NSLocationWhenInUseUsageDescription: "Used to map and geotag detections, share your current location with your own beacon over encrypted Bluetooth, and keep Live Mode active in the background. Coordinates are not automatically uploaded; you choose whether to include them in an export or contribution."
-        NSFocusStatusUsageDescription: "This app checks whether a Focus or Do Not Disturb is active so it can stay silent and skip the vibrate alert while you have one on."
         UIBackgroundModes:
           - bluetooth-central
           - location
@@ -153,6 +156,8 @@ targets:
       - BeaconsWidget
       - path: Beacons/Shared/DetectionActivityAttributes.swift
       - path: Beacons/Shared/DriveModeIntents.swift
+      # Shared so the hosted BeaconsTests suite can pin the widget's neutral empty state.
+      - path: Beacons/Shared/WidgetEmptyState.swift
       # Brand fonts for the Live Activity surfaces (Space Grotesk digits, JetBrains
       # Mono kickers). Same TTFs the app bundles; declared in UIAppFonts below.
       - path: Beacons/Resources/Fonts/SpaceGrotesk-Bold.ttf

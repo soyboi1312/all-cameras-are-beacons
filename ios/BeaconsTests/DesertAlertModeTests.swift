@@ -173,8 +173,7 @@ final class DesertAlertModeTests: XCTestCase {
     //
     // These drive BLEManager itself over a throwaway UserDefaults suite, so they cover the CALLS
     // the pure cases above cannot see: that the Alerts picker's origin reaches the transition, and
-    // that setDesertMode performs the effect it is handed. Vibrate is kept out of them on purpose -
-    // setAlertMode(.vibrate) asks for Focus authorization, which is not a unit test's business.
+    // that setDesertMode performs the effect it is handed.
 
     private var isolatedSuites: [(name: String, defaults: UserDefaults)] = []
 

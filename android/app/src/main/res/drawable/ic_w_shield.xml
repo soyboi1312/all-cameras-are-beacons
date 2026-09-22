@@ -1,0 +1,14 @@
+<!-- Widget empty-state glyph: a half-filled shield, the Android counterpart of the SF Symbol
+     shield.lefthalf.filled that iOS draws in the same slot (Shared/WidgetEmptyState.swift) and on
+     a Live Activity zero. Neutral on purpose: it replaced a check-mark shield that read as an
+     all-clear on a zero and on a disconnected widget. Checked in as a white vector like the
+     other widget glyphs; BeaconsWidgetProvider tints it. -->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="24dp" android:height="24dp"
+    android:viewportWidth="24" android:viewportHeight="24">
+    <path android:fillColor="#00000000" android:strokeColor="#FFFFFF" android:strokeWidth="1.8"
+        android:strokeLineJoin="round"
+        android:pathData="M12,2.1L4,5.65v5.35c0,5.03 3.41,9.71 8,10.93 4.59,-1.22 8,-5.9 8,-10.93V5.65L12,2.1z" />
+    <path android:fillColor="#FFFFFF"
+        android:pathData="M12,2.1L4,5.65v5.35c0,5.03 3.41,9.71 8,10.93z" />
+</vector>

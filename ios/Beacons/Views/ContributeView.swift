@@ -1,4 +1,5 @@
 import SwiftUI
+import Combine   // Timer.publish(...).autoconnect(): Xcode 27 warns when the file relies on SwiftUI's re-export
 import PhotosUI
 import UIKit
 import MessageUI
@@ -229,7 +230,8 @@ struct ContributeView: View {
         // same photo). Gated on idle, an in-progress capture keeps its photo and share dirs
         // across tab switches; confirmed Discard and Start over run cleanupTemp explicitly
         // instead (performDiscard). A capture abandoned mid-flow by leaving the tab for good can
-        // strand temp files - acceptable, the OS purges temporaryDirectory. onDisappear still
+        // strand temp files; the real Clear log deletes its share dirs and the next launch sweeps
+        // share dirs and loose photos older than 1 hour (ExportTempCache). onDisappear still
         // does NOT fire while a share or mail sheet is presented over this view (the presenter
         // stays "appeared"), so an in-flight share's files are never deleted here either.
         .onDisappear { if phase == .idle { cleanupTemp() } }
@@ -394,7 +396,11 @@ struct ContributeView: View {
         // Both actions ride the existing generation/cleanup machinery: Replace is just another
         // pick (loadPhoto supersedes + deletes the old file), Remove clears the selection (which
         // loadPhoto(nil) treats as deselection and cleans up).
+        // Both font builders are @MainActor and PhotosPicker's label closure is @Sendable, so it
+        // runs nonisolated (a SwiftUI Button's label is not @Sendable, which is why Button labels
+        // may call them). The fonts are built here in body and only read inside the picker.
         if let thumb = photoThumb, photoURL != nil {
+            let replaceFont = ACABTheme.mono(10, weight: .bold)
             HStack(spacing: 12) {
                 Image(uiImage: thumb)
                     .resizable().scaledToFill()
@@ -412,7 +418,7 @@ struct ContributeView: View {
                 }
                 Spacer(minLength: 8)
                 PhotosPicker(selection: $photoItem, matching: .images) {
-                    Text("REPLACE").font(ACABTheme.mono(10, weight: .bold)).tracking(1)
+                    Text("REPLACE").font(replaceFont).tracking(1)
                         .foregroundStyle(ACABTheme.dim)
                         .padding(.horizontal, 8).padding(.vertical, 5)
                         .overlay(Capsule().strokeBorder(ACABTheme.line, lineWidth: 1))
@@ -439,10 +445,11 @@ struct ContributeView: View {
             .background(ACABTheme.bg2, in: RoundedRectangle(cornerRadius: 12))
             .overlay(RoundedRectangle(cornerRadius: 12).strokeBorder(ACABTheme.line, lineWidth: 1))
         } else {
+            let attachFont = ACABTheme.mono(12)
             PhotosPicker(selection: $photoItem, matching: .images) {
                 Label(photoLoading ? "Preparing photo\u{2026}" : "Attach a photo (optional)",
                       systemImage: photoLoading ? "hourglass" : "photo")
-                    .font(ACABTheme.mono(12)).foregroundStyle(ACABTheme.dim)
+                    .font(attachFont).foregroundStyle(ACABTheme.dim)
                     .frame(maxWidth: .infinity).padding(.vertical, 11)
                     .frame(minHeight: 44)
                     .overlay(RoundedRectangle(cornerRadius: 12).strokeBorder(ACABTheme.line, lineWidth: 1))
@@ -805,6 +812,7 @@ struct ContributeView: View {
                 return .failure("That photo couldn't be previewed.")
             }
 
+            // Name pattern is matched by ExportTempCache.isLooseContributionFile (launch sweep).
             let url = FileManager.default.temporaryDirectory
                 .appendingPathComponent("beacons-observation-\(UUID().uuidString).jpg")
             do {
@@ -821,8 +829,9 @@ struct ContributeView: View {
     /// directory. Called from performDiscard (a confirmed Discard / Start over) and from
     /// onDisappear only when the flow is IDLE - a live capture must survive tab switches (see
     /// body). Never runs while a share is in flight: the sheets keep this view "appeared" and
-    /// the discard buttons are unreachable behind them. temporaryDirectory is OS-purgeable
-    /// anyway, so this is housekeeping, not correctness.
+    /// the discard buttons are unreachable behind them. Files stranded despite this are bounded
+    /// by ExportTempCache (the real Clear log deletes share dirs; a launch sweep removes share
+    /// dirs and loose photos older than 1 hour).
     private func cleanupTemp() {
         // Invalidate any picker Task still loading. Its UUID path is private to that Task, so when
         // it eventually reaches the publish check it removes only its own file and cannot install a
@@ -937,7 +946,9 @@ struct ContributeView: View {
                                       buildError = "The export file couldn't be created. Nothing was shared." }
                 return
             }
-            let csvURL = dir.appendingPathComponent("beacons-observation.csv")
+            // Leaf names come from ExportTempCache so Clear log and the launch sweep recognise
+            // this dir as ours (a dir with any other leaf is skipped).
+            let csvURL = dir.appendingPathComponent(ExportTempCache.contributionCSVLeaf)
             guard (try? csvData.write(to: csvURL,
                                       options: [.atomic, .completeFileProtection])) != nil else {
                 try? FileManager.default.removeItem(at: dir)
@@ -947,7 +958,7 @@ struct ContributeView: View {
             }
             var photoShareURL: URL?
             if let photoData {
-                let p = dir.appendingPathComponent("beacons-observation.jpg")
+                let p = dir.appendingPathComponent(ExportTempCache.contributionPhotoLeaf)
                 do {
                     try photoData.write(to: p, options: [.atomic, .completeFileProtection])
                     photoShareURL = p
@@ -979,7 +990,7 @@ struct ContributeView: View {
             if let photoShareURL { items.append(photoShareURL) }
             let bundle = ShareBundle(items: items)
             await MainActor.run {
-                shareDirs.append(dir)   // owned by this view; removed on disappear
+                shareDirs.append(dir)   // owned by this view; removed by cleanupTemp (else Clear log / launch sweep)
                 preparing = false
                 share = bundle
             }
@@ -1038,6 +1049,7 @@ private struct PickedPhotoFile: Transferable, Sendable {
                   sourceSize <= contributionPhotoSourceByteLimit else {
                 throw CocoaError(.fileReadTooLarge)
             }
+            // Name pattern is matched by ExportTempCache.isLooseContributionFile (launch sweep).
             let copy = FileManager.default.temporaryDirectory
                 .appendingPathComponent("beacons-photo-source-\(UUID().uuidString)")
             do {

@@ -86,6 +86,8 @@ import tech.acab.app.ble.DetectionNotifier
 import tech.acab.app.ble.FoundBoard
 import tech.acab.app.ble.OtaPhase
 import tech.acab.app.ble.OtaProgress
+import tech.acab.app.ble.RememberedBoardCopy
+import tech.acab.app.ble.pickerRows
 import tech.acab.app.model.Detection
 import tech.acab.app.model.DeviceType
 import tech.acab.app.ui.theme.Acab
@@ -157,6 +159,15 @@ fun AcabApp(
 ) {
     val state by ble.state.collectAsState()
     val found by ble.found.collectAsState()
+    // The remembered board (AcabBleManager.refreshRememberedBoard) merged into the scan results:
+    // one row per board, and the owner's board listed even when it sent no advert. Memoized on
+    // its two inputs, so recomposition does no work and no prefs read happens here.
+    val rememberedRow by ble.rememberedRow.collectAsState()
+    val boardRows = remember(found, rememberedRow) { pickerRows(found, rememberedRow) }
+    // Lookup time for the remembered row: cold start, every connection-state edge (a failed or
+    // ended connect lands back here), and a permission grant. The manager also looks it up on
+    // startScan and on app foreground; this adds no connection behavior, it only re-reads bonds.
+    LaunchedEffect(state, permissionsGranted) { ble.refreshRememberedBoard() }
     val connectHint by ble.connectHint.collectAsState()
     val scanHint by ble.scanHint.collectAsState()
     val ota by ble.otaProgress.collectAsState()
@@ -553,7 +564,7 @@ fun AcabApp(
                                     }
                                 }
                             }
-                            items(found) { board -> BoardRow(board, onConnect = { ble.connect(board) }) }
+                            items(boardRows) { board -> BoardRow(board, onConnect = { ble.connect(board) }) }
                             }
                         }
                     }
@@ -738,7 +749,14 @@ private fun BoardRow(board: FoundBoard, onConnect: () -> Unit) {
     }
     val addrHi = board.device.address.substringBefore(':').toIntOrNull(16) ?: 0
     val stableAddress = board.device.address.takeIf { (addrHi shr 6) != 0b01 }
-    val spoken = buildString {
+    // The remembered row's label mirrors iOS ConnectView.boardRowAccessibilityLabel for that row.
+    val spoken = if (board.owned) buildString {
+        append(RememberedBoardCopy.LABEL)
+        if (board.name.isNotBlank()) append(", ").append(board.name)
+        append(", ").append(if (board.advertSeen) "$signal signal" else "no live signal")
+        append(", connects securely")
+        board.firmware?.let { append(", firmware ").append(it) }
+    } else buildString {
         append(board.name)
         board.firmware?.let { append(", firmware ").append(it) }
         append(", ").append(signal).append(" signal")
@@ -756,8 +774,8 @@ private fun BoardRow(board: FoundBoard, onConnect: () -> Unit) {
         Spacer(Modifier.width(12.dp))
         Column(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(2.dp)) {
             Row(verticalAlignment = Alignment.CenterVertically) {
-                Text(board.name, color = Acab.text, fontSize = 14.sp, fontWeight = FontWeight.SemiBold,
-                    fontFamily = Acab.mono)
+                Text(if (board.owned) RememberedBoardCopy.LABEL else board.name, color = Acab.text,
+                    fontSize = 14.sp, fontWeight = FontWeight.SemiBold, fontFamily = Acab.mono)
                 if (board.firmware != null) {
                     Spacer(Modifier.width(6.dp))
                     Text("v${board.firmware}", color = Acab.accentText, fontSize = 9.sp,
@@ -785,11 +803,20 @@ private fun BoardRow(board: FoundBoard, onConnect: () -> Unit) {
             if (stableAddress != null) {
                 Text(stableAddress, color = Acab.dim, fontSize = 10.sp, fontFamily = Acab.mono)
             }
+            // The remembered board names the board it remembers and says whether an advert is
+            // live (none is ever the case once Level 1 firmware stops advertising to a bonded
+            // owner). The rssi field is a placeholder until an advert merges in and is never shown.
+            if (board.owned) {
+                Text(RememberedBoardCopy.subtitle(board.name, board.advertSeen), color = Acab.dim,
+                    fontSize = 11.sp, fontFamily = Acab.mono)
+            }
         }
-        SignalBars(bars, tint = Acab.accent)
-        Spacer(Modifier.width(8.dp))
-        Text("$signal · ${board.rssi} dBm", color = Acab.dim, fontSize = 11.sp,
-            fontFamily = Acab.mono)
+        if (board.advertSeen) {
+            SignalBars(bars, tint = Acab.accent)
+            Spacer(Modifier.width(8.dp))
+            Text("$signal · ${board.rssi} dBm", color = Acab.dim, fontSize = 11.sp,
+                fontFamily = Acab.mono)
+        }
     }
 }
 
