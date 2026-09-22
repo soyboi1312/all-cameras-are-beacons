@@ -98,14 +98,13 @@ CANARIES = {
     # authoritative rather than using the version string itself as a circular content proof.
     "2.0.8": None,
     # 2.0.9 has two production changes. The MAC OUI D8:1F:65 added to the Axon signature table is
-    # three binary bytes in a const array: bin_strings cannot see it, and the detail string it
+    # three binary bytes in a const array, so bin_strings cannot see it, and the detail string it
     # renders under ("Axon OUI") already ships in 2.0.7 and 2.0.8, so it would false-pass. The
-    # offline-buffer flood limit adds a new production format string in acab_ble_service.cpp
-    # ("[diag] offline buffer refused: bufdrops=%u flood=%u") that could serve as a canary, but it
-    # was not proven present in every staged image before this entry was written, so it stays None
-    # until the 2.0.9 release pass checks it against the staged binaries. Until then staleness plus
-    # raw esp_app_desc remain what prove the image was rebuilt from this source.
-    "2.0.9": None,
+    # offline-buffer flood limit is the honest canary: its diag format string is new in 2.0.9 and
+    # is compiled into every production image (the .rodata pool puts it next to the version
+    # literal). Confirmed at the 2.0.9 release pass against all five staged binaries, and absent
+    # from all five published 2.0.8 images.
+    "2.0.9": ["offline buffer refused"],
 }
 
 HERE = os.path.dirname(os.path.abspath(__file__))
