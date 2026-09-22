@@ -138,7 +138,7 @@ start with the [BLE protocol](docs/ble-protocol.md) for app integration, [signat
 
 ## where things stand
 
-the current source version is **2.0.8** for the ESP32-S3 firmware and both apps. public distribution can lag the source tree; check the app's firmware update screen and store listings for available releases.
+the current source version is **2.0.9** for the ESP32-S3 firmware and both apps. public distribution can lag the source tree; check the app's firmware update screen and store listings for available releases.
 
 the detector, mesh path, apps, and update flows have been exercised on real hardware. field validation remains ongoing, especially for capture candidates. update sequencing is documented in the [OTA protocol](docs/ble-protocol.md#firmware-update-ota).
 
