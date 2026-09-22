@@ -204,7 +204,55 @@ struct RootView: View {
 
     /// The tab shell or connect screen, the banners above them, and the state mirrors and
     /// onboarding triggers that ride on them. `body` adds the sheets, the alert and the launch hooks.
+    ///
+    /// STAGED, AND THE CLOSURES ARE TYPED, ON PURPOSE. Xcode 26.6 (the gating CI lane) still gave
+    /// up on this half as one chain after `body` was split: five overloaded `onChange` calls and two
+    /// `animation(_:value:)` calls with untyped closures in a single expression, where Xcode 27 took
+    /// ~80 ms. Each stage below is its own expression with at most three of them, and every
+    /// `onChange` closure names its parameter types, so the old solver has no overloads to search.
+    /// Modifier order is exactly what the single chain had.
     private var shell: some View {
+        shellMirrors
+            .preferredColorScheme(.dark)
+            .animation(.easeInOut, value: ble.connectionState)
+            // Mount sample data at its synthetic connected boundary. A real session is mounted by the
+            // explicit encrypted-readiness publication below, not early transport state.
+            .onChange(of: ble.connectionState) { (_: BLEConnectionState, new: BLEConnectionState) in
+                if new == .connected, ble.demoMode {
+                    hasMountedMain = true
+                }
+            }
+            .onChange(of: ble.sessionReady) { (_: Bool, ready: Bool) in
+                if ready {
+                    hasMountedMain = true
+                }
+                routeOnboardingIfNeeded(isSessionReady: ready)
+            }
+            // Sample data gets the same orientation every time it is entered, but completing or
+            // skipping that tour must never consume the one-time real-board onboarding marker.
+            .onChange(of: ble.demoMode) { (_: Bool, isSample: Bool) in
+                if isSample {
+                    presentSampleTourIfNeeded()
+                } else {
+                    routeOnboardingIfNeeded(isSessionReady: ble.sessionReady)
+                }
+            }
+    }
+
+    /// Stage one of `shell`: the layout plus the two type-preference mirrors.
+    private var shellMirrors: some View {
+        shellLayout
+            .animation(.easeInOut, value: ble.offlineSyncBanner)
+            .onChange(of: colorSchemeContrast, initial: true) { (_: ColorSchemeContrast, c: ColorSchemeContrast) in
+                TypePrefs.shared.highContrast = (c == .increased)
+            }
+            .onChange(of: legibilityWeight, initial: true) { (_: LegibilityWeight?, w: LegibilityWeight?) in
+                TypePrefs.shared.bold = (w == .bold)
+            }
+    }
+
+    /// The banners over either the tab shell or the connect screen, with no modifiers.
+    private var shellLayout: some View {
         ZStack {
             ACABTheme.bg.ignoresSafeArea()
             VStack(spacing: 0) {
@@ -226,37 +274,6 @@ struct RootView: View {
                             .zIndex(1)
                     }
                 }
-            }
-        }
-        .animation(.easeInOut, value: ble.offlineSyncBanner)
-        .onChange(of: colorSchemeContrast, initial: true) { _, c in
-            TypePrefs.shared.highContrast = (c == .increased)
-        }
-        .onChange(of: legibilityWeight, initial: true) { _, w in
-            TypePrefs.shared.bold = (w == .bold)
-        }
-        .preferredColorScheme(.dark)
-        .animation(.easeInOut, value: ble.connectionState)
-        // Mount sample data at its synthetic connected boundary. A real session is mounted by the
-        // explicit encrypted-readiness publication below, not early transport state.
-        .onChange(of: ble.connectionState) { _, new in
-            if new == .connected, ble.demoMode {
-                hasMountedMain = true
-            }
-        }
-        .onChange(of: ble.sessionReady) { _, ready in
-            if ready {
-                hasMountedMain = true
-            }
-            routeOnboardingIfNeeded(isSessionReady: ready)
-        }
-        // Sample data gets the same orientation every time it is entered, but completing or
-        // skipping that tour must never consume the one-time real-board onboarding marker.
-        .onChange(of: ble.demoMode) { _, isSample in
-            if isSample {
-                presentSampleTourIfNeeded()
-            } else {
-                routeOnboardingIfNeeded(isSessionReady: ble.sessionReady)
             }
         }
     }
