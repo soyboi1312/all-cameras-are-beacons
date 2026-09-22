@@ -118,61 +118,13 @@ struct RootView: View {
             mainShellVisible: mainIsUsable)
     }
 
+    // ONE chain was too much for Xcode 26.6: the whole body (the shell below plus every sheet,
+    // alert and lifecycle hook) was a single expression, and adding the higher-contrast mirror
+    // tipped it into "unable to type-check this expression in reasonable time" on the CI
+    // runner while Xcode 27 still managed (~400 ms locally). Keep the halves separate, and put a
+    // new modifier on whichever half it belongs to instead of regrowing one chain.
     var body: some View {
-        ZStack {
-            ACABTheme.bg.ignoresSafeArea()
-            VStack(spacing: 0) {
-                topBanners
-                ZStack {
-                    if hasMountedMain || hasUsableSession {
-                        connectedContent
-                            .opacity(mainIsUsable ? 1 : 0)
-                            .allowsHitTesting(mainIsUsable)
-                            .accessibilityHidden(!mainIsUsable)
-                    }
-                    if !mainIsUsable {
-                        ConnectView(showAlertRestore: connectScreenCarriesRestore,
-                                    onOpenSetupHelp: {
-                            guard !showFirstRunTour, !showFinishSetup else { return }
-                            showSetupHelp = true
-                        })
-                            .background(ACABTheme.bg.ignoresSafeArea())
-                            .zIndex(1)
-                    }
-                }
-            }
-        }
-        .animation(.easeInOut, value: ble.offlineSyncBanner)
-        .onChange(of: colorSchemeContrast, initial: true) { _, c in
-            TypePrefs.shared.highContrast = (c == .increased)
-        }
-        .onChange(of: legibilityWeight, initial: true) { _, w in
-            TypePrefs.shared.bold = (w == .bold)
-        }
-        .preferredColorScheme(.dark)
-        .animation(.easeInOut, value: ble.connectionState)
-        // Mount sample data at its synthetic connected boundary. A real session is mounted by the
-        // explicit encrypted-readiness publication below, not early transport state.
-        .onChange(of: ble.connectionState) { _, new in
-            if new == .connected, ble.demoMode {
-                hasMountedMain = true
-            }
-        }
-        .onChange(of: ble.sessionReady) { _, ready in
-            if ready {
-                hasMountedMain = true
-            }
-            routeOnboardingIfNeeded(isSessionReady: ready)
-        }
-        // Sample data gets the same orientation every time it is entered, but completing or
-        // skipping that tour must never consume the one-time real-board onboarding marker.
-        .onChange(of: ble.demoMode) { _, isSample in
-            if isSample {
-                presentSampleTourIfNeeded()
-            } else {
-                routeOnboardingIfNeeded(isSessionReady: ble.sessionReady)
-            }
-        }
+        shell
         .sheet(isPresented: $showFirstRunTour, onDismiss: finishTourDismissed) {
             FirstRunTourView(
                 isSampleData: tourIsSampleData,
@@ -246,6 +198,65 @@ struct RootView: View {
                 UserDefaults.standard.set(true, forKey: "acab.pendingNewFilter")
                 UserDefaults.standard.set(2, forKey: "acab.pendingTab")
                 NotificationCenter.default.post(name: Notification.Name("acabOpenLogNew"), object: nil)
+            }
+        }
+    }
+
+    /// The tab shell or connect screen, the banners above them, and the state mirrors and
+    /// onboarding triggers that ride on them. `body` adds the sheets, the alert and the launch hooks.
+    private var shell: some View {
+        ZStack {
+            ACABTheme.bg.ignoresSafeArea()
+            VStack(spacing: 0) {
+                topBanners
+                ZStack {
+                    if hasMountedMain || hasUsableSession {
+                        connectedContent
+                            .opacity(mainIsUsable ? 1 : 0)
+                            .allowsHitTesting(mainIsUsable)
+                            .accessibilityHidden(!mainIsUsable)
+                    }
+                    if !mainIsUsable {
+                        ConnectView(showAlertRestore: connectScreenCarriesRestore,
+                                    onOpenSetupHelp: {
+                            guard !showFirstRunTour, !showFinishSetup else { return }
+                            showSetupHelp = true
+                        })
+                            .background(ACABTheme.bg.ignoresSafeArea())
+                            .zIndex(1)
+                    }
+                }
+            }
+        }
+        .animation(.easeInOut, value: ble.offlineSyncBanner)
+        .onChange(of: colorSchemeContrast, initial: true) { _, c in
+            TypePrefs.shared.highContrast = (c == .increased)
+        }
+        .onChange(of: legibilityWeight, initial: true) { _, w in
+            TypePrefs.shared.bold = (w == .bold)
+        }
+        .preferredColorScheme(.dark)
+        .animation(.easeInOut, value: ble.connectionState)
+        // Mount sample data at its synthetic connected boundary. A real session is mounted by the
+        // explicit encrypted-readiness publication below, not early transport state.
+        .onChange(of: ble.connectionState) { _, new in
+            if new == .connected, ble.demoMode {
+                hasMountedMain = true
+            }
+        }
+        .onChange(of: ble.sessionReady) { _, ready in
+            if ready {
+                hasMountedMain = true
+            }
+            routeOnboardingIfNeeded(isSessionReady: ready)
+        }
+        // Sample data gets the same orientation every time it is entered, but completing or
+        // skipping that tour must never consume the one-time real-board onboarding marker.
+        .onChange(of: ble.demoMode) { _, isSample in
+            if isSample {
+                presentSampleTourIfNeeded()
+            } else {
+                routeOnboardingIfNeeded(isSessionReady: ble.sessionReady)
             }
         }
     }
