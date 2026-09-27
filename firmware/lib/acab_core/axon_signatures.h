@@ -24,6 +24,12 @@
 // MAC OUI: Axon Enterprise, Inc. (formerly TASER International) - the block the IEEE
 // registry attributes to them (MA-L, 2010).
 //   src: IEEE OUI registry -> https://maclookup.app/macaddress/0025DF
+// OUI-ONLY GROUND TRUTH on this block (hits with NO BWCDEVICE tag in the packet, one weak packet
+// each at -88 dBm or below, conf 75): 54:7b:5a (2026-09-16) and 7d:8c:de + f8:38:3f (2026-09-23,
+// Agoura Hills area, two officers on scene, one second apart), ALL THREE OWNER-CONFIRMED as body
+// cams. Recorded from app CSV exports. So the OUI fallback earns its keep at the edge of range,
+// where only an untagged advertisement gets through; it is not a reason to raise the 75, because
+// a dock or other Axon gear on the same block is indistinguishable on the air (docs/signatures.md).
 #define AXON_OUI_REGISTERED  { 0x00, 0x25, 0xdf }
 
 // D8:1F:65 - a SECOND block that field capture, not the registry, put in this table. BOTH BLOCKS

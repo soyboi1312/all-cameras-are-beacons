@@ -8,7 +8,7 @@ is a demotion candidate) and to tune signatures without dropping real cameras. S
 "How reliable is it?" section in the README for why OUI matches are the noisy ones.
 
 When you hit one in the app, note the MAC (or at least the OUI), what the detail screen
-says it "Matched on", and what the device actually was. A screenshot of the detail
+shows on the "matched on" row under MATCH QUALITY, and what the device actually was. A screenshot of the detail
 screen captures all of it. For a capture-build identifier there is no detail screen, so
 record the assigned number, the runtime tag, and where the evidence lives.
 

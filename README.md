@@ -8,8 +8,8 @@
 
 - **want the beacon?** visit [Tindie](https://www.tindie.com/stores/soyboitech/) for hardware and [soyboi.tech](https://soyboi.tech) for pricing and availability.
 - **need help?** read the [getting-started guide](https://soyboi.tech/getting-started), [app guide](docs/app-guide.md), or [FAQ](https://soyboi.tech/faq), or open a [GitHub issue](https://github.com/soyboi1312/all-cameras-are-beacons/issues).
-- **trying it without hardware?** install the [iPhone app](https://apps.apple.com/us/app/beacons-surveillance-scanner/id6781841861) or [Android app](https://play.google.com/store/apps/details?id=tech.soyboi.beacons) and tap **See how it works** to explore fictional detections.
-- **already have a board?** power it on, tap **Scan for beacons** in the app, choose the board, and approve pairing. the app walks you through setup and permissions. make your first pairing in trusted surroundings; see the [pairing guide](docs/app-guide.md#try-it-or-connect-a-board).
+- **trying it without hardware?** install the [iPhone app](https://apps.apple.com/us/app/beacons-surveillance-scanner/id6781841861) or [Android app](https://play.google.com/store/apps/details?id=tech.soyboi.beacons) and tap **See How It Works** to explore fictional detections.
+- **already have a board?** power it on, tap **Scan for Beacons** in the app, choose the board, and approve pairing. the app walks you through setup and permissions. make your first pairing in trusted surroundings; see the [pairing guide](docs/app-guide.md#try-it-or-connect-a-board).
 - **building OUI-Spy or Mesh-Detect?** use the [DIY flasher](https://soyboi1312.github.io/all-cameras-are-beacons/) or the [command-line instructions](#flashing-from-the-command-line).
 
 **a compatible board is required for live detection.** sample mode and your saved Log remain available without one. the iPhone and Android apps are free.
@@ -73,10 +73,10 @@ optional location access lets the phone geotag sightings and send its fix to you
 
 both native apps provide the same core views:
 
-- **Status:** devices heard recently, grouped by category.
-- **Map:** optional location context and a separate community-mapped camera layer.
-- **Log:** saved detections, filters, signal history, matching evidence, and CSV or GPX export, available even while disconnected.
-- **Beacon:** detector categories, alert settings, radios, offline buffering, firmware updates, and connection status.
+- **Status:** devices heard in the last 45 seconds, on a radar with a count per category.
+- **Map:** located sightings from the last 45 seconds, the last 15 minutes, or all history, plus a separate community-mapped camera layer.
+- **Log:** saved detections as active / new / all, with search, filters, signal history, matching evidence, and CSV or GPX export, available even while disconnected.
+- **Beacon:** the board's detectors, alerts, radios, offline buffering, firmware updates, and connection status, and this phone's notifications, Live Mode, and display settings.
 
 **most detection pins mark where your phone heard the signal, not the device's exact position.** Remote ID drones can supply their own aircraft coordinates. the community camera layer is reference data, and a missing pin does not establish that no camera exists.
 

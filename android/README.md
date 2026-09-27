@@ -15,7 +15,7 @@ Install the published app from [Google Play](https://play.google.com/store/apps/
 ## Status
 
 Working end to end. Done:
-- Gradle/Compose project, runtime permissions, the full Crimson theme.
+- Gradle/Compose project, runtime permissions, the Material 3 theme from the crimson seed (`ui/theme/Theme.kt`).
 - BLE layer (`ble/AcabBleManager.kt`): scan by service UUID, connect, **bond**
   (the GATT service is encrypted as of firmware 0.2.2/0.2.3), request a **512-byte
   ATT MTU** (so the status + richer drone JSON fit one notify; config writes stay

@@ -1,23 +1,23 @@
 # map performance checks
 
-the regression workload is a zoomed-out Map with Desert mode and 4,999 retained detections. on both platforms, detection-driven map rebuilds are coalesced on one row-count ladder (0.3 s under 500 rows, 0.5 s from 500, 0.75 s from 2,000, 1.0 s from 4,000: iOS `mapDetectionRefreshInterval` behind `scheduleDetectionSnapshotRefresh`, Android `mapDetectionRefreshIntervalMs` behind `coalesceDetectionRevisions`), leading edge plus trailing edge so the newest state always lands. a pan, zoom, filter, history-scope or trail toggle change skips that ladder and rebuilds at once, but not the same way on both: Android rebuilds from the last installed evidence snapshot (`locatedEvidence`, keyed on the installed revision) and leaves the ladder's timing alone, while iOS rebuilds through `installFreshSnapshot`, which walks the live store, takes over any pending trailing refresh, and restarts the interval. the projection behind that gate is each platform's own code (`MapTabView.swift` on iOS, `MapProjection.kt` on Android) sharing the same-spot tolerance and the pin priority order. **Recent** defaults to the last 15 minutes; **All history** remains available. history scope changes presentation only, not recording, retained evidence, export, or tracker breadcrumb collection.
+the regression workload is a zoomed-out Map with Desert mode and 4,999 retained detections. on both platforms, detection-driven map rebuilds are coalesced on one row-count ladder (0.3 s under 500 rows, 0.5 s from 500, 0.75 s from 2,000, 1.0 s from 4,000: iOS `mapDetectionRefreshInterval` behind `scheduleDetectionSnapshotRefresh`, Android `mapDetectionRefreshIntervalMs` behind `coalesceDetectionRevisions`), leading edge plus trailing edge so the newest state always lands. a pan, zoom, filter, history-scope or trail toggle change skips that ladder and rebuilds at once, but not the same way on both: Android rebuilds from the last installed evidence snapshot (`locatedEvidence`, keyed on the installed revision) and leaves the ladder's timing alone, while iOS rebuilds through `installFreshSnapshot`, which walks the live store, takes over any pending trailing refresh, and restarts the interval. the projection behind that gate is each platform's own code (`MapTabView.swift` on iOS, `MapProjection.kt` on Android) sharing the same-spot tolerance and the pin priority order. the scope control at the top of the Map offers **active** (the last 45 seconds, the Status window), **recent** (the last 15 minutes, the default) and **all** (every retained located row, undated ones included). history scope changes presentation only, not recording, retained evidence, export, or tracker breadcrumb collection. phone breadcrumb trails on the main Map are off by default (`MapTabView.showBreadcrumbsDefault` on iOS, `MAP_SHOW_BREADCRUMBS_DEFAULT` on Android), so turn them on in Map options for the trail checks below.
 
-the workload was first reported against app 2.0.7 (1) on an iPhone 17 Pro. the source tree has since moved to 2.0.8, so read every recorded figure below as a dated record of the run that produced it rather than as a property of the current build.
+the workload was first reported against app 2.0.7 (1) on an iPhone 17 Pro. the source tree has moved on since then, so read every recorded figure below as a dated record of the run that produced it rather than as a property of the current build.
 
 ## repeatable checks
 
 exercise 500, 2,500, and 4,999 detections, including a mixture of infrastructure, trackers, drones, watched devices, muted devices, and sightings without a reliable time or location. use synthetic coordinates and identifiers for automated fixtures; do not publish real drive logs or exported locations with performance reports.
 
-check both history scopes and each of these states:
+check all three history scopes and each of these states:
 
 - zoomed out, then zoomed in, while the same devices receive repeated RSSI/count updates;
 - fresh device arrivals, stronger located sightings, new tracker breadcrumbs, and removal/eviction;
 - pan/zoom, category changes, star/unstar, mute/unmute, and opening a detection from the Log;
 - community cameras off and on, including crowded map regions and the date line;
-- search, New/Offline/category filters, both sort orders, and paused Log exports;
+- search, the Log's active / new / all segments, the Offline only and category filters, both sort orders, and paused Log exports;
 - large text, VoiceOver/TalkBack, and opening/closing Map options and technical details.
 
-unchanged coordinates and membership should not reconstruct clusters on every signal update. new locations and membership must eventually appear, while a direct filter or viewport change should respond immediately. when dense artwork or trails are simplified, the UI must say so and the full retained evidence must remain available. a Recent cutoff must not invent a capture time for an undated offline row.
+unchanged coordinates and membership should not reconstruct clusters on every signal update. new locations and membership must eventually appear, while a direct filter or viewport change should respond immediately. when dense artwork or trails are simplified, the UI must say so and the full retained evidence must remain available. an active or recent cutoff must not invent a capture time for an undated offline row.
 
 ## automated measurements
 

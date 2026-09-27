@@ -4,9 +4,33 @@ This is the contract between the ACAB firmware and the native apps (the
 SwiftUI iOS app and the Android app). Every build exposes one service.
 
 **Advertised name.** The v2 beacon board advertises as **`beacon`** and reports the
-`fw` label **`beacon board`**; the legacy Colonel Panic oui-spy build advertises as
-**`ACAB`** and reports `ACAB-ouispy`. Do not match on the name: both are found by
-scanning for the service UUID below, so the app pairs with either board the same way.
+`fw` label **`beacon board`** (rev-B: `beacon board rev-B`); the legacy Colonel Panic oui-spy
+build advertises as **`ACAB`** and reports `ACAB-ouispy`; the Colonel Panic Mesh-Detect build
+advertises as **`ACAB-mesh`** in its scan response (the primary advert carries the shortened
+`ACAB-mes`) and reports `mesh-detect-ACAB` (`mesh-detect-ACAB-ch<N>` off channel 0). Do not
+match on the name to pair: every build is found by scanning for the service UUID below, so the
+app pairs with any board the same way.
+
+**Board kinds (app copy only).** The apps name the board in the owner's hand ("your OUI-Spy"),
+and nothing else reads this: not pairing, not the scan filter, not OTA, not detection. The
+kinds are `beacon`, `ouiSpy` and `meshDetect` (stored raw values, the same on both apps), and
+the apps resolve one per board in this order:
+
+1. the connected board's Status `fw` label, by prefix: `beacon board`, `ACAB-ouispy`,
+   `mesh-detect`. This is the only source the apps store, on the remembered board, from the
+   first Status frame of a ready session;
+2. the kind stored on the remembered board, for that board only;
+3. before a connect, a hint from the REAL advertised local name: exactly `beacon`, exactly
+   `ACAB`, or a name starting `ACAB-mes`. A nameless advert gives no hint, so the app's own
+   `ACAB` display fallback never reads as an OUI-Spy;
+4. otherwise unknown, which the apps word exactly as a beacon.
+
+So the label and the names above are a wire contract for app copy too: renaming one changes
+what the apps call that board. The name follows the firmware image, not the hardware. The
+table and the resolvers live in `ios/Beacons/Models/BoardKind.swift` and
+`android/app/src/main/java/tech/acab/app/ble/BoardKind.kt`, and
+`firmware/tools/check-signature-drift.py` compares them with each other and with the literals
+the two firmware mains advertise and report.
 
 ## Service & characteristics
 
@@ -365,8 +389,8 @@ reachable Status document strictly under that guard as a hard ceiling.
 | `bufon` | offline buffering is enabled |
 | `keymis` | present + `true` only when this authenticated session offered a different key for a nonempty or untrusted log generation. The board preserved the existing key/rows and denied sync; surface an ownership-conflict notice requiring explicit log clear before replacement. Absent = false. Session-only and rebuilt at authentication, so it cannot carry from phone B into phone A's next link |
 | `bufall` | record-everything mode is on. **Sent only when true**; absent means off (saves MTU, same idiom as `ledon`). Not parsed by either app today (the feature has no app-side switch yet) |
-| `bufsat` | Stationary/record-all mode reached ring capacity, so later uncategorized nearby rows **may have been omitted**. Set on the exact transition to full (and when `bufall` is enabled on an already-full ring), sent only when true, persisted across reboots, and cleared by `clearlog`. It is a capacity/censoring-risk flag, not proof that a refusal already happened; `bufdrops` is the current boot's actual-refusal counter. Both apps surface it beside the evidence in Logbook and repeat it at the Offline Buffer control: a full capture cannot prove whether power stopped immediately after the exact-fill row or listening continued after capacity |
-| `bufrl` | the board's signature-row **flood limit refused at least one row**, so some real detections **may be missing** from the offline log. Every buffered row except an uncategorized nearby one spends a token from a bucket of 256 that refills one per 10 s (`DET_LOG_RATE_*` in `det_log.h`, which carries the evidence for those numbers), and whose last 32 tokens are kept for devices heard for at least 10 s, so a transmitter minting fake Flock/Remote ID/netcam identities can no longer overwrite the ring in minutes (a sustained flood needs about 67.6 hours to overwrite all 24,576 slots) or starve a real camera that keeps transmitting. Raised on the first refusal, sent only when true, **persisted across reboots**, and cleared by `clearlog` (and by any other wipe of the log, at exactly the points that clear `bufsat`). The current boot's refused-append count is on the `{"diag":true}` serial line (`flood=`). **Never sent in the same frame as `wiping`**: the builder emits it as the `else` arm of `wiping`, a status-budget trade (the worst-case frame had 3 bytes spare) that loses nothing, because a sweep is erasing the rows the flag qualifies and ends by clearing it. Both apps show `DETECTION FLOOD REFUSED` beside the evidence in Logbook and at the Offline Buffer control, ordered after `OFFLINE LOG INCOMPLETE` and before `CAPTURE REACHED CAPACITY` |
+| `bufsat` | Stationary/record-all mode reached ring capacity, so later uncategorized nearby rows **may have been omitted**. Set on the exact transition to full (and when `bufall` is enabled on an already-full ring), sent only when true, persisted across reboots, and cleared by `clearlog`. It is a capacity/censoring-risk flag, not proof that a refusal already happened; `bufdrops` is the current boot's actual-refusal counter. Both apps surface it beside the evidence in the Log and repeat it at the Offline Buffer control: a full capture cannot prove whether power stopped immediately after the exact-fill row or listening continued after capacity |
+| `bufrl` | the board's signature-row **flood limit refused at least one row**, so some real detections **may be missing** from the offline log. Every buffered row except an uncategorized nearby one spends a token from a bucket of 256 that refills one per 10 s (`DET_LOG_RATE_*` in `det_log.h`, which carries the evidence for those numbers), and whose last 32 tokens are kept for devices heard for at least 10 s, so a transmitter minting fake Flock/Remote ID/netcam identities can no longer overwrite the ring in minutes (a sustained flood needs about 67.6 hours to overwrite all 24,576 slots) or starve a real camera that keeps transmitting. Raised on the first refusal, sent only when true, **persisted across reboots**, and cleared by `clearlog` (and by any other wipe of the log, at exactly the points that clear `bufsat`). The current boot's refused-append count is on the `{"diag":true}` serial line (`flood=`). **Never sent in the same frame as `wiping`**: the builder emits it as the `else` arm of `wiping`, a status-budget trade (the worst-case frame had 3 bytes spare) that loses nothing, because a sweep is erasing the rows the flag qualifies and ends by clearing it. Both apps show `DETECTION FLOOD REFUSED` beside the evidence in the Log and at the Offline Buffer control, ordered after `OFFLINE LOG INCOMPLETE` and before `CAPTURE REACHED CAPACITY` |
 | `wiping` | present + `true` **only while** a deferred buffer erase is still sweeping (an explicit `clearlog`/authorized ownership transfer or an automatic lifecycle wipe runs the flash erase one block per pass so the radios stay live). While set, the board writes no new records; absent = idle. The app can gate a "clearing…" state on it and knows a fresh `sync` won't capture anything until it clears |
 | `ledon` | onboard LED enabled. **Omitted when on** (the default), so an absent key means on; sent as `false` only in lights-out mode |
 | `tracker` | BLE item-tracker detector enabled |

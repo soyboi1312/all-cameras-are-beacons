@@ -44,12 +44,12 @@ ios/Beacons/
 │   ├── ACABProfile.swift    # the Bluetooth service + characteristic IDs
 │   └── BLEManager.swift     # all the Bluetooth and location plumbing
 └── Views/
-    ├── Theme.swift          # the look: dark, mono type, crimson accent
+    ├── Theme.swift          # the look: dark, system type, crimson accent
     ├── Components.swift      # shared bits (wordmark, signal bars, radar, ...)
     ├── ConnectView.swift     # find and pick a board
     ├── DashboardView.swift   # the radar "what's around me" home screen
     ├── MapTabView.swift      # everything located, on a map
-    ├── DetectionsView.swift  # the logbook, with CSV export
+    ├── DetectionsView.swift  # the Log: active / new / all, search, tools menu, CSV + GPX export
     ├── DetectionDetailView.swift
     └── SettingsView.swift    # the Beacon screen: radios, buzzer, firmware, about
 ```
@@ -71,7 +71,7 @@ companion BLE scanner has gone silent (its half of detection is dark).
 ## Where it's at
 
 It's a working app: connect to a board, watch detections on a radar dashboard and
-a map, browse and export a logbook, check the board's firmware version, and tune
+a map, browse and export the Log, check the board's firmware version, and tune
 its radios and buzzer. Firmware updates are built in: the app checks a hosted
 manifest for the latest version (no App Store release needed when firmware ships)
 and, on OTA-capable boards, pushes the update over Bluetooth with progress and a

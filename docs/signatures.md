@@ -589,6 +589,16 @@ names nobody for the second:
   is clear, so it is a globally-administered block. Nine MACs sharing three bytes across two cities
   six weeks apart is not something a random-address generator produces.
 
+- **The registered block's OUI-only path has its own ground truth.** Three `00:25:DF` BLE hits that
+  carried NO `BWCDEVICE` tag (one weak packet each, -88 dBm or below, conf 75 "OUI match") were
+  owner-confirmed as body cams worn by officers: `00:25:DF:54:7B:5A` (2026-09-16) and
+  `00:25:DF:7D:8C:DE` + `00:25:DF:F8:38:3F` (2026-09-23, Agoura Hills area, two officers on scene,
+  one second apart). All three come from app CSV exports, not serial logs. Reading: at the edge of
+  range the board can hear an Axon cam's untagged advertisement only, and the OUI fallback is what
+  catches it. That is why the tier stays: 3 of 3 confirmed, no non-cam Axon device seen on the block
+  yet. It is NOT a reason to raise the 75; a dock or other Axon gear on the same block would look
+  identical on the air.
+
 Both OUIs share one `baseConfidence` (75) because `AxonSignature` has no per-OUI confidence field;
 splitting them would be a struct change, not a table edit.
 
@@ -977,9 +987,9 @@ string, has to be true against these two facts:
    detections. This also means the tile fetch belongs in Google's Data Safety form, which treats
    an off-device transmission as collection regardless of what it carries.
 
-The first-run tour should describe DETECTION as passive, not claim the board never transmits. The
-board never probes, jams, or spoofs nearby devices; it does use its encrypted BLE link to exchange
-results and settings with the user's phone. Keep both halves in the wording so "passive" cannot
+The connect screen (its subtitle and its footnote) should describe DETECTION as passive, not claim
+the board never transmits. The board never probes, jams, or spoofs nearby devices; it does use its
+encrypted BLE link to exchange results and settings with the user's phone. Keep both halves in the wording so "passive" cannot
 drift back into the false absolute "never transmits".
 
 Canonical wording lives in `web/privacy.html`. The FAQ answer (`faq-content.json`, byte-identical
