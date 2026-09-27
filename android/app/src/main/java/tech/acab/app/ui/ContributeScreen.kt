@@ -31,7 +31,6 @@ import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Text
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.runtime.LaunchedEffect
-import androidx.compose.material3.SwitchDefaults
 import androidx.compose.material3.Switch
 import androidx.compose.material3.minimumInteractiveComponentSize
 import androidx.compose.material.icons.Icons
@@ -143,7 +142,7 @@ fun ContributeContent(ble: AcabBleManager, vm: ContributionViewModel) {
 
     // CSV-only save: SAF create-document, so the user picks the destination themselves. It writes
     // the same redacted CSV as Share but intentionally never claims or copies the optional photo;
-    // the visible action says SAVE CSV COPY so the two delivery manifests cannot be confused.
+    // the visible action says Save CSV Copy so the two delivery manifests cannot be confused.
     val saveCopy = rememberLauncherForActivityResult(
         ActivityResultContracts.CreateDocument("text/csv")
     ) { uri ->
@@ -197,10 +196,10 @@ fun ContributeContent(ble: AcabBleManager, vm: ContributionViewModel) {
                     border = BorderStroke(1.dp, Acab.accent),
                     colors = ButtonDefaults.outlinedButtonColors(contentColor = Acab.text),
                     shape = RoundedCornerShape(Acab.radiusSm),
-                ) { Text("START CAPTURE", fontFamily = Acab.mono, fontWeight = FontWeight.Bold, fontSize = 13.sp) }
+                ) { Text("Start Capture", fontFamily = Acab.mono, fontWeight = FontWeight.Bold, fontSize = 13.sp) }
                 Text("Discard", color = Acab.faint, fontSize = 12.sp, fontFamily = Acab.mono,
                     modifier = Modifier.fillMaxWidth().minimumInteractiveComponentSize()
-                        .clickable(enabled = !vm.sharePreparing) { vm.requestExit() }
+                        .clickable(enabled = !vm.sharePreparing, role = Role.Button) { vm.requestExit() }
                         .padding(vertical = 8.dp),
                     textAlign = androidx.compose.ui.text.style.TextAlign.Center)
             }
@@ -229,10 +228,10 @@ fun ContributeContent(ble: AcabBleManager, vm: ContributionViewModel) {
                     border = BorderStroke(1.dp, Acab.accent),
                     colors = ButtonDefaults.outlinedButtonColors(contentColor = Acab.text),
                     shape = RoundedCornerShape(Acab.radiusSm),
-                ) { Text("STOP CAPTURE", fontFamily = Acab.mono, fontWeight = FontWeight.Bold, fontSize = 13.sp) }
+                ) { Text("Stop Capture", fontFamily = Acab.mono, fontWeight = FontWeight.Bold, fontSize = 13.sp) }
                 Text("Discard", color = Acab.faint, fontSize = 12.sp, fontFamily = Acab.mono,
                     modifier = Modifier.fillMaxWidth().minimumInteractiveComponentSize()
-                        .clickable(enabled = !vm.sharePreparing) { vm.requestExit() }
+                        .clickable(enabled = !vm.sharePreparing, role = Role.Button) { vm.requestExit() }
                         .padding(vertical = 8.dp),
                     textAlign = androidx.compose.ui.text.style.TextAlign.Center)
             }
@@ -275,15 +274,16 @@ fun ContributeContent(ble: AcabBleManager, vm: ContributionViewModel) {
                         colors = ButtonDefaults.outlinedButtonColors(
                             containerColor = Acab.accent, contentColor = Acab.onAccent),
                         shape = RoundedCornerShape(Acab.radiusSm),
-                    ) { Text("START A NEW CAPTURE", fontFamily = Acab.mono, fontWeight = FontWeight.Bold, fontSize = 13.sp) }
+                    ) { Text("Start a New Capture", fontFamily = Acab.mono, fontWeight = FontWeight.Bold, fontSize = 13.sp) }
                 } else {
                     Text("Captured $liveCount observation${if (liveCount == 1) "" else "s"} over ${elapsed(vm.startMs, vm.stopMs)} " +
                         "(${clockTime(vm.startMs)} to ${clockTime(vm.stopMs)}).",
                         color = Acab.text, fontSize = 13.sp, fontFamily = Acab.mono)
                 }
 
-                Text("WHAT DID YOU SEE?", color = Acab.faint, fontSize = 11.sp,
-                    fontWeight = FontWeight.Bold, fontFamily = Acab.mono, letterSpacing = 0.5.sp)
+                // An uppercase label: Kicker's instrument face (R16), as iOS ContributeView draws
+                // this header. TWIN: iOS ContributeView Kicker("WHAT DID YOU SEE?").
+                Kicker("WHAT DID YOU SEE?", color = Acab.faint)
                 FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp),
                     verticalArrangement = Arrangement.spacedBy(8.dp)) {
                     kinds.forEach { k ->
@@ -334,7 +334,7 @@ fun ContributeContent(ble: AcabBleManager, vm: ContributionViewModel) {
                     ) {
                         Icon(Icons.Filled.Image,
                             contentDescription = null, modifier = Modifier.padding(end = 8.dp))
-                        Text("Attach a photo (optional)", fontFamily = Acab.mono, fontSize = 12.sp)
+                        Text("Attach a Photo (Optional)", fontFamily = Acab.mono, fontSize = 12.sp)
                     }
                 } else {
                     // The actual picked image, so review shows what will really be attached, with
@@ -377,8 +377,8 @@ fun ContributeContent(ble: AcabBleManager, vm: ContributionViewModel) {
                         .background(Acab.bg2).border(1.dp, Acab.line, RoundedCornerShape(Acab.radiusSm)).padding(14.dp),
                     verticalArrangement = Arrangement.spacedBy(6.dp),
                 ) {
-                    Text("WHAT THIS EXPORT CONTAINS", color = Acab.faint, fontSize = 11.sp,
-                        fontWeight = FontWeight.Bold, fontFamily = Acab.mono, letterSpacing = 0.5.sp)
+                    // TWIN: iOS ContributeView Kicker("WHAT THIS EXPORT CONTAINS"), the same face.
+                    Kicker("WHAT THIS EXPORT CONTAINS", color = Acab.faint)
                     Text(
                         "$liveCount observation${if (liveCount == 1) "" else "s"} from ${clockTime(vm.startMs)} to ${clockTime(vm.stopMs)}, " +
                             "as CSV: MAC addresses, device type and maker, signal strength, timestamps, " +
@@ -407,9 +407,9 @@ fun ContributeContent(ble: AcabBleManager, vm: ContributionViewModel) {
                         CircularProgressIndicator(color = Acab.dim, strokeWidth = 2.dp,
                             modifier = Modifier.size(14.dp).padding(end = 0.dp))
                         Spacer(Modifier.padding(horizontal = 4.dp))
-                        Text("PREPARING…", fontFamily = Acab.mono, fontWeight = FontWeight.Bold, fontSize = 13.sp)
+                        Text("Preparing…", fontFamily = Acab.mono, fontWeight = FontWeight.Bold, fontSize = 13.sp)
                     } else {
-                        Text("REVIEW & SHARE", fontFamily = Acab.mono, fontWeight = FontWeight.Bold, fontSize = 13.sp)
+                        Text("Review & Share", fontFamily = Acab.mono, fontWeight = FontWeight.Bold, fontSize = 13.sp)
                     }
                 }
 
@@ -422,12 +422,12 @@ fun ContributeContent(ble: AcabBleManager, vm: ContributionViewModel) {
                     border = BorderStroke(1.dp, Acab.line),
                     colors = ButtonDefaults.outlinedButtonColors(contentColor = Acab.dim),
                     shape = RoundedCornerShape(Acab.radiusSm),
-                ) { Text("SAVE CSV COPY", fontFamily = Acab.mono, fontSize = 13.sp) }
+                ) { Text("Save CSV Copy", fontFamily = Acab.mono, fontSize = 13.sp) }
 
                 Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
-                    Text("Start over", color = Acab.faint, fontSize = 12.sp, fontFamily = Acab.mono,
+                    Text("Start Over", color = Acab.faint, fontSize = 12.sp, fontFamily = Acab.mono,
                         modifier = Modifier.minimumInteractiveComponentSize()
-                            .clickable(enabled = !vm.sharePreparing) {
+                            .clickable(enabled = !vm.sharePreparing, role = Role.Button) {
                                 if (!vm.sharePreparing) {
                                     // An empty window has nothing to lose; a real capture confirms first.
                                     if (emptyWindow) {
@@ -439,14 +439,14 @@ fun ContributeContent(ble: AcabBleManager, vm: ContributionViewModel) {
                             .padding(vertical = 8.dp))
                     Text("Discard", color = Acab.faint, fontSize = 12.sp, fontFamily = Acab.mono,
                         modifier = Modifier.minimumInteractiveComponentSize()
-                            .clickable(enabled = !vm.sharePreparing) { vm.requestExit() }
+                            .clickable(enabled = !vm.sharePreparing, role = Role.Button) { vm.requestExit() }
                             .padding(vertical = 8.dp))
                 }
             }
         }
     }
 
-    // One confirmation for every way out of a live capture (back press, Discard, Start over):
+    // One confirmation for every way out of a live capture (back press, Discard, Start Over):
     // a field capture cannot be re-taken from the couch, so it is never dropped silently.
     if (vm.confirmDiscard != null) {
         androidx.compose.material3.AlertDialog(
@@ -459,20 +459,20 @@ fun ContributeContent(ble: AcabBleManager, vm: ContributionViewModel) {
                     color = Acab.dim, fontSize = 14.sp)
             },
             confirmButton = {
-                Text("DISCARD", color = Acab.accentText, fontSize = 12.sp, fontWeight = FontWeight.Bold,
-                    letterSpacing = 0.5.sp, fontFamily = Acab.mono,
+                Text("Discard", color = Acab.accentText, fontSize = 12.sp, fontWeight = FontWeight.Bold,
+                    fontFamily = Acab.mono,
                     modifier = Modifier.minimumInteractiveComponentSize()
-                        .clickable(enabled = !vm.sharePreparing) {
+                        .clickable(enabled = !vm.sharePreparing, role = Role.Button) {
                             ble.cancelContributionCapture()
                             vm.confirmDiscardNow()
                         }
                         .padding(8.dp))
             },
             dismissButton = {
-                Text("KEEP CAPTURE", color = Acab.dim, fontSize = 12.sp, fontWeight = FontWeight.Bold,
-                    letterSpacing = 0.5.sp, fontFamily = Acab.mono,
+                Text("Keep Capture", color = Acab.dim, fontSize = 12.sp, fontWeight = FontWeight.Bold,
+                    fontFamily = Acab.mono,
                     modifier = Modifier.minimumInteractiveComponentSize()
-                        .clickable(enabled = !vm.sharePreparing) { vm.dismissDiscard() }
+                        .clickable(enabled = !vm.sharePreparing, role = Role.Button) { vm.dismissDiscard() }
                         .padding(8.dp))
             },
         )
@@ -531,11 +531,11 @@ private fun PhotoAttachmentRow(
         Text("Replace", color = Acab.dim, fontSize = 12.sp, fontFamily = Acab.mono,
             fontWeight = FontWeight.Bold,
             modifier = Modifier.minimumInteractiveComponentSize()
-                .clickable(enabled = enabled, onClick = onReplace).padding(4.dp))
+                .clickable(enabled = enabled, role = Role.Button, onClick = onReplace).padding(4.dp))
         Text("Remove", color = Acab.accentText, fontSize = 12.sp, fontFamily = Acab.mono,
             fontWeight = FontWeight.Bold,
             modifier = Modifier.minimumInteractiveComponentSize()
-                .clickable(enabled = enabled, onClick = onRemove).padding(4.dp))
+                .clickable(enabled = enabled, role = Role.Button, onClick = onRemove).padding(4.dp))
     }
 }
 
@@ -775,7 +775,8 @@ private fun SwitchRow(
             Text(hint, color = Acab.faint, fontSize = 11.sp, fontFamily = Acab.mono)
         }
         Spacer(Modifier.padding(horizontal = 6.dp))
-        Switch(checked = checked, enabled = enabled, onCheckedChange = null,
-            colors = SwitchDefaults.colors(checkedTrackColor = Acab.accent, checkedThumbColor = Acab.text))
+        // Scheme defaults (thumb onPrimary on a primary track). The old override put the light
+        // text ink on the light primary track, which no longer reads.
+        Switch(checked = checked, enabled = enabled, onCheckedChange = null)
     }
 }

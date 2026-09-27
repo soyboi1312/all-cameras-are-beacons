@@ -289,6 +289,41 @@ final class ExportTests: XCTestCase {
                        "rows first heard before the seen watermark are not New")
     }
 
+    /// The paused Log reads lastSeen from the frozen snapshot, so the snapshot must carry it, and
+    /// it must stay out of the evidence file: the CSV header is still exactly the shared column
+    /// list. Fails if the accessor returns the first-seen stamp.
+    /// TWIN: Android AcabBleManagerExportTest.frozenSnapshotCarriesLastSeenAndTheCsvIgnoresIt.
+    func testExportSnapshotCarriesLastSeenAndTheCsvIgnoresIt() throws {
+        let first = Date(timeIntervalSince1970: 1_780_000_000)
+        let last = first.addingTimeInterval(90)
+        let input = BLEManager.CSVRowInput(d: try decode(Self.nearbyJSON), firstSeen: first,
+                                           loc: nil, basis: .exact,
+                                           lastSeen: last, lastSeenBasis: .exact)
+        let snapshot = BLEManager.DetectionExportSnapshot(rows: [input], unseenIDs: [])
+        XCTAssertEqual(snapshot.lastSeen(for: input.d.id), last)
+        XCTAssertEqual(snapshot.lastSeenBasis(for: input.d.id), .exact)
+        XCTAssertNil(snapshot.lastSeen(for: "no such row"))
+        let records = try XCTUnwrap(ContributionCsv.parseDocument(
+            BLEManager.buildCSV(snapshot.rows))?.records)
+        XCTAssertEqual(records[0], ContributionCsv.detectionColumns)
+    }
+
+    /// The producer freezes the basis of the LAST-seen stamp, not the first-seen one: a row whose
+    /// first stamp is a pseudo ordering key (`.unknown`) and whose last stamp is a clock reading
+    /// (`.exact`) must report both. Fails if the producer passes the first-seen basis as
+    /// lastSeenBasis, which would file a row heard today under "older" in the paused Log.
+    func testExportSnapshotCarriesTheLastSeenBasis() throws {
+        let manager = try makeManager()
+        let d = try decode(Self.nearbyJSON)
+        let now = Date(timeIntervalSince1970: 1_780_001_000)
+        manager.testSeedContributionDetection(d, firstSeen: Date(timeIntervalSince1970: 0),
+                                              lastSeen: now)
+        let snapshot = manager.detectionExportSnapshot()
+        XCTAssertEqual(snapshot.basis(for: d.id), .unknown)
+        XCTAssertEqual(snapshot.lastSeenBasis(for: d.id), .exact)
+        XCTAssertEqual(snapshot.lastSeen(for: d.id), now)
+    }
+
     func testLoneCarriageReturnInUasIdCannotBypassRealEmitterRedaction() throws {
         // A lone CR is a CSV record separator just like LF/CRLF. uas_id precedes every drone and
         // operator location column, so leaving it unquoted lets the apparent row break before the

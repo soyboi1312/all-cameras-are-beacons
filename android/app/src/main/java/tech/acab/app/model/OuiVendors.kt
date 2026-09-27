@@ -189,6 +189,18 @@ val Detection.displayName: String
  *  subtitle. Mirrors iOS Detection.hasName. */
 val Detection.hasName: Boolean get() = displayName != type.label
 
+/** The row TITLE: [displayName], except that a row falling all the way through to the bare
+ *  category reads the category's display name ([DeviceType.titleFallback]: "body cam", "network
+ *  camera") instead of the export label. One displayName evaluation (hot path: every Log row).
+ *  Used ONLY where a title is drawn (Log row titles, the Status nearest card, the dossier hero,
+ *  the Map member sheet headline); displayName stays the CSV / GPX value, the search key and the
+ *  managed-list label. Mirrors iOS Detection.titleName. */
+val Detection.titleName: String
+    get() {
+        val n = displayName
+        return if (n == type.label) type.titleFallback else n
+    }
+
 /** Which body-cam signature actually fired. Body cam is the one category that carries
  *  several makers' signatures at once, so the category alone cannot name a vendor: an Axon
  *  payload tag and the broad Motorola proxy both arrive as t=3. The firmware distinguishes

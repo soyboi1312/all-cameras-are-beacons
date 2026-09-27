@@ -1,6 +1,8 @@
-<!-- Home-screen widget surface: the Acab dark card, matching bg2 (#161214) with the same
-     hairline crimson-tinted border the in-app panels use, so the widget reads as one piece
-     with the app. Corner radius mirrors Acab.radius (18dp). -->
+<!-- Background of the static widget-picker preview only (layout/widget_beacons_preview.xml,
+     the android:previewLayout in xml/widget_beacons_info.xml). The live Glance widget does not
+     draw this drawable; it sets its own background and corner radius in BeaconsWidgetProvider.kt.
+     This preview keeps its own palette, hairline and radius on purpose. The app's cards are
+     12dp (Acab.radius, ui/theme/Theme.kt). -->
 <shape xmlns:android="http://schemas.android.com/apk/res/android"
     android:shape="rectangle">
     <solid android:color="#161214" />

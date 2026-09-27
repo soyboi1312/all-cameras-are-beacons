@@ -10,11 +10,14 @@ import tech.acab.app.ble.CombinedUpdatePhase
 import tech.acab.app.ble.CombinedUpdateProgress
 import tech.acab.app.ble.ConnState
 import tech.acab.app.ble.DemoStatusToggle
+import tech.acab.app.ble.LOG_ACTIVE_SECTION_HEADER
 import tech.acab.app.ble.OtaPhase
 import tech.acab.app.ble.withDemoStatusToggle
 import tech.acab.app.model.Detection
 import tech.acab.app.model.DeviceStatus
 import tech.acab.app.model.DeviceType
+import tech.acab.app.model.displayName
+import tech.acab.app.model.titleName
 
 class StatusBeaconPresentationTest {
     private fun row(
@@ -316,7 +319,7 @@ class StatusBeaconPresentationTest {
 
     /** The pill's own arm order, one step at a time: the twin of iOS
      *  BeaconRadioPresentation.chipLabel over the connection label beaconRadioPresentation picks
-     *  (null here is the DEMO pill, which LinkChip draws for sample mode). Each case also turns on
+     *  (null here is the SAMPLE pill, which LinkChip draws for sample mode). Each case also turns on
      *  the input of every arm below it, so each assertion fails if its arm drops below the next.
      *  The update reboot is the one exception: the update arm below it returns the same word, so
      *  that case leaves the update inputs off and turns on the missing frame and the fault instead.
@@ -364,8 +367,8 @@ class StatusBeaconPresentationTest {
      *  it above the connection check makes `beaconReconnect` read the update line.
      *
      *  The tab's OTHER presenter is pinned at the end of this test, because it ranks this fact on
-     *  its own: beaconConnectionPresentation feeds the Beacon tab's header kicker and its hero, the
-     *  two lines read before the row above. Every call to it outside that block leaves
+     *  its own: beaconConnectionPresentation feeds the Beacon hero's two lines, read before the
+     *  row above. Every call to it outside that block leaves
      *  rebootingForUpdate at its default, so before `header` nothing entered that arm and it could
      *  have been deleted with this suite and check-signature-drift.py both green. Dropping it, or
      *  moving it under its own `!hasStatus` arm, makes `header` read "CONNECTED · WAITING FOR BOARD
@@ -386,7 +389,7 @@ class StatusBeaconPresentationTest {
         assertFalse(gap.scanning)
 
         // A frame in hand that reports the co-processor down, with the coordinator's flag down:
-        // no radio line, no scan and no fault pill until the reboot window closes.
+        // no radio line, no scan and no fault banner until the reboot window closes.
         val confirming = statusScanPresentation(
             demo = false, reconnecting = false, rebootingForUpdate = true, hasStatus = true,
             bleIntent = true, wifiIntent = true, coAlive = false, nrfUpdating = false,
@@ -409,7 +412,7 @@ class StatusBeaconPresentationTest {
         )
         assertEquals("RECONNECTING · BOARD STATUS UNAVAILABLE", reconnect.label)
 
-        // The Beacon tab's collapsed Scan radios row, the same three moments. This is the split
+        // The Beacon tab's Scan radios row value, the same three moments. This is the split
         // the arm closes: the reboot drop clears the frame and the reconnect lands READY with the
         // tabs uncovered, so this row used to read CONNECTED · WAITING FOR BOARD STATUS while the
         // Status tab one tap away read the update line, on the path every S3 update takes.
@@ -440,7 +443,7 @@ class StatusBeaconPresentationTest {
                 CombinedUpdatePhase.RECONNECTING),
         )
 
-        // The Beacon tab's header kicker and hero, which take this fact through their OWN arm in
+        // The Beacon hero's two lines, which take this fact through their OWN arm in
         // beaconConnectionPresentation rather than through the row above. Same moment as `gap`:
         // the reboot drop cleared the frame and the reconnect landed READY, so hasStatus is false.
         val header = beaconConnectionPresentation(
@@ -449,7 +452,7 @@ class StatusBeaconPresentationTest {
         assertEquals(gap.label, header.headerKicker)
         assertEquals("UPDATING FIRMWARE · detection may pause", header.heroPrefix)
         // The link is up through the reboot, so only those two lines move: what hangs off
-        // `connected` (the refresh button's enabled gate, and currentStatus) stays as it was.
+        // `connected` (the refresh action's enabled gate, and currentStatus) stays as it was.
         assertTrue(header.connected)
         // The connection outranks the reboot here too, as it does on the row and on iOS.
         assertEquals(
@@ -476,7 +479,7 @@ class StatusBeaconPresentationTest {
      *  NotifyCard). iOS SettingsView notifyCard prints the same template from the same
      *  DeviceType.inlineLabel. The ALPR line is the one `label.lowercase()` got wrong ("the alpr
      *  camera detector"), so it fails if the name source is reverted; the body-cam line pins the
-     *  template around a name that is not an initialism. */
+     *  template around a name that is not an initialism, and its display name "body cam" (U3-d). */
     @Test
     fun notifyDetectorOffWarningKeepsTheAlprInitialism() {
         assertEquals(
@@ -484,7 +487,7 @@ class StatusBeaconPresentationTest {
             notifyDetectorOffWarning(DeviceType.FLOCK_CAMERA),
         )
         assertEquals(
-            "the body camera detector is off, so this won't fire. turn it on under Detectors.",
+            "the body cam detector is off, so this won't fire. turn it on under Detectors.",
             notifyDetectorOffWarning(DeviceType.BODY_CAM),
         )
     }
@@ -496,6 +499,24 @@ class StatusBeaconPresentationTest {
     @Test
     fun seenWindowKickerNamesTheFreshnessWindow() {
         assertEquals("SEEN < 45s", STATUS_SEEN_WINDOW_KICKER)
+    }
+
+    /** The quiet sentence (the Status first-zero line) says which window zero covers, and the
+     *  number comes from ACTIVE_NEARBY_WINDOW_MS, so retuning the window moves the sentence with
+     *  it; this pins the shipped number and the opening clause. TWIN: iOS
+     *  DashboardPresentationTests.testQuietSentenceNamesTheWindow. */
+    @Test
+    fun quietSentenceNamesTheWindow() {
+        assertTrue(FirstRunTour.QUIET_SENTENCE.contains("in the last 45 seconds."))
+        assertTrue(FirstRunTour.QUIET_SENTENCE.startsWith("quiet does not mean clear. "))
+    }
+
+    /** The Log's first time-section header is built from ACTIVE_NEARBY_WINDOW_MS, so retuning the
+     *  window moves the copy with it; this pins the shipped number. TWIN: iOS
+     *  DashboardPresentationTests.testActiveSectionHeaderNamesTheWindow. */
+    @Test
+    fun activeSectionHeaderNamesTheWindow() {
+        assertEquals("heard in the last 45 s", LOG_ACTIVE_SECTION_HEADER)
     }
 
     @Test
@@ -519,6 +540,16 @@ class StatusBeaconPresentationTest {
         assertEquals("last heard just now", statusLastHeardAge(now + 10_000L, now, demo = false))
         assertEquals("last heard 44s ago", statusLastHeardAge(now - 44_900L, now, demo = false))
         assertEquals("last heard 1m ago", statusLastHeardAge(now - 60_000L, now, demo = false))
+        // Hour and day arms, the same branches as iOS dashboardLastHeardLabel (STA-P8): two hours
+        // reads "2h ago", never "120m ago".
+        val later = 200_000_000L
+        assertEquals("last heard 59m ago", statusLastHeardAge(later - 3_599_000L, later, demo = false))
+        assertEquals("last heard 2h ago", statusLastHeardAge(later - 7_200_000L, later, demo = false))
+        assertEquals("last heard 23h ago", statusLastHeardAge(later - 86_399_000L, later, demo = false))
+        assertEquals(
+            "last heard more than a day ago",
+            statusLastHeardAge(later - 86_400_000L, later, demo = false),
+        )
         assertEquals("last heard unknown", statusLastHeardAge(null, now, demo = false))
         // Byte-identical to iOS dashboardLastHeardLabel's demo string, asserted there too.
         assertEquals("sample sighting · not live", statusLastHeardAge(null, now, demo = true))
@@ -543,6 +574,51 @@ class StatusBeaconPresentationTest {
         )
         assertEquals("CONNECTED OVER BLE", ready.headerKicker)
         assertTrue(ready.connected)
+    }
+
+    /** The Beacon hero draws its second line (the presenter's headerKicker) only when the first
+     *  line does not already say it, case aside. Wrong inputs: a case-sensitive compare draws the
+     *  first-frame and update-reboot sentences twice; a whole-string compare draws SAMPLE DATA
+     *  under SAMPLE DATA · no live board; dropping the rule entirely also fails the lost-link arm. */
+    @Test
+    fun heroDropsTheSecondLineWhenTheStatusLineRepeatsIt() {
+        fun hero(p: BeaconConnectionPresentation, demo: Boolean = false, firmware: String? = null): Pair<String, String?> {
+            val status = beaconHeroStatusLine(p, demo = demo, firmware = firmware)
+            return status to beaconHeroConnectionLine(status, p.headerKicker)
+        }
+        val firstFrame = beaconConnectionPresentation(
+            demo = false, reconnecting = false, state = ConnState.READY, hasStatus = false,
+        )
+        assertEquals("CONNECTED · waiting for board status" to null, hero(firstFrame))
+
+        val reboot = beaconConnectionPresentation(
+            demo = false, reconnecting = false, state = ConnState.READY, hasStatus = false,
+            rebootingForUpdate = true,
+        )
+        assertEquals("UPDATING FIRMWARE · detection may pause" to null, hero(reboot))
+
+        val sample = beaconConnectionPresentation(
+            demo = true, reconnecting = false, state = ConnState.READY, hasStatus = true,
+        )
+        assertEquals("SAMPLE DATA · no live board" to null, hero(sample, demo = true, firmware = "beacon board"))
+
+        val lost = beaconConnectionPresentation(
+            demo = false, reconnecting = false, state = ConnState.DISCONNECTED, hasStatus = false,
+        )
+        assertEquals("CONNECTION LOST · BOARD STATUS UNAVAILABLE" to null, hero(lost))
+
+        // Lines that say different things both stay.
+        val retained = beaconConnectionPresentation(
+            demo = false, reconnecting = true, state = ConnState.CONNECTING, hasStatus = true,
+        )
+        assertEquals(
+            "RECONNECTING · last reported · beacon board" to "RECONNECTING · BOARD STATUS UNAVAILABLE",
+            hero(retained, firmware = "beacon board"),
+        )
+        val ready = beaconConnectionPresentation(
+            demo = false, reconnecting = false, state = ConnState.READY, hasStatus = true,
+        )
+        assertEquals("CONNECTED · beacon board" to "CONNECTED OVER BLE", hero(ready, firmware = "beacon board"))
     }
 
     @Test
@@ -678,11 +754,14 @@ class StatusBeaconPresentationTest {
                 CombinedUpdatePhase.IDLE),
         )
         // Sample mode is shared with iOS as of 2026-09-08. Both tours echo the radio switches
-        // into the synthetic status and both presenters read them, so the collapsed row names
-        // them the way the Status header does, on both phones. iOS pins the same four literals
-        // in BeaconPresentationTests.testDemoNamesItsSampleRadiosAndSweepsWithThem.
+        // into the synthetic status and both presenters read them. Since the 2026-09-26 review
+        // (P3-8) this row prints the LIVE arm's own words for the echoed switches, not the SAMPLE
+        // DATA family the Status header keeps (statusScanPresentation, pinned above): the banner,
+        // the pill, the dot and the hero already say sample on that page. iOS's Scan radios row
+        // reads the same four literals from sampleRadiosRowValue (BeaconPagePolishTests); the
+        // full four-way pin is BeaconScanRadiosSampleTest.
         assertEquals(
-            "SAMPLE DATA · WI-FI ONLY",
+            "SCANNING · WI-FI",
             beaconRadioStatusLabel(true, connected, false, true, false, true, null, false,
                 CombinedUpdatePhase.IDLE),
         )
@@ -883,5 +962,241 @@ class StatusBeaconPresentationTest {
             hasStatus = true, combinedRunning = false, nrfUpdating = true))
         assertFalse(canStartBeaconFirmwareAction(true, false, ConnState.READY,
             hasStatus = true, combinedRunning = false, nrfUpdating = false))
+    }
+
+    /** The Beacon tab's two segments, in order, with every render gate the rows carry: Alerts
+     *  leaves on a mesh board (no buzzer), Firmware leaves while an update is promoted to the
+     *  banner, System readiness and the saved log never show in the sample tour, Improve detection
+     *  only when its gate is true. Wrong inputs: ALERTS listed before DESERT fails the first
+     *  assertion; SYSTEM_READINESS without its `!demo` fails the demo assertion.
+     *  iOS twin: BeaconPresentationTests.testBeaconRowsFollowTheSharedPartition (iOS also lists
+     *  disconnect and power off as rows; Android puts them in the overflow menu. iOS also lists
+     *  the phone side's PREFERENCES / SUPPORT header rows; Android derives those two labels from
+     *  the group key in beaconGroupHeaderLabel, so this phone list is rows only, decisions R13). */
+    @Test
+    fun beaconRowsFollowTheSharedPartition() {
+        val board = listOf(
+            BeaconRowId.HERO, BeaconRowId.UPTIME, BeaconRowId.DETECTIONS, BeaconRowId.DETECTION_HEADER,
+            BeaconRowId.SCAN_RADIOS, BeaconRowId.DETECTORS, BeaconRowId.DESERT, BeaconRowId.ON_BOARD_HEADER,
+            BeaconRowId.ALERTS, BeaconRowId.BOARD_LED, BeaconRowId.FIRMWARE, BeaconRowId.MANAGED_DEVICES,
+        )
+        assertEquals(board, beaconRows(BeaconSegment.BOARD, meshBoard = false, firmwareVisible = true,
+            demo = false, improveAvailable = true, hasSavedLog = true))
+        assertEquals(board - BeaconRowId.ALERTS, beaconRows(BeaconSegment.BOARD, meshBoard = true,
+            firmwareVisible = true, demo = false, improveAvailable = true, hasSavedLog = true))
+        assertEquals(board - BeaconRowId.FIRMWARE, beaconRows(BeaconSegment.BOARD, meshBoard = false,
+            firmwareVisible = false, demo = false, improveAvailable = true, hasSavedLog = true))
+
+        val phone = listOf(
+            BeaconRowId.NOTIFICATIONS, BeaconRowId.LIVE_MODE, BeaconRowId.DISPLAY,
+            BeaconRowId.SYSTEM_READINESS, BeaconRowId.IMPROVE_DETECTION, BeaconRowId.HELP_SUPPORT,
+            BeaconRowId.ABOUT, BeaconRowId.SAVED_LOG,
+        )
+        assertEquals(phone, beaconRows(BeaconSegment.PHONE, meshBoard = false, firmwareVisible = true,
+            demo = false, improveAvailable = true, hasSavedLog = true))
+        assertEquals(
+            listOf(BeaconRowId.NOTIFICATIONS, BeaconRowId.LIVE_MODE, BeaconRowId.DISPLAY,
+                BeaconRowId.HELP_SUPPORT, BeaconRowId.ABOUT),
+            beaconRows(BeaconSegment.PHONE, meshBoard = false, firmwareVisible = true,
+                demo = true, improveAvailable = false, hasSavedLog = true),
+        )
+        assertEquals(phone - BeaconRowId.SAVED_LOG, beaconRows(BeaconSegment.PHONE, meshBoard = false,
+            firmwareVisible = true, demo = false, improveAvailable = true, hasSavedLog = false))
+    }
+
+    /** The partition cut into groups (decisions R13): the hero card, the Uptime / Detections tile
+     *  pair, then DETECTION and ON THE BOARD with their header rows lifted into the header slot,
+     *  and the THIS PHONE groups under their iOS keys. Each group with rows under a header or an
+     *  intro gets its one line from beaconGroupIntro; the cards get none. Wrong inputs: filing a
+     *  header row as a row fails the groups assertion, dropping the mesh gate from the ON THE
+     *  BOARD line fails the mesh assertion, and a help line that promises setup checks in the
+     *  sample tour fails the demo one. The sentences themselves are pinned byte for byte against
+     *  iOS by the drift row "Beacon group intro lines".
+     *  iOS twin: BeaconPresentationTests.testBeaconRowsFollowTheSharedPartition (its grouping
+     *  block, which also has key 4 for Disconnect and Power off). */
+    @Test
+    fun beaconRowGroupsFollowTheIosSectionsAndCarryTheirIntros() {
+        val board = beaconRows(BeaconSegment.BOARD, meshBoard = false, firmwareVisible = true,
+            demo = false, improveAvailable = true, hasSavedLog = true)
+        val groups = beaconRowGroups(board)
+        assertEquals(listOf(
+            BeaconRowGroup(0, null, listOf(BeaconRowId.HERO)),
+            BeaconRowGroup(1, null, listOf(BeaconRowId.UPTIME, BeaconRowId.DETECTIONS)),
+            BeaconRowGroup(2, BeaconRowId.DETECTION_HEADER,
+                listOf(BeaconRowId.SCAN_RADIOS, BeaconRowId.DETECTORS, BeaconRowId.DESERT)),
+            BeaconRowGroup(3, BeaconRowId.ON_BOARD_HEADER, listOf(BeaconRowId.ALERTS, BeaconRowId.BOARD_LED,
+                BeaconRowId.FIRMWARE, BeaconRowId.MANAGED_DEVICES)),
+        ), groups)
+        assertEquals(listOf(true, true, false, false), groups.map { it.isCardGroup })
+        val mesh = beaconRowGroups(beaconRows(BeaconSegment.BOARD, meshBoard = true, firmwareVisible = true,
+            demo = false, improveAvailable = true, hasSavedLog = true))
+        assertEquals(listOf(BeaconRowId.BOARD_LED, BeaconRowId.FIRMWARE, BeaconRowId.MANAGED_DEVICES), mesh[3].rows)
+
+        val phone = beaconRowGroups(beaconRows(BeaconSegment.PHONE, meshBoard = false, firmwareVisible = true,
+            demo = false, improveAvailable = true, hasSavedLog = true))
+        assertEquals(listOf(5, 6, 7), phone.map { it.key })
+        assertEquals(listOf(
+            listOf(BeaconRowId.NOTIFICATIONS, BeaconRowId.LIVE_MODE, BeaconRowId.DISPLAY),
+            listOf(BeaconRowId.SYSTEM_READINESS, BeaconRowId.IMPROVE_DETECTION, BeaconRowId.HELP_SUPPORT,
+                BeaconRowId.ABOUT),
+            listOf(BeaconRowId.SAVED_LOG),
+        ), phone.map { it.rows })
+        assertFalse(phone.any { it.isCardGroup })
+
+        fun intro(key: Int, mesh: Boolean = false, demo: Boolean = false, word: String = "phone") =
+            beaconGroupIntro(key, mesh, demo = demo, deviceWord = word)
+        // The cards and the saved-log group have no line.
+        assertNull(intro(0))
+        assertNull(intro(1))
+        assertNull(intro(7))
+        assertEquals("radios, detectors, desert mode, and the offline buffer.", intro(2))
+        assertEquals("alerts, the board light, firmware, and managed devices.", intro(3))
+        assertEquals("the board light, firmware, and managed devices.", intro(3, mesh = true))
+        assertEquals("notifications, Live Mode, and display for this phone.", intro(5))
+        assertEquals("notifications, Live Mode, and display for this tablet.", intro(5, word = "tablet"))
+        assertEquals("setup checks, help, support, and about this app.", intro(6))
+        assertEquals("help, support, and about this app.", intro(6, demo = true))
+        // The mesh and sample facts each move only their own line.
+        assertEquals(intro(2), intro(2, mesh = true, demo = true))
+        assertEquals(intro(6), intro(6, mesh = true))
+        assertEquals(intro(3), intro(3, demo = true))
+    }
+
+    /** Disconnect and Power off moved from the foot of the page into the overflow menu with their
+     *  gates unchanged: Disconnect reads "Exit Sample Data" in the tour and is blocked while the
+     *  combined update runs; Power off is rev-B only, needs a connected board with a current frame,
+     *  never shows in the tour, and is disabled while board controls are unavailable. Wrong input:
+     *  the power-off gate without `!demo` gives the demo case a second item. iOS twin:
+     *  disconnectButton / showPowerOff in SettingsView.swift. */
+    @Test
+    fun overflowCarriesTheSlotGates() {
+        assertEquals(listOf(BeaconOverflowItem("disconnect", "Exit Sample Data", true)),
+            beaconOverflowItems(demo = true, connected = true, hasStatus = true, boardRev = "B",
+                combinedRunning = true, boardControlsAvailable = true))
+        assertEquals(
+            listOf(BeaconOverflowItem("disconnect", "Disconnect", true),
+                BeaconOverflowItem("poweroff", "Power Off Beacon", true)),
+            beaconOverflowItems(demo = false, connected = true, hasStatus = true, boardRev = "B",
+                combinedRunning = false, boardControlsAvailable = true),
+        )
+        assertEquals(BeaconOverflowItem("disconnect", "Disconnect", false),
+            beaconOverflowItems(demo = false, connected = true, hasStatus = true, boardRev = "B",
+                combinedRunning = true, boardControlsAvailable = true).first())
+        assertEquals(BeaconOverflowItem("poweroff", "Power Off Beacon", false),
+            beaconOverflowItems(demo = false, connected = true, hasStatus = true, boardRev = "B",
+                combinedRunning = false, boardControlsAvailable = false).last())
+        for ((rev, connected, hasStatus) in listOf(
+            Triple<String?, Boolean, Boolean>("A", true, true),
+            Triple<String?, Boolean, Boolean>(null, true, true),
+            Triple<String?, Boolean, Boolean>("B", false, true),
+            Triple<String?, Boolean, Boolean>("B", true, false),
+        )) {
+            assertEquals("rev $rev, connected $connected, status $hasStatus",
+                listOf("disconnect"),
+                beaconOverflowItems(demo = false, connected = connected, hasStatus = hasStatus,
+                    boardRev = rev, combinedRunning = false, boardControlsAvailable = true).map { it.id })
+        }
+    }
+
+    /** A pushed page draws only while its row is listed, and a board page only while board
+     *  controls are available. That second rule is what keeps the restore offer exclusive: the
+     *  Desert and Alerts pages carry it, and desertRestoreNeedsDetachedSurface draws the detached
+     *  copy exactly when they are withheld (AcabAppStateTest pins that side). Phone pages and
+     *  Firmware are not board-gated. Wrong inputs: dropping the board gate makes the first
+     *  assertion return DETECTORS; gating every page makes the NOTIFICATIONS and FIRMWARE
+     *  assertions return null. */
+    @Test
+    fun boardPagesDrawOnlyWhileTheBoardAnswersAndTheirRowIsListed() {
+        val rows = beaconRows(BeaconSegment.BOARD, meshBoard = false, firmwareVisible = true,
+            demo = false, improveAvailable = true, hasSavedLog = true) +
+            beaconRows(BeaconSegment.PHONE, meshBoard = false, firmwareVisible = true,
+                demo = false, improveAvailable = true, hasSavedLog = true)
+        assertNull(beaconPageToDraw(BeaconRowId.DETECTORS, rows, boardControlsAvailable = false))
+        assertEquals(BeaconRowId.DETECTORS,
+            beaconPageToDraw(BeaconRowId.DETECTORS, rows, boardControlsAvailable = true))
+        assertEquals(BeaconRowId.NOTIFICATIONS,
+            beaconPageToDraw(BeaconRowId.NOTIFICATIONS, rows, boardControlsAvailable = false))
+        assertEquals(BeaconRowId.FIRMWARE,
+            beaconPageToDraw(BeaconRowId.FIRMWARE, rows, boardControlsAvailable = false))
+        assertNull("the Firmware row leaves while the banner is promoted",
+            beaconPageToDraw(BeaconRowId.FIRMWARE, rows - BeaconRowId.FIRMWARE, boardControlsAvailable = true))
+        val meshRows = beaconRows(BeaconSegment.BOARD, meshBoard = true, firmwareVisible = true,
+            demo = false, improveAvailable = true, hasSavedLog = true)
+        assertNull("no Alerts page on a mesh board",
+            beaconPageToDraw(BeaconRowId.ALERTS, meshRows, boardControlsAvailable = true))
+        assertNull(beaconPageToDraw(null, rows, boardControlsAvailable = true))
+    }
+
+    /** U1-d: sample data says sample less on Status. The bare "SAMPLE DATA" kicker is not drawn
+     *  (null), the radio variants and every live label are, and the strongest header carries no
+     *  suffix in sample data while a real session keeps " · RECENT". Wrong inputs: hiding every
+     *  sample label (the second assertion fails); keeping " · SAMPLE" (the header assertion fails).
+     *  TWIN: iOS DashboardPresentationTests (dashboardScanKicker, dashboardStrongestHeader). */
+    @Test
+    fun sampleDataSaysSampleLessOnStatus() {
+        assertNull(statusScanKicker("SAMPLE DATA", demo = true))
+        assertEquals("SAMPLE DATA · BLUETOOTH ONLY", statusScanKicker("SAMPLE DATA · BLUETOOTH ONLY", demo = true))
+        assertEquals("SAMPLE DATA · RADIOS OFF", statusScanKicker("SAMPLE DATA · RADIOS OFF", demo = true))
+        assertEquals("SCANNING · BLE · WI-FI", statusScanKicker("SCANNING · BLE · WI-FI", demo = false))
+        assertEquals("STRONGEST MATCH", statusStrongestHeader(StatusStrongestKind.MATCHED, demo = true))
+        assertEquals("STRONGEST AMBIENT", statusStrongestHeader(StatusStrongestKind.AMBIENT, demo = true))
+        assertEquals("STRONGEST MATCH · RECENT", statusStrongestHeader(StatusStrongestKind.MATCHED, demo = false))
+        assertEquals("STRONGEST UNCLASSIFIED · RECENT",
+            statusStrongestHeader(StatusStrongestKind.UNCLASSIFIED, demo = false))
+    }
+
+    /** U3-d: a row with no name, maker or serial is TITLED by the category's display name while
+     *  its export value (displayName, the CSV / GPX type column) keeps DeviceType.label. A
+     *  Hikvision row keeps its maker title. Wrong inputs: changing `label` (the displayName
+     *  assertion and the CSV tests fail) or leaving titleName = displayName (the first fails). */
+    @Test
+    fun titleNameUsesTheDisplayNameOnlyForTheBareCategory() {
+        val bodyCam = row("00:25:df:00:00:01", DeviceType.BODY_CAM)
+        assertEquals("body cam", bodyCam.titleName)
+        assertEquals("Body Camera", bodyCam.displayName)
+        val netcam = row("44:19:b6:00:00:02", DeviceType.NETWORK_CAMERA)
+        assertEquals("network camera", netcam.titleName)
+        assertEquals("Network camera", netcam.displayName)
+        val hikvision = netcam.copy(method = 1, detail = "Hikvision on wifi")
+        assertEquals("Hikvision", hikvision.titleName)
+        assertEquals("Hikvision", hikvision.displayName)
+        assertEquals("network camera", DeviceType.NETWORK_CAMERA.inlineCategory)
+        assertEquals("body cam", DeviceType.BODY_CAM.inlineLabel)
+    }
+
+    /** U2-b: the THIS PHONE row values name a system block the way iOS does ("· BLOCKED BY IOS"),
+     *  and never in sample data. Wrong input: the old kickers, which never said BLOCKED. TWIN: iOS
+     *  SettingsView notifyKicker / liveModeState. */
+    @Test
+    fun thisPhoneRowValuesNameTheAndroidBlock() {
+        assertEquals("3 ON · BLOCKED BY ANDROID", beaconNotifyRowValue(3, blockedBySystem = true, demo = false))
+        assertEquals("3 ON", beaconNotifyRowValue(3, blockedBySystem = true, demo = true))
+        assertEquals("3 ON", beaconNotifyRowValue(3, blockedBySystem = false, demo = false))
+        assertEquals("OFF", beaconNotifyRowValue(0, blockedBySystem = true, demo = false))
+        assertEquals("LIVE BLOCKED BY ANDROID · COUNTS VISIBLE",
+            beaconLiveRowValue(wanted = true, deliverable = false, countsPrivate = false, demo = false))
+        // Sample data never reads BLOCKED, and since R19 never LIVE either: the switch is a
+        // preview there (LiveModePreviewCopyTest pins both sample arms).
+        assertEquals("PREVIEW ON · COUNTS VISIBLE",
+            beaconLiveRowValue(wanted = true, deliverable = false, countsPrivate = false, demo = true))
+        assertEquals("LIVE ON · COUNTS PRIVATE",
+            beaconLiveRowValue(wanted = true, deliverable = true, countsPrivate = true, demo = false))
+        assertEquals("LIVE OFF · COUNTS VISIBLE",
+            beaconLiveRowValue(wanted = false, deliverable = false, countsPrivate = false, demo = false))
+    }
+
+    /** U2-c: in sample data the notify card promises no permission prompt (its switches are
+     *  previews). Wrong input: the permission-prompt sentence in sample data. TWIN: iOS
+     *  SettingsView notifyCard's sample sentence ("... and iOS won't ask permission."). */
+    @Test
+    fun sampleNotifyCardPromisesNoPermissionPrompt() {
+        assertEquals(
+            "Preview which categories you could enable. Nothing is saved and Android won't ask permission.",
+            notifyCardExplainer(demo = true),
+        )
+        assertEquals(
+            "Pick what's worth a notification. Every category is off until you turn it on, and Android asks permission the first time you do.",
+            notifyCardExplainer(demo = false),
+        )
     }
 }

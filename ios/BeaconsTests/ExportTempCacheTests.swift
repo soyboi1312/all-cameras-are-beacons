@@ -1,7 +1,7 @@
 import XCTest
 @testable import Beacons
 
-/// "Clear log" must not leave copies of the history behind. These pin the three pieces that make
+/// "Clear Log" must not leave copies of the history behind. These pin the three pieces that make
 /// that true without touching real user state:
 ///  - ExportTempCache.sweep, run over a temp root THIS TEST creates (its name is not a UUID, so the
 ///    app's own launch sweep of the host's tmp can never match it, and it is removed in tearDown);
@@ -49,7 +49,7 @@ final class ExportTempCacheTests: XCTestCase {
 
     private func exists(_ url: URL) -> Bool { fm.fileExists(atPath: url.path) }
 
-    // MARK: - Clear log form (no age bound)
+    // MARK: - Clear Log form (no age bound)
 
     func testClearRemovesEveryOwnedExportDirAndNothingElse() throws {
         let logCSV = try makeDir(files: ["acab-detections.csv"])

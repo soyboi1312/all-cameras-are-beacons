@@ -28,7 +28,7 @@ class ContributionViewModelTest {
         }
         assertEquals(2, vm.frozenRowCount)
 
-        // Start over: back to IDLE, and the artifact plus its count are gone together.
+        // Start Over: back to IDLE, and the artifact plus its count are gone together.
         vm.requestRestart()
         vm.confirmDiscardNow()
         assertNull(vm.frozenCsv)

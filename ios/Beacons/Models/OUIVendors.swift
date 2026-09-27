@@ -156,7 +156,7 @@ extension Detection {
     /// genuine plate reader. Desert mode and the watchlist pass arbitrary MACs, which is how the
     /// 21 Espressif blocks become reachable, and our own board is an ESP32-S3 that other boards
     /// detect. The dossier subtitle already made this exact call (see the "NEITHER branch may
-    /// consult the OUI lookup" comment in DetectionDetailView.headerBlock, which is why the old
+    /// consult the OUI lookup" comment in DetectionDetailView.titleBlock, which is why the old
     /// OUI-first `displayVendor` was deleted rather than reused); this extends that decision
     /// rather than reopening it.
     ///

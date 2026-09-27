@@ -3,7 +3,7 @@ import Foundation
 enum DetectionLogSort: String, CaseIterable {
     case newest, strongest
 
-    var label: String { self == .newest ? "Newest" : "Strongest signal" }
+    var label: String { self == .newest ? "Newest" : "Strongest Signal" }
 }
 
 /// Per-row folded haystack, kept ACROSS publishes. The store republishes ~3 Hz while detections
@@ -218,15 +218,33 @@ func applyDetectionLogLens(_ rows: [Detection], category: String?, unseenOnly: B
 extension BLEManager.DetectionExportSnapshot {
     /// Apply the same lens to a single immutable snapshot, retaining timestamps, coordinates,
     /// and NEW membership even after the manager has evicted a row in a paused view.
+    /// `activeIDs` is the Active segment's membership at the tap (`activeIDs(now:isDemoMode:)`);
+    /// nil exports every scope-independent row.
     func reviewed(category: String?, unseenOnly: Bool, offlineOnly: Bool,
+                  activeIDs: Set<String>? = nil,
                   query: DetectionLogQuery, sort: DetectionLogSort,
                   isWatched: (Detection) -> Bool) -> BLEManager.DetectionExportSnapshot {
-        let selected = applyDetectionLogLens(detections, category: category,
+        var selected = applyDetectionLogLens(detections, category: category,
             unseenOnly: unseenOnly, offlineOnly: offlineOnly, query: query, sort: sort,
             isUnseen: { unseenIDs.contains($0.id) }, isWatched: isWatched)
+        if let activeIDs {
+            selected = selected.filter {
+                logScopeKeeps($0, scope: .active, isUnseen: { _ in false }, activeIDs: activeIDs)
+            }
+        }
         let byID = Dictionary(uniqueKeysWithValues: rows.map { ($0.d.id, $0) })
         let selectedIDs = Set(selected.map(\.id))
         return BLEManager.DetectionExportSnapshot(rows: selected.compactMap { byID[$0.id] },
             unseenIDs: unseenIDs.intersection(selectedIDs))
+    }
+
+    /// The ids the Active segment shows over THIS snapshot at `now`: the rows that are not replayed,
+    /// in snapshot order (detectionExportSnapshot sorts newest-first on lastSeen), cut at the same
+    /// binary-search boundary the screen uses. Demo keeps every live row, as Status does.
+    func activeIDs(now: Date, isDemoMode: Bool) -> Set<String> {
+        let live = rows.filter { !$0.d.isHistory }
+        if isDemoMode { return Set(live.map { $0.d.id }) }
+        let k = activeBoundary(newestFirstEnvelope(live.map(\.lastSeen)), now: now)
+        return Set(live.prefix(k).map { $0.d.id })
     }
 }

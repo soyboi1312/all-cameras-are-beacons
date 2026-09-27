@@ -8,25 +8,27 @@ import android.os.Build
 import android.os.Bundle
 import android.provider.Settings
 import androidx.activity.ComponentActivity
+import androidx.activity.SystemBarStyle
 import androidx.activity.compose.setContent
+import androidx.activity.enableEdgeToEdge
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.activity.viewModels
-import androidx.compose.material3.LocalTextStyle
-import androidx.compose.runtime.CompositionLocalProvider
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.setValue
 import androidx.lifecycle.Lifecycle
+import tech.acab.app.ble.BoardKind
 import tech.acab.app.ble.ConnState
 import tech.acab.app.ble.DetectionNotifier
 import tech.acab.app.ble.defaultLiveModeStartConfirmed
 import tech.acab.app.ble.defaultLiveModeStartReady
 import tech.acab.app.net.AlprStore
 import tech.acab.app.ui.AcabApp
+import tech.acab.app.ui.BeaconSegment
 import tech.acab.app.ui.NearbyPermissionDenial
 import tech.acab.app.ui.canRetryAllMissingPermissions
 import tech.acab.app.ui.resolveNearbyPermissionDenial
-import tech.acab.app.ui.theme.Acab
+import tech.acab.app.ui.theme.AcabTheme
 import tech.acab.app.ui.theme.ContrastMode
 
 class MainActivity : ComponentActivity() {
@@ -36,6 +38,9 @@ class MainActivity : ComponentActivity() {
     private var notificationsAvailable by mutableStateOf(false)
     private var nearbyPermissionDenial by mutableStateOf(NearbyPermissionDenial.NONE)
     private var liveNotificationDenied by mutableStateOf(false)
+    // True from the moment requestOptionalLocation opens the system Location dialog until its
+    // result arrives. AcabApp holds the Live rationale back while it is up (contracts 9.1).
+    private var locationRequestOutstanding by mutableStateOf(false)
     private var startDriveRequested = false
     private var defaultLiveStartPending = false
     private var scanAfterPermissionGrant = false
@@ -52,7 +57,10 @@ class MainActivity : ComponentActivity() {
 
     private val requestLocation = registerForActivityResult(
         ActivityResultContracts.RequestMultiplePermissions()
-    ) { syncPermissionState() }
+    ) {
+        locationRequestOutstanding = false
+        syncPermissionState()
+    }
 
     private val requestDriveNotification = registerForActivityResult(
         ActivityResultContracts.RequestPermission()
@@ -65,9 +73,24 @@ class MainActivity : ComponentActivity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        // Edge-to-edge on every OS version, not only the Android 15+ that targetSdk 36 forces it
+        // on: without this, Android 8 to 14 paints its own navigation bar in the window colour
+        // under the M3 NavigationBar (surfaceContainer), a two-tone band. The Compose tree already
+        // pads for the bars (safeDrawing, statusBars, NavigationBar's own insets). Both bars are
+        // transparent with the DARK style because the app is dark-only, so the bar icons stay
+        // light even while the system is in light mode. The theme's bar colours still paint the
+        // cold-start frame before this runs.
+        enableEdgeToEdge(
+            statusBarStyle = SystemBarStyle.dark(android.graphics.Color.TRANSPARENT),
+            navigationBarStyle = SystemBarStyle.dark(android.graphics.Color.TRANSPARENT),
+        )
         defaultLiveStartPending = savedInstanceState?.getBoolean(KEY_DEFAULT_LIVE_PENDING) == true
         scanAfterPermissionGrant = savedInstanceState?.getBoolean(KEY_SCAN_AFTER_PERMISSION) == true
         liveNotificationDenied = savedInstanceState?.getBoolean(KEY_LIVE_NOTIFICATION_DENIED) == true
+        // A rotation while the system Location dialog is up recreates this activity; the result is
+        // re-delivered to the new instance, whose callback clears the flag.
+        locationRequestOutstanding =
+            savedInstanceState?.getBoolean(KEY_LOCATION_REQUEST_OUTSTANDING) == true
         syncPermissionState()
         // Prime the known-ALPR store at launch so a default-on install fetches the dataset
         // before the first Map open, matching iOS (ALPRStore.init refreshes at launch).
@@ -77,16 +100,19 @@ class MainActivity : ComponentActivity() {
         // plus the system contrast inputs. Listeners keep it live while we are up.
         ContrastMode.load(this)
         ContrastMode.startListening(this)
+        // Screenshot / UI-check hook, DEBUG builds only (see EXTRA_BOARD_KIND). Display-only: it
+        // never touches the real remembered board, prefs or a radio call.
+        if (BuildConfig.DEBUG) {
+            debugBoardKindExtra(intent?.getStringExtra(EXTRA_BOARD_KIND))?.let(vm.ble::applyDebugBoardKind)
+        }
         handleDeepLink(intent)
         // The permission prompt is NOT fired here anymore. The connect screen shows a
         // "before the system asks" rationale first, and its CTA calls onRequestPermissions,
         // so the OS prompt only appears after the user has seen why we ask.
         setContent {
-            // Space Grotesk is the default face for any non-mono Text, like the iOS
-            // app. Doesn't touch component colors.
-            CompositionLocalProvider(
-                LocalTextStyle provides LocalTextStyle.current.copy(fontFamily = Acab.display)
-            ) {
+            // The app's one MaterialTheme (colour scheme from the palette in force, M3 type
+            // scale, M3 shapes). This is the only Compose root, so the only place it goes.
+            AcabTheme {
                 AcabApp(
                     ble = vm.ble,
                     permissionsGranted = permissionsGranted,
@@ -94,6 +120,7 @@ class MainActivity : ComponentActivity() {
                     notificationsAvailable = notificationsAvailable,
                     nearbyPermissionDenial = nearbyPermissionDenial,
                     liveNotificationDenied = liveNotificationDenied,
+                    locationRequestOutstanding = locationRequestOutstanding,
                     onRequestPermissions = {
                         getSharedPreferences("acab_ui", MODE_PRIVATE).edit()
                             .putBoolean(KEY_NEARBY_PERMISSION_REQUESTED, true).apply()
@@ -104,6 +131,7 @@ class MainActivity : ComponentActivity() {
                     onRequestLocation = ::requestOptionalLocation,
                     onStartDefaultLiveMode = ::startDefaultLiveMode,
                     onLiveNotificationDenialHandled = { liveNotificationDenied = false },
+                    initialBeaconSegment = beaconSegmentExtra(intent?.getStringExtra(EXTRA_BEACON_SEGMENT)),
                 )
             }
         }
@@ -129,6 +157,7 @@ class MainActivity : ComponentActivity() {
         outState.putBoolean(KEY_DEFAULT_LIVE_PENDING, defaultLiveStartPending)
         outState.putBoolean(KEY_SCAN_AFTER_PERMISSION, scanAfterPermissionGrant)
         outState.putBoolean(KEY_LIVE_NOTIFICATION_DENIED, liveNotificationDenied)
+        outState.putBoolean(KEY_LOCATION_REQUEST_OUTSTANDING, locationRequestOutstanding)
         super.onSaveInstanceState(outState)
     }
 
@@ -183,8 +212,8 @@ class MainActivity : ComponentActivity() {
         vm.ble.startDriveMode()
     }
 
-    /** Root-level default startup, invoked only after the real-board tour is no longer covering
-     * the app. Keeping this in the activity/root path means it runs regardless of the selected tab.
+    /** Root-level default startup, invoked only after the setup checklist has completed. Keeping
+     * this in the activity/root path means it runs regardless of the selected tab.
      * The explanatory UI decides whether this invocation should also trigger the one-time runtime
      * notification request; subsequent sessions simply restore the user's persisted choice. */
     private fun startDefaultLiveMode(requestNotification: Boolean) {
@@ -227,9 +256,9 @@ class MainActivity : ComponentActivity() {
         if (!vm.ble.driveModeOn) vm.ble.startDriveMode()
     }
 
-    /** The first-run CTA says "Allow & scan", so a successful grant must do both. Permission
-     * callbacks may arrive below RESUMED just like the notification result, and a LOW_LATENCY
-     * scan must not be started until this activity is actually visible. */
+    /** The pre-permission CTA says "Continue" and then scans, so a successful grant must do both.
+     * Permission callbacks may arrive below RESUMED just like the notification result, and a
+     * LOW_LATENCY scan must not be started until this activity is actually visible. */
     private fun maybeStartPermissionScan() {
         if (!scanAfterPermissionGrant || !permissionsGranted ||
             !lifecycle.currentState.isAtLeast(Lifecycle.State.RESUMED)) return
@@ -259,8 +288,9 @@ class MainActivity : ComponentActivity() {
     }
 
     // Android 12+ needs only Nearby Devices to find and pair with the beacon. Location is optional
-    // there and is requested later from Map/geotagging surfaces. On older Android, the platform
-    // itself gates BLE scanning on fine location, so it remains part of the initial request.
+    // there and is requested later from the setup checklist's Continue and from Map/geotagging
+    // surfaces. On older Android, the platform itself gates BLE scanning on fine location, so it
+    // remains part of the initial request.
     private fun requestedPermissions(): Array<String> = requiredPermissions()
 
     // What we actually need to scan and connect. On 12+ location is just for the
@@ -295,6 +325,8 @@ class MainActivity : ComponentActivity() {
             return
         }
         prefs.edit().putBoolean(KEY_LOCATION_REQUESTED, true).apply()
+        // Only this path shows a system dialog over the app, so only this path raises the flag.
+        locationRequestOutstanding = true
         requestLocation.launch(permissions)
     }
 
@@ -313,11 +345,25 @@ class MainActivity : ComponentActivity() {
         /** Quick Settings intent consumed only after the activity is visible. */
         const val EXTRA_START_DRIVE = "start_drive"
 
+        /** Store-screenshot hook: "phone" opens the Beacon tab on its THIS PHONE segment; any
+         *  other value, or no extra, opens BOARD. Parsed by [beaconSegmentExtra]. */
+        const val EXTRA_BEACON_SEGMENT = "beacon_segment"
+
+        /** DEBUG-only screenshot hook: a BoardKind raw value ("beacon", "ouiSpy", "meshDetect"),
+         *  parsed by [debugBoardKindExtra] and honoured only when BuildConfig.DEBUG. The connect
+         *  screen then lists a display-only "your <kind>" row (a tap does nothing) and reads that
+         *  kind throughout, and sample data reports that kind's fw label, so the Beacon hero shows
+         *  its title (AcabBleManager.applyDebugBoardKind). Example:
+         *  adb shell am start -n tech.soyboi.beacons/tech.acab.app.MainActivity --es board_kind ouiSpy
+         *  iOS twin: the `-boardKind ouiSpy|meshDetect|beacon` launch argument (ACABApp.swift). */
+        const val EXTRA_BOARD_KIND = "board_kind"
+
         private const val KEY_LOCATION_REQUESTED = "location_requested"
         private const val KEY_NEARBY_PERMISSION_REQUESTED = "perms_requested"
         private const val KEY_DEFAULT_LIVE_PENDING = "default_live_pending"
         private const val KEY_SCAN_AFTER_PERMISSION = "scan_after_permission"
         private const val KEY_LIVE_NOTIFICATION_DENIED = "live_notification_denied"
+        private const val KEY_LOCATION_REQUEST_OUTSTANDING = "location_request_outstanding"
 
         /** Pending deep link, as observable state rather than a MainScreen parameter:
          *  AcabApp sits between the activity and the tab shell, and the tap can arrive while
@@ -326,3 +372,11 @@ class MainActivity : ComponentActivity() {
         val openLogNew = mutableStateOf(false)
     }
 }
+
+/** The board kind named by [MainActivity.EXTRA_BOARD_KIND]: its exact raw value, else null, so a
+ *  misspelt or empty extra is ignored rather than guessed at. */
+internal fun debugBoardKindExtra(value: String?): BoardKind? = BoardKind.fromRaw(value)
+
+/** The Beacon segment named by [MainActivity.EXTRA_BEACON_SEGMENT]: "phone" gives PHONE, anything
+ *  else (including no extra) gives BOARD. iOS twin: the `-beacon-segment phone` launch argument. */
+internal fun beaconSegmentExtra(value: String?): BeaconSegment = if (value == "phone") BeaconSegment.PHONE else BeaconSegment.BOARD

@@ -20,7 +20,7 @@ struct ACABApp: App {
                 // the window exists; the colours themselves read the trait (see ACABTheme).
                 .background(WindowTraitApplier())
                 .preferredColorScheme(.dark)
-                .tint(ACABTheme.red)
+                .tint(ACABTheme.tint)
                 .onAppear {
                     // Non-blocking: refresh the firmware manifest in the background so the
                     // Device screen can show the live "latest" and offer OTA when eligible.
@@ -30,9 +30,20 @@ struct ACABApp: App {
                     alpr.refresh()
                     #if DEBUG
                     // Launch with `-demo` in the scheme to load canned detections.
-                    if ProcessInfo.processInfo.arguments.contains("-demo") {
+                    let args = ProcessInfo.processInfo.arguments
+                    let demo = args.contains("-demo")
+                    // `-boardKind ouiSpy|meshDetect` names the board kind for screenshots: a
+                    // display-only remembered row, or with `-demo` the sample frame's label.
+                    // Applied before the seed below, which reads it.
+                    if let kind = boardKindLaunchArgument(args) {
+                        ble.applyDebugBoardKind(kind, demo: demo)
+                    }
+                    if demo {
                         ble.seedDemoData(showTour: false)
                     }
+                    // `-bluetoothIdle` (simulator startup-screen shots) is not parsed here: it has
+                    // to act before the manager would create its CBCentralManager, so BLEManager
+                    // reads it when it is built (BLEManager.debugBluetoothIdleAtLaunch).
                     #endif
                     // Cold launch: reconcile here too, not only from the scenePhase change below.
                     // This is the launch that has to RESUME Drive mode after a force-quit, and

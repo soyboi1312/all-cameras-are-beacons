@@ -18,12 +18,21 @@ class LogViewModel : ViewModel() {
     internal var frozenExport by mutableStateOf<DetectionExportSnapshot?>(null)
         private set
 
+    /** The pause instant, null while live. While paused the Log's Active boundary, the local day
+     *  of its time sections and an "-active" export all read it instead of the clock, so they stay
+     *  as they were at the pause. It lives here, beside [frozenExport], so a rotation keeps the
+     *  same instant as it keeps the same rows. TWIN: iOS DetectionsView.pausedAt. */
+    var pausedAtMs by mutableStateOf<Long?>(null)
+        private set
+
     /** Pause from one manager snapshot so displayed rows and their evictable side metadata are
      * indivisible. Holding only Detection objects let STORE_CAP eviction erase their timestamps
-     * and observer fixes before a later paused export. */
-    internal fun pause(snapshot: DetectionExportSnapshot) {
+     * and observer fixes before a later paused export. [atMs] is the pause instant; it is written
+     * before [paused] turns true, so no paused frame reads a null instant. */
+    internal fun pause(snapshot: DetectionExportSnapshot, atMs: Long = System.currentTimeMillis()) {
         frozenExport = snapshot
         frozen = snapshot.rows.map { it.detection }
+        pausedAtMs = atMs
         paused = true
     }
 
@@ -38,5 +47,6 @@ class LogViewModel : ViewModel() {
         paused = false
         frozen = emptyList()
         frozenExport = null
+        pausedAtMs = null
     }
 }

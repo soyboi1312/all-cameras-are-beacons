@@ -14,8 +14,9 @@ enum BeaconPresentationTone: Equatable {
 /// deliberately separate: a healthy encrypted BLE control link can coexist with both detection
 /// radios switched off, while an nRF fault can leave Wi-Fi detection running.
 ///
-/// `scanLabel` fills BOTH the Status hero and the Beacon tab's "Scan radios" fold row, and it is
-/// the SHARED wording: android StatusScreen.kt `statusScanPresentation` and DeviceScreen.kt
+/// `scanLabel` fills BOTH the Status hero and the Beacon tab's "Scan radios" row value (in real
+/// sessions; in sample data the Scan radios row reads `sampleRadiosRowValue` instead, P3-8), and
+/// it is the SHARED wording: android StatusScreen.kt `statusScanPresentation` and DeviceScreen.kt
 /// `beaconRadioStatusLabel` return the same strings for the same connected board state and in
 /// sample mode, apart from the one exception named on `beaconRadioPresentation` below. All three
 /// move together, sample mode included. BOTH tours echo their sample radio switches into the
@@ -25,6 +26,22 @@ enum BeaconPresentationTone: Equatable {
 /// "SAMPLE DATA · BLUETOOTH ONLY", "SAMPLE DATA · WI-FI ONLY", "SAMPLE DATA · RADIOS OFF") and
 /// sweeping the radar whenever either sample radio is on. Sample mode was the last deliberate
 /// wording split in this file; do not reintroduce it.
+/// The Beacon tab's Scan radios row value in sample data (P3-8 of the 2026-09-26 UI review): the
+/// sample frame's echoed radio switches in the LIVE arm's words, so the row shows radio state
+/// where the presenter's scanLabel would say "SAMPLE DATA" a fifth time on the page (the banner,
+/// the pill, the dot and the hero already say it). The four strings are `beaconRadioPresentation`'s
+/// four healthy connected arms, byte for byte (no fault arms: the sample frame has no co-processor
+/// to lose). Status keeps the presenter's sample label (dashboardScanKicker). TWIN: android
+/// DeviceScreen.kt `beaconRadioStatusLabel`'s sample arm, the same four strings.
+func sampleRadiosRowValue(bleOn: Bool, wifiOn: Bool) -> String {
+    switch (bleOn, wifiOn) {
+    case (true, true):   return "SCANNING · BLE · WI-FI"
+    case (true, false):  return "SCANNING · BLE"
+    case (false, true):  return "SCANNING · WI-FI"
+    case (false, false): return "RADIOS OFF · NOT SCANNING"
+    }
+}
+
 struct BeaconRadioPresentation: Equatable {
     let connectionLabel: String
     let scanLabel: String
@@ -32,15 +49,16 @@ struct BeaconRadioPresentation: Equatable {
     let isScanning: Bool
     let tone: BeaconPresentationTone
 
-    /// Compact wording for the shared header pill. The longer connection and scan labels retain
-    /// the full explanation beside the hero; this stays short enough for narrow phones and large
-    /// Dynamic Type without collapsing the page title. TWIN: android StatusScreen.kt
+    /// Compact wording for the shared status pill (LinkChip), which leads the Beacon hero and
+    /// Status's first content row. The longer connection and scan labels keep the full
+    /// explanation on the hero status line; this stays short enough for narrow phones and large
+    /// Dynamic Type. TWIN: android StatusScreen.kt
     /// `statusLinkChipLabel`, which ranks the same facts in the same order for every state its
-    /// Status screen shows uncovered (DEMO, RECONNECTING, WAITING, UPDATING, RADIO FAULT,
+    /// Status screen shows uncovered (SAMPLE, RECONNECTING, WAITING, UPDATING, RADIO FAULT,
     /// CONNECTED). DashboardPresentationTests and StatusBeaconPresentationTest pin the order.
     var chipLabel: String {
         switch connectionLabel {
-        case "SAMPLE DATA":                       return "DEMO"
+        case "SAMPLE DATA":                       return LinkChip.sampleLabel
         case "CONNECTED OVER BLE":                return "CONNECTED"
         case "CONNECTED · UPDATING", "UPDATING FIRMWARE":
             return "UPDATING"
@@ -336,7 +354,7 @@ struct BeaconFirmwareStatusPresentation: Equatable {
 /// "this app's current catalog" and repeat the installed version, which the card already prints
 /// in its own row right above; the owner cut both as noise (2026-09-20). The arms that describe
 /// what this app CANNOT know still say so in full: an absent status frame and a board missing
-/// from the catalog each get their own sentence below, and the fold row's kicker stays
+/// from the catalog each get their own sentence below, and the Firmware row's value stays
 /// "LATEST KNOWN", so nothing claims global currency on a stale or bundled manifest.
 /// `revisionCompatible` is the belt-and-braces OTA revision gate reaching the copy: when the
 /// listing we would flash from disagrees with the revision the board reports, this card must say

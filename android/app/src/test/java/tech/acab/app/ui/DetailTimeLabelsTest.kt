@@ -1,8 +1,11 @@
 package tech.acab.app.ui
 
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNull
+import org.junit.Assert.assertTrue
 import org.junit.Test
+import tech.acab.app.model.DeviceType
 
 /** The dossier's clock-derived labels, [relativeAgo] ("4m ago") and [seenSpan] ("18m", which
  *  CONFIRM IT renders as "over 18m"), are pure in (stamp, nowMs), and DetailScreen.kt hands both
@@ -14,7 +17,10 @@ import org.junit.Test
  *
  *  What this cannot pin: a DetailScreen.kt call site that stops passing nowMs. relativeAgo keeps a
  *  wall-clock default for MapScreen checkedAgo, so such a call still compiles; seenSpan has no
- *  default, so ConfirmItPanel cannot drop it silently. */
+ *  default, so ConfirmItPanel cannot drop it silently.
+ *
+ *  Since Route A this file also pins the dossier's pure row presenters (methodChipLabel,
+ *  dossierConfidenceLine, dossierValueForDisplay, dossierActionsStacked), so the dossier's tests stay in one file. */
 class DetailTimeLabelsTest {
 
     /** A 1970 stamp against a tick 61 s later. Measured to the wall clock instead, the same stamp
@@ -82,5 +88,140 @@ class DetailTimeLabelsTest {
         assertEquals("59m", seenSpan(t, t + 3_599_999L))
         assertEquals("1h", seenSpan(t, t + 3_600_000L))
         assertEquals("1d", seenSpan(t, t + 86_400_000L))
+    }
+
+    /** The "matched on" row. A maker on an OUI hit means the block is the maker's own, so it
+     *  reads VENDOR ONLY, never CHIPSET ONLY; every other method reads its own label verbatim,
+     *  casing kept (U3-c), as iOS methodChipLabel does. Swapping the two OUI arms fails the first
+     *  assertion; "NAME MATCH" fails the third; a `.lowercase()` ("manufacturer id") the fourth. */
+    @Test
+    fun methodChipLabelPrefersVendorOnlyOverChipsetOnly() {
+        assertEquals("OUI · VENDOR ONLY", methodChipLabel(1, "Axon Enterprise", "OUI match"))
+        assertEquals("OUI · CHIPSET ONLY", methodChipLabel(1, null, "OUI match"))
+        assertEquals("device name", methodChipLabel(2, null, "device name"))
+        assertEquals("manufacturer ID", methodChipLabel(3, null, "manufacturer ID"))
+        assertEquals("Remote ID", methodChipLabel(7, null, "Remote ID"))
+    }
+
+    /** The "confidence" row: the verdict, then the percent, at the verdict edges 50 and 80 (the
+     *  same thresholds as iOS). A verdict that read 50 as weak, or a percent placed first, fails. */
+    @Test
+    fun confidenceRowReadsTheVerdictThenThePercent() {
+        assertEquals("Weak match, verify · 49%", dossierConfidenceLine(49))
+        assertEquals("Partial match · 50%", dossierConfidenceLine(50))
+        assertEquals("Partial match · 79%", dossierConfidenceLine(79))
+        assertEquals("Strong match · 80%", dossierConfidenceLine(80))
+    }
+
+    /** Watch and Mute sit two-up below font scale 1.5 and stack from it, the threshold
+     *  DeviceScreen and StatusScreen use. A mute rule does not stack them (its state renders under
+     *  the pair), which is why the rule takes no argument here. A `>` threshold keeps 1.5 two-up
+     *  and fails the third assertion; a lower one such as 1.3 fails the second. */
+    /** The dossier value as drawn: a no-break space before each middle dot, the iOS
+     *  dossierValueForDisplay substitution, so at a large font scale "Strong match · 80%" never
+     *  starts a line with "· 80%". Written with escapes, so a literal the editor turned into a
+     *  plain space cannot make it pass. The builder's string (dossierConfidenceLine) stays as the
+     *  test above pins it; the display form differs from it only at the dot. A helper that did
+     *  nothing, bound the space AFTER the dot (segmentLabelForDisplay's rule) or also touched a
+     *  value with no dot fails. */
+    @Test
+    fun dossierValueHoldsEachMiddleDotToTheWordBeforeIt() {
+        assertEquals("Strong match\u00A0\u00B7 80%", dossierValueForDisplay(dossierConfidenceLine(80)))
+        assertEquals("12\u00A0\u00B7 first ~3 min ago", dossierValueForDisplay("12 \u00B7 first ~3 min ago"))
+        assertEquals("a\u00A0\u00B7 b\u00A0\u00B7 c", dossierValueForDisplay("a \u00B7 b \u00B7 c"))
+        assertEquals("AA:BB:CC:DD:EE:FF", dossierValueForDisplay("AA:BB:CC:DD:EE:FF"))
+        assertTrue(dossierConfidenceLine(80).contains(" \u00B7 "))
+    }
+
+    @Test
+    fun actionsStackFromFontScaleOnePointFive() {
+        assertFalse(dossierActionsStacked(1.0f))
+        assertFalse(dossierActionsStacked(1.49f))
+        assertTrue(dossierActionsStacked(1.5f))
+        assertTrue(dossierActionsStacked(2.0f))
+    }
+    /** C12-03: in sample data the Technical details "Last seen" row reads "now", the same demo arm
+     *  that keeps the SIGNAL header off STALE (it reads SAMPLE, U1-b), and never computes the measured age; a real row keeps its
+     *  measured reading. Wrong input: the old row printed relativeAgo of the seed stamp, "9m ago"
+     *  under LIVE. TWIN: iOS DetectionDetailTimeTests (dossierLastSeenValue). */
+    @Test
+    fun sampleDataLastSeenReadsNowLikeTheLiveHeader() {
+        val now = 1_800_000_000_000L
+        val seeded = now - 9 * 60_000L
+        assertEquals("9m ago", relativeAgo(seeded, now))
+        assertEquals("now", dossierLastSeenValue(demo = true) { error("sample rows never measure an age") })
+        assertEquals("9m ago", dossierLastSeenValue(demo = false) { relativeAgo(seeded, now) })
+    }
+
+    /** U1-b: the SIGNAL header word. Sample rows read SAMPLE (never LIVE, which claims a real
+     *  reading); real rows read STALE / LIVE from the clock. Wrong input: demo -> "LIVE" fails the
+     *  first assertion. TWIN: iOS DetectionDetailTimeTests (dossierSignalWord). */
+    @Test
+    fun signalWordReadsSampleForSampleRows() {
+        assertEquals("SAMPLE", dossierSignalWord(demo = true, stale = false))
+        assertEquals("STALE", dossierSignalWord(demo = false, stale = true))
+        assertEquals("LIVE", dossierSignalWord(demo = false, stale = false))
+    }
+
+    /** U3-a: a drone's method and source are both "Remote ID", so it says it once. Wrong input:
+     *  the old template, "Flagged by Remote ID over Remote ID.". */
+    @Test
+    fun flaggedLineNeverRepeatsTheSameWord() {
+        assertEquals("Flagged by Remote ID.", dossierFlaggedLine("Remote ID", "Remote ID"))
+        assertEquals("Flagged by OUI match over WiFi.", dossierFlaggedLine("OUI match", "WiFi"))
+    }
+
+    /** U3-b: the hero subtitle drops the maker when the headline already says it (ignoring case),
+     *  with no fuzzy match. Wrong input: always append (the first two fail). */
+    @Test
+    fun heroSubtitleDropsAMakerTheHeadlineAlreadySays() {
+        assertEquals("NODE AABB", dossierHeroSubtitle("AABB", "Apple Find My", "Apple Find My"))
+        assertEquals("NODE 5E6F", dossierHeroSubtitle("5E6F", "Meta", "Meta"))
+        assertEquals("NODE 2A10 · Flock Safety", dossierHeroSubtitle("2A10", "Flock Safety", "FlockSafety"))
+    }
+
+    /** U3-f: the body-cam fallback sentence names the offline buffer only for a real replay.
+     *  Wrong input: gating on "detail is nil" would hand a live row the replay sentence. TWIN: iOS
+     *  DetectionDetailTimeTests (dossierBodyCamFallbackLine). */
+    @Test
+    fun bodyCamFallbackNamesTheBufferOnlyForAReplay() {
+        assertEquals(
+            "Matched a body-worn camera signature. This record came from the offline buffer, which doesn't keep which signature fired.",
+            dossierBodyCamFallbackLine(replay = true),
+        )
+        assertEquals(
+            "Matched a body-worn camera signature. The board didn't report which one.",
+            dossierBodyCamFallbackLine(replay = false),
+        )
+    }
+
+    /** U3-g: the tracker "(offline)" gloss needs the tracker category AND the suffix. Wrong input:
+     *  gating on the suffix alone fails the body-cam case. */
+    @Test
+    fun trackerOfflineNoteNeedsATrackerAndTheSuffix() {
+        assertEquals(
+            "offline here means separated from its owner, not replayed from the offline buffer.",
+            trackerOfflineNote(DeviceType.TRACKER, "Apple Find My (offline)"),
+        )
+        assertNull(trackerOfflineNote(DeviceType.TRACKER, "Tile"))
+        assertNull(trackerOfflineNote(DeviceType.BODY_CAM, "x (offline)"))
+        assertNull(trackerOfflineNote(DeviceType.TRACKER, null))
+    }
+
+    /** U3-h: the signal graph sits on one fixed dBm scale, -100 (bottom) to -30 (top), clamped.
+     *  Wrong input: a per-series min...max, where a [-88, -86] series reaches 1.0 and the relative
+     *  assertions fail. TWIN: iOS signalGraphFraction(rssi:), same five points. */
+    @Test
+    fun signalGraphUsesOneFixedDbmScale() {
+        assertEquals(-100, SIGNAL_GRAPH_FLOOR_DBM)
+        assertEquals(-30, SIGNAL_GRAPH_CEILING_DBM)
+        assertEquals(1f, signalGraphFraction(-30), 1e-6f)
+        assertEquals(0f, signalGraphFraction(-100), 1e-6f)
+        assertEquals(0.5f, signalGraphFraction(-65), 1e-6f)
+        assertEquals(1f, signalGraphFraction(-20), 1e-6f)
+        assertEquals(0f, signalGraphFraction(-110), 1e-6f)
+        assertTrue(signalGraphFraction(-88) < signalGraphFraction(-54))
+        assertTrue(signalGraphFraction(-88) < 0.25f)
+        assertTrue(signalGraphFraction(-86) < 0.25f)
     }
 }

@@ -1,7 +1,7 @@
 import XCTest
 @testable import Beacons
 
-/// The logbook's first-open baseline gate (logFirstOpenBaselineRuns in DetectionsView.swift).
+/// The Log's first-open baseline gate (logFirstOpenBaselineRuns in DetectionsView.swift).
 /// It decides whether an ordinary appearance of the Log runs BLEManager.seedSeenWatermarkOnce,
 /// which marks everything already stored as seen. Running it one appearance too early is the
 /// regression this pins: the user taps a NEW notification, the first dossier pop runs the
@@ -56,5 +56,25 @@ final class DetectionsViewGateTests: XCTestCase {
                        "a visit seeded before any baseline is still a visit")
         XCTAssertTrue(logFirstOpenBaselineRuns(deepLinkNew: false, hasVisit: false,
                                                visitWatermark: nil, current: nil))
+    }
+
+    /// The LogFocus handoff (logFocusSeed in DetectionsView.swift): the Beacon tab's Saved log row
+    /// (pendingAll) seeds All with no category and wins over a category left in the other slot.
+    /// Checking the category arm first fails the last assertion.
+    func testSavedLogSeedWinsAndClearsTheCategory() {
+        XCTAssertNil(logFocusSeed(pendingAll: false, pendingCategory: nil))
+        XCTAssertEqual(logFocusSeed(pendingAll: false, pendingCategory: "DRONE"),
+                       LogFocusSeed(scope: .all, category: "DRONE"))
+        XCTAssertEqual(logFocusSeed(pendingAll: true, pendingCategory: "DRONE"),
+                       LogFocusSeed(scope: .all, category: nil))
+    }
+
+    /// U1-a: leaving the Log tab marks every row seen in a real session only. In sample data the
+    /// seed's own baseline (the rows it flags new) stays until the user taps Mark Seen.
+    /// Wrong input: `{ _ in true }`, which re-emptied the sample New segment on every tab switch.
+    /// TWIN: android MainScreen's Tab.LOG `openedInDemo` gate.
+    func testLeavingTheLogMarksSeenOnlyOutsideSampleData() {
+        XCTAssertFalse(logTabLeaveMarksSeen(isDemoMode: true))
+        XCTAssertTrue(logTabLeaveMarksSeen(isDemoMode: false))
     }
 }

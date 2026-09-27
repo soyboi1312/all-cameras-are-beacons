@@ -53,7 +53,10 @@ AND_DEVICE_TYPE = "android/app/src/main/java/tech/acab/app/model/Models.kt"
 # SHARED_CONSTANTS).
 IOS_CONTRIBUTION_CSV = "ios/Beacons/BLE/ContributionCsv.swift"
 IOS_BLE_MANAGER = "ios/Beacons/BLE/BLEManager.swift"
+IOS_BLE_OTA = "ios/Beacons/BLE/BLEManager+OTA.swift"
+IOS_BLE_NRF_DFU = "ios/Beacons/BLE/BLEManager+NrfDFU.swift"
 AND_BLE_MANAGER = "android/app/src/main/java/tech/acab/app/ble/AcabBleManager.kt"
+AND_NRF_DFU = "android/app/src/main/java/tech/acab/app/ble/NrfDfuCoordinator.kt"
 IOS_SETTINGS = "ios/Beacons/Views/SettingsView.swift"
 AND_DEVICE_SCREEN = "android/app/src/main/java/tech/acab/app/ui/DeviceScreen.kt"
 IOS_ROOT_VIEW = "ios/Beacons/Views/RootView.swift"
@@ -70,12 +73,33 @@ AND_MAIN_SCREEN = "android/app/src/main/java/tech/acab/app/ui/MainScreen.kt"
 IOS_COMPONENTS = "ios/Beacons/Views/Components.swift"
 IOS_THEME = "ios/Beacons/Views/Theme.swift"
 AND_COMPONENTS = "android/app/src/main/java/tech/acab/app/ui/Components.kt"
+# The instrument layer's shared constants (decisions R16) live in the theme file on both sides.
+AND_THEME = "android/app/src/main/java/tech/acab/app/ui/theme/Theme.kt"
 IOS_OUI_VENDORS = "ios/Beacons/Models/OUIVendors.swift"
 AND_OUI_VENDORS = "android/app/src/main/java/tech/acab/app/model/OuiVendors.kt"
 IOS_BEACON_PRESENTATION = "ios/Beacons/Models/BeaconPresentation.swift"
 IOS_DASHBOARD_VIEW = "ios/Beacons/Views/DashboardView.swift"
 IOS_DETECTION_DETAIL = "ios/Beacons/Views/DetectionDetailView.swift"
 AND_DETAIL_SCREEN = "android/app/src/main/java/tech/acab/app/ui/DetailScreen.kt"
+IOS_DETECTION_ROW = "ios/Beacons/Views/DetectionRow.swift"
+IOS_FIRST_RUN_TOUR = "ios/Beacons/Views/FirstRunTourView.swift"
+AND_FIRST_RUN_TOUR = "android/app/src/main/java/tech/acab/app/ui/FirstRunTour.kt"
+# The Help + support screen the dossier's Related help pushes to on iOS (its navigation title is
+# the twin of Android's DOSSIER_HELP_TITLE in DetailScreen.kt).
+IOS_HELP_VIEW = "ios/Beacons/Views/HelpView.swift"
+# The checklist's state sentences live beside the sheet on iOS (ChecklistRows) and in
+# FirstRunTour.kt on Android; the ALPR callout headline lives with the dataset on iOS
+# (ALPRAttribution) and in MapAlpr.kt on Android; Detection.titleName sits on the model on iOS.
+IOS_CHECKLIST = "ios/Beacons/Views/ChecklistView.swift"
+IOS_ALPR_DATASET = "ios/Beacons/Models/ALPRDataset.swift"
+AND_MAP_ALPR = "android/app/src/main/java/tech/acab/app/ui/MapAlpr.kt"
+IOS_DETECTION = "ios/Beacons/Models/Detection.swift"
+# The board kind (decisions R14: which product the owner holds, for copy only) and the remembered
+# board's row copy. The kind table and its resolvers live in one file per app; the remembered row
+# copy lives beside the remembered-board rules on iOS and in AcabBleManager.kt on Android.
+IOS_BOARD_KIND = "ios/Beacons/Models/BoardKind.swift"
+AND_BOARD_KIND = "android/app/src/main/java/tech/acab/app/ble/BoardKind.kt"
+IOS_REMEMBERED_BOARD = "ios/Beacons/BLE/RememberedBoard.swift"
 # The bundled FAQ, shipped as ONE file copied into both resource trees (check_faq_copies
 # asserts the two are byte-identical; SHARED_SHAPES pins the promises inside them).
 IOS_FAQ = "ios/Beacons/Resources/faq-content.json"
@@ -390,6 +414,27 @@ def _android_faq_keys():
     return keys, unreadable
 
 
+def _faq_case_drift(faq):
+    """The questions and support row titles in `faq` (the parsed JSON) that break the sentence-case
+    rule, each as one message. A question starts with a capital, and so does every sentence inside
+    it (a lowercase letter after '. ', '? ' or '! ' is the miss); a support row title starts with a
+    capital. Answers are not read: they stay lowercase-first on purpose."""
+    bad = []
+    for sec in faq.get("sections", []):
+        for q in sec.get("questions", []):
+            text = q.get("q", "")
+            if not text[:1].isupper():
+                bad.append(f"question '{text}' does not start with a capital")
+            inner = re.search(r"[.?!] ([a-z])", text)
+            if inner:
+                bad.append(f"question '{text}' starts a sentence in lowercase at '{inner.group(0)}'")
+    for row in faq.get("support", []):
+        title = row.get("title", "")
+        if not title[:1].isupper():
+            bad.append(f"support row title '{title}' does not start with a capital")
+    return bad
+
+
 def check_faq_copies():
     """The bundled FAQ ships as ONE file copied into both app resource trees. Assert byte equality.
 
@@ -430,6 +475,17 @@ def check_faq_copies():
     except Exception as e:
         print(f"   !! faq-content.json does not parse: {e}")
         return 1
+    # Case rule (decisions R19 and R20): FAQ QUESTIONS and the Help SUPPORT ROW TITLES are
+    # sentence case (the first letter up, and a sentence that starts inside a question gets its
+    # capital too: "...isn't detecting it. Is it broken?"); answers stay lowercase-first. Both
+    # apps draw these strings as written, so a lowercase question or row title ships as typed.
+    wrong_case = _faq_case_drift(d)
+    if wrong_case:
+        for msg in wrong_case:
+            print(f"   !! {msg}")
+        print("      questions and support row titles are sentence case (CLAUDE.md Copy rules)")
+        return 1
+    print(f"   ok: every question and support row title is sentence case")
     # Related-help coverage: both apps key the detail screen's Related Help panel off the
     # DeviceType faq key into relatedHelp. A key with no entry HIDES the panel silently at
     # runtime (both apps skip rendering on an empty lookup), so a category can lose its help
@@ -509,6 +565,42 @@ def check_faq_copies():
 # slug), and `scale` {"ios": n, "android": m} with a `unit` on a string row when the two sides
 # declare one number in different units (each value times its factor must be exactly equal). An
 # option on a kind it does not apply to is reported, never ignored.
+def _toggle_title_rows():
+    """One "string" row per Beacon sub-screen toggle title that both phones draw (P3-11): the
+    title hole `"([^"]*)"` is read from the radioToggle / ToggleRow call whose subtitle opens with
+    `anchor` (iOS writes its middle dots as \\u{00B7}, Android as the character, so the anchor
+    stops before the first dot). `and_anchor` is the Android subtitle's opening when it is not a
+    literal (a val, an if)."""
+    rows = []
+    for what, anchor, and_anchor in (
+        ("Scan radios Bluetooth toggle title", "ALPR ", None),
+        ("Scan radios Wi-Fi toggle title", "2\\.4 GHz", None),
+        ("Detectors drones toggle title", "FAA remote ID", None),
+        ("Detectors non-broadcasting drones toggle title", "OUI match only", None),
+        ("Detectors body cams toggle title", "Axon ", None),
+        ("Detectors Motorola sub-toggle title", "vendor match only", None),
+        ("Detectors trackers toggle title", "AirTag", None),
+        ("Detectors glasses toggle title", "Ray-Ban", None),
+        ("Detectors network cameras toggle title", "known IP-camera", None),
+        ("Offline buffer toggle title", "board buffers while away", r"bufferSubtitle,"),
+        ("Desert mode toggle title", "show \\+ log ANY", None),
+        ("Board LED lights-out toggle title", "no LEDs", None),
+        ("Display higher-contrast toggle title", "brighter secondary text",
+         r"if \(ContrastMode\.systemHasControl\)"),
+    ):
+        rows.append({
+            "what": what,
+            "kind": "string",
+            "why": "a Beacon sub-screen row title, sentence case and the same bytes on both phones"
+                   " (P3-11, decisions R20); read from the call whose subtitle opens '"
+                   + anchor.replace("\\", "") + "'",
+            "ios": (IOS_SETTINGS, r'radioToggle\("([^"]*)",\s*"' + anchor),
+            "android": (AND_DEVICE_SCREEN,
+                        r'ToggleRow\(\s*"([^"]*)",\s*' + (and_anchor if and_anchor else '"' + anchor)),
+        })
+    return tuple(rows)
+
+
 SHARED_CONSTANTS = (
     {
         "what": "detection CSV columns",
@@ -523,10 +615,36 @@ SHARED_CONSTANTS = (
     {
         "what": "pairing-window hint",
         "kind": "string",
+        # A TEMPLATE since decisions R14 ("turn the {noun} off and on"): the template is compared,
+        # and renderBoardCopy fills it on each side (the "board kind table" check pins that).
         "why": "user-facing recovery copy: the same failure has to read the same on both phones",
         "ios": (IOS_BLE_MANAGER, r'static\s+let\s+pairWindowHint\s*=\s*"((?:[^"\\]|\\.)*)"'),
         "android": (AND_BLE_MANAGER,
-                    r'\bconst\s+val\s+PAIR_WINDOW_HINT\s*=\s*"((?:[^"\\]|\\.)*)"'),
+                    r'\bconst\s+val\s+PAIR_WINDOW_HINT_TEMPLATE\s*=\s*"((?:[^"\\]|\\.)*)"'),
+    },
+    # The two update-quarantine lines (a retry on the link that owned a quarantined attempt) are
+    # TEMPLATES since 2026-09-25: the iOS pair said "board" and the Android pair "beacon" in
+    # different sentences. Settled to one lowercase-first {noun} template per update, filled by
+    # renderBoardCopy with the connected board's kind on each side.
+    {
+        "what": "board update quarantine line",
+        "kind": "string",
+        "why": "user-facing recovery copy: a retried board update that must reconnect first reads"
+               " the same on both phones",
+        "ios": (IOS_BLE_OTA,
+                r'static\s+let\s+otaReconnectBeforeRetryTemplate\s*=\s*"((?:[^"\\]|\\.)*)"'),
+        "android": (AND_BLE_MANAGER,
+                    r'\bconst\s+val\s+OTA_RECONNECT_BEFORE_RETRY_TEMPLATE\s*=\s*"((?:[^"\\]|\\.)*)"'),
+    },
+    {
+        "what": "co-processor update quarantine line",
+        "kind": "string",
+        "why": "user-facing recovery copy: a retried co-processor update that must reconnect first"
+               " reads the same on both phones",
+        "ios": (IOS_BLE_NRF_DFU,
+                r'static\s+let\s+nrfReconnectBeforeRetryTemplate\s*=\s*"((?:[^"\\]|\\.)*)"'),
+        "android": (AND_NRF_DFU,
+                    r'\bconst\s+val\s+NRF_DFU_RECONNECT_BEFORE_RETRY_TEMPLATE\s*=\s*"((?:[^"\\]|\\.)*)"'),
     },
     {
         "what": "location-fix freshness window (seconds)",
@@ -709,6 +827,31 @@ SHARED_CONSTANTS = (
         "ios": (IOS_MAP_TAB, r"\bstatic\s+let\s+sameSpotDegrees\s*=\s*([0-9.e-]+)\b"),
         "android": (AND_MAP_SCREEN, r"\bconst\s+val\s+PIN_GROUP_EPSILON_DEG\s*=\s*([0-9.e-]+)\b"),
     },
+    # Same REQUIRED shapes as the Log's two whole-declaration rows (contracts 5.2 and 5.4): the
+    # Android label is an expression body `= when (scope) {` closed at column 0, and the iOS
+    # headline is a single-expression body with no `return`.
+    {
+        "what": "map scope segment labels",
+        "kind": "fragments",
+        "why": "the Map's active / recent / all control names each scope and its count in the"
+               " same words on both phones; unlike the Log, the Map's All carries a count",
+        "ios": (IOS_MAP_TAB,
+                r"(func mapScopeSegmentLabel\(_ scope: MapHistoryScope, count: Int\) -> String \{.*?\n\})"),
+        "android": (AND_MAP_PROJECTION,
+                    r"(internal fun mapScopeSegmentLabel\(scope: MapHistoryScope, count: Int\): String ="
+                    r" when \(scope\) \{.*?\n\})"),
+    },
+    {
+        "what": "map honesty headline",
+        "kind": "fragments",
+        "why": "'N on the map · M without a location' is the line that stops a map with few pins"
+               " reading as few detections; a phone that words it differently hides what the"
+               " other one admits",
+        "ios": (IOS_MAP_TAB,
+                r'func mapHonestyHeadline\(onMap: Int, withoutLocation: Int\) -> String \{\s*("[^\n]*")\s*\n\}'),
+        "android": (AND_MAP_PROJECTION,
+                    r'internal fun mapHonestyHeadline\(onMap: Int, withoutLocation: Int\): String =\s*("[^\n]*")'),
+    },
     {
         "what": "export base filename",
         "kind": "string",
@@ -731,14 +874,8 @@ SHARED_CONSTANTS = (
                     r"(val slugParts = if \(wholeLog\) emptyList\(\) else buildList \{"
                     r".*?joinToString\([^\n]*)"),
     },
-    {
-        "what": "log header kicker",
-        "kind": "fragments",
-        "why": "'N SELECTED' and 'N DETECTED · M NEW' are the one line that tells the user the"
-               " Log counts the live store even while paused",
-        "ios": (IOS_DETECTIONS_VIEW, r'Kicker\((selecting \? ".*?NEW")\)'),
-        "android": (AND_LOG_SCREEN, r'Kicker\(\s*(if \(selectMode\) ".*?NEW")\s*\)'),
-    },
+    # "log header kicker" was retired with the Logbook header (Route A C10, both apps): the
+    # counts it carried are the active / new / all segment labels below.
     # The Log lens summary is TWO rows, one per template. A single region over both compared the
     # union of their text, so a clause dropped from only the spoken form still passed on the drawn
     # one. iOS builds the category tail once (`let category`) and hands it to both templates, so
@@ -748,11 +885,11 @@ SHARED_CONSTANTS = (
     {
         "what": "log lens summary (shown)",
         "kind": "fragments",
-        "why": "'5 of 5 paused' under '200 NEW' must not read as 195 lost sightings on either"
-               " phone",
-        "ios": (IOS_DETECTIONS_VIEW,
-                r'(let category = filter\.map \{ "[^"]*" \} \?\? "")\s*\n\s*'
-                r'return Text\(("\\\(snap\.shown\.count\) of [^\n]*\\\(category\)")\)'),
+        "why": "'5 of 5 paused' under a 'new · 200' segment must not read as 195 lost sightings"
+               " on either phone",
+        # Both sides are now pure functions of the same four inputs (the category arrives as its
+        # drawn chip label, never the filter key), so both are anchored the same way.
+        "ios": (IOS_DETECTIONS_VIEW, r"(func logLensSummaryText\(.*?)\n\n"),
         "android": (AND_LOG_SCREEN, r"(internal fun logLensSummaryText\(.*?)\n\n"),
     },
     {
@@ -760,19 +897,41 @@ SHARED_CONSTANTS = (
         "kind": "fragments",
         "why": "the screen-reader form of the same line has to say the same thing in the same"
                " words on both phones",
-        "ios": (IOS_DETECTIONS_VIEW,
-                r'(let category = filter\.map \{ "[^"]*" \} \?\? "")\s*\n(?:[^\n]*\n){1,6}?\s*'
-                r'\.accessibilityLabel\(("\\\(snap\.shown\.count\) matching detections of [^\n]*'
-                r'\\\(category\)")\)'),
+        "ios": (IOS_DETECTIONS_VIEW, r"(func logLensSummaryDescription\(.*?)\n\n"),
         "android": (AND_LOG_SCREEN, r"(internal fun logLensSummaryDescription\(.*?)\n\n"),
     },
+    # "log card heading" was retired too (C10): the time-section headers below replaced it.
+    #
+    # The Log's time sections under the Newest sort (contracts 3.4). The Active header lives
+    # beside the window it names on both phones and is anchored on that hole, so the number keeps
+    # coming from activeNearbyInterval / ACTIVE_NEARBY_WINDOW_MS rather than a literal 45.
     {
-        "what": "log card heading",
+        "what": "log active section header",
         "kind": "fragments",
-        "why": "'ALL DETECTIONS' and '<category> · NEW' name both lens axes in one heading;"
-               " a phone that words the scope differently reads as a different lens",
-        "ios": (IOS_DETECTIONS_VIEW, r"(private var logHeading: String \{.*?\n    \})"),
-        "android": (AND_LOG_SCREEN, r"(val scopeTag = when \(scope\) \{.*?val label = [^\n]*)"),
+        "why": "the header over rows heard inside the recently-heard window names that window;"
+               " a phone that words it differently, or types the number in, describes a"
+               " different cut of the same Log",
+        "ios": (IOS_BLE_MANAGER,
+                r'static let activeSectionHeader = ("heard in the last \\\(Int\(activeNearbyInterval\)\) s")'),
+        "android": (AND_BLE_MANAGER,
+                    r'internal val LOG_ACTIVE_SECTION_HEADER = ("heard in the last'
+                    r' \$\{ACTIVE_NEARBY_WINDOW_MS / 1_000L\} s")'),
+    },
+    {
+        "what": "log earlier-today section header",
+        "kind": "string",
+        "why": "the header over rows last heard earlier on this calendar day reads the same on"
+               " both phones",
+        "ios": (IOS_DETECTIONS_VIEW, r'static let earlierTodaySectionHeader = "([^"]*)"'),
+        "android": (AND_LOG_SCREEN, r'internal const val LOG_EARLIER_TODAY_HEADER = "([^"]*)"'),
+    },
+    {
+        "what": "log older section header",
+        "kind": "string",
+        "why": "the header over older rows, and over every row whose time cannot be trusted,"
+               " reads the same on both phones",
+        "ios": (IOS_DETECTIONS_VIEW, r'static let olderSectionHeader = "([^"]*)"'),
+        "android": (AND_LOG_SCREEN, r'internal const val LOG_OLDER_HEADER = "([^"]*)"'),
     },
     {
         "what": "no-match panel copy",
@@ -787,17 +946,53 @@ SHARED_CONSTANTS = (
         "what": "no-match clear-filters button",
         "kind": "string",
         "why": "the one tap that resets search, category and scope reads the same on both phones",
-        "ios": (IOS_DETECTIONS_VIEW, r'Button\("(Clear filters)"\)'),
-        "android": (AND_LOG_SCREEN, r'Text\("(Clear filters)",'),
+        "ios": (IOS_DETECTIONS_VIEW, r'Button\("(Clear Filters)"\)'),
+        "android": (AND_LOG_SCREEN, r'Text\("(Clear Filters)",'),
     },
     {
         "what": "log search placeholder",
         "kind": "string",
         "why": "the empty search field's hint reads the same on both phones",
-        "ios": (IOS_DETECTIONS_VIEW, r'TextField\("((?:[^"\\]|\\.)*)", text: \$searchText\)'),
+        # iOS moved the field into the system search bar (C10), so the prompt is pinned at the
+        # one .searchable call bound to the Log's own search text. Since R19 (review P2-7) that
+        # call carries an optional `placement:` argument of up to three lines before the prompt.
+        "ios": (IOS_DETECTIONS_VIEW,
+                r'\.searchable\(text: \$searchText,\s*(?:placement:(?:[^\n]*\n){1,3}?\s*)?'
+                r'prompt: "((?:[^"\\]|\\.)*)"\)'),
         # The literal lives in LOG_SEARCH_PLACEHOLDER, which the fit rule measures and the
         # placeholder slot draws (Text(LOG_SEARCH_PLACEHOLDER, ...)); pin the constant.
         "android": (AND_LOG_SCREEN, r'internal const val LOG_SEARCH_PLACEHOLDER = "((?:[^"\\]|\\.)*)"'),
+    },
+    {
+        "what": "log select-mode count",
+        "kind": "fragments",
+        # Anchored on the hole on both sides, so the number is the live selection's own count.
+        "why": "'N SELECTED' in the select bar says how many rows its mute button is about to"
+               " act on; it reads the same on both phones",
+        "ios": (IOS_DETECTIONS_VIEW, r'Kicker\(("\\\(selection\.count\) SELECTED")\)'),
+        "android": (AND_LOG_SCREEN, r'Kicker\(("\$count SELECTED")\)'),
+    },
+    # The two whole-declaration rows below rely on the REQUIRED source shapes (contracts 3.2 and
+    # 3.6): a multi-line switch / `when` closed by a brace at column 0 (column 4 for the iOS
+    # computed property). A one-line Android body or a block body with `return when` stops matching.
+    {
+        "what": "log scope segment labels",
+        "kind": "fragments",
+        "why": "the Log's active / new / all control names each cut and its count in the same"
+               " words on both phones; All carries no count on either",
+        "ios": (IOS_DETECTIONS_VIEW,
+                r"(func logScopeSegmentLabel\(_ scope: StatusScope, count: Int\) -> String \{.*?\n\})"),
+        "android": (AND_LOG_SCREEN,
+                    r"(internal fun logScopeSegmentLabel\(scope: LogScope, count: Int\): String ="
+                    r" when \(scope\) \{.*?\n\})"),
+    },
+    {
+        "what": "confidence verdict words",
+        "kind": "fragments",
+        "why": "the spoken verdict a Log row gives with its confidence number; a screen reader"
+               " user hears 'weak match, verify' on both phones or the row is hedged on one only",
+        "ios": (IOS_DETECTION_ROW, r"(private var confidenceWord: String \{.*?\n    \})"),
+        "android": (AND_LOG_SCREEN, r"(internal fun confidenceWord\(pct: Int\): String = when \{.*?\n\})"),
     },
     {
         "what": "phone-notification dead-switch warning",
@@ -836,9 +1031,11 @@ SHARED_CONSTANTS = (
                " app deliberately left the alert mode where it was, and what the control beside it"
                " will do; a phone that words the offer differently is describing a different"
                " promise about who decides whether the detector makes sound",
+        # A TEMPLATE since decisions R14 ("desert mode ended on the {noun}"); each side renders
+        # it with the kind its surface names.
         "ios": (IOS_SETTINGS, r'\blet\s+desertRestoreOffer\s*=\s*"((?:[^"\\]|\\.)*)"'),
         "android": (AND_DEVICE_SCREEN,
-                    r'\bconst\s+val\s+DESERT_RESTORE_OFFER\s*=\s*"((?:[^"\\]|\\.)*)"'),
+                    r'\bconst\s+val\s+DESERT_RESTORE_OFFER_TEMPLATE\s*=\s*"((?:[^"\\]|\\.)*)"'),
     },
     {
         "what": "desert restore action label",
@@ -858,7 +1055,7 @@ SHARED_CONSTANTS = (
         # onto some other button stops matching instead of comparing equal from elsewhere on the
         # screen. Neither literal is a named constant, so neither app suite pins these bytes at
         # all; this row is the only place they are compared.
-        "why": "two uppercase words are all a screen reader gets from the label, so this sentence"
+        "why": "two words are all a screen reader gets from the label, so this sentence"
                " is where 'puts back the mode you had' actually reaches a VoiceOver or TalkBack"
                " user; a phone that describes the tap differently describes a different action",
         "ios": (IOS_SETTINGS,
@@ -930,6 +1127,732 @@ SHARED_CONSTANTS = (
         # ends in "Label(" too.
         "ios": (IOS_DETECTION_DETAIL, r'(?<![A-Za-z])Label\("(Phone breadcrumb trail[^"]*)"'),
         "android": (AND_DETAIL_SCREEN, r'Text\(\s*"(Phone breadcrumb trail[^"]*)"'),
+    },
+    # The connect screen (C14: one shared screen, contracts 9.5). Each row is anchored on its
+    # sentence's first words, so a second copy left beside a rewrite matches twice and fails.
+    # Decisions R15 (2026-09-26): the hero's passive subtitle is gone. The hero is the wordmark
+    # and the tagline, and the scope footnote below is the screen's ONE passive statement (the
+    # SHARED_SHAPES rule "connect screen says passive once" holds the count).
+    {
+        "what": "connect tagline",
+        "kind": "string",
+        "why": "the line under the wordmark names the product line on both phones and never takes"
+               " a kind; a board-named tagline on one phone would read as a different product",
+        # Anchored on the call that draws it, so a comment that quotes the words never counts.
+        "ios": (IOS_CONNECT_VIEW, r'Kicker\("(ALL CAMERAS ARE [^"]*)"\)'),
+        "android": (AND_ACAB_APP, r'Kicker\("(ALL CAMERAS ARE [^"]*)",'),
+    },
+    {
+        "what": "connect tagline spoken",
+        "kind": "string",
+        "why": "a screen reader hears the tagline as words, not letter by letter, and the same"
+               " words on both phones",
+        "ios": (IOS_CONNECT_VIEW, r'\.accessibilityLabel\("(all cameras are [^"]*)"\)'),
+        "android": (AND_ACAB_APP, r'contentDescription = "(all cameras are [^"]*)"'),
+    },
+    {
+        "what": "connect opt-in sentence",
+        "kind": "string",
+        "why": "the line saying trackers and network cameras start off, and where to turn them on;"
+               " a phone that drops it leaves two categories silently missing",
+        "ios": (IOS_CONNECT_VIEW, r'"(trackers and network cameras are opt-in[^"]*)"'),
+        "android": (AND_ACAB_APP, r'"(trackers and network cameras are opt-in[^"]*)"'),
+    },
+    {
+        "what": "connect scope footnote",
+        "kind": "string",
+        "why": "the footnote that says the board never jams, spoofs or interferes reads the same"
+               " on both phones",
+        # Settled 2026-09-25 (decisions R14): both opened "Passive ... The", against the
+        # lowercase-first rule. Anchored lowercase, so a side that reverts matches 0 times.
+        "ios": (IOS_CONNECT_VIEW, r'"(passive detection only[^"]*)"'),
+        "android": (AND_ACAB_APP, r'"(passive detection only[^"]*)"'),
+    },
+    # The connect screen's per-kind TEMPLATES (decisions R14): one literal per surface on each
+    # side, holes {noun} / {a_noun} / {plural} / {NOUN} / {os_pairing_request} filled only by
+    # renderBoardCopy, so the templates themselves are compared. Anchored on each sentence's first
+    # words like the rows above, so an untemplated leftover ("power on your beacon ...") beside
+    # the template matches twice and fails. Rows whose iOS literal writes a character as an
+    # escape (\u{2026}, \u{00B7}) are "fragments" rows, which decode escapes before comparing.
+    {
+        "what": "connect setup sentence",
+        "kind": "string",
+        "why": "the first instruction a new owner reads, naming the board they hold (decisions"
+               " R15: one line; the pairing step is said where it applies, not here)",
+        "ios": (IOS_CONNECT_VIEW, r'"(power on your [^"]*)"'),
+        "android": (AND_ACAB_APP, r'"(power on your [^"]*)"'),
+    },
+    {
+        "what": "connect rationale rest",
+        "kind": "string",
+        "why": "why the app asks for the radio permission, after the platform's bold permission"
+               " name; the promise (the board listens, not the phone) is the same on both",
+        "ios": (IOS_CONNECT_VIEW, r'"(connects your phone to your [^"]*)"'),
+        "android": (AND_ACAB_APP, r'"(connects your phone to your [^"]*)"'),
+    },
+    {
+        "what": "connect bluetooth off",
+        "kind": "string",
+        "why": "the Bluetooth-off panel's one instruction",
+        "ios": (IOS_CONNECT_VIEW, r'"(turn on Bluetooth to find your [^"]*)"'),
+        "android": (AND_ACAB_APP, r'"(turn on Bluetooth to find your [^"]*)"'),
+    },
+    {
+        "what": "connect looking line",
+        "kind": "fragments",
+        "why": "the line under the scan while nothing is heard yet",
+        "ios": (IOS_CONNECT_VIEW, r'("looking for your [^"]*")'),
+        "android": (AND_ACAB_APP, r'("looking for your [^"]*")'),
+    },
+    {
+        "what": "connect none found",
+        "kind": "string",
+        "why": "the empty-scan panel (drawn, and spoken on iOS): what to check before scanning"
+               " again",
+        "ios": (IOS_CONNECT_VIEW, r'"(no [^"]* found\. make sure your [^"]*)"'),
+        "android": (AND_ACAB_APP, r'"(no [^"]* found\. make sure your [^"]*)"'),
+    },
+    {
+        "what": "connect secure pairing note",
+        "kind": "string",
+        "why": "the note above the heard boards: a tap pairs, and pairing encrypts the link",
+        "ios": (IOS_CONNECT_VIEW, r'"(tap your [^"]*pairing encrypts[^"]*)"'),
+        "android": (AND_ACAB_APP, r'"(tap your [^"]*pairing encrypts[^"]*)"'),
+    },
+    {
+        "what": "connect connecting body",
+        "kind": "string",
+        "why": "the guidance under each platform's own status word while a connect or pairing"
+               " runs",
+        "ios": (IOS_CONNECT_VIEW, r'"(keep your [^"]* powered on and nearby\. approve [^"]*)"'),
+        "android": (AND_ACAB_APP, r'"(keep your [^"]* powered on and nearby\. approve [^"]*)"'),
+    },
+    {
+        "what": "reconnect panel title",
+        "kind": "fragments",
+        "why": "the pre-shell reconnect panel names the board that dropped",
+        "ios": (IOS_CONNECT_VIEW, r'("reconnecting to your [^"\\]*\\u\{2026\}")'),
+        "android": (AND_ACAB_APP, r'("reconnecting to your [^"]*\u2026")'),
+    },
+    {
+        "what": "reconnect panel body",
+        "kind": "string",
+        "why": "what the reconnect does on its own, and the way out, on both phones",
+        "ios": (IOS_CONNECT_VIEW, r'"(it reconnects on its own [^"]*)"'),
+        "android": (AND_ACAB_APP, r'"(it reconnects on its own [^"]*)"'),
+    },
+    {
+        "what": "reconnect banner",
+        "kind": "fragments",
+        # The title (no ellipsis, unlike the panel's) and the body, as two groups.
+        "why": "the banner over the tabs during a drop names the board and says the open screen"
+               " and capture survive it",
+        "ios": (IOS_CONNECT_VIEW, r'static let reconnectBannerTitle = ("reconnecting to your [^"\\]*")'
+                r'\s*\n\s*static let reconnectBannerSubtitle = ("[^"]*")'),
+        "android": (AND_MAIN_SCREEN, r'const val RECONNECT_BANNER_TITLE_TEMPLATE = ("reconnecting to your [^"]*")'
+                    r'\s*\n\s*internal const val RECONNECT_BANNER_BODY = ("[^"]*")'),
+    },
+    {
+        "what": "connect hears row",
+        "kind": "string",
+        "why": "the row that opens what the board can hear, in place under the row on both"
+               " phones (decisions R15 retired the iOS sheet and its C2 header)",
+        # Anchored on the names: a doc comment on iOS quotes the row's words.
+        "ios": (IOS_CONNECT_VIEW, r'static let hearsRow = "([^"]*)"'),
+        "android": (AND_ACAB_APP, r'const val CONNECT_HEARS_TEMPLATE = "([^"]*)"'),
+    },
+    {
+        "what": "connect hears show action",
+        "kind": "string",
+        "why": "the hears row's spoken action while it is closed; a screen reader hears the same"
+               " words on both phones",
+        "ios": (IOS_CONNECT_VIEW, r'static let hearsShow = "([^"]*)"'),
+        "android": (AND_ACAB_APP, r'const val CONNECT_HEARS_SHOW_TEMPLATE = "([^"]*)"'),
+    },
+    {
+        "what": "connect hears hide action",
+        "kind": "string",
+        "why": "the hears row's spoken action while it is open",
+        "ios": (IOS_CONNECT_VIEW, r'static let hearsHide = "([^"]*)"'),
+        "android": (AND_ACAB_APP, r'const val CONNECT_HEARS_HIDE_TEMPLATE = "([^"]*)"'),
+    },
+    {
+        "what": "connect saved log kicker",
+        "kind": "fragments",
+        "why": "the saved log needs no board, and says so the same way on both phones",
+        "ios": (IOS_CONNECT_VIEW, r'("history on this phone [^"]*")'),
+        "android": (AND_ACAB_APP, r'("history on this phone [^"]*")'),
+    },
+    {
+        "what": "connect help row title",
+        "kind": "string",
+        # Settled 2026-09-25 (decisions R14, L3): iOS read "setup + pairing help", a sentence-case
+        # row everywhere else.
+        "why": "the row title is a row, sentence case like its neighbours, and the same words on"
+               " both phones",
+        "ios": (IOS_CONNECT_VIEW, r'connectRow\("questionmark\.circle", "([^"]*)"'),
+        "android": (AND_ACAB_APP, r'GroupedRow\(\s*"([Ss]etup \+ pairing help)"'),
+    },
+    {
+        "what": "connect help row subtitle",
+        "kind": "string",
+        # Settled 2026-09-25 (decisions R14) to Android's line; iOS read "power, secure pairing,
+        # and recovery \u00b7 works offline".
+        "why": "the line under 'Setup + pairing help' says what the help covers and that it works"
+               " offline, in the same words on both phones",
+        "ios": (IOS_CONNECT_VIEW, r'static let setupHelpSubtitle = "([^"]*)"'),
+        "android": (AND_ACAB_APP, r'\bconst\s+val\s+CONNECT_SETUP_HELP_SUBTITLE\s*=\s*"([^"]*)"'),
+    },
+    {
+        "what": "connect failure panel title",
+        "kind": "string",
+        # Settled 2026-09-25 (decisions R14): Android read "Connection didn't finish".
+        "why": "the title above either phone's own failure hint",
+        "ios": (IOS_CONNECT_VIEW, r'Text\("(connection did[^"]*)"\)'),
+        "android": (AND_ACAB_APP, r'\bconst\s+val\s+CONNECTION_HINT_TITLE\s*=\s*"([^"]*)"'),
+    },
+    {
+        "what": "connect failure pair-window note",
+        "kind": "string",
+        # Decisions R15: the note left the idle screen and rests under a failed connect's hint.
+        # The pinned "pairing-window hint" template follows this lead on both sides, so the row
+        # is anchored on the concatenation itself: a side that drops the hint or swaps it for
+        # another line matches 0 times.
+        "why": "the second-phone rule under a failed connect reads the same on both phones; the"
+               " board hangs up before it can explain itself, so this line is the only"
+               " explanation a user who missed the window gets",
+        "ios": (IOS_CONNECT_VIEW, r'Text\("(already paired to another phone\? )"\s*'
+                r'\+ renderBoardCopy\(BLEManager\.pairWindowHint, kind\)\)'),
+        "android": (AND_ACAB_APP, r'"(already paired to another phone\? )" \+ AcabBleManager\.pairWindowHint\(kind\)'),
+    },
+    {
+        "what": "remembered row title",
+        "kind": "string",
+        "why": "the remembered board's row names its kind ('your OUI-Spy'); never the raw"
+               " advertised name, which every board of one kind shares",
+        "ios": (IOS_REMEMBERED_BOARD, r'static let labelTemplate = "([^"]*)"'),
+        "android": (AND_BLE_MANAGER, r'const val LABEL_TEMPLATE = "([^"]*)"'),
+    },
+    {
+        "what": "remembered row subtitles",
+        "kind": "fragments",
+        "why": "the remembered row's second line: whether an advert is live, then the tap",
+        "ios": (IOS_REMEMBERED_BOARD, r'static let noSignal = ("(?:[^"\\]|\\.)*")'
+                r'\s*\n\s*static let seen = ("[^"]*")'),
+        "android": (AND_BLE_MANAGER, r'const val NO_SIGNAL = ("(?:[^"\\]|\\.)*")'
+                    r'\s*\n\s*const val SEEN = ("[^"]*")'),
+    },
+    # The post-connect checklist and what an empty radar means (C14, contracts 9.2): one home per
+    # string on each platform, on FirstRunTour / object FirstRunTour.
+    {
+        "what": "quiet-does-not-mean-clear sentence",
+        "kind": "fragments",
+        # Anchored on the window hole on both sides, like the Log's active header.
+        "why": "the sentence Status shows for a connected session with nothing nearby, and the"
+               " checklist's footer: zero is not all clear, and the gear it cannot hear is named."
+               " A phone that words it differently, or types the window in, tells its owner a"
+               " different thing about an empty radar",
+        "ios": (IOS_FIRST_RUN_TOUR,
+                r'static let quietSentence = ("quiet does not mean clear\. zero nearby means[^"]*'
+                r'\\\(Int\(activeNearbyInterval\)\) seconds\.[^"]*")'),
+        "android": (AND_FIRST_RUN_TOUR,
+                    r'val QUIET_SENTENCE = ("quiet does not mean clear\. zero nearby means[^"]*'
+                    r'\$\{ACTIVE_NEARBY_WINDOW_MS / 1_000L\} seconds\.[^"]*")'),
+    },
+    # The title, subtitle and preview note are TEMPLATES since decisions R14 ("your {noun} is
+    # listening"), rendered with the checklist's board kind on each side.
+    {
+        "what": "checklist title",
+        "kind": "string",
+        "why": "the post-connect checklist's title reads the same on both phones",
+        "ios": (IOS_FIRST_RUN_TOUR, r'static let checklistTitle = "([^"]*)"'),
+        "android": (AND_FIRST_RUN_TOUR, r'const val CHECKLIST_TITLE_TEMPLATE = "([^"]*)"'),
+    },
+    {
+        "what": "checklist subtitle",
+        "kind": "string",
+        "why": "the line that says detection already runs and the rest is optional reads the"
+               " same on both phones",
+        "ios": (IOS_FIRST_RUN_TOUR, r'static let checklistSubtitle = "([^"]*)"'),
+        "android": (AND_FIRST_RUN_TOUR, r'const val CHECKLIST_SUBTITLE_TEMPLATE = "([^"]*)"'),
+    },
+    {
+        "what": "checklist preview note",
+        "kind": "string",
+        "why": "the replay's line saying the sheet is a preview of the post-connect state, so its"
+               " unticked rows do not read as a failed setup",
+        "ios": (IOS_FIRST_RUN_TOUR, r'static let checklistPreviewNote = "([^"]*)"'),
+        "android": (AND_FIRST_RUN_TOUR, r'const val CHECKLIST_PREVIEW_NOTE_TEMPLATE = "([^"]*)"'),
+    },
+    {
+        "what": "checklist detectors note",
+        "kind": "string",
+        "why": "which detectors start on, which start off and why, and that desert mode should"
+               " go back off; the same facts on both phones",
+        "ios": (IOS_FIRST_RUN_TOUR, r'static let detectorsNote = "([^"]*)"'),
+        "android": (AND_FIRST_RUN_TOUR, r'const val DETECTORS_NOTE = "([^"]*)"'),
+    },
+    {
+        "what": "checklist location rationale (shared tail)",
+        "kind": "string",
+        # Each side's LEAD is literal text outside the group, so a lead that drifts matches 0
+        # times; only the shared tail is compared. The leads differ by design: only iPhone needs
+        # Location to keep Live Mode current in the background (docs/app-guide.md).
+        "why": "the consent line under the Location request, ending on the canonical 'nothing is"
+               " uploaded automatically.'; a phone that words what Location is used for"
+               " differently asks for the same permission on a different promise",
+        "ios": (IOS_FIRST_RUN_TOUR,
+                r'static let locationRationale = "Location is optional\. it keeps Live Mode current'
+                r' in the background, ([^"]*)"'),
+        # Both sides are {noun} templates since 2026-09-25 (decisions R14): the tail names the
+        # checklist's board ("lets the {noun} label buffered hits").
+        "android": (AND_FIRST_RUN_TOUR,
+                    r'const val LOCATION_RATIONALE_TEMPLATE = "Location is optional\. it ([^"]*)"'),
+    },
+    {
+        "what": "checklist fixed row titles",
+        "kind": "list",
+        "why": "the checklist's fixed rows, in order; a row renamed on one phone sends a support"
+               " answer to a row the other phone does not have",
+        "ios": (IOS_FIRST_RUN_TOUR, r"static let checklistRowTitles = \[(.*?)\]"),
+        "android": (AND_FIRST_RUN_TOUR, r"val CHECKLIST_ROW_TITLES = listOf\((.*?)\)"),
+    },
+    # Sample data (decisions U1): one banner, one pill word, one "new" baseline on both phones.
+    # Where each word is DRAWN, and that the pill word leads, is pinned in SHARED_SHAPES below.
+    {
+        "what": "sample link pill word",
+        "kind": "string",
+        # iOS names it once on LinkChip (BeaconRadioPresentation.chipLabel reads the same
+        # constant); Android writes it as linkChipAppearance's FIRST arm, so the pattern takes the
+        # arm only in that slot.
+        "why": "the pill that says the screen is not a live beacon; the tour's last card and"
+               " both banners call it sample data, so a phone that still says DEMO names one"
+               " mode two ways",
+        "ios": (IOS_COMPONENTS, r'\bstatic let sampleLabel = "([^"]*)"'),
+        "android": (AND_COMPONENTS, r'val label = when \{\s*demo -> "([^"]*)"'),
+    },
+    {
+        "what": "sample banner message",
+        "kind": "string",
+        "why": "the banner over every tab in sample data says the rows are not nearby devices;"
+               " the same words on both phones",
+        "ios": (IOS_ROOT_VIEW, r'\blet sampleBannerMessage = "((?:[^"\\]|\\.)*)"'),
+        "android": (AND_MAIN_SCREEN, r'\bconst val SAMPLE_BANNER_MESSAGE = "((?:[^"\\]|\\.)*)"'),
+    },
+    {
+        "what": "status motto, first half",
+        "kind": "string",
+        "why": "the brand line under the radar caption (owner decision R12); the same words on both"
+               " phones",
+        "ios": (IOS_COMPONENTS, r'struct PunkLine: View \{.*?Text\("((?:[^"\\]|\\.)*)"\)\.foregroundStyle\(ACABTheme\.dim\)'),
+        "android": (AND_STATUS_SCREEN, r'fun PunkLine\(.*?SpanStyle\(color = dim\)\) \{ append\("((?:[^"\\]|\\.)*)"\)'),
+    },
+    {
+        "what": "status motto, second half",
+        "kind": "string",
+        "why": "the crimson half of the brand line under the radar caption (owner decision R12)",
+        "ios": (IOS_COMPONENTS, r'struct PunkLine: View \{.*?Text\("((?:[^"\\]|\\.)*)"\)\.foregroundStyle\(ACABTheme\.accentText\)'),
+        "android": (AND_STATUS_SCREEN, r'fun PunkLine\(.*?SpanStyle\(color = crimson\)\) \{ append\("((?:[^"\\]|\\.)*)"\)'),
+    },
+    {
+        "what": "sample banner exit label",
+        "kind": "string",
+        "why": "the one way out of sample data, named the way the tour's last card names it;"
+               " a phone that labels it differently sends the reader looking for another control",
+        "ios": (IOS_ROOT_VIEW, r'\blet sampleBannerExitLabel = "((?:[^"\\]|\\.)*)"'),
+        "android": (AND_MAIN_SCREEN, r'\bconst val SAMPLE_BANNER_EXIT_LABEL = "((?:[^"\\]|\\.)*)"'),
+    },
+    # The two offsets that make the sample Log open on "new 4 of 6" on both phones: an unflagged
+    # row is first seen 2 s before the seed and the watermark sits 1 s before it, so exactly the
+    # rows the seed flags new sit above it. Each pattern takes the minus sign and the flag's arm
+    # as literal text, so a flipped sign or an arm that stamps every row alike stops matching.
+    {
+        "what": "sample unflagged first-seen offset",
+        "kind": "string",
+        "scale": {"ios": 1000, "android": 1},
+        "unit": "ms",
+        "why": "how far before the seed an unflagged sample row was first seen; with the"
+               " watermark below, it decides which sample rows read new, and the two phones"
+               " must open the sample Log on the same count",
+        "ios": (IOS_BLE_MANAGER,
+                r"flaggedNew \? seededAt : seededAt\.addingTimeInterval\(-([0-9][0-9_.]*)\)"),
+        "android": (AND_BLE_MANAGER,
+                    r"if \(flaggedNew\) seededAtMs else seededAtMs - ([0-9][0-9_]*)L\b"),
+    },
+    {
+        "what": "sample seen watermark offset",
+        "kind": "string",
+        "scale": {"ios": 1000, "android": 1},
+        "unit": "ms",
+        "why": "how far before the seed the sample watermark sits; it has to fall between an"
+               " unflagged row and a flagged one on both phones, or the sample New lens counts"
+               " differently on each",
+        "ios": (IOS_BLE_MANAGER,
+                r"func sampleSeenWatermark\(seededAt: Date\) -> Date \{"
+                r" seededAt\.addingTimeInterval\(-([0-9][0-9_.]*)\) \}"),
+        "android": (AND_BLE_MANAGER,
+                    r"fun sampleSeenWatermarkMs\(seededAtMs: Long\): Long = seededAtMs - ([0-9][0-9_]*)L\b"),
+    },
+    # The radar sweep (decisions M3): one turn every 4.5 s on both phones, from the clock.
+    {
+        "what": "radar sweep period",
+        "kind": "string",
+        "scale": {"ios": 1000, "android": 1},
+        "unit": "ms",
+        "why": "one sweep turn on both phones; iOS declares it in seconds and Android in"
+               " milliseconds, and a different period reads as a different scanner",
+        "ios": (IOS_COMPONENTS, r"\bstatic let sweepPeriod: TimeInterval = ([0-9][0-9_.]*)\b"),
+        "android": (AND_STATUS_SCREEN, r"\bconst val RADAR_SWEEP_PERIOD_MS = ([0-9][0-9_]*)L\b"),
+    },
+    # The dossier (decisions U3). The case-insensitive equality each helper tests, and where each
+    # is drawn, are pinned in SHARED_SHAPES; these rows compare the words.
+    {
+        "what": "dossier flagged line",
+        "kind": "fragments",
+        "why": "'Flagged by <method> over <source>.', said once when the two are the same word;"
+               " the same sentence on both phones",
+        "ios": (IOS_DETECTION_DETAIL,
+                r"(func dossierFlaggedLine\(methodLabel: String, sourceLabel: String\) -> String \{.*?\n\})"),
+        "android": (AND_DETAIL_SCREEN,
+                    r"(internal fun dossierFlaggedLine\(methodLabel: String, sourceLabel: String\):"
+                    r" String =.*?)\n\n"),
+    },
+    {
+        "what": "dossier hero subtitle",
+        "kind": "fragments",
+        "why": "'NODE <node> · <maker>' under the dossier title, the maker dropped when it is the"
+               " title; the same line on both phones",
+        "ios": (IOS_DETECTION_DETAIL,
+                r"(func dossierHeroSubtitle\(node: String, makerOrVendor: String, headline: String\)"
+                r" -> String \{.*?\n\})"),
+        "android": (AND_DETAIL_SCREEN,
+                    r"(internal fun dossierHeroSubtitle\(node: String, makerOrVendor: String,"
+                    r" headline: String\): String =.*?)\n\n"),
+    },
+    {
+        "what": "dossier body-cam fallback lines",
+        "kind": "fragments",
+        "why": "what MATCH QUALITY says about a body cam with no recognized signature; only a"
+               " replayed record blames the offline buffer, in the same words on both phones",
+        "ios": (IOS_DETECTION_DETAIL,
+                r"(func dossierBodyCamFallbackLine\(isReplay: Bool\) -> String \{.*?\n\})"),
+        "android": (AND_DETAIL_SCREEN,
+                    r"(internal fun dossierBodyCamFallbackLine\(replay: Boolean\): String =.*?)\n\n"),
+    },
+    {
+        "what": "tracker offline note",
+        "kind": "string",
+        "why": "the app's gloss under a tracker's firmware '(offline)': separated from its owner,"
+               " not replayed; a phone that words it differently explains the same word two ways",
+        "ios": (IOS_DETECTION_DETAIL,
+                r'func trackerOfflineNote\(type: DeviceType, detail: String\?\) -> String\? \{.*?\n'
+                r'    return "((?:[^"\\]|\\.)*)"\n\}'),
+        "android": (AND_DETAIL_SCREEN,
+                    r'internal fun trackerOfflineNote\(type: DeviceType, detail: String\?\): String\? =.*?\n'
+                    r'        "((?:[^"\\]|\\.)*)"\n    else null'),
+    },
+    {
+        "what": "matched-on method telegrams",
+        "kind": "fragments",
+        "why": "the two OUI answers in the dossier's 'matched on' row, quoted by the FAQ; every"
+               " other method passes its own label through (pinned in SHARED_SHAPES)",
+        "ios": (IOS_DETECTION_DETAIL,
+                r"(func methodChipLabel\(method: DetectionMethod, maker: String\?\) -> String \{.*?\n\})"),
+        "android": (AND_DETAIL_SCREEN,
+                    r"(internal fun methodChipLabel\(method: Int, maker: String\?, methodLabel: String\):"
+                    r" String = when \{.*?\n\})"),
+    },
+    {
+        "what": "signal graph floor (dBm)",
+        "kind": "string",
+        "why": "the WEAK edge of the dossier's fixed signal scale; a different floor on one phone"
+               " draws the same history at a different height",
+        "ios": (IOS_COMPONENTS, r"\blet signalGraphFloorDbm = (-?\d+)\b"),
+        "android": (AND_DETAIL_SCREEN, r"\bconst val SIGNAL_GRAPH_FLOOR_DBM = (-?\d+)\b"),
+    },
+    {
+        "what": "signal graph ceiling (dBm)",
+        "kind": "string",
+        "why": "the STRONG edge of the same scale",
+        "ios": (IOS_COMPONENTS, r"\blet signalGraphCeilingDbm = (-?\d+)\b"),
+        "android": (AND_DETAIL_SCREEN, r"\bconst val SIGNAL_GRAPH_CEILING_DBM = (-?\d+)\b"),
+    },
+    {
+        "what": "drone operator caption",
+        "kind": "string",
+        "why": "the caption under a drone thumbnail that draws the operator marker; the same"
+               " words on both phones",
+        "ios": (IOS_DETECTION_DETAIL, r'\blet droneOperatorCaption = "((?:[^"\\]|\\.)*)"'),
+        "android": (AND_DETAIL_SCREEN, r'\bconst val DRONE_OPERATOR_CAPTION = "((?:[^"\\]|\\.)*)"'),
+    },
+    # The Map (decisions U2 and U3). Each legend pattern is anchored on the key's first word, so a
+    # reworded tail reads as a difference and a second copy reads as two matches.
+    {
+        "what": "map drone operator legend key",
+        "kind": "string",
+        "why": "the legend names the operator marker in the same words on both phones",
+        "ios": (IOS_MAP_TAB, r'legendEntry\("(Drone [^"]*)"\)'),
+        "android": (AND_MAP_SCREEN, r'Text\("(Drone [^"]*)", style'),
+    },
+    {
+        "what": "map known-ALPR legend key",
+        "kind": "string",
+        "why": "the solid ring's key reads the same on both phones",
+        "ios": (IOS_MAP_TAB, r'legendEntry\("(Known ALPR[^"]*)"\)'),
+        "android": (AND_MAP_SCREEN, r'"(Known ALPR[^"]*)", hollow = true'),
+    },
+    {
+        "what": "map lower-confidence legend key",
+        "kind": "string",
+        "why": "the amber ring's key reads the same on both phones",
+        "ios": (IOS_MAP_TAB, r'legendEntry\("(ALPR \(lower[^"]*)"\)'),
+        "android": (AND_MAP_SCREEN, r'"(ALPR \(lower[^"]*)", hollow = true'),
+    },
+    # The Map legend's floating info button and card (owner decision 2026-09-26, decisions R17).
+    {
+        "what": "map legend loading state",
+        "kind": "string",
+        "why": "a first known-ALPR download no longer opens the legend; the info button's spinner"
+               " badge and this spoken suffix are how it shows, in the same words on both phones",
+        "ios": (IOS_MAP_TAB, r'\bstatic let legendLoadingValue = "((?:[^"\\]|\\.)*)"'),
+        "android": (AND_MAP_SCREEN, r'\bconst val MAP_LEGEND_LOADING_STATE = "((?:[^"\\]|\\.)*)"'),
+    },
+    {
+        "what": "map legend close label",
+        "kind": "string",
+        "why": "the open legend card's close control is named the same on both phones",
+        "ios": (IOS_MAP_TAB, r'accessibilityLabel\("(close map [^"]*)"\)'),
+        "android": (AND_MAP_SCREEN, r'contentDescription = "(close map [^"]*)"'),
+    },
+    {
+        "what": "map lower-confidence toggle title",
+        "kind": "string",
+        "why": "the Map options switch for the tier nobody could name a maker for; the legend"
+               " key above and this switch have to name one tier",
+        "ios": (IOS_MAP_TAB, r'Toggle\("(lower-confidence [^"]*)",'),
+        "android": (AND_MAP_SCREEN, r'GroupedSwitchRow\(\s*"(lower-confidence [^"]*)",'),
+    },
+    {
+        "what": "map lower-confidence line",
+        "kind": "fragments",
+        # From `one` on: the count's grouping is each language's own call (count.formatted() /
+        # "%,d"), which the anchors pin, and "%,d" is not a sentence fragment.
+        "why": "the line under that switch says what the tier MEANS, hidden or shown, and agrees"
+               " in number; the same words on both phones",
+        "ios": (IOS_MAP_TAB,
+                r"func alprLowerConfidenceLine\(count: Int, showing: Bool\) -> String \{\s*"
+                r"let n = count\.formatted\(\)\s*(let one = .*?\n\})"),
+        "android": (AND_MAP_SCREEN,
+                    r'internal fun alprLowerConfidenceLine\(.*?\): String \{\s*'
+                    r'val n = String\.format\(locale, "%,d", count\)\s*(val one = .*?\n\})'),
+    },
+    {
+        "what": "map ALL chip label",
+        "kind": "string",
+        "why": "the fixed first chip of the Map's category row reads the same on both phones",
+        "ios": (IOS_MAP_TAB, r'chip\(nil, "([^"]*)", snap\.totalLocated\)'),
+        "android": (AND_MAP_SCREEN, r'MapChipModel\(null, "([^"]*)", allCount,'),
+    },
+    {
+        "what": "map breadcrumb toggle subline",
+        "kind": "string",
+        "why": "the line under the Map's phone breadcrumb trails switch says the path is the"
+               " phone's and lives in memory only; the same words on both phones",
+        "ios": (IOS_MAP_TAB, r'\bstatic let breadcrumbToggleSubline = "((?:[^"\\]|\\.)*)"'),
+        "android": (AND_MAP_SCREEN,
+                    r'\bconst val MAP_BREADCRUMB_TOGGLE_SUBLINE =\s*"((?:[^"\\]|\\.)*)"'),
+    },
+    # The known-ALPR callout title, ONE ROW PER TIER: the fragment set cannot see which arm a
+    # sentence sits in, so a row over the whole switch would pass two tiers' titles swapped.
+    {
+        "what": "ALPR callout title, tier 1",
+        "kind": "fragments",
+        "why": "the title a mapped camera's callout reads with and without a maker; the same"
+               " words for the same tier on both phones",
+        "ios": (IOS_ALPR_DATASET,
+                r"static func headline\(tier: UInt8, maker: String\) -> String \{\s*switch tier \{\s*"
+                r"case 1:\s*(return[^\n]*\n[^\n]*)\n\s*case 2:"),
+        "android": (AND_MAP_ALPR,
+                    r"internal fun alprAttributionHeadline\(tier: Int, maker: String\): String ="
+                    r" when \(tier\) \{\s*1 -> ([^\n]*)\n\s*2 -> "),
+    },
+    {
+        "what": "ALPR callout title, tier 2",
+        "kind": "fragments",
+        "why": "the legacy-tag candidate's title, the same on both phones",
+        "ios": (IOS_ALPR_DATASET,
+                r"static func headline\(tier: UInt8, maker: String\) -> String \{\s*switch tier \{\s*"
+                r"case 1:\s*return[^\n]*\n[^\n]*\n\s*case 2:\s*(return[^\n]*\n[^\n]*)\n\s*default:"),
+        "android": (AND_MAP_ALPR,
+                    r"internal fun alprAttributionHeadline\(tier: Int, maker: String\): String ="
+                    r" when \(tier\) \{\s*1 -> [^\n]*\n\s*2 -> ([^\n]*)\n\s*else -> "),
+    },
+    {
+        "what": "ALPR callout title, other tiers",
+        "kind": "fragments",
+        "why": "the canonical-tag title every other tier reads, the same on both phones",
+        "ios": (IOS_ALPR_DATASET,
+                r"static func headline\(tier: UInt8, maker: String\) -> String \{.*?"
+                r"\n\s*default:\s*(return[^\n]*\n[^\n]*)\n\s*\}\n    \}"),
+        "android": (AND_MAP_ALPR,
+                    r"internal fun alprAttributionHeadline\(tier: Int, maker: String\): String ="
+                    r" when \(tier\) \{.*?\n\s*else -> ([^\n]*)\n\}"),
+    },
+    # The instrument layer (decisions R16, 2026-09-26): JetBrains Mono for short instrument text,
+    # sized from the platform's own text style or M3 role, so the two sides share the FACTOR and
+    # the tracking, not a point size. The face itself is spelled per platform (a PostScript name
+    # against a resource id) and is pinned by each side's own test (iOS TelemetryTypeTests,
+    # Android TelemetryTypeTest).
+    {
+        "what": "telemetry scale (instrument face size / text style size)",
+        "kind": "string",
+        "why": "mono reads optically larger than the system face; one factor keeps the instrument"
+               " text the same step under the copy beside it on both phones",
+        "ios": (IOS_THEME, r"\bstatic\s+let\s+telemetryScale\s*:\s*CGFloat\s*=\s*([0-9.]+)\b"),
+        "android": (AND_THEME, r"\bconst\s+val\s+TELEMETRY_SCALE\s*=\s*([0-9.]+)f\b"),
+    },
+    {
+        "what": "telemetry tracking (uppercase instrument labels)",
+        "kind": "string",
+        "unit": "pt / sp",
+        "why": "the spaced capitals of an uppercase label (a kicker, a ring word, a tile label); a"
+               " different spacing on one phone wraps the same label at a different width",
+        "ios": (IOS_THEME, r"\bstatic\s+let\s+telemetryTracking\s*:\s*CGFloat\s*=\s*([0-9.]+)\b"),
+        "android": (AND_THEME, r"\bval\s+TELEMETRY_TRACKING\s*:\s*TextUnit\s*=\s*([0-9.]+)\.sp\b"),
+    },
+    {
+        "what": "wordmark shrink floor (share of its full size)",
+        "kind": "string",
+        "why": "the Space Grotesk Bold \"beacons\" stays on one line and shrinks to fit, never below"
+               " this share, on both phones (R16); a lower floor on one side clips the wordmark there",
+        "ios": (IOS_COMPONENTS,
+                r'Text\("beacons"\)\s*\.font\(Font\.custom\("SpaceGrotesk-Bold",[^\n]*\n'
+                r'(?:[^\n]*\n){0,6}?\s*\.lineLimit\(1\)\s*\.minimumScaleFactor\(([0-9.]+)\)'),
+        "android": (AND_ACAB_APP, r"\binternal\s+const\s+val\s+WORDMARK_MIN_FIT\s*=\s*([0-9.]+)f\b"),
+    },
+    # The 2026-09-26 UI review batch (decisions R19): the strings both apps settled to one wording
+    # and case, each pinned at the literal a view draws.
+    {
+        "what": "map dimmed-pin legend key",
+        "kind": "string",
+        "why": "the legend names the dim treatment of a stale pin ('treatment: meaning',"
+               " lowercase-first like every row) in the same words on both phones (R19 settled"
+               " R17's open item)",
+        "ios": (IOS_MAP_TAB, r'legendEntry\("(dimmed: [^"]*)"\)'),
+        "android": (AND_MAP_SCREEN, r'LegendRow\(dimTone\(scheme\.onSurface\), "(dimmed: [^"]*)"\)'),
+    },
+    {
+        "what": "map ring-peek legend key",
+        "kind": "string",
+        "why": "the legend names the wide ring of a live hit at a mapped camera in the same words"
+               " on both phones (R19 settled R17's open item)",
+        "ios": (IOS_MAP_TAB, r'legendEntry\("(wide ring: [^"]*)"\)'),
+        "android": (AND_MAP_SCREEN, r'"(wide ring: [^"]*)", hollow = true, wide = true'),
+    },
+    {
+        "what": "map legend qualifier words",
+        "kind": "fragments",
+        "why": "the legend's telemetry line ('N displayed · N retained · N markers · N outside"
+               " display budget · simplified') uses iOS projectionSummary's words, lowercase, on"
+               " both phones (R19); iOS's extra 'outside this view' clause names a count Android's"
+               " projection does not report, so only the shared clauses are compared, in order",
+        "ios": (IOS_MAP_TAB,
+                r'var parts = \[("\\\(snap\.representedRows\) displayed"),\s*'
+                r'("\\\(snap\.retainedLocated\) retained")\].*?'
+                r'parts\.append\(("\\\(snap\.markerCount\) markers")\).*?'
+                r'parts\.append\(("\\\(snap\.droppedRows\) outside display budget")\).*?'
+                r'parts\.append\(("simplified")\)'),
+        "android": (AND_MAP_SCREEN,
+                    r'val parts = mutableListOf\(("\$displayed displayed"), ("\$retained retained")\).*?'
+                    r'parts\.add\(("\$markers markers")\).*?'
+                    r'parts\.add\(("\$omittedRows outside display budget")\).*?'
+                    r'parts\.add\(("simplified")\)'),
+    },
+    {
+        "what": "Detectors ALPR toggle title",
+        "kind": "string",
+        "why": "the ALPR detector row keeps the initialism uppercase inside lowercase-first copy"
+               " ('ALPR radio signals'), the same bytes on both phones (R19)",
+        "ios": (IOS_SETTINGS, r'radioToggle\("(ALPR radio [^"]*)", "flock over bluetooth'),
+        "android": (AND_DEVICE_SCREEN, r'ToggleRow\("(ALPR radio [^"]*)", "flock over bluetooth'),
+    },
+    # Row titles are sentence case since the 2026-09-26 review (P3-11, decisions R20: the first
+    # letter up, feature and company names keep their case). Each Beacon sub-screen toggle that
+    # exists on both phones is one row here, anchored on the opening words of its OWN subtitle so
+    # the title hole is read from the right call and a retitled row still matches; the platform-
+    # only rows (iOS Live Activity counter / Hide counts on lock screen, Android Live counter
+    # notification / Keep counts private on lock screen) have no twin and are not listed.
+    *_toggle_title_rows(),
+    {
+        "what": "offline buffer erase row title",
+        "kind": "string",
+        "why": "the OFFLINE BUFFER card's erase row is a row title, sentence case on both phones"
+               " (P3-11); it was 'buffered log' on Android and 'Buffered log' on iOS",
+        "ios": (IOS_SETTINGS, r'Text\("([Bb]uffered log)"\)\.font\(ACABTheme\.font\(\.body, weight: \.medium\)\)'),
+        "android": (AND_DEVICE_SCREEN, r'Text\("([Bb]uffered log)", color = Acab\.text, fontSize = 14\.sp'),
+    },
+    {
+        "what": "Scan radios row value in sample data",
+        "kind": "list",
+        "why": "in the tour the Beacon tab's Scan radios row prints the echoed sample radio switches"
+               " in the LIVE arm's four words (P3-8) instead of the presenter's SAMPLE DATA family,"
+               " which the banner, the pill, the dot and the hero already carry; the four literals"
+               " are read from the sample arms in switch order (both on, BLE only, Wi-Fi only,"
+               " both off) and must match each other and the live arms (each app's own tests pin"
+               " the live half: BeaconPagePolishTests, BeaconScanRadiosSampleTest)",
+        "ios": (IOS_BEACON_PRESENTATION,
+                r"\nfunc sampleRadiosRowValue\(bleOn: Bool, wifiOn: Bool\) -> String \{(.*?)\n\}"),
+        "android": (AND_DEVICE_SCREEN, r"\n    if \(demo\) return when \{(.*?)\n    \}"),
+    },
+    {
+        "what": "log radios-off empty state",
+        "kind": "string",
+        "why": "the Log's first-empty line with both radios off is two plain sentences ('Radios"
+               " are off. Turn them on in Beacon.') on both phones (R19)",
+        "ios": (IOS_DETECTIONS_VIEW, r'if radiosOff \{ return "((?:[^"\\]|\\.)*)" \}'),
+        "android": (AND_LOG_SCREEN, r'radiosOff -> EmptyState\("((?:[^"\\]|\\.)*)", null\)'),
+    },
+    {
+        "what": "sample tour kicker",
+        "kind": "string",
+        "why": "the tour names itself with the mono kicker beside Skip on both phones (R19,"
+               " review P2-16)",
+        "ios": (IOS_FIRST_RUN_TOUR, r'Kicker\("(SAMPLE DATA [^"]*)"\)'),
+        "android": (AND_FIRST_RUN_TOUR, r'\binternal const val SAMPLE_TOUR_KICKER = "([^"]*)"'),
+    },
+    {
+        "what": "sample tour card 1 note",
+        "kind": "string",
+        "why": "the first tour card names the post-connect sheet 'the setup checklist', the one"
+               " name Help and the FAQ use (R19, review P2-13); the same bytes on both phones",
+        "ios": (IOS_FIRST_RUN_TOUR, r'note: "(sample settings are safe[^"]*)"'),
+        "android": (AND_FIRST_RUN_TOUR, r'"(sample settings are safe[^"]*)",'),
+    },
+    {
+        "what": "sample tour card 3 body",
+        "kind": "string",
+        "why": "the last tour card names the Exit Sample Data banner in plain words on both"
+               " phones (R19, review P2-14)",
+        "ios": (IOS_FIRST_RUN_TOUR, r'body: "(an Exit Sample Data banner[^"]*)"'),
+        "android": (AND_FIRST_RUN_TOUR, r'"(an Exit Sample Data banner[^"]*)",'),
+    },
+    {
+        "what": "Live Mode sample preview sentence",
+        "kind": "string",
+        "why": "in sample data the Live Mode page says the switch is a preview in the same"
+               " sentence on both phones (R19, review P2-12)",
+        "ios": (IOS_SETTINGS, r'case "Preview on": return "((?:[^"\\]|\\.)*)"'),
+        "android": (AND_DEVICE_SCREEN,
+                    r'\binternal const val LIVE_MODE_PREVIEW_NOTE =\s*"((?:[^"\\]|\\.)*)"'),
+    },
+    {
+        "what": "dossier related-help push title",
+        "kind": "string",
+        "why": "the screen the dossier's Related help pushes to is named 'Help + support' like"
+               " every other route to it, so the screen reader announces one name (R19, review"
+               " P1-5)",
+        "ios": (IOS_HELP_VIEW, r'\.navigationTitle\("(Help [^"]*)"\)'),
+        "android": (AND_DETAIL_SCREEN, r'\binternal const val DOSSIER_HELP_TITLE = "([^"]*)"'),
     },
 )
 
@@ -1115,6 +2038,12 @@ INLINE_LABEL_TABLES = (
     ("inlineCategory", IOS_DEVICE_TYPE, _ios_arm_block("inlineCategory"),
      r'return "([^"]*)"', r"\breturn\b",
      AND_DEVICE_TYPE, _and_arm_block("inlineCategory", "this"), r'->\s*"([^"]*)"', r"->"),
+    # The row-title fallback (decisions U3-d): what a Log row, the Status nearest card and the
+    # dossier headline say when the only name is the bare category. label itself stays the
+    # CSV / GPX type column; Detection.titleName (pinned in SHARED_SHAPES) picks between them.
+    ("titleFallback", IOS_DEVICE_TYPE, _ios_arm_block("titleFallback"),
+     r'return "([^"]*)"', r"\breturn\b",
+     AND_DEVICE_TYPE, _and_arm_block("titleFallback", "this"), r'->\s*"([^"]*)"', r"->"),
     ("Detection.vendor", IOS_COMPONENTS, _ios_arm_block("vendor"),
      r'\breturn\b[^\n]*?"([^"]*)"[ \t]*$', r"\breturn\b",
      AND_DEVICE_TYPE, _and_arm_block(r"Detection\.vendor", "type"),
@@ -1134,9 +2063,10 @@ def check_inline_labels():
     because no transform gets them right. `label.lowercased()` flattened "Flock Raven" to "flock
     raven", and `category.lowercased()` spelled the ALPR initialism "alpr". Hand-written on two
     platforms is exactly the shape that drifts, and all four doc comments already CLAIM
-    byte-identity, so pin the claim. Detection.vendor (the dossier's vendor line per category) and
-    BodyCamSignature.vendor (the maker behind each body-cam signature) are the same shape and are
-    pinned the same way.
+    byte-identity, so pin the claim. Detection.vendor (the dossier's vendor line per category),
+    BodyCamSignature.vendor (the maker behind each body-cam signature) and DeviceType.titleFallback
+    (a row title when the only name is the bare category, "body cam" and "network camera" among
+    the title-case words) are the same shape and are pinned the same way.
 
     NOTE these are display strings only. `category` itself is untouched and remains the key the
     filters, counts, widget rows and drive surface match on; do NOT fold the two together.
@@ -1335,36 +2265,85 @@ _KT_ARM_GAP = r"\s*(?://[^\n]*\s*)*"
 # so a side that deletes either surface has to delete its half of this promise too.
 _FAQ_DESERT_PROMISES = (
     ("the alerts answer still promises an offer, not an automatic restore",
-     re.escape("trackers never beep on the board in any mode, and desert mode drops the board to"
-               " silent while it runs. when you switch desert mode off yourself, your previous"
-               " mode comes back, unless you picked a mode by hand while it was running, silent"
-               " included. when the board ends desert mode on its own, after a factory reset, on"
-               " an older board, or because another paired phone ended it, the app does not change"
-               " your alert mode. if this phone saved a mode on the way into desert mode, it offers"
-               " that one back instead. a restore alerts control appears on the desert card under"
-               " Beacon, and under alerts as well when that section is shown. nothing changes until"
-               " you tap it. the offer waits through app restarts. it moves to the top of the"
-               " Beacon tab whenever board controls are unavailable, and onto the connect screen"
-               " when the app is back to looking for a beacon, so it stays tappable with the"
-               " beacon off or gone.")),
+     re.escape("trackers never beep on the board in any mode, and desert mode sets the board to"
+               " silent while it runs. turning desert mode off yourself restores your previous"
+               " alert mode, unless you picked a mode by hand (including silent) while desert mode"
+               " was running. when the board ends desert mode on its own (after a factory reset,"
+               " on an older board, or because another paired phone ended it), the app doesn't"
+               " change your alert mode. if this phone saved a mode when desert mode started, the"
+               " app offers to restore it: a Restore Alerts control appears on the desert card"
+               " under Beacon, and under alerts when that section is shown. nothing changes until"
+               " you tap it. the offer stays after app restarts. it moves to the top of the Beacon"
+               " tab when board controls are unavailable, and to the connect screen when the app"
+               " is scanning for a beacon again, so you can tap it with the beacon off or not"
+               " connected.")),
     ("the desert-mode answer still promises the same thing",
-     re.escape("desert mode automatically silences the board while it runs. switching it off"
-               " yourself restores your prior alert mode, unless you picked a mode by hand while"
-               " desert mode was running, silent included. if the board ends desert mode on its"
-               " own, your alert mode is left alone, and if this phone saved a mode on the way in,"
-               " a restore alerts control appears on the desert card under Beacon, and under alerts"
-               " as well when that section is shown, so the choice stays yours. the offer waits"
-               " through app restarts. it moves to the top of the Beacon tab whenever board"
-               " controls are unavailable, and onto the connect screen when the app is back to"
-               " looking for a beacon, so it stays tappable with the beacon off or gone.")),
+     re.escape("deduplication, and rate limits still apply. desert mode sets the board to silent"
+               " while it runs. turning desert mode off yourself restores your previous alert"
+               " mode, unless you picked a mode by hand (including silent) while desert mode was"
+               " running. when the board ends desert mode on its own (after a factory reset, on an"
+               " older board, or because another paired phone ended it), the app doesn't change"
+               " your alert mode. if this phone saved a mode when desert mode started, the app"
+               " offers to restore it: a Restore Alerts control appears on the desert card under"
+               " Beacon, and under alerts when that section is shown. nothing changes until you"
+               " tap it. the offer stays after app restarts. it moves to the top of the Beacon tab"
+               " when board controls are unavailable, and to the connect screen when the app is"
+               " scanning for a beacon again, so you can tap it with the beacon off or not"
+               " connected.")),
 )
+
+# The checklist's state sentences both phones draw byte for byte (decisions U2-a), for the
+# "checklist state sentences" rule below. Written ONCE here and turned into one quoted-literal
+# needle per side with re.escape, so each side has to carry the same bytes: a sentence reworded on
+# one phone fails that phone's needle. The platform-specific arms are pinned per side in the rule.
+# The two that name the board are TEMPLATES (decisions R14); the rule also pins that each side
+# renders every {noun} sentence with the checklist's kind, never draws it raw.
+_CHECKLIST_SHARED_SENTENCES = (
+    "optional; not decided yet",
+    "off until you choose categories under Beacon",
+    "active on supported system surfaces",
+    "off by choice; change it later under Beacon",
+    "ready to start with this {noun}",
+    "on; the {noun} retains hits while this phone is away",
+    "off; turn it on under Beacon if you want away-time hits retained",
+)
+# Shared sentences with the PLATFORM WORD as their one hole ("iOS" / "Android"), each needle
+# built from the template with that side's word filled in, so the rest is still one set of bytes.
+_CHECKLIST_BLOCKED_TEMPLATE = (" chosen, but {} is blocking them; turn notifications on for"
+                               " beacons in Settings")
+_NOTIFY_EXPLAINER_SAMPLE = ("Preview which categories you could enable. Nothing is saved and {}"
+                            " won't ask permission.")
+_NOTIFY_EXPLAINER_REAL = ("Pick what's worth a notification. Every category is off until you turn"
+                          " it on, and {} asks permission the first time you do.")
+
+# The Beacon tab's one-line group intros (decisions R13, 2.0.8's "BEACON HARDWARE" block), which
+# both apps draw byte for byte under a group's header. Written ONCE here, as the checklist
+# sentences above are, so a sentence reworded on one app fails that app's needle. Each pair is the
+# full line and its short variant: the ON THE BOARD line without "alerts" on a mesh board (no
+# buzzer, so no Alerts row), the help line without "setup checks" in the sample tour (no System
+# readiness row). The notifications line has the device word as its one hole: iOS fills it with
+# thisDeviceName ("iPhone" / "iPad"), Android with deviceWord ("phone" / "tablet"), the same hole
+# the hardware note's "This ...'s preferences remain available." already has.
+_BEACON_INTRO_SCAN = "radios, detectors, desert mode, and the offline buffer."
+_BEACON_INTRO_BOARD = ("alerts, the board light, firmware, and managed devices.",
+                       "the board light, firmware, and managed devices.")
+_BEACON_INTRO_NOTIFY_TEMPLATE = "notifications, Live Mode, and display for this {}."
+_BEACON_INTRO_HELP = ("setup checks, help, support, and about this app.",
+                      "help, support, and about this app.")
+
+
+def _quoted(sentence):
+    """A needle for `sentence` written as one whole string literal, quotes included."""
+    return '"' + re.escape(sentence) + '"'
+
 
 SHARED_SHAPES = (
     {
         "what": "kicker captions may always wrap (neither side hugs its ideal width)",
         "why": "a kicker is drawn inside rows that cannot refuse an oversized child, and several"
                " are fed RUNTIME strings: the Beacon tab's Scan radios row prints"
-               " radioPresentation.scanLabel, 14-25 chars in every steady state but 39 while a"
+               " radioPresentation.scanLabel (sampleRadiosRowValue in the tour, P3-8), 14-25 chars"
+               " in every steady state but 39 while a"
                " firmware update runs and 39 again while the link is reconnecting. iOS hugged its"
                " ideal width and the whole Beacon page went wider than the screen mid-update,"
                " clipped on BOTH edges, because the .frame(maxWidth: .infinity) above it CENTERS"
@@ -1461,9 +2440,15 @@ SHARED_SHAPES = (
               ("silent means Silent, not Vibrate", r"alertsSilent: ble\.alertMode == \.silent\b"),
               ("mesh-detect is excluded", r"isMeshDetect: ble\.status\?\.isMeshDetect == true"),
               ("the pinned string is what it draws", r"Text\(desertSilenceNotice\)"),
-              # The premise of the narrowing: the row the copy sends the user to.
+              # The premise of the narrowing: the row the copy sends the user to. The Beacon list
+              # is presenter-driven (beaconRows, one call per file), so the gate is pinned in two
+              # halves: the fact the caller hands over, and the line that drops the row. A caller
+              # that hard-codes `meshBoard: false`, or a presenter that appends Alerts
+              # unconditionally, fails one of them.
+              ("and the Beacon presenter is handed the mesh fact",
+               r"meshBoard: ble\.status\?\.isMeshDetect == true\b"),
               ("and the Alerts row it points at is mesh-gated",
-               r"if ble\.status\?\.isMeshDetect != true \{"))),
+               r"if !meshBoard \{ rows\.append\(\.alerts\) \}"))),
             ("Android Desert card", AND_DEVICE_SCREEN, None,
              (("saw-Desert reads the run flag", r"sawDesertOn = desertRanThisRun\b"),
               ("desert reads the card's own toggle", r"desertOn = desertOn\b"),
@@ -1471,8 +2456,14 @@ SHARED_SHAPES = (
                r"alertsSilent = shownAlertMode == AlertMode\.SILENT\b"),
               ("mesh-detect is excluded", r"isMeshDetect = status\?\.isMeshDetect == true"),
               ("the pinned string is what it draws", r"Text\(DESERT_SILENCE_NOTICE,"),
+              ("and the Beacon presenter is handed the mesh fact",
+               r"meshBoard = status\?\.isMeshDetect == true\b"),
+              # The row lists are memoised; the mesh fact is a key, so a board that turns out to
+              # be mesh-detect after the first frame drops its Alerts row on the next pass.
+              ("and the row memo re-runs when that fact changes",
+               r"remember\(status\?\.isMeshDetect == true, showBanner, demo,"),
               ("and the Alerts row it points at is mesh-gated",
-               r"if \(status\?\.isMeshDetect != true\) \{"))),
+               r"if \(!meshBoard\) add\(BeaconRowId\.ALERTS\)"))),
             ("iOS run flag", IOS_BLE_MANAGER, None,
              (("in-memory, starts false",
                r"@Published private\(set\) var desertRanThisRun = false"),
@@ -1614,7 +2605,11 @@ SHARED_SHAPES = (
             #
             # THE PANEL SURFACES ARE PINNED BY POSITION, not only by existence. They are the same
             # card (AlertRestorePanel) and it LEADS its page on both platforms: the Beacon screen's
-            # copy above the stats, the connect screen's copy above the setup and scan panels. iOS
+            # copy above the cross-cutting banners at both widths, then the Board / This phone
+            # control in compact width (Route A C13; it was above the stats) or the hero and the
+            # two columns in regular width (the final-review order, which is Android's twoCol
+            # order too), the connect screen's copy above the setup and scan
+            # panels. iOS
             # used to draw its copy after the stats grid, hanging off the board-unavailable notice,
             # while Android led its slot list with it - the same silence reported in two different
             # places. The needles below span the neighbour each one leads, so a copy that slides
@@ -1647,14 +2642,27 @@ SHARED_SHAPES = (
               # The board gate and the collapsed row, the two ways the offer went missing at a
               # glance. iOS disables the whole hardware panel as ONE unit and a SwiftUI disable
               # cannot be opted out of by a child, so this copy has to live outside that panel.
-              ("a copy LEADS the compact page while the board is away, above the stats",
+              ("a copy LEADS the compact page while the board is away, above the cross-cutting"
+               " banners",
                r"if desertRestoreNeedsDetachedSurface\(restoreOffered: alertRestoreOffered,\n"
                r"\s*boardControlsAvailable: hardwareControlsEnabled\) \{\n"
-               r"\s*AlertRestorePanel\(\)\n\s*\}\n\s*statsGrid"),
-              ("and leads the regular-width page too, above the two-column split",
-               r"if desertRestoreNeedsDetachedSurface\(\n\s*restoreOffered: alertRestoreOffered,\n"
+               r"\s*AlertRestorePanel\(\)\n\s*\}\n\s*crossCuttingBanners"),
+              # The regular-width twin is pinned from the page's own stack down to the split: the
+              # gate is the FIRST child of that stack (only comment lines before it), then the
+              # banners, the hero and the two columns in that order, which is Android's twoCol
+              # order behind its own leading panel. A panel that slides below the banners or the
+              # hero fails here, and so does anything new drawn above it. The hero is a bare
+              # rowView since decisions R13: it draws its own crimson-edged card (BeaconCard), so
+              # it no longer rides a .groupedCell() the way the plain Route A cell did.
+              ("and leads the regular-width page too, above the banners, the hero and the"
+               " two-column split",
+               r"ScrollView \{\n\s*VStack\(alignment: \.leading, spacing: 16\) \{\n"
+               r"(?:\s*//[^\n]*\n)*"
+               r"\s*if desertRestoreNeedsDetachedSurface\(\n\s*restoreOffered: alertRestoreOffered,\n"
                r"\s*boardControlsAvailable: hardwareControlsEnabled\) \{\n"
-               r"\s*AlertRestorePanel\(\)\n\s*\}\n\s*HStack\(alignment: \.top, spacing: 14\) \{"),
+               r"\s*AlertRestorePanel\(\)\n\s*\}\n\s*crossCuttingBanners\n"
+               r"\s*rowView\(\.hero\)\n"
+               r"\s*HStack\(alignment: \.top, spacing: 14\) \{", 1),
               # The screen under all of them. Its gate is the negation of the one that draws the tab
               # shell, so this surface and the three above can never draw together, and with no
               # session at all it is the ONLY one of the four on the phone. ONE screen reads it
@@ -1785,6 +2793,64 @@ SHARED_SHAPES = (
             ("bundled FAQ (Android copy)", AND_FAQ, None, _FAQ_DESERT_PROMISES),
         ),
     },
+    # Decisions R15 (2026-09-26), the owner's middle ground for the startup screen: the passive
+    # idea was said at the top AND the bottom, so it is now said once, in the scope footnote; and
+    # the "already paired to another phone?" note left the idle screen for the connection-failure
+    # panel. The words are compared in SHARED_CONSTANTS ("connect scope footnote", "connect failure
+    # pair-window note"); this holds WHERE they are drawn.
+    {
+        "what": "connect screen says passive once, and the pair-window note only after a failure",
+        "why": "the owner asked for the passive statement once per screen (R15); a second passive"
+               " sentence, or the pair-window note back on the idle screen, is the busier screen"
+               " the owner turned down",
+        "sides": (
+            # A string literal (not a comment line) that says passive / jams / spoofs /
+            # interferes, any case: exactly the footnote's one declaration.
+            ("iOS connect screen", IOS_CONNECT_VIEW, None,
+             (("one passive statement, the scope footnote",
+               r'^(?!\s*(?://|\*|/\*))[^\n]*"[^"\n]*(?i:passive|jams?\b|spoofs?\b|interferes)[^"\n]*"'),
+              ("the pair-window note is drawn from one call site", r"\bpairWindowNote\(kind\)"))),
+            ("iOS failure panel", IOS_CONNECT_VIEW,
+             r"private func connectionFailurePanel\(.*?\n    \}",
+             (("and that call site is the connection-failure panel", r"\bpairWindowNote\(kind\)"),)),
+            ("Android connect screen", AND_ACAB_APP, None,
+             (("one passive statement, the scope footnote",
+               r'^(?!\s*(?://|\*|/\*))[^\n]*"[^"\n]*(?i:passive|jams?\b|spoofs?\b|interferes)[^"\n]*"'),
+              ("the pair-window note is drawn from one call site", r"\bPairWindowNote\(kind\)"))),
+            ("Android failure panel", AND_ACAB_APP,
+             r"private fun ConnectionHintPanel\(.*?\n\}",
+             (("and that call site is the connection-failure panel", r"\bPairWindowNote\(kind\)"),)),
+        ),
+    },
+    # The row above holds WHERE the note is drawn; this one holds WHEN. Both panels ask the same
+    # predicate of the hint's stage, and each suite pins it (iOS
+    # OnboardingPolicyTests.testPairWindowNoteShowsOnlyForLinkAndPairingStages, Android
+    # OnboardingRecoveryPolicyTest.pairWindowNoteShowsOnlyForLinkAndPairingStages), but a stage
+    # flipped on one phone together with that phone's test would keep both suites green. The
+    # switch is exhaustive on each side, so a new stage cannot compile without an arm; the arm
+    # count below stops a third arm from splitting a stage off without this row noticing.
+    {
+        "what": "pair-window note stages (LINK and PAIRING show it, PROFILE and SECURE_SETUP do not)",
+        "why": "the note tells the user to power-cycle for a second phone's pairing window; under a"
+               " wrong-profile or secure-setup failure it sends them to do that for nothing, and"
+               " missing under a link or pairing failure it hides the one recovery that works",
+        "sides": (
+            ("iOS", IOS_BLE_MANAGER,
+             r"(func showsPairWindowNote\(for stage: ConnectFailureStage\) -> Bool \{.*?\n\})",
+             (("link and pairing show the note", r"^\s*case \.link, \.pairing:\n\s*return true$"),
+              ("profile and secure setup do not",
+               r"^\s*case \.profile, \.secureSetup:\n\s*return false$"),
+              ("no other arm", r"^\s*(?:case\b|default:)", 2))),
+            ("Android", AND_BLE_MANAGER,
+             r"(internal fun showsPairWindowNote\(stage: ConnectFailureStage\): Boolean ="
+             r" when \(stage\) \{.*?\n\})",
+             (("LINK and PAIRING show the note",
+               r"^\s*ConnectFailureStage\.LINK, ConnectFailureStage\.PAIRING -> true$"),
+              ("PROFILE and SECURE_SETUP do not",
+               r"^\s*ConnectFailureStage\.PROFILE, ConnectFailureStage\.SECURE_SETUP -> false$"),
+              ("no other arm", r"->", 2))),
+        ),
+    },
     {
         "what": "Log seed positions one axis and resets the rest",
         # NOT the no-match panel: it renders only when the shown list is empty (iOS draws it under
@@ -1802,6 +2868,9 @@ SHARED_SHAPES = (
               ("scope axis", r"\bscope = newScope\b"),
               ("sort back to newest", r"\bsortOrder = \.newest\b"),
               ("search cleared", r'\bsearchText = ""'),
+              # The offline filter is a lens axis of its own since C10 (the tune menu), so a
+              # seed that kept it would show a category's replayed rows only.
+              ("offline filter cleared", r"\bofflineOnly = false\b"),
               ("paused feed resumed", r"\bresumeFeed\(\)"),
               # A seed ends select mode and closes the dossier for the same reason it clears the
               # search: what the last visit left behind now points at rows the user never picked.
@@ -1814,6 +2883,9 @@ SHARED_SHAPES = (
             ("Android LogScreen defaults", AND_LOG_SCREEN, None,
              (("category axis seeds from the filter",
                r"mutableStateOf\(\(initialFilter as\? LogFilter\.Category\)\?\.key\)"),
+              ("offline filter seeds from the filter",
+               r"var offlineOnly by rememberSaveable \{ mutableStateOf\(initialFilter is"
+               r" LogFilter\.OfflineOnly\) \}"),
               ("search starts empty",
                r'var searchQuery by rememberSaveable \{ mutableStateOf\(""\) \}'),
               ("sort starts at Newest",
@@ -1833,6 +2905,48 @@ SHARED_SHAPES = (
              (("re-keys LogScreen", r"\blogScreenKey\+\+"),
               ("resumes a paused feed", r"\blogPauseVm\.resume\(\)"),
               ("closes the dossier", r"setSelected\(null\)"))),
+        ),
+    },
+    {
+        "what": "Log Active segment draws no time-section header (all and new keep the three)",
+        # Owner decision L6 (2026-09-24): every row under Active was heard in the last 45 s, so a
+        # "heard in the last 45 s" header only repeats the segment. Both pure builders return ONE
+        # untitled section for Active, first thing, before any per-row work; both lists skip the
+        # header for an untitled section; and both memos key on the scope, because two segments
+        # can cut EQUAL lists (sample data, where every row is active) and only the scope then
+        # says whether the untitled arm applies. Each suite pins the builder with its own frames
+        # (DetectionLogLensTests / LogExportLensTest); this rule is the half neither suite sees:
+        # that the scope still reaches the builder and that the list still honours a nil title.
+        "why": "the Log reads the same on both phones: an Active segment with no header, All and"
+               " New with 'heard in the last 45 s', 'earlier today' and 'older'. A phone that"
+               " drops the scope from the builder or its memo draws the redundant header again,"
+               " and one that draws a header for an untitled section draws an empty one",
+        "sides": (
+            ("iOS builder", IOS_DETECTIONS_VIEW, None,
+             (("Active returns one untitled section, before any per-row work",
+               r"calendar: Calendar\) -> \[LogSection\] \{\n"
+               r"\s*if scope == \.active \{ return shown\.isEmpty \? \[\] :"
+               r" \[LogSection\(title: nil, rows: shown\)\] \}"),
+              ("the one call hands it the segment",
+               r"logSections\(shown, scope: scope, activeIDs: activeIDs,"),
+              ("and the memo re-runs when the segment changes",
+               r"let key = SectionsKey\(lens: lensGeneration, feed: feedGeneration, k: k,"
+               r" scope: scope,"),
+              ("an untitled section draws no header",
+               r"\} header: \{\n\s*if let title = section\.title \{\n"
+               r"\s*Kicker\(title\)"))),
+            ("Android builder", AND_LOG_SCREEN, None,
+             (("Active returns one untitled section, before any per-row work",
+               r"zone: ZoneId,\n\): List<LogSection> \{\n"
+               r"\s*if \(scope == LogScope\.Active\) return if \(shown\.isEmpty\(\)\) emptyList\(\)"
+               r" else listOf\(LogSection\(null, shown\)\)"),
+              ("the one call hands it the segment",
+               r"logSections\(shown, scope, activeIds,"),
+              ("and the memo re-runs when the segment changes",
+               r"val sections = remember\(shown, scope, activeIds,"),
+              ("an untitled section draws no header",
+               r"val title = section\.title\n\s*if \(title != null\) \{\n"
+               r"\s*stickyHeader\("))),
         ),
     },
     {
@@ -1983,6 +3097,10 @@ SHARED_SHAPES = (
                r'bleFault -> "RADIO FAULT"\s*\n\s*else -> "CONNECTED"'),)),
             ("Android Status header", AND_STATUS_SCREEN, None,
              (("the header computes the pill with it", r"val linkStateLabel = statusLinkChipLabel\("),
+              # Two hops from the presenter to the pill: the top bar is handed the word, and
+              # the chip draws it. `linkStateLabel = null` at the first hop compiles (the
+              # parameter is nullable) and blanks the pill.
+              ("the top bar is handed that word", r"\blinkStateLabel = linkStateLabel\b"),
               ("the header draws that word", r"\bstateLabel = linkStateLabel\b"),
               # Both presenters can only rank a fact they are GIVEN, and both take it as a named
               # argument, so `rebootingForUpdate = false` at either call site compiles, keeps every
@@ -2049,7 +3167,9 @@ SHARED_SHAPES = (
                r'case \(false, false\) where bluetoothFault:\s*return BeaconRadioPresentation\(\s*'
                r'connectionLabel: "CONNECTED · RADIO FAULT"'))),
             ("iOS pill words", IOS_BEACON_PRESENTATION, r"var chipLabel: String \{(.*?)\n    \}",
-             (("sample mode", r'case "SAMPLE DATA":\s*return "DEMO"'),
+             # The sample word is LinkChip.sampleLabel, whose literal the constants row "sample
+             # link pill word" compares with Android's linkChipAppearance arm.
+             (("sample mode", r'case "SAMPLE DATA":\s*return LinkChip\.sampleLabel\s*$'),
               ("reconnect", r'case "RECONNECTING":\s*return "RECONNECTING"'),
               ("first frame", r'case "CONNECTED · WAITING FOR STATUS":\s*return "WAITING"'),
               ("either update label",
@@ -2069,10 +3189,16 @@ SHARED_SHAPES = (
                r"isRebootingForUpdate: ble\.isRebootingForUpdate\)"),)),
             # The Android twin of the side above, and the fourth surface that ranks this fact. TWO
             # presenters on this one tab take it: beaconConnectionPresentation feeds the header
-            # kicker and the hero, beaconRadioStatusLabel feeds the Scan radios row. Both take it
+            # kicker and the hero, beaconRadioStatusLabel feeds the Scan radios row (in sample data
+            # its demo arm prints the live arm's words, P3-8, pinned by the constants row "Scan
+            # radios row value in sample data"). Both take it
             # as a named Boolean with a default, so `rebootingForUpdate = false` at either call
             # site compiles and drops the arm on that surface alone, leaving this tab reading
-            # CONNECTED · WAITING FOR BOARD STATUS through a reboot the iPhone names. Hence 2.
+            # CONNECTED · WAITING FOR BOARD STATUS through a reboot the iPhone names. Since Route
+            # A the tab also draws the Status pill (C7), from statusLinkChipLabel with the frame
+            # gate written inline; since decisions R13 that pill sits in the hero's footer, as on
+            # iOS, rather than in the top bar, so the tab still draws ONE pill and the count is 3; a statusScanPresentation call
+            # on this tab would make it 4 and is not allowed (contracts 11.3 S8).
             # Those two counts say the fact ARRIVES, not that anything ranks it. Nothing else
             # holds beaconConnectionPresentation's reboot arm: every call to it under
             # android/app/src/test passes four positional arguments or names only demo,
@@ -2083,8 +3209,11 @@ SHARED_SHAPES = (
             # needle pins the arm as written and in its slot above the missing-frame arm, which is
             # where beaconRadioStatusLabel and statusScanPresentation rank the same fact.
             ("Android Beacon tab header", AND_DEVICE_SCREEN, None,
-             (("both presenters on the tab are handed the update reboot",
-               r"rebootingForUpdate = rebootingForUpdate,", 2),
+             (("both presenters and the hero's link pill on the tab are handed the update reboot",
+               r"rebootingForUpdate = rebootingForUpdate,", 3),
+              ("the pill is the shared presenter's word",
+               r"val beaconLinkStateLabel = statusLinkChipLabel\("),
+              ("and the scan presenter is not called here", r"statusScanPresentation\(", 0),
               ("and the fact is the OTA engine's own reboot window",
                r"ble\.otaProgress\.map \{ otaPhaseIsUpdateReboot\(it\.phase\) \}"),
               ("the tab's own reboot arm, above the missing frame",
@@ -2108,6 +3237,37 @@ SHARED_SHAPES = (
              r'(val radarContentDescription: String\s*\n\s*get\(\) = .*?not direction\.")',
              (("device, devices", r'device\$\{if \(total == 1\) "" else "s"\} nearby'),
               ("dot, dots", r'dot\$\{if \(dots\.size == 1\) "" else "s"\} drawn'))),
+        ),
+    },
+    # The Status radar's size (decisions R12): the owner cut it by a quarter on 2026-09-25. Two
+    # numbers and a min, which no one-literal row carries, and iOS writes them as CGFloat statics
+    # while Android writes a Float and a Dp, so each side pins its own spelling of the same rule.
+    {
+        "what": "status radar side is 0.75 of the column, capped at 315 (pt / dp)",
+        "why": "the owner asked for the radar about 25% smaller so the caption, the motto and more"
+               " of the strip reach the first screen; a different fraction or cap on one phone"
+               " draws a different-sized instrument, and a side that stops using the rule (or a"
+               " Status screen that stops calling it) brings the whole-column radar back",
+        "sides": (
+            ("iOS RadarSideLayout", IOS_COMPONENTS,
+             r"\nstruct RadarSideLayout: Layout \{(.*?)\n\}",
+             (("the fraction", r"^    static let fraction: CGFloat = 0\.75$"),
+              ("the cap", r"^    static let cap: CGFloat = 315$"),
+              ("side = min(column x fraction, cap)",
+               r"return max\(0, min\(width \* fraction, cap\)\)"),
+              ("the subview is proposed that square",
+               r"proposal: ProposedViewSize\(width: side, height: side\)"))),
+            ("iOS Status", IOS_DASHBOARD_VIEW, None,
+             (("the radar sits in RadarSideLayout",
+               r"^\s*RadarSideLayout \{\n\s*RadarScope\(count: snapshot\.total,"),)),
+            ("Android", AND_STATUS_SCREEN, None,
+             (("the fraction", r"^internal const val STATUS_RADAR_SIDE_FRACTION = 0\.75f$"),
+              ("the cap", r"^internal val STATUS_RADAR_MAX_SIDE: Dp = 315\.dp$"),
+              ("side = min(column x fraction, cap)",
+               r"minOf\(column \* STATUS_RADAR_SIDE_FRACTION, STATUS_RADAR_MAX_SIDE\)"),
+              ("the Status radar is handed that side", r"side = statusRadarSide\(maxWidth\)\)"),
+              ("RadarScope draws a square that side wide",
+               r"^\s*\.width\(side\)\n\s*\.aspectRatio\(1f\)$"))),
         ),
     },
     {
@@ -2146,6 +3306,32 @@ SHARED_SHAPES = (
             ("Android draw loop", AND_MAP_PROJECTION, r"internal fun orderSameSpotMembers\((.*?)\n\n",
              (("a stable sort keeps arrival order on a tie",
                r"members\.sortedWith\(sameSpotOrder\(\{ it\.type \}, \{ lastSeenOf\(it\.id\) \}\)\)"),)),
+        ),
+    },
+    {
+        "what": "main-Map breadcrumb trails are OFF by default (a stored choice still wins)",
+        # Owner decision B1 (2026-09-24). Each side pins the default where it is declared, the one
+        # read of the stored preference that falls back to it, and the key, so a second read with
+        # its own literal default, or a renamed key that silently resets every user's choice,
+        # fails here. Collection is not part of this rule and is unchanged: the dossier still
+        # draws a tracker's trail whatever this toggle says. Each suite pins its own constant
+        # (MapPinRulesTests / MapProjectionTest); this is the half that compares the two.
+        "why": "a user's own or a family member's tag (a Tile, a Samsung tag, a partner's AirTag)"
+               " rides along all day, and a default-on trail draws it across the main Map as if"
+               " it were following them. A phone that defaults it on again draws that on one"
+               " platform only, and the FAQ can describe one default",
+        "sides": (
+            ("iOS Map", IOS_MAP_TAB, None,
+             (("the default is off", r"static let showBreadcrumbsDefault = false\b"),
+              ("the stored choice falls back to that default",
+               r'@AppStorage\("map\.showBreadcrumbs"\) private var showBreadcrumbs ='
+               r" MapTabView\.showBreadcrumbsDefault\b"),
+              ("and nothing else reads the key", r'"map\.showBreadcrumbs"'))),
+            ("Android Map", AND_MAP_SCREEN, None,
+             (("the default is off", r"internal const val MAP_SHOW_BREADCRUMBS_DEFAULT = false\b"),
+              ("the stored choice falls back to that default",
+               r'mapPrefs\.getBoolean\("show_breadcrumbs", MAP_SHOW_BREADCRUMBS_DEFAULT\)'),
+              ("and nothing else reads the key", r'getBoolean\("show_breadcrumbs"'))),
         ),
     },
     {
@@ -2237,38 +3423,39 @@ SHARED_SHAPES = (
         ),
     },
     {
-        "what": "dossier shape (one panel order; COPY MAC outside Technical details; the capture"
+        "what": "dossier shape (one panel order; Copy MAC outside Technical details; the capture"
                 " note closes MATCH QUALITY)",
-        "why": "docs/app-guide.md names dossier panels by where they sit (Related help and the"
-               " map near the top, Technical details further down), so a panel that moves on one"
-               " phone makes that sentence false on the other. COPY MAC ADDRESS is the sharp one:"
-               " an address is what gets handed to a reporter or a records request, so it may not"
-               " sit behind a collapsed section on either phone",
-        # iOS owns the order (its body carries the canonical list and says so), so its needles pin
-        # the sequence and the Android ones pin that the three panels settled on 2026-09-11 stayed
-        # where they were put: COPY MAC out of the disclosure, CONFIRM IT after the stat grid, and
-        # the firmware's capture note folded into MATCH QUALITY with its own panel deleted.
+        "why": "docs/app-guide.md names dossier panels by where they sit, and the order is one"
+               " order on both phones: Watch and Mute at the top with the match caveats right"
+               " under them, Related help and Technical details closing the page, Copy MAC"
+               " Address the last control. A panel that moves on one phone makes that sentence"
+               " false on the other. Copy MAC Address is the sharp one: an address is what gets"
+               " handed to a reporter or a records request, so it may not sit behind a collapsed"
+               " section on either phone",
+        # ONE ORDER, both sides pinned joint by joint (Route A C12, contracts 6.1): the hero, Watch
+        # and Mute with any mute rule's rows, MATCH QUALITY, the experimental note, CONFIRM IT,
+        # SIGNAL, the sightings row, the map, Seen with you, Related help, Technical details, then
+        # Copy MAC Address last and outside the disclosure. iOS still carries the canonical list in
+        # its body; the Android needles pin the same joints in the same sequence, so each joint
+        # is held on both phones. The firmware's capture note stays folded into MATCH QUALITY.
         "sides": (
             ("iOS body", IOS_DETECTION_DETAIL, r"var body: some View \{(.*?)\n    \}",
-             (# This span runs THROUGH the Related help joint on purpose. The three spans used to
-              # stop at relatedHelpPanel and pick up again at the location panel, which left that
-              # one seam unpinned on the side this rule calls canonical, and the seam is where a
-              # new panel naturally lands: directly under the help block and above the map. The
-              # Android twin needle ("Related help, then location") already covers the same joint.
-              ("match quality, the experimental note, Related help, then location",
+             (("the hero, Watch and Mute, then match quality",
+               r"titleBlock" + _KT_ARM_GAP + r"primaryActions" + _KT_ARM_GAP + r"matchQualityPanel"),
+              ("match quality, the experimental note, CONFIRM IT, then signal",
                r"matchQualityPanel" + _KT_ARM_GAP
                + r"if d\.type\.isExperimental \{ experimentalNote \}" + _KT_ARM_GAP
-               + r"relatedHelpPanel" + _KT_ARM_GAP
-               + r"if let coord = mapCoordinate \{ locationPanel\(coord\) \}"),
-              ("location, follow, signal, then the stat grid",
-               r"if let coord = mapCoordinate \{ locationPanel\(coord\) \}" + _KT_ARM_GAP
-               + r"followPanel" + _KT_ARM_GAP + r"signalPanel" + _KT_ARM_GAP + r"statGrid"),
-              ("CONFIRM IT after the stat grid, then Technical details, then COPY MAC last",
-               r"statGrid" + _KT_ARM_GAP + r"if showConfirmIt \{ confirmItPanel \}" + _KT_ARM_GAP
+               + r"if showConfirmIt \{ confirmItPanel \}" + _KT_ARM_GAP + r"signalPanel"),
+              ("signal, the stat grid, location, then follow",
+               r"signalPanel" + _KT_ARM_GAP + r"statGrid" + _KT_ARM_GAP
+               + r"if let coord = mapCoordinate \{ locationPanel\(coord\) \}" + _KT_ARM_GAP
+               + r"followPanel"),
+              ("follow, Related help, Technical details, then Copy MAC last",
+               r"followPanel" + _KT_ARM_GAP + r"relatedHelpPanel" + _KT_ARM_GAP
                + r"identityDisclosure" + _KT_ARM_GAP + r"copyButton"))),
             ("iOS Technical details", IOS_DETECTION_DETAIL,
              r"private var identityDisclosure: some View \{(.*?)\n    \}",
-             (("COPY MAC is not inside the disclosure", r"copyButton", 0),)),
+             (("Copy MAC is not inside the disclosure", r"copyButton", 0),)),
             ("iOS match quality", IOS_DETECTION_DETAIL,
              r"private var matchQualityPanel: some View \{(.*?)\n    \}",
              (("the panel's kicker", r'Kicker\("MATCH QUALITY"\)'),
@@ -2285,41 +3472,51 @@ SHARED_SHAPES = (
             # separated by real code rather than comments: the span may cross anything EXCEPT
             # another panel call, so a panel inserted between the two named ones fails here.
             ("Android body", AND_DETAIL_SCREEN, None,
-             (("match quality, the experimental note, then Related help",
+             (# The mute rule's rows close the Watch and Mute child, so this span is the joint
+              # between the decisions and what the match rests on.
+              ("Watch and Mute, then match quality",
+               r"muteRule\?\.let \{ rule ->\s*\n\s*MutedStateRows\("
+               r"(?:(?!Panel\()[\s\S])*?MatchQualityPanel\(d\)"),
+              ("match quality, the experimental note, then CONFIRM IT",
                r"MatchQualityPanel\(d\)" + _KT_ARM_GAP
                + r"if \(d\.type\.isExperimental\) ExperimentalNote\(d\.type\)" + _KT_ARM_GAP
-               + r"RelatedHelpPanel\(d\)"),
-              ("Related help, then location",
-               r"RelatedHelpPanel\(d\)(?:(?!Panel\()[\s\S])*?LocationPanel\(d, lat, lon"),
-              ("location, then follow",
-               r"LocationPanel\(d, lat, lon, breadcrumbTrail, onOpenInMap\)\s*\n\s*\}\s*\n\s*"
-               r"if \(d\.type == DeviceType\.TRACKER\) FollowEvidencePanel\("),
-              # The kicker literal in the middle is what makes this needle's NAME true. Android's
-              # signal section is an inline Column, not a `*Panel(` call, so the panel-gap span
-              # alone said only that no OTHER panel sits between follow and the stat grid: with
-              # the whole signal block deleted, kicker, RSSI number, band and history graph, it
-              # still matched. The kicker is that section's own first line, so it binds the slot.
-              ("follow and the signal panel, then the stat grid",
-               r"FollowEvidencePanel\(d\.id, d\.type, ble, timeBasis\)"
-               r"(?:(?!Panel\()[\s\S])*?"
-               r'Kicker\(if \(stale\) "SIGNAL · STALE" else "SIGNAL · LIVE"'
+               + r"if \(d\.isOuiMatch \|\| d\.confidence < 50\) \{\s*\n\s*ConfirmItPanel\("),
+              # The signal header's word in the middle is what makes this needle's NAME true.
+              # Android's signal section is an inline Column, not a `*Panel(` call, so the panel-gap
+              # span alone would say only that no OTHER panel sits between CONFIRM IT and the stat
+              # grid: with the whole signal block deleted it would still match. The header's
+              # SAMPLE / STALE / LIVE word (dossierSignalWord, computed then drawn) is that
+              # section's own header, so it binds the slot.
+              ("CONFIRM IT, the signal section, then the stat grid",
+               r"ConfirmItPanel\((?:(?!Panel\()[\s\S])*?"
+               r"val signalWord = dossierSignalWord\(demo = demo, stale = stale\)"
+               r"(?:(?!Panel\()[\s\S])*?Text\(signalWord,"
                r"(?:(?!Panel\()[\s\S])*?StatGrid\("),
-              ("CONFIRM IT after the stat grid",
-               r"StatGrid\((?:(?!Panel\()[\s\S])*?ConfirmItPanel\("),
-              ("then Technical details",
-               r"ConfirmItPanel\((?:(?!Panel\()[\s\S])*?DisclosureSection\(\s*"
+              ("the stat grid, then location",
+               r"StatGrid\((?:(?!Panel\()[\s\S])*?LocationPanel\(d, lat, lon"),
+              ("location, then follow",
+               r"LocationPanel\(d, lat, lon, breadcrumbTrail, onOpenInMap,"
+               r" headerStacked = actionsStacked\)\s*\n\s*\}\s*\n\s*"
+               r"if \(d\.type == DeviceType\.TRACKER\) FollowEvidencePanel\("),
+              ("follow, then Related help",
+               r"FollowEvidencePanel\(d\.id, d\.type, ble, timeBasis\)"
+               r"(?:(?!Panel\()[\s\S])*?RelatedHelpPanel\(d\)"),
+              ("Related help, then Technical details",
+               r"RelatedHelpPanel\(d\)(?:(?!Panel\()[\s\S])*?DisclosureSection\(\s*"
                r'title = "Technical details"'),
-              ("and COPY MAC last, after the disclosure closes",
+              ("and Copy MAC last, after the disclosure closes",
                r"\n            \}" + _KT_ARM_GAP + r"CopyMacButton\(d\.mac\)"),
               ("the separate capture-note panel is gone", r"FirmwareDetailNote", 0))),
             ("Android Technical details", AND_DETAIL_SCREEN,
              r'DisclosureSection\(\s*title = "Technical details",(.*?)\n            \}',
-             (("COPY MAC is not inside the disclosure", r"CopyMacButton", 0),
+             (("Copy MAC is not inside the disclosure", r"CopyMacButton", 0),
               ("the capture note renders again as the Detail row",
                r'd\.detail\?\.takeIf \{ it\.isNotEmpty\(\) \}\?\.let \{ add\("Detail" to it\) \}'))),
             ("Android match quality", AND_DETAIL_SCREEN,
              r"private fun MatchQualityPanel\(d: Detection\) \{(.*?)\n\}",
-             (("the panel's kicker", r'Kicker\("MATCH QUALITY"\)'),
+             (# Exact, with no trailing argument: the M3 section label, as on every other flat
+              # section of this screen.
+              ("the panel's kicker", r'SectionLabel\("MATCH QUALITY"\)'),
               ("closes with the capture note verbatim",
                r"d\.detail\?\.takeIf \{ it\.isNotEmpty\(\) \}\?\.let \{\s*\n\s*"
                r"Text\(it, color = Acab\.text"),
@@ -2342,19 +3539,827 @@ SHARED_SHAPES = (
              # mounted to take the handoff, would keep drawing the dashed trail over the thumbnail
              # with nothing saying it is the phone's own path.
              (("the caption sits under the thumbnail",
-               r"\} else \{\s*\n\s*mapThumbnail\(coord\)[\s\S]*?"
-               r"lineWidth: 1\)\)\s*\n\s*\}\s*\n\s*"
+               r"\} else \{\s*\n\s*mapThumbnail\(coord\)[\s\S]*?\n\s*\}\s*\n\s*"
                r'if hasTrackerTrail \{\s*\n\s*Label\("Phone breadcrumb trail'),
               ("and it renders once", r'"Phone breadcrumb trail · this session"'))),
             ("Android breadcrumb caption", AND_DETAIL_SCREEN,
              r"private fun LocationPanel\((.*?)\n\}",
-             # OPEN IN MAP is the pill inside the same Box as the AndroidView, so a span from it to
+             # Open in Map is the pill inside the same Box as the AndroidView, so a span from it to
              # the caption's trail gate crosses the whole thumbnail and fails if the caption moves
              # above it.
              (("the caption sits under the thumbnail",
-               r'"OPEN IN MAP"[\s\S]*?'
+               r'"Open in Map"[\s\S]*?'
                r"if \(breadcrumbTrail\.count \{ validCoord\(it\.first, it\.second\) \} >= 2\)"),
               ("and it renders once", r'"Phone breadcrumb trail · this session"'))),
+        ),
+    },
+    # ---- decisions U1: sample data says the same thing, and counts the same rows, on both ----
+    {
+        "what": "one sample banner and one pill word (drawn from the pinned constants)",
+        "why": "the constants rows compare the banner and pill words; these needles hold that each"
+               " phone DRAWS them, so a view that goes back to its own literal cannot pass on a"
+               " constant nothing renders",
+        "sides": (
+            ("iOS banner", IOS_ROOT_VIEW, None,
+             (("the banner draws the message", r"\bText\(sampleBannerMessage\)"),
+              ("and its one button", r"\bButton\(sampleBannerExitLabel\) \{ ble\.exitDemo\(\) \}"))),
+            ("iOS pill", IOS_COMPONENTS, None,
+             (("the pill reads the sample word first",
+               r'let label = demo \? Self\.sampleLabel : stateLabel \?\?'),
+              # R19 (review P2-18): the pill's mark is a small filled circle, a state light;
+              # Android draws the same DOT for sample data instead of its fault triangle.
+              ("its mark is an 8pt filled circle",
+               r'Circle\(\)\.fill\(ink\)\s*\n\s*\.frame\(width: 8, height: 8\)'))),
+            ("Android banner", AND_MAIN_SCREEN, None,
+             (("the banner draws the message", r"\bAcabBanner\(SAMPLE_BANNER_MESSAGE,"),
+              ("and its one button", r"\{ Text\(SAMPLE_BANNER_EXIT_LABEL\) \}"))),
+            ("Android pill", AND_COMPONENTS, None,
+             (("sample data takes the dot mark, before the attention triangle",
+               r'demo -> LinkChipMark\.DOT\s*\n\s*tone == LinkChipTone\.ATTENTION -> LinkChipMark\.WARNING'),)),
+        ),
+    },
+    {
+        "what": "sample data opens one new baseline (the seed's flagged rows; Mark Seen in memory"
+                " only; leaving the Log never marks sample rows seen)",
+        "why": "the sample Log opens on the same 'new' count on both phones, Mark Seen empties it"
+               " without touching the real watermark on disk, and switching tabs does not quietly"
+               " mark the tour's rows seen on one phone only",
+        "sides": (
+            ("iOS seed", IOS_BLE_MANAGER, None,
+             (("each row's first-seen comes from its flag",
+               r"firstSeenAt\[d\.id\] = sampleFirstSeen\(flaggedNew: d\.isNew, seededAt: seededAt\)"),
+              ("and the watermark sits between the two",
+               r"\bseenWatermark = sampleSeenWatermark\(seededAt: seededAt\)"))),
+            ("iOS Mark Seen", IOS_BLE_MANAGER, r"\n    func markAllSeen\(\) \{(.*?)\n    \}",
+             (("moves the watermark in memory, then stops before disk in sample data",
+               r"\bseenWatermark = now\b[\s\S]*?"
+               r"guard seenWatermarkWritesAllowed\(isDemoMode: demoMode\) else \{ return \}\s*\n\s*"
+               r"defaults\.set\(now\.timeIntervalSince1970, forKey: watermarkKey\)"),)),
+            ("iOS first-run baseline", IOS_BLE_MANAGER,
+             r"\n    func seedSeenWatermarkOnce\(\) \{(.*?)\n    \}",
+             (("never runs in sample data, before it reads the once-only flag",
+               r"^\s*if demoMode \{ return \}\s*\n\s*guard !defaults\.bool\(forKey: seenWatermarkSeededKey\)"),)),
+            ("iOS leaving the Log", IOS_ROOT_VIEW, None,
+             (("marks seen only outside sample data",
+               r"func logTabLeaveMarksSeen\(isDemoMode: Bool\) -> Bool \{ !isDemoMode \}"),
+              ("and the tab switch asks it",
+               r"if old == 2 && new != 2 && logTabLeaveMarksSeen\(isDemoMode: ble\.demoMode\) \{\s*\n\s*"
+               r"ble\.markAllSeen\(\)"),
+              ("and nothing else here marks seen", r"markAllSeen\(\)", 1))),
+            ("iOS Log tools", IOS_DETECTIONS_VIEW,
+             r"private func logToolsMenu\(_ snap: LogSnapshot\) -> some View \{(.*?)\n    \}",
+             (("Mark Seen is offered ungated, right after Select",
+               r'Label\("Select", systemImage: "checkmark\.circle"\) \}\s*\n\s*'
+               r"Button \{ markSeen\(\) \} label:"),)),
+            ("Android seed", AND_BLE_MANAGER, None,
+             (("each row's first-seen comes from its flag",
+               r"firstSeenAt\[d\.id\] = sampleFirstSeenMs\(d\.isNew, now\)"),
+              ("and the watermark sits between the two",
+               r"_seenWatermark\.value = sampleSeenWatermarkMs\(now\)"))),
+            ("Android Mark Seen", AND_BLE_MANAGER, r"\n    fun markAllSeen\(\) \{(.*?)\n    \}",
+             (("moves the watermark in memory, then stops before disk in sample data",
+               r"_seenWatermark\.value = stamps[\s\S]*?"
+               r"if \(!persistedLogMutationAllowed\(_demoMode\.value\)\) return\s*\n\s*prefs\.edit\(\)"),)),
+            ("Android first-run baseline", AND_BLE_MANAGER,
+             r"\n    fun seedSeenWatermarkOnce\(\) \{(.*?)\n    \}",
+             (("never runs in sample data, before it reads the once-only flag",
+               r"^\s*if \(!persistedLogMutationAllowed\(_demoMode\.value\)\) return\s*\n\s*"
+               r'if \(prefs\.getBoolean\("seenWatermarkSeeded", false\)\) return'),)),
+            ("Android leaving the Log", AND_MAIN_SCREEN, None,
+             (("marks seen only when the Log was not opened in sample data",
+               r"val openedInDemo = demoMode\s*\n\s*DisposableEffect\(Unit\) \{\s*\n\s*"
+               r"onDispose \{ if \(!openedInDemo\) ble\.markAllSeen\(\) \}"),
+              ("and nothing else here marks seen", r"markAllSeen\(\)", 1))),
+            ("Android Log tools", AND_LOG_SCREEN, None,
+             (("Mark Seen is gated on rows alone (Clear Log is the sample-data difference)",
+               r"markSeen = hasRows, export = hasRows, clear = !demo\)"),
+              ("and its handler is not gated either",
+               r"LogTool\.MarkSeen -> \{ ble\.markAllSeen\(\); scope = LogScope\.All \}"))),
+        ),
+    },
+    {
+        "what": "dossier signal word (SAMPLE, then STALE, then LIVE; drawn and spoken)",
+        "why": "the SIGNAL header names a sample row SAMPLE rather than LIVE on both phones, and"
+               " the screen reader hears the same word the header draws",
+        "sides": (
+            ("iOS rule", IOS_DETECTION_DETAIL,
+             r"func dossierSignalWord\(isDemoMode: Bool, stale: Bool\) -> String \{(.*?)\n\}",
+             (("sample first, then stale, then live",
+               r'^\s*if isDemoMode \{ return "SAMPLE" \}\s*\n\s*return stale \? "STALE" : "LIVE"\s*$'),)),
+            ("iOS header", IOS_DETECTION_DETAIL, r"private var signalPanel: some View \{(.*?)\n    \}",
+             (("the word is the rule's",
+               r"let word = dossierSignalWord\(isDemoMode: ble\.demoMode, stale: stale\)"),
+              ("the header draws it", r"\bText\(word\)"),
+              ("and speaks it", r'\.accessibilityLabel\("SIGNAL · \\\(word\)"\)'))),
+            ("Android rule", AND_DETAIL_SCREEN,
+             r"internal fun dossierSignalWord\(demo: Boolean, stale: Boolean\): String = when \{(.*?)\n\}",
+             (("sample first, then stale, then live",
+               r'^\s*demo -> "SAMPLE"\s*\n\s*stale -> "STALE"\s*\n\s*else -> "LIVE"\s*$'),)),
+            ("Android header", AND_DETAIL_SCREEN, None,
+             (("the word is the rule's",
+               r"val signalWord = dossierSignalWord\(demo = demo, stale = stale\)"),
+              ("the header draws it", r"\bText\(signalWord,"),
+              ("and speaks it", r'contentDescription = "SIGNAL · \$signalWord"'))),
+        ),
+    },
+    {
+        "what": "Status says sample less (no bare SAMPLE DATA kicker, no suffix on the strongest"
+                " header in sample data)",
+        "why": "the banner and the SAMPLE pill already say it; both phones drop the same two"
+               " repeats and keep the radio-variant kickers and the row's own sample line",
+        "sides": (
+            ("iOS rules", IOS_DASHBOARD_PRESENTATION, None,
+             (("only the bare sample kicker is hidden",
+               r'isDemoMode && scanLabel == "SAMPLE DATA" \? nil : scanLabel'),
+              ("the strongest header drops its suffix in sample data",
+               r'isDemoMode \? "STRONGEST \\\(kind\)" : "STRONGEST \\\(kind\) · RECENT"'))),
+            ("iOS Status", IOS_DASHBOARD_VIEW, None,
+             (("the header's kicker comes from the rule",
+               r"let scanKicker = dashboardScanKicker\(scanLabel: radioPresentation\.scanLabel,"),
+              ("and is drawn only when there is one",
+               r"if let scanKicker \{\s*\n\s*Kicker\(scanKicker,"),
+              ("the strongest header comes from the rule",
+               r"SectionHeader\(dashboardStrongestHeader\(kind: kind, isDemoMode: ble\.demoMode\),"))),
+            ("Android rules", AND_STATUS_SCREEN, None,
+             (("only the bare sample kicker is hidden",
+               r'if \(demo && label == "SAMPLE DATA"\) null else label'),
+              ("the strongest header drops its suffix in sample data",
+               r'return if \(demo\) base else "\$base · RECENT"'))),
+            ("Android Status", AND_STATUS_SCREEN, None,
+             (("the header's kicker comes from the rule",
+               r"val scanKicker = statusScanKicker\(scanLabel, demo\)"),
+              ("and is drawn only when there is one",
+               r"if \(scanKicker != null\) Row\([\s\S]*?Kicker\(scanKicker,"),
+              ("the strongest header comes from the rule",
+               r"val title = statusStrongestHeader\(kind, demo\)"))),
+        ),
+    },
+    # ---- decisions R13: the Beacon tab's group intros ----
+    {
+        "what": "Beacon group intro lines (the same sentences under the same groups; mesh and"
+                " sample variants gated alike)",
+        "why": "each Beacon group names what it holds in one lowercase-first line under its header,"
+               " the same words on both apps (decisions R13); the short variants follow the rows:"
+               " a mesh board has no Alerts row, so its ON THE BOARD line must not promise alerts,"
+               " and the sample tour has no System readiness row, so its help line must not"
+               " promise setup checks. The cards (hero, Uptime / Detections) and the saved-log and"
+               " Disconnect groups carry no line",
+        "sides": (
+            ("iOS intros", IOS_SETTINGS, r"private func groupIntroText\(_ key: Int\) -> String\? \{(.*?)\n    \}",
+             (("scan radios group", r"case BeaconRowID\.scanRadios\.sectionKey:\s*\n\s*return "
+               + _quoted(_BEACON_INTRO_SCAN)),
+              ("ON THE BOARD group, alerts dropped on a mesh board",
+               r"case BeaconRowID\.boardLED\.sectionKey:\s*\n\s*return ble\.status\?\.isMeshDetect == true"
+               r"\s*\n\s*\? " + _quoted(_BEACON_INTRO_BOARD[1]) + r"\s*\n\s*: " + _quoted(_BEACON_INTRO_BOARD[0])),
+              ("notifications group, with the device word",
+               r"case BeaconRowID\.notifications\.sectionKey:\s*\n\s*return "
+               + re.escape('"' + _BEACON_INTRO_NOTIFY_TEMPLATE.format("\\(thisDeviceName)") + '"')),
+              ("help group, setup checks dropped in the sample tour",
+               r"case BeaconRowID\.helpSupport\.sectionKey:\s*\n\s*return ble\.demoMode \? "
+               + _quoted(_BEACON_INTRO_HELP[1]) + r"\s*\n\s*: " + _quoted(_BEACON_INTRO_HELP[0])),
+              ("every other group has none", r"default:\s*\n\s*return nil"))),
+            ("iOS header", IOS_SETTINGS, None,
+             (("the group header draws that line", r"let intro = groupIntroText\(group\.id\)"),
+              ("the device word is the idiom's name",
+               r'UIDevice\.current\.userInterfaceIdiom == \.pad \? "iPad" : "iPhone"'))),
+            ("Android intros", AND_DEVICE_SCREEN,
+             r"(internal fun beaconGroupIntro\(key: Int, meshBoard: Boolean, demo: Boolean, deviceWord: String\)"
+             r": String\? =.*?\n    \})",
+             (("scan radios group", r"beaconSectionKey\(BeaconRowId\.SCAN_RADIOS\) -> "
+               + _quoted(_BEACON_INTRO_SCAN)),
+              ("ON THE BOARD group, alerts dropped on a mesh board",
+               r"beaconSectionKey\(BeaconRowId\.BOARD_LED\) ->\s*\n\s*if \(meshBoard\) "
+               + _quoted(_BEACON_INTRO_BOARD[1]) + r"\s*\n\s*else " + _quoted(_BEACON_INTRO_BOARD[0])),
+              ("notifications group, with the device word",
+               r"beaconSectionKey\(BeaconRowId\.NOTIFICATIONS\) -> "
+               + re.escape('"' + _BEACON_INTRO_NOTIFY_TEMPLATE.format("$deviceWord") + '"')),
+              ("help group, setup checks dropped in the sample tour",
+               r"beaconSectionKey\(BeaconRowId\.HELP_SUPPORT\) ->\s*\n\s*if \(demo\) "
+               + _quoted(_BEACON_INTRO_HELP[1]) + r"\s*\n\s*else " + _quoted(_BEACON_INTRO_HELP[0])),
+              ("every other group has none", r"else -> null"))),
+            # The mesh fact goes in by position (the "desert still-silent notice gate" row pins the
+            # named spelling to the one beaconRows call), so the call is pinned whole: a literal
+            # false, or the phone's own demo flag in the mesh slot, compiles and still reads well.
+            ("Android header", AND_DEVICE_SCREEN, None,
+             (("the group header draws that line, from the same mesh and sample facts as the rows",
+               r"intro = beaconGroupIntro\(group\.key, status\?\.isMeshDetect == true, demo = demo,"
+               r"\s*\n\s*deviceWord = deviceWord\)"),
+              ("the device word is the device class's name",
+               r'val deviceWord = if \(isTablet\) "tablet" else "phone"'))),
+        ),
+    },
+    # ---- decisions R13 (L1): the THIS-device groups get headers like the board's ----
+    {
+        "what": "Beacon THIS-device group headers (PREFERENCES over notifications / Live Mode /"
+                " display, SUPPORT over readiness / help / about, at both widths)",
+        "why": "both segments open every rows group with a C2 identifier (decisions R13): the board"
+               " side's DETECTION and ON THE BOARD, this device's PREFERENCES and SUPPORT, over"
+               " the groups' unchanged intro lines. iOS carries the two as header rows in its"
+               " partition (sectionHeaderRow draws a Kicker at compact and a SectionHeader at"
+               " regular width); Android derives them from the group key in"
+               " beaconGroupHeaderLabel, which ConfigGroupLabel draws in both layouts. Same"
+               " labels, same groups (keys 5 and 6)",
+        "sides": (
+            ("iOS partition", IOS_SETTINGS, None,
+             (("the phone rows open with PREFERENCES and put SUPPORT before readiness",
+               r"var rows: \[BeaconRowID\] = \[\.preferencesHeader, \.notifications, \.liveMode,"
+               r" \.display,\s*\n\s*\.supportHeader\]"),
+              ("PREFERENCES heads key 5",
+               r"case \.preferencesHeader, \.notifications, \.liveMode, \.display:\s*return 5"),
+              ("SUPPORT heads key 6",
+               r"case \.supportHeader, \.systemReadiness, \.improveDetection, \.helpSupport,"
+               r" \.about:\s*\n\s*return 6"),
+              ("both are header rows, lifted into the group's header slot",
+               r"case \.detectionHeader, \.onBoardHeader, \.preferencesHeader, \.supportHeader:"
+               r" return true"),
+              ("the PREFERENCES label",
+               r'case \.preferencesHeader:\s*\n\s*return sectionHeaderRow\("PREFERENCES"\)'),
+              ("the SUPPORT label", r'case \.supportHeader:\s*\n\s*return sectionHeaderRow\("SUPPORT"\)'),
+              ("a header row draws at both widths",
+               r"hSize == \.regular \? AnyView\(SectionHeader\(title\)\) : AnyView\(Kicker\(title\)\)"))),
+            ("Android labels", AND_DEVICE_SCREEN,
+             r"(internal fun beaconGroupHeaderLabel\(group: BeaconRowGroup\): String\? =.*?\n    \})",
+             (("the board side keeps its header rows",
+               r"group\.header\?\.let\(::beaconGroupLabel\)"),
+              ("PREFERENCES heads the notifications group (key 5)",
+               r'beaconSectionKey\(BeaconRowId\.NOTIFICATIONS\) -> "PREFERENCES"'),
+              ("SUPPORT heads the help group (key 6)",
+               r'beaconSectionKey\(BeaconRowId\.HELP_SUPPORT\) -> "SUPPORT"'))),
+            ("Android keys", AND_DEVICE_SCREEN, None,
+             (("key 5", r"BeaconRowId\.NOTIFICATIONS, BeaconRowId\.LIVE_MODE, BeaconRowId\.DISPLAY -> 5"),
+              ("key 6", r"BeaconRowId\.SYSTEM_READINESS, BeaconRowId\.IMPROVE_DETECTION,"
+                        r" BeaconRowId\.HELP_SUPPORT, BeaconRowId\.ABOUT -> 6"),
+              ("the one group header draws the label in both layouts",
+               r"label = beaconGroupHeaderLabel\(group\),"))),
+        ),
+    },
+    # ---- decisions R14: the board kind names the owner's board (copy only) ----
+    {
+        "what": "board kind precedence (fw label, then live advert hint, then stored; the screen:"
+                " the target, the remembered board, the rows' one kind, else beacon)",
+        # Settled 2026-09-25 (decisions R14): the order was fw > stored > hint, so a remembered
+        # board reflashed to another kind kept its old name until it connected.
+        "why": "which name the owner reads for their own board: the firmware's own label wins;"
+               " before connect a live named advert wins, so a reflashed board reads as its new"
+               " kind; a nameless (stealth) advert falls back to what this phone stored from the"
+               " last fw label, and the next fw label re-stamps it; a startup screen with a mixed"
+               " or empty scan stays beacon. Unknown reads as beacon on both",
+        "sides": (
+            ("iOS", IOS_BOARD_KIND, None,
+             (("one board", r"BoardKind\.fromFirmwareLabel\(firmwareLabel\) \?\? advertHint \?\? storedKind"),
+              ("the screen: the target while a connect runs or failed",
+               r"if targetActive \{ return targetKind \}"),
+              ("then the remembered board", r"if let rememberedKind \{ return rememberedKind \}"),
+              ("then the one kind every row agrees on",
+               r"return rowKinds\.allSatisfy \{ \$0 == kind \} \? kind : nil"),
+              ("unknown reads as beacon", r"let k = kind \?\? \.beacon"),
+              ("the hero title too", r"\(kind \?\? \.beacon\)\.heroTitle"))),
+            ("Android", AND_BOARD_KIND, None,
+             (("one board", r"BoardKind\.fromFirmwareLabel\(firmwareLabel\) \?: advertHint \?: storedKind"),
+              ("the screen: the target while a connect runs or failed",
+               r"if \(targetActive\) return targetKind"),
+              ("then the remembered board", r"if \(rememberedKind != null\) return rememberedKind"),
+              ("then the one kind every row agrees on",
+               r"return first\.takeIf \{ rowKinds\.all \{ it == first \} \}"),
+              ("unknown reads as beacon", r"this \?: BoardKind\.BEACON"))),
+            ("Android hero", AND_DEVICE_SCREEN, None,
+             (("the hero title", r"\(kind \?: BoardKind\.BEACON\)\.heroTitle"),)),
+        ),
+    },
+    {
+        "what": "the board kind names the Beacon hero, the About link and the picker rows (never"
+                " the raw advertised name)",
+        "why": "the Beacon hero reads 'All Cameras Are Beacons' for a beacon or an unknown board and"
+               " the product's own name for an OUI-Spy or a Mesh-Detect; the Colonel Panic About"
+               " link shows for every board that is not a beacon; a remembered row reads 'your"
+               " <kind>' from its live hint, else its stored kind, and a scanned row '<kind>',"
+               " because every board of one kind advertises the same name and 'ACAB' told the"
+               " owner nothing",
+        "sides": (
+            ("iOS Beacon", IOS_SETTINGS, None,
+             (("hero", r"Text\(boardHeroTitle\(ble\.connectedKind\)\)"),
+              ("About link", r"if ble\.connectedKind != \.beacon \{"))),
+            ("iOS picker", IOS_CONNECT_VIEW, None,
+             (("row titles", r"entry\.isRemembered \? RememberedBoardCopy\.label\(kind: entry\.kind\)"
+                             r" : \(entry\.kind \?\? \.beacon\)\.noun"),
+              ("remembered subtitle carries no name",
+               r"return RememberedBoardCopy\.subtitle\(hasSignal: entry\.rssi != nil\)"))),
+            ("iOS merge", IOS_REMEMBERED_BOARD, None,
+             (("the remembered row: the live hint, else the stored kind",
+               r"lead\.kind = row\.kind \?\? remembered\.kind"),)),
+            ("Android Beacon", AND_DEVICE_SCREEN, None,
+             (("hero", r"title = boardHeroTitle\(connectedKind\),"),
+              ("About link", r"showColonel = connectedKind != BoardKind\.BEACON,"))),
+            ("Android picker", AND_ACAB_APP, None,
+             (("row titles", r"if \(board\.owned\) RememberedBoardCopy\.label\(kind\) else scannedRowTitle\(kind\)"),
+              ("a scanned row's title", r"= \(kind \?: BoardKind\.BEACON\)\.noun"),
+              ("the remembered row: the live hint, else the stored kind",
+               r"resolveBoardKind\(firmwareLabel = null, storedKind = rememberedKind\?\.takeIf \{ owned \},"
+               r" advertHint = kindHint\)"),
+              ("remembered subtitle carries no name",
+               r"Text\(RememberedBoardCopy\.subtitle\(board\.advertSeen\)"))),
+        ),
+    },
+    {
+        "what": "a scan row's kind hint is the last named kind it heard (a nameless frame keeps it)",
+        # Settled 2026-09-25 (decisions R14): Android cleared the hint on any frame whose name
+        # claimed no kind, so a scan-response frame could flip a reflashed row back to its
+        # stored kind between adverts.
+        "why": "the live advert hint outranks the stored kind before connect, so a row whose hint"
+               " a nameless or unclaimed frame wiped would flicker between its new and its old"
+               " name on one phone and not the other",
+        "sides": (
+            ("iOS", IOS_BLE_MANAGER, None,
+             (("a new named kind replaces the hint; no name keeps it",
+               r"if let kindHint \{ discovered\[i\]\.kindHint = kindHint \}"),)),
+            ("Android", AND_BOARD_KIND, None,
+             (("a new named kind replaces the hint; no name keeps it",
+               r"BoardKind\.fromAdvertName\(advertName\) \?: previous"),)),
+            ("Android scan", AND_BLE_MANAGER, None,
+             (("the scan callback carries the hint forward",
+               r"val kindHint = carriedAdvertHint\(advertName, prev\?\.kindHint\)"),)),
+        ),
+    },
+    {
+        "what": "offline-sync banner: the nothing-replayed arm names the board that buffered",
+        # Settled 2026-09-25 (decisions R14): both read "... couldn't be replayed from the beacon"
+        # for every board.
+        "why": "when the board promised buffered rows and sent none, the banner says which board"
+               " to reconnect; an OUI-Spy owner told 'the beacon' reads it as a different device",
+        "sides": (
+            ("iOS", IOS_ROOT_VIEW, None,
+             (("the nothing-replayed arm",
+               r'"\\\(unreplayed\) buffered \\\(bnoun\) couldn\'t be replayed from the \{noun\}"'),
+              ("rendered with the connected kind",
+               r"offlineSyncMessage\(count: summary\.count, unreplayed: summary\.unreplayed,"
+               r"\s*kind: ble\.connectedKind\)"))),
+            ("Android", AND_MAIN_SCREEN, None,
+             (("the nothing-replayed arm, singular",
+               r'"1 buffered detection couldn\'t be replayed from the \{noun\}"'),
+              ("the nothing-replayed arm, plural",
+               r'"\$unreplayed buffered detections couldn\'t be replayed from the \{noun\}"'))),
+        ),
+    },
+    # ---- decisions U2: Android adopts the iOS words ----
+    {
+        "what": "checklist state sentences (shared set byte for byte; platform arms per side)",
+        "why": "the checklist's rows describe the same states in the same words on both phones;"
+               " where a platform has a state the other does not (restricted Location, Live"
+               " Activities, an unknown buffer before the first frame), that arm is its own and is"
+               " pinned on its own side; the notifications row never reads blocked in sample"
+               " data, like the THIS PHONE row below",
+        "sides": (
+            ("iOS rows", IOS_CHECKLIST, r"\nstruct ChecklistRows \{(.*?)\n\}",
+             tuple((f"shared: {s}", _quoted(s)) for s in _CHECKLIST_SHARED_SENTENCES)
+             + (("shared, with the platform word: blocked notifications",
+                 re.escape('"\\(count)' + _CHECKLIST_BLOCKED_TEMPLATE.format("iOS") + '"')),
+                ("shared: the count agrees in number",
+                 r'"\\\(count\) categor\\\(count == 1 \? "y" : "ies"\) enabled on this phone"'),
+                ("notifications: OFF first, then blocked only outside sample data",
+                 r'if count == 0 \{ return "off until you choose categories under Beacon" \}'
+                 + _KT_ARM_GAP + r'if !ble\.demoMode, ble\.notifier\.mutedBySystem \{\s*\n\s*return "\\\(count\) chosen,'),
+                ("iOS only: Location also feeds background Live Mode",
+                 _quoted("allowed; Map and background Live Mode are ready")),
+                ("iOS only: restricted Location",
+                 _quoted("restricted by device policy; detection still works")),
+                ("iOS only: denied Location", _quoted("off in iOS settings; detection still works")),
+                ("iOS only: Live Activities blocked",
+                 _quoted("on by default, but Live Activities are blocked by iOS")),
+                ("iOS only: Live Mode waits for Location",
+                 _quoted("on by default; waits for Location before showing a system surface")),
+                ("every board-naming sentence is rendered with the checklist's kind",
+                 r'renderBoardCopy\("[^"]*\{noun\}[^"]*", kind\)', 2))),
+            ("iOS sheet", IOS_CHECKLIST, None,
+             (("the sheet draws the four rows",
+               r"\brows\.(?:locationDetail|notificationDetail|liveModeDetail|bufferDetail)\b", 8),)),
+            ("Android rows", AND_FIRST_RUN_TOUR,
+             r"(internal fun checklistLocationDetail\(.*?internal fun checklistBufferDetail\(.*?\n\})",
+             tuple((f"shared: {s}", _quoted(s)) for s in _CHECKLIST_SHARED_SENTENCES)
+             + (("shared, with the platform word: blocked notifications",
+                 re.escape('"$count' + _CHECKLIST_BLOCKED_TEMPLATE.format("Android") + '"')),
+                ("shared: the count agrees in number",
+                 r'count == 1 -> "\$count category enabled on this phone"\s*\n\s*'
+                 r'else -> "\$count categories enabled on this phone"'),
+                ("notifications: OFF first, then blocked only outside sample data",
+                 r'count == 0 -> "off until you choose categories under Beacon"\s*\n\s*'
+                 r'!demo && blockedBySystem -> "\$count chosen,'),
+                ("Android only: Location feeds the Map alone", _quoted("allowed; Map is ready")),
+                ("Android only: the Live Mode notification blocked",
+                 _quoted("on by default, but its notification is blocked by Android")),
+                ("Android only: the buffer before the first frame",
+                 _quoted("not known until your {noun} reports it")),
+                ("every board-naming sentence is rendered with the checklist's kind",
+                 r'renderBoardCopy\("[^"]*\{noun\}[^"]*", kind\)', 3))),
+            ("Android sheet", AND_FIRST_RUN_TOUR, None,
+             (("the sheet draws the four rows",
+               r"\bKicker\(checklist(?:Location|Notification|LiveMode|Buffer)Detail\(", 4),
+              ("the notifications row passes the system block and the sample-data flag",
+               r"\bKicker\(checklistNotificationDetail\(phoneAlertsCount, !phoneAlertsAvailable, demo\)\)"))),
+        ),
+    },
+    {
+        "what": "THIS PHONE row values name the platform's block (never in sample data), and the"
+                " notify card's two sentences",
+        "why": "a notification or Live Mode the system will not deliver reads BLOCKED on both"
+               " phones, in each platform's own row shape; the notify card promises the same"
+               " thing about permission with the platform's name in the one hole",
+        "sides": (
+            ("iOS Notifications row", IOS_SETTINGS, r"private var notifyKicker: String \{(.*?)\n    \}",
+             (("blocked only outside sample data, with something on",
+               r'if !ble\.demoMode, ble\.notifier\.mutedBySystem, n > 0 \{\s*\n\s*'
+               r'return "\\\(n\) ON \\u\{00B7\} BLOCKED BY IOS"'),
+              ("otherwise OFF or the count", r'return n == 0 \? "OFF" : "\\\(n\) ON"'))),
+            ("iOS Live Mode row", IOS_SETTINGS, r"private var liveModeState: String \{(.*?)\n    \}",
+             (("sample data first, a preview, never live",
+               r'^\s*if ble\.demoMode \{ return ble\.settingsDriveModeWanted \? "Preview on" : "Off" \}'),
+              ("the system block", r'if !ble\.liveActivitiesEnabled \{ return "Blocked by iOS" \}'))),
+            ("iOS notify card", IOS_SETTINGS, None,
+             (("the two sentences, iOS in the hole",
+               r"Text\(ble\.demoMode\s*\?\s*" + _quoted(_NOTIFY_EXPLAINER_SAMPLE.format("iOS"))
+               + r"\s*:\s*" + _quoted(_NOTIFY_EXPLAINER_REAL.format("iOS")) + r"\)"),)),
+            ("Android Notifications row", AND_DEVICE_SCREEN,
+             r"internal fun beaconNotifyRowValue\(count: Int, blockedBySystem: Boolean, demo: Boolean\):"
+             r" String = when \{(.*?)\n\}",
+             (("OFF, then blocked outside sample data, then the count",
+               r'count == 0 -> "OFF"\s*\n\s*!demo && blockedBySystem -> "\$count ON · BLOCKED BY ANDROID"'
+               r'\s*\n\s*else -> "\$count ON"'),)),
+            ("Android Live Mode row", AND_DEVICE_SCREEN,
+             r"internal fun beaconLiveRowValue\((.*?)\n\}",
+             (("the system block outside sample data",
+               r'!demo && wanted && !deliverable -> "LIVE BLOCKED BY ANDROID"'),
+              # R19 (review P2-12): sample data reads PREVIEW ON / OFF, never LIVE, the iOS
+              # story ("Preview on" / "Off" through driveKicker's uppercase).
+              ("sample data is a preview, never live",
+               r'demo && wanted -> "PREVIEW ON"\s*\n\s*demo -> "OFF"'),
+              ("then the counts", r'return "\$live · COUNTS \$counts"'))),
+            ("Android notify card", AND_DEVICE_SCREEN, None,
+             (("the two sentences, Android in the hole",
+               r"if \(demo\) " + _quoted(_NOTIFY_EXPLAINER_SAMPLE.format("Android"))
+               + r"\s*else " + _quoted(_NOTIFY_EXPLAINER_REAL.format("Android"))),
+              ("the card draws them", r"\bnotifyCardExplainer\(demo\),"),
+              ("the rows draw their values",
+               r"val (?:notifyKicker = beaconNotifyRowValue|driveKicker = beaconLiveRowValue)\(", 2))),
+        ),
+    },
+    {
+        "what": "ALPR layer words (callout titles from the shared helper; 'cameras' as the count"
+                " noun; the floating Map options button speaks the layer state)",
+        "why": "the callout titles compared per tier above only matter if each phone's callout"
+               " draws them; the dataset caption counts cameras, not records, on both phones; and"
+               " the Map options button (a floating layers button at the lower right on both"
+               " phones since the 2026-09-26 legend decision) is named the same and speaks the"
+               " known-ALPR layer state in the same words, with no scope suffix",
+        "sides": (
+            ("iOS callout", IOS_MAP_TAB, None,
+             (("the title is the shared helper's", r"\bText\(ALPRAttribution\.headline\("),)),
+            ("iOS dataset caption", IOS_MAP_TAB, None,
+             # Two captions count cameras: the dataset line in lowercase and the check row's
+             # "Updated · N Cameras" flash in Title Case (a button label), so the C takes either case.
+             (("the count noun agrees in number",
+               r'[Cc]amera\\\((?:shown|n) == 1 \? "" : "s"\)', 2),
+              ("and no caption counts records", r"ALPR record", 0))),
+            ("Android callout", AND_MAP_ALPR, None,
+             (("tiers 0, 1 and 2 take the shared helper's title",
+               r"rawTier == 0 \|\| rawTier == 1 \|\| rawTier == 2 ->"
+               r" alprAttributionHeadline\(rawTier, maker\)"),)),
+            ("Android dataset caption", AND_MAP_SCREEN, None,
+             (("the count noun agrees in number",
+               r'"%,d camera%s", n, if \(n == 1\) "" else "s"'),
+              ("and in the check row's Title Case flash too",
+               r'"%,d Camera%s", n, if \(n == 1\) "" else "s"'),
+              ("and no caption counts records", r"ALPR record", 0))),
+            ("iOS layers button", IOS_MAP_TAB, None,
+             (("named Map options", r'\.accessibilityLabel\("Map options"\)'),
+              ("and the layer state spoken",
+               r'\.accessibilityValue\(alpr\.enabled \? "known ALPR layer on" : "known ALPR layer off"\)'))),
+            ("Android layers button", AND_MAP_SCREEN, None,
+             (("named Map options", r'contentDescription = "Map options"'),
+              ("with no scope suffix", r'(?i)"options · ', 0),
+              ("and the layer state spoken",
+               r'stateDescription = if \(alprEnabled\) "known ALPR layer on" else "known ALPR layer off"'))),
+        ),
+    },
+    {
+        # The 'map ALL chip label' string row above compares the word only; this is the number
+        # beside it. The Android count is scopedEvidence.size at the call site (the chip model takes
+        # it as a bare parameter), and the iOS count is the one tally the snapshot takes after the
+        # scope guard and before the category guard.
+        "what": "map ALL chip counts the located rows in scope, before the category chip",
+        "why": "the ALL chip's number is what the pins represent with no category chip on, under"
+               " the current scope, on both phones; a count taken after the category filter, or"
+               " before the scope, would read a different number over the same map",
+        "sides": (
+            ("iOS ALL chip", IOS_MAP_TAB, None,
+             (("the chip draws the snapshot total", r'\bchip\(nil, "ALL", snap\.totalLocated\)'),
+              ("the snapshot stores the one tally", r'\btotalLocated: total,'),
+              ("the tally is taken once", r'\btotal \+= 1'),
+              ("after the scope guard and before the category guard",
+               r'guard inScope else \{ continue \}\s*\n\s*total \+= 1\s*\n\s*'
+               r'counts\[d\.type\.category, default: 0\] \+= 1'))),
+            ("Android ALL chip", AND_MAP_SCREEN, None,
+             (("the chip model draws the count it is given",
+               r'add\(MapChipModel\(null, "ALL", allCount, selected = filter == null\)\)'),
+              ("the call site gives the scoped located rows", r'\ballCount = scopedEvidence\.size,'),
+              ("which are the located rows under the scope, before the category chip",
+               r'val scopedEvidence = remember\(locatedEvidence, historyScope, scopedIds\) \{\s*\n\s*'
+               r'mapScopedLocated\(locatedEvidence, historyScope, scopedIds\)'))),
+        ),
+    },
+    # ---- decisions U3: dossier and Map wording ----
+    {
+        "what": "row titles fall back to titleFallback only for the bare category (label stays"
+                " the export value)",
+        "why": "a Log row, the Status nearest card and the dossier headline name a bare body cam"
+               " 'body cam' on both phones, and nothing else changes: the CSV / GPX type column"
+               " still reads DeviceType.label",
+        "sides": (
+            ("iOS rule", IOS_DETECTION, r"\n    var titleName: String \{(.*?)\n    \}",
+             (("the fallback only when the display name IS the label",
+               r"^\s*let n = displayName\s*\n\s*return n == type\.label \? type\.titleFallback : n\s*$"),)),
+            ("iOS Log row", IOS_DETECTION_ROW, None, (("draws it", r"\bText\(d\.titleName\)"),)),
+            ("iOS Status", IOS_DASHBOARD_VIEW, None, (("draws it", r"\bText\(d\.titleName\)"),)),
+            ("iOS dossier", IOS_DETECTION_DETAIL, None,
+             (("the headline is it", r"\blet headline = d\.titleName\b"),)),
+            ("Android rule", AND_OUI_VENDORS, r"\nval Detection\.titleName: String\s*\n\s*get\(\) \{(.*?)\n    \}",
+             (("the fallback only when the display name IS the label",
+               r"^\s*val n = displayName\s*\n\s*return if \(n == type\.label\) type\.titleFallback else n\s*$"),)),
+            ("Android Log rows", AND_LOG_SCREEN, None,
+             (("both row layouts draw it", r"\bText\(d\.titleName,", 2),)),
+            ("Android Status", AND_STATUS_SCREEN, None, (("draws it", r"\bText\(d\.titleName,"),)),
+            ("Android dossier", AND_DETAIL_SCREEN, None,
+             (("the headline is it", r"\bval headline = d\.titleName\b"),)),
+        ),
+    },
+    {
+        "what": "dossier line rules (no 'X over X', no maker repeating the title, the tracker"
+                " note only under a tracker's '(offline)', the buffer blamed only for a replay)",
+        "why": "the words are compared in SHARED_CONSTANTS; these hold the conditions that pick"
+               " them and the slots that draw them, so one phone cannot say 'Remote ID over Remote"
+               " ID' or explain a tracker's '(offline)' under a different kind of row",
+        "sides": (
+            ("iOS rules", IOS_DETECTION_DETAIL, None,
+             (("the source is dropped when it equals the method, ignoring case",
+               r"methodLabel\.caseInsensitiveCompare\(sourceLabel\) == \.orderedSame"),
+              ("the maker is dropped when it equals the headline, ignoring case",
+               r"makerOrVendor\.caseInsensitiveCompare\(headline\) == \.orderedSame"),
+              ("the tracker note needs a tracker and the firmware's suffix",
+               r'guard type == \.tracker, let detail, detail\.hasSuffix\("\(offline\)"\) else \{ return nil \}'))),
+            ("iOS slots", IOS_DETECTION_DETAIL, None,
+             (("the flagged line", r"\bText\(dossierFlaggedLine\(methodLabel: d\.method\.label,"
+               r" sourceLabel: d\.source\.label\)\)"),
+              ("the hero subtitle, handed the headline",
+               r"\bText\(dossierHeroSubtitle\(node: d\.nodeName, makerOrVendor: d\.maker \?\? d\.vendor,"
+               r"\s*headline: headline\)\)"),
+              ("the body-cam fallback, told whether the row is a replay",
+               r"return Text\(dossierBodyCamFallbackLine\(isReplay: d\.isHistory\)\)"))),
+            ("iOS match quality", IOS_DETECTION_DETAIL,
+             r"private var matchQualityPanel: some View \{(.*?)\n    \}",
+             (("the tracker note sits directly under the verbatim detail",
+               r"\n(\s*)Text\(detail\)\n(?:\1\s+[^\n]*\n)*\s*\}\s*\n(?:\s*//[^\n]*\n)*"
+               r"\s*if let note = trackerOfflineNote\(type: d\.type, detail: d\.detail\) \{"
+               r"\s*\n\s*Text\(note\)"),)),
+            ("Android rules", AND_DETAIL_SCREEN, None,
+             (("the source is dropped when it equals the method, ignoring case",
+               r"methodLabel\.equals\(sourceLabel, ignoreCase = true\)"),
+              ("the maker is dropped when it equals the headline, ignoring case",
+               r"makerOrVendor\.equals\(headline, ignoreCase = true\)"),
+              ("the tracker note needs a tracker and the firmware's suffix",
+               r'type == DeviceType\.TRACKER && detail\?\.endsWith\("\(offline\)"\) == true'))),
+            ("Android slots", AND_DETAIL_SCREEN, None,
+             (("the flagged line", r"\bText\(dossierFlaggedLine\(d\.methodLabel, d\.sourceLabel\),"),
+              ("the hero subtitle, handed the headline",
+               r"\bText\(dossierHeroSubtitle\(nodeName\(d\.mac\), d\.maker \?: d\.vendor, headline\),"),
+              ("the body-cam fallback, told whether the row is a replay",
+               r"\bappend\(dossierBodyCamFallbackLine\(replay = d\.hist \|\| d\.offline\)\)"))),
+            ("Android match quality", AND_DETAIL_SCREEN,
+             r"private fun MatchQualityPanel\(d: Detection\) \{(.*?)\n\}",
+             (("the tracker note sits directly under the verbatim detail",
+               r"d\.detail\?\.takeIf \{ it\.isNotEmpty\(\) \}\?\.let \{\s*\n\s*Text\(it, color = Acab\.text,"
+               r"[^\n]*\n[^\n]*\n\s*\}\s*\n(?:\s*//[^\n]*\n)*"
+               r"\s*trackerOfflineNote\(d\.type, d\.detail\)\?\.let \{"),)),
+        ),
+    },
+    {
+        "what": "matched-on keeps each method label's own casing (two OUI telegrams, then the"
+                " label verbatim)",
+        "why": "the dossier's 'matched on' row quotes the same method words the FAQ does; a phone"
+               " that lowercases them, or renames one (NAME MATCH), answers in words the FAQ never"
+               " uses",
+        "sides": (
+            ("iOS rule", IOS_DETECTION_DETAIL,
+             r"func methodChipLabel\(method: DetectionMethod, maker: String\?\) -> String \{(.*?)\n\}",
+             (("vendor, then chipset, then the label as written",
+               r'case \.oui where maker != nil: return "OUI \\u\{00B7\} VENDOR ONLY"\s*\n\s*'
+               r'case \.oui:\s*return "OUI \\u\{00B7\} CHIPSET ONLY"\s*\n\s*'
+               r"default:\s*return method\.label\s*$"),
+              ("no case is changed", r"lowercased|uppercased|capitalized", 0))),
+            ("iOS row", IOS_DETECTION_DETAIL, None,
+             (("the row reads it",
+               r'dossierRow\("matched on", methodChipLabel\(method: d\.method, maker: d\.maker\)'),)),
+            ("Android rule", AND_DETAIL_SCREEN,
+             r"internal fun methodChipLabel\(method: Int, maker: String\?, methodLabel: String\):"
+             r" String = when \{(.*?)\n\}",
+             (("vendor, then chipset, then the label as written",
+               r'method == 1 && maker != null -> "OUI · VENDOR ONLY"\s*\n\s*'
+               r'method == 1 -> "OUI · CHIPSET ONLY"\s*\n\s*else -> methodLabel\s*$'),
+              ("no case is changed", r"lowercase|uppercase|capitalize", 0))),
+            ("Android row", AND_DETAIL_SCREEN, None,
+             (("the row reads it", r"\bmethodChipLabel\(d\.method, d\.maker, d\.methodLabel\) to "),)),
+        ),
+    },
+    {
+        "what": "signal graph on one fixed dBm scale, STRONG over WEAK",
+        "why": "the floor and ceiling are compared in SHARED_CONSTANTS; these hold that both"
+               " phones clamp to them and place every reading by that fraction, never by the"
+               " series' own min and max, and label the edges with the same two words",
+        "sides": (
+            ("iOS scale", IOS_COMPONENTS, None,
+             (("clamped to the pinned edges",
+               r"min\(max\(rssi, signalGraphFloorDbm\), signalGraphCeilingDbm\)"),
+              ("each point placed by it", r"signalGraphFraction\(rssi: values\[i\]\)"))),
+            ("iOS sparkline", IOS_COMPONENTS, r"\nstruct Sparkline: View \{(.*?)\n\}",
+             (("no stretch to the series", r"\.min\(\)|\.max\(\)", 0),
+              ("no line under two readings", r"if values\.count >= 2 \{"))),
+            ("iOS edge words", IOS_DETECTION_DETAIL, None,
+             (("STRONG at the top, WEAK at the bottom",
+               r'Text\("STRONG"\)\s*\n\s*Spacer\(minLength: 0\)\s*\n\s*Text\("WEAK"\)'),)),
+            ("Android scale", AND_DETAIL_SCREEN, None,
+             (("clamped to the pinned edges",
+               r"rssi\.coerceIn\(SIGNAL_GRAPH_FLOOR_DBM, SIGNAL_GRAPH_CEILING_DBM\)"),
+              ("STRONG at the top, WEAK at the bottom",
+               r'Kicker\("STRONG",[^\n]*\n\s*Kicker\("WEAK",'))),
+            ("Android sparkline", AND_DETAIL_SCREEN,
+             r"private fun DrawScope\.drawSparkline\((.*?)\n\}",
+             (("each point placed by it", r"fun y\(v: Int\) = h - signalGraphFraction\(v\) \* h"),
+              ("no stretch to the series", r"\.min\(\)|\.max\(\)|minOrNull|maxOrNull", 0),
+              ("no line under two readings", r"if \(values\.size < 2\) return"))),
+        ),
+    },
+    {
+        "what": "drone operator keys appear only with an operator marker (Map legend and dossier"
+                " caption)",
+        "why": "a legend key or caption for a marker nothing draws reads as a rendering bug; both"
+               " phones gate the key on the drawn markers and the caption on the pilot position",
+        "sides": (
+            ("iOS legend", IOS_MAP_TAB, None,
+             (("the flag comes from the drawn overlays",
+               r"hasOperatorPins: mapHasOperatorPins\(drones\.lazy\.map\(\\\.detection\)\)"),
+              ("and gates the key",
+               r'if snap\.hasOperatorPins \{\s*\n\s*Divider\(\)[^\n]*\n\s*legendEntry\("Drone operator"\)'))),
+            ("iOS dossier", IOS_DETECTION_DETAIL, None,
+             (("the caption needs a drone with a pilot position",
+               r"if d\.type == \.drone, d\.pilotCoordinate != nil \{\s*\n\s*"
+               r'Label\(droneOperatorCaption, systemImage: "person\.fill"\)'),)),
+            ("Android legend", AND_MAP_SCREEN, None,
+             (("the flag comes from the drawn markers",
+               r"mapOperatorPinFlag\(hasOperatorPins, operatorPins\)\?\.let \{ hasOperatorPins = it \}"),
+              ("and gates the key",
+               r'if \(hasOperatorPins\) \{(?:(?!\bif \()[\s\S])*?Text\("Drone operator"'))),
+            ("Android dossier", AND_DETAIL_SCREEN, None,
+             (("the caption needs a drone with a valid pilot position",
+               r"if \(d\.type == DeviceType\.DRONE && pla != null && plo != null && validCoord\(pla, plo\)\)"
+               r" \{(?:(?!\bif \()[\s\S])*?Text\(DRONE_OPERATOR_CAPTION,"),)),
+        ),
+    },
+    {
+        "what": "the Map legend is a floating button and card; a download never opens it",
+        "why": "owner decision 2026-09-26 (decisions R17): the legend is a round info button at"
+               " the lower left that opens a card, and the map fills the tab. A docked legend that"
+               " insets the map re-frames it on every toggle (the reported shift), and a download"
+               " that opens the legend by itself takes the map away unasked. iOS keeps a constant"
+               " bottom inset for MapKit's logo and Legal line; Android has no sheet at all",
+        "sides": (
+            ("iOS legend button", IOS_MAP_TAB, None,
+             (("the button speaks open and downloading",
+               r"mapLegendAccessibilityValue\(open: legendExpanded, downloading: alpr\.downloading\)"),
+              ("and a download never opens the card", r"legendExpanded \|\| alpr\.downloading", 0),
+              ("the map's bottom inset is the constant",
+               r"\.safeAreaPadding\(\.bottom, mapFloatingControlsInset\)"))),
+            ("Android legend button", AND_MAP_SCREEN, None,
+             (("no bottom sheet", r"BottomSheetScaffold\(", 0),
+              ("and nothing expands one", r"sheetState\.expand\(\)", 0),
+              ("the button speaks open and downloading",
+               r"stateDescription = mapLegendStateDescription\(open = legendOpen, downloading = alprDownloading\)"))),
+        ),
+    },
+    # ---- decisions M3: the radar sweep ----
+    {
+        "what": "radar sweep angle comes from the absolute clock (beam kept mounted; Reduce Motion"
+                " parks it at 0)",
+        "why": "the owner reported the iOS beam as sporadic and resetting; the angle is now"
+               " fract(time / period) x 360 of an absolute clock on both phones, so a re-render, a"
+               " re-mount or a tab return continues the turn. A per-view start time or an implicit"
+               " repeating animation on either phone brings the reset back",
+        "sides": (
+            ("iOS rule", IOS_COMPONENTS,
+             r"\nfunc radarSweepDegrees\(at seconds: TimeInterval, period: TimeInterval ="
+             r" RadarScope\.sweepPeriod\) -> Double \{(.*?)\n\}",
+             (("fract of the absolute reading, times 360",
+               r"let turns = seconds / period\s*\n\s*return \(turns - turns\.rounded\(\.down\)\) \* 360"),)),
+            ("iOS beam", IOS_COMPONENTS, r"\nprivate struct SweepBeam: View \{(.*?)\n\}",
+             (("a clock-driven timeline, paused when parked or under Reduce Motion",
+               r"TimelineView\(\.animation\(minimumInterval: nil, paused: !running \|\| reduceMotion\)\)"),
+              ("the angle is the frame date's",
+               r"reduceMotion\s*\?\s*0 : radarSweepDegrees\(at: ctx\.date\.timeIntervalSinceReferenceDate\)"),
+              ("no ancestor animation may interpolate it", r"\.transaction \{ \$0\.animation = nil \}"),
+              ("hidden, not removed, while parked", r"\.opacity\(running \? 1 : 0\)"),
+              ("no implicit repeating animation", r"repeatForever|withAnimation", 0),
+              ("and no start on appear", r"onAppear", 0))),
+            ("iOS scope", IOS_COMPONENTS, None,
+             (("the beam is always mounted", r"^\s*SweepBeam\(size: s, running: sweeping\)\s*$"),)),
+            ("Android rule", AND_STATUS_SCREEN,
+             r"internal fun radarSweepDegrees\(timeMs: Long, periodMs: Long = RADAR_SWEEP_PERIOD_MS\):"
+             r" Float =(.*?)\n\n",
+             (("fract of the absolute reading, times 360",
+               r"Math\.floorMod\(timeMs, periodMs\)\.toFloat\(\) / periodMs \* 360f"),)),
+            ("Android scope", AND_STATUS_SCREEN, None,
+             (("seeded from the frame clock's time base",
+               r"mutableFloatStateOf\(radarSweepDegrees\(System\.nanoTime\(\) / 1_000_000\)\)"),
+              ("advanced from each frame's own time",
+               r"while \(true\) withFrameNanos \{ sweepAngle = radarSweepDegrees\(it / 1_000_000\) \}"),
+              ("no loop while parked or under reduce motion",
+               r"if \(!scanning \|\| reduceMotion\) return@LaunchedEffect"),
+              ("parked at 0 under reduce motion", r"rotate\(if \(reduceMotion\) 0f else sweepAngle, c\)"),
+              ("no infinite transition restarts it", r"rememberInfiniteTransition\(", 0))),
+        ),
+    },
+    # The 2026-09-26 UI review batch (decisions R19): the two places a category name is drawn
+    # beside other lowercase-first rows now read DeviceType.inlineLabel (whose arms
+    # check_inline_labels pins byte for byte), never `label`, which mixes Title Case ("ALPR
+    # Camera", "Body Camera") with sentence case ("Network camera") in one list.
+    {
+        "what": "Log row subtitle leads with inlineLabel (named rows), and the Notifications rows"
+                " draw inlineLabel in row-title sentence case",
+        "why": "a named Log row's subtitle and the seven Notifications row titles are one case on"
+               " both phones; a side that goes back to `label` puts 'ALPR Camera' beside 'network"
+               " camera' in the same list (review P2-5 and P2-11). Since P3-11 (decisions R20) every"
+               " row title is sentence case, so the Notifications rows raise inlineLabel's first"
+               " letter (iOS DeviceView.sentenceCaseRowTitle, Android rowTitleCase: 'Body cam',"
+               " 'ALPR camera' unchanged) and the subtitle sentence keeps the bare lowercase name",
+        "sides": (
+            ("iOS Log row", IOS_DETECTION_ROW,
+             r"\n    static func subtitle\(for d: Detection\) -> String \{(.*?)\n    \}",
+             (("the named branch leads with inlineLabel",
+               r'd\.hasName\s*\n\s*\? "\\\(d\.type\.inlineLabel\) \\u\{00B7\} \\\(d\.method\.label\)"'),
+              ("and never with label", r"d\.type\.label", 0))),
+            ("iOS Notifications rows", IOS_SETTINGS, None,
+             (("the row title is inlineLabel in sentence case",
+               r"\bradioToggle\(Self\.sentenceCaseRowTitle\(t\.inlineLabel\), notifySubtitle\(t\)"),
+              ("never the bare lowercase name", r"\bradioToggle\(t\.inlineLabel,", 0),
+              ("never label", r"\bradioToggle\((?:Self\.sentenceCaseRowTitle\()?t\.label", 0))),
+            ("Android Log row", AND_LOG_SCREEN,
+             r"\ninternal fun detectionRowSubtitle\(d: Detection\): String =(.*?)\n\n",
+             (("the named branch leads with inlineLabel",
+               r'if \(d\.hasName\) "\$\{d\.type\.inlineLabel\} · \$\{d\.methodLabel\}"'),
+              ("and never with label", r"d\.type\.label", 0))),
+            ("Android Notifications rows", AND_DEVICE_SCREEN, None,
+             (("the row title is inlineLabel in sentence case",
+               r"\bToggleRow\(rowTitleCase\(t\.inlineLabel\), notifySubtitle\(t\)"),
+              ("never the bare lowercase name", r"\bToggleRow\(t\.inlineLabel,", 0),
+              ("never label", r"\bToggleRow\((?:rowTitleCase\()?t\.label", 0))),
+        ),
+    },
+    # The 2026-09-26 review's P3 batch (decisions R20).
+    {
+        "what": "the sample tour's dots speak the step, and no card draws it as text (P3-12)",
+        "why": "'step N of 3' as text 8pt above a three-dot indicator said one thing twice, so the"
+               " text is gone on both phones and the dots carry the words as their spoken value; a"
+               " side that draws the text again, or drops the value, says it twice or not at all",
+        "sides": (
+            ("iOS words", IOS_FIRST_RUN_TOUR, None,
+             (("one pure home for the words",
+               r'static func tourStepValue\(page: Int, count: Int\) -> String \{ "step \\\(page \+ 1\) of \\\(count\)" \}'),
+              ("the dots speak them",
+               r"\.accessibilityValue\(FirstRunTour\.tourStepValue\(page: page, count: sampleCards\.count\)\)"),
+              ("no card draws them", r'Text\("step ', 0))),
+            ("Android words", AND_FIRST_RUN_TOUR, None,
+             (("one pure home for the words",
+               r'internal fun tourStepDescription\(page: Int, count: Int\): String = "step \$\{page \+ 1\} of \$count"'),
+              ("the dots speak them", r"contentDescription = stepDescription"),
+              ("read from that home", r"val stepDescription = tourStepDescription\(pager\.currentPage, cards\.size\)"),
+              ("no card draws them", r'Text\(\s*(?:text = )?"step ', 0))),
+        ),
+    },
+    {
+        "what": "Reduce Motion is observed live on both phones (P3-13)",
+        "why": "iOS reads the environment's accessibilityReduceMotion, which SwiftUI refreshes when"
+               " the setting flips; Android's animator-duration-scale setting is not a"
+               " configuration change, so a one-shot read on composition held the old verdict"
+               " while the app stayed open. rememberReduceMotion registers a ContentObserver on"
+               " the setting's URI for the ornament's composition lifetime and re-reads once after"
+               " registering, so the radar sweep stops the moment the user removes animations",
+        "sides": (
+            ("iOS", IOS_COMPONENTS, None,
+             (("the environment value, refreshed by the system",
+               r"@Environment\(\\\.accessibilityReduceMotion\) private var reduceMotion", 2),)),
+            ("Android", AND_COMPONENTS, r"\nfun rememberReduceMotion\(\): Boolean \{(.*?)\n\}",
+             (("a remembered state, not a one-shot read",
+               r"var reduce by remember\(resolver\) \{ mutableStateOf\(read\(\)\) \}"),
+              ("an observer on the setting's own URI",
+               r"Settings\.Global\.getUriFor\(Settings\.Global\.ANIMATOR_DURATION_SCALE\), false, observer\)"),
+              ("that flips the state", r"override fun onChange\(selfChange: Boolean\) \{ reduce = read\(\) \}"),
+              ("re-read once after registering, then released with the composition",
+               r"reduce = read\(\)\s*\n\s*onDispose \{ resolver\.unregisterContentObserver\(observer\) \}"))),
         ),
     },
 )
@@ -2397,6 +4402,164 @@ def check_shared_shapes():
             drift += 1
         else:
             print(f"   ok: {rule['what']} ({len(rule['sides'])} sides)")
+    return drift
+
+
+# The board kind table (decisions R14): which product a board is, for COPY ONLY. Parsed per side
+# rather than pinned as literals, because the two apps spell the table differently (a Swift enum
+# with one switch per property, a Kotlin enum with one constructor row per kind), and then checked
+# against what the firmware actually advertises and reports, so a renamed advert or fw label that
+# would silently turn every OUI-Spy back into "beacon" fails here instead.
+_BOARD_KIND_PROPS = (("noun", "noun"), ("aNoun", "aNoun"), ("plural", "plural"),
+                     ("upperNoun", "nounUpper"), ("heroTitle", "heroTitle"))
+# Every template hole, and the property that fills it on each side. {os_pairing_request} is the
+# one hole that differs per app by design ("the iOS pairing request" / "Android's pairing request").
+_BOARD_KIND_HOLES = {"{noun}": "noun", "{a_noun}": "aNoun", "{plural}": "plural",
+                     "{NOUN}": "upperNoun", "{os_pairing_request}": None}
+
+
+def _ios_board_kinds(text):
+    """The iOS table as (raws in order, {prop: {raw: value}}, fw prefixes, exact names, name
+    prefixes, holes), or a reason string. A Swift String enum's raw value is its case name."""
+    block = re.findall(r"\nenum BoardKind: String[^{]*\{(.*?)\n\}", text, re.S)
+    if len(block) != 1:
+        return f"{len(block)} `enum BoardKind: String` blocks (expected exactly 1)"
+    body = block[0]
+    raws = re.findall(r"^    case (\w+)\s*$", body, re.M)
+    props = {}
+    for prop, _ in _BOARD_KIND_PROPS:
+        sw = re.findall(r"var " + prop + r": String \{\s*switch self \{(.*?)\n        \}", body, re.S)
+        if len(sw) != 1:
+            return f"{len(sw)} `var {prop}` switches (expected exactly 1)"
+        props[prop] = dict(re.findall(r'case \.(\w+): return "([^"]*)"', sw[0]))
+    fw = re.findall(r'if label\.hasPrefix\("([^"]*)"\) \{ return \.(\w+) \}', body)
+    exact = re.findall(r'if name == "([^"]*)" \{ return \.(\w+) \}', body)
+    prefix = re.findall(r'if name\.hasPrefix\("([^"]*)"\) \{ return \.(\w+) \}', body)
+    holes = dict(re.findall(r'\.replacingOccurrences\(of: "(\{\w+\})", with: (?:k\.)?(\w+)\)', text))
+    return raws, props, fw, exact, prefix, holes
+
+
+def _and_board_kinds(text):
+    """The Android table in the same shape, raw values mapped from the enum names."""
+    rows = re.findall(r'^    ([A-Z_]+)\(' + ", ".join(['"([^"]*)"'] * 6) + r'\)[,;]', text, re.M)
+    if not rows:
+        return "no `NAME(\"raw\", ...)` rows in enum class BoardKind"
+    raw_of = {r[0]: r[1] for r in rows}
+    raws = [r[1] for r in rows]
+    props = {}
+    for i, (prop, _) in enumerate(_BOARD_KIND_PROPS):
+        props[prop] = {r[1]: r[2 + i] for r in rows}
+    try:
+        fw = [(p, raw_of[k]) for p, k in re.findall(r'label\.startsWith\("([^"]*)"\) -> ([A-Z_]+)', text)]
+        exact = [(p, raw_of[k]) for p, k in re.findall(r'name == "([^"]*)" -> ([A-Z_]+)', text)]
+        prefix = [(p, raw_of[k]) for p, k in re.findall(r'name\.startsWith\("([^"]*)"\) -> ([A-Z_]+)', text)]
+    except KeyError as exc:
+        return f"a resolver arm names {exc}, which is not a BoardKind row"
+    and_prop = {a: i for i, a in _BOARD_KIND_PROPS}
+    holes = {h: ("osPairingRequest" if v == "OS_PAIRING_REQUEST" else and_prop.get(v, v))
+             for h, v in re.findall(r'\.replace\("(\{\w+\})", (?:k\.)?(\w+)\)', text)}
+    return raws, props, fw, exact, prefix, holes
+
+
+def _resolve_kind(name, exact, prefix):
+    """What a side's fromAdvertName returns for `name`, walking its arms in source order (exact
+    names first, as both sides write them)."""
+    for n, raw in exact:
+        if name == n:
+            return raw
+    for p, raw in prefix:
+        if name.startswith(p):
+            return raw
+    return None
+
+
+def check_board_kinds():
+    """The board kind table and its detection rules: both apps agree, and both match the firmware."""
+    print("\n== board kind table (copy only; both apps, and what the firmware sends) ==")
+    sides = {}
+    for label, rel, parse in (("iOS", IOS_BOARD_KIND, _ios_board_kinds),
+                              ("Android", AND_BOARD_KIND, _and_board_kinds)):
+        try:
+            parsed = parse(read_local(rel))
+        except OSError as exc:
+            parsed = f"{rel} could not be read ({exc})"
+        if isinstance(parsed, str):
+            print(f"   !! {label} board kind table could not be read ({rel}): {parsed}")
+            return 1
+        sides[label] = parsed
+    drift = 0
+    (i_raws, i_props, i_fw, i_exact, i_prefix, i_holes) = sides["iOS"]
+    (a_raws, a_props, a_fw, a_exact, a_prefix, a_holes) = sides["Android"]
+    rows = [("raw values (stored; order)", i_raws, a_raws)]
+    rows += [(f"{prop} per kind", i_props[prop], a_props[prop]) for prop, _ in _BOARD_KIND_PROPS]
+    rows += [("fw label prefixes (in order)", i_fw, a_fw),
+             ("exact advert names", i_exact, a_exact),
+             ("advert name prefixes", i_prefix, a_prefix),
+             ("template holes and what fills them", i_holes,
+              {h: ("osPairingRequest" if v == "osPairingRequest" else v) for h, v in a_holes.items()})]
+    for what, ios, android in rows:
+        # An empty parse on both sides would "agree", so it is a failure, like _pinned_constant.
+        if not ios or not android:
+            print(f"   !! {what}: parsed to nothing on {'iOS' if not ios else 'Android'}")
+            drift += 1
+        elif ios != android:
+            print(f"   !! {what} DIFFERS between the two apps")
+            print(f"      iOS      {ios!r}")
+            print(f"      Android  {android!r}")
+            drift += 1
+        else:
+            shown = len(ios) if not isinstance(ios, dict) else ", ".join(f"{k}={v}" for k, v in ios.items())
+            print(f"   ok: {what}: {shown}")
+    want_holes = {h: (v or "osPairingRequest") for h, v in _BOARD_KIND_HOLES.items()}
+    if i_holes != want_holes:
+        print(f"   !! renderBoardCopy fills {i_holes!r}, expected {want_holes!r}")
+        drift += 1
+    # Against the firmware: each build's advert name and fw label must resolve to its own kind.
+    # The literals are read from the two mains, so a rename there fails here.
+    fw_side = []
+    try:
+        beacon = read_local(FW_BEACON_MAIN)
+        mesh = read_local(FW_MESH_MAIN)
+        names = re.findall(r'const char\* kBleName = "([^"]*)";', beacon)
+        labels = re.findall(r'const char\* kFwLabel = "([^"]*)";', beacon)
+        mesh_name = re.findall(r'acabBleBegin\("([^"]*)", fwLabel', mesh)
+        mesh_label = re.findall(r'snprintf\(fwLabel, sizeof\(fwLabel\), "(mesh-detect[^"%]*)"\)', mesh)
+    except OSError as exc:
+        print(f"   !! firmware mains could not be read ({exc})")
+        return drift + 1
+    if len(names) != 2 or len(labels) != 2 or len(mesh_name) != 1 or len(mesh_label) != 1:
+        print(f"   !! firmware identities moved: kBleName {names}, kFwLabel {labels},"
+              f" mesh name {mesh_name}, mesh label {mesh_label} (expected 2, 2, 1, 1)")
+        return drift + 1
+    # beacon-board main.cpp declares the dual build's pair first ("beacon" / "beacon board"),
+    # then the single-radio oui-spy's ("ACAB" / "ACAB-ouispy").
+    expected = (("dual-radio beacon", names[0], labels[0], "beacon"),
+                ("single-radio OUI-Spy", names[1], labels[1], "ouiSpy"),
+                ("Mesh-Detect", mesh_name[0], mesh_label[0], "meshDetect"))
+    for build, name, label, raw in expected:
+        for side, fw, exact, prefix in (("iOS", i_fw, i_exact, i_prefix),
+                                        ("Android", a_fw, a_exact, a_prefix)):
+            by_label = next((r for p, r in fw if label.startswith(p)), None)
+            by_name = _resolve_kind(name, exact, prefix)
+            if by_label != raw or by_name != raw:
+                fw_side.append(f"{side}: the {build} build (advert {name!r}, fw {label!r}) reads"
+                               f" as label {by_label}, name {by_name}; expected {raw}")
+    # The app's own nameless fallback must never read as a kind.
+    for side, exact, prefix in (("iOS", i_exact, i_prefix), ("Android", a_exact, a_prefix)):
+        for nameless in ("", "ACAB-01", "AdaDFU"):
+            if _resolve_kind(nameless, exact, prefix) is not None:
+                fw_side.append(f"{side}: the advert name {nameless!r} reads as a kind")
+    if fw_side:
+        print("   !! the apps no longer name the firmware builds by their own kind")
+        for line in fw_side:
+            print(f"      {line}")
+        print("      each build's advert name and fw label are what the apps read to name the board"
+              " (docs/ble-protocol.md 'Board kinds'); a rename on either side makes an OUI-Spy"
+              " read as a beacon, or the reverse")
+        drift += 1
+    else:
+        print(f"   ok: the three firmware builds read as their own kind on both apps"
+              f" ({', '.join(f'{n}/{l}' for _, n, l, _ in expected)})")
     return drift
 
 
@@ -2775,7 +4938,8 @@ def main():
     drift = (check_flock(args.offline) + check_odid(args.offline) + check_odid_copies()
              + check_faq_copies() + check_inline_labels()
              + check_ascii_clamp_copies() + check_shared_constants()
-             + check_shared_shapes() + check_map_refresh_ladder() + check_pin_priority()
+             + check_shared_shapes() + check_board_kinds() + check_map_refresh_ladder()
+             + check_pin_priority()
              + check_privacy_contract())
     # Last, so it sees every file the checks above read.
     drift += check_ci_trigger_paths()

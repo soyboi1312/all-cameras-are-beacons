@@ -122,7 +122,7 @@ final class BeaconPresentationTests: XCTestCase {
     /// Sample mode names the tour's radio switches and sweeps the radar with them, arm for arm
     /// with Android's statusScanPresentation (StatusBeaconPresentationTest pins the same four
     /// literals). It never claims live hardware: the connection label stays SAMPLE DATA, so the
-    /// header pill stays DEMO in every arm.
+    /// header pill stays SAMPLE in every arm.
     func testDemoNamesItsSampleRadiosAndSweepsWithThem() throws {
         let cases: [(Bool, Bool, String, Bool)] = [
             (true,  true,  "SAMPLE DATA", true),
@@ -140,7 +140,7 @@ final class BeaconPresentationTests: XCTestCase {
                 status: try makeStatus(ble: ble, wifi: wifi),
                 combinedUpdateRunning: false)
 
-            XCTAssertEqual(value.chipLabel, "DEMO", "ble=\(ble) wifi=\(wifi)")
+            XCTAssertEqual(value.chipLabel, "SAMPLE", "ble=\(ble) wifi=\(wifi)")
             XCTAssertEqual(value.connectionLabel, "SAMPLE DATA", "ble=\(ble) wifi=\(wifi)")
             XCTAssertEqual(value.scanLabel, expected)
             XCTAssertEqual(value.isScanning, sweeps, "the beam follows the sample switches")
@@ -159,7 +159,7 @@ final class BeaconPresentationTests: XCTestCase {
             status: nil,
             combinedUpdateRunning: false)
 
-        XCTAssertEqual(value.chipLabel, "DEMO")
+        XCTAssertEqual(value.chipLabel, "SAMPLE")
         XCTAssertEqual(value.scanLabel, "SAMPLE DATA · RADIOS OFF")
         XCTAssertFalse(value.isScanning)
     }
@@ -377,6 +377,84 @@ final class BeaconPresentationTests: XCTestCase {
             combinedStale: combinedStale,
             s3Stale: s3Stale,
             combinedS3Updated: combinedS3Updated)
+    }
+
+    /// The Beacon partition, both segments. TWIN: Android
+    /// StatusBeaconPresentationTest.beaconRowsFollowTheSharedPartition, the same lists without
+    /// disconnect and powerOff (Android draws those in the overflow menu) and without the phone
+    /// side's preferencesHeader / supportHeader: Android derives PREFERENCES and SUPPORT from the
+    /// group key (DeviceScreen.kt beaconGroupHeaderLabel), so its phone list is rows only, while the
+    /// groups, their keys and the labels match (decisions R13). Every render gate the
+    /// rows have lives in beaconRows, so each gate is one assertion here: listing Alerts before
+    /// Desert fails the first, an unconditional System readiness fails the demo one, dropping the
+    /// mesh gate fails the mesh one, and a grouping that files header rows as rows fails the last
+    /// block.
+    func testBeaconRowsFollowTheSharedPartition() {
+        func rows(_ s: BeaconSegment, mesh: Bool = false, fw: Bool = true, demo: Bool = false,
+                  improve: Bool = true, saved: Bool = true, powerOff: Bool = true) -> [BeaconRowID] {
+            beaconRows(segment: s, meshBoard: mesh, firmwareVisible: fw, demo: demo,
+                       improveAvailable: improve, hasSavedLog: saved, showPowerOff: powerOff)
+        }
+        let board = rows(.board)
+        XCTAssertEqual(board, [.hero, .uptime, .detections, .detectionHeader, .scanRadios, .detectors,
+                               .desert, .onBoardHeader, .alerts, .boardLED, .firmware, .managedDevices,
+                               .disconnect, .powerOff])
+        XCTAssertEqual(rows(.board, mesh: true), board.filter { $0 != .alerts }, "no buzzer, no Alerts row")
+        XCTAssertEqual(rows(.board, fw: false), board.filter { $0 != .firmware }, "the banner replaces the row")
+        XCTAssertEqual(rows(.board, powerOff: false), board.filter { $0 != .powerOff })
+        let phone = rows(.phone)
+        XCTAssertEqual(phone, [.preferencesHeader, .notifications, .liveMode, .display, .supportHeader,
+                               .systemReadiness, .improveDetection, .helpSupport, .about, .savedLog])
+        XCTAssertEqual(rows(.phone, demo: true, improve: false),
+                       [.preferencesHeader, .notifications, .liveMode, .display, .supportHeader,
+                        .helpSupport, .about])
+        XCTAssertEqual(rows(.phone, saved: false), phone.filter { $0 != .savedLog })
+        XCTAssertEqual(rows(.phone, mesh: true, fw: false, powerOff: false), phone,
+                       "board-only facts never move a phone row")
+        // The rows become grouped sections, header rows become the section headers (decisions
+        // R13; Android's twin is StatusBeaconPresentationTest
+        // .beaconRowGroupsFollowTheIosSectionsAndCarryTheirIntros, without key 4). The hero and
+        // the Uptime / Detections pair are the two card groups; every other group is a cell.
+        XCTAssertEqual(beaconRowGroups(board), [
+            BeaconRowGroup(id: 0, header: nil, rows: [.hero]),
+            BeaconRowGroup(id: 1, header: nil, rows: [.uptime, .detections]),
+            BeaconRowGroup(id: 2, header: .detectionHeader, rows: [.scanRadios, .detectors, .desert]),
+            BeaconRowGroup(id: 3, header: .onBoardHeader, rows: [.alerts, .boardLED, .firmware, .managedDevices]),
+            BeaconRowGroup(id: 4, header: nil, rows: [.disconnect, .powerOff])])
+        XCTAssertEqual(beaconRowGroups(rows(.board, mesh: true))[3].rows, [.boardLED, .firmware, .managedDevices])
+        XCTAssertEqual(beaconRowGroups(board).map(\.isCardGroup), [true, true, false, false, false])
+        XCTAssertFalse(beaconRowGroups(phone).contains { $0.isCardGroup })
+        XCTAssertEqual(beaconRowGroups(phone).map(\.rows),
+                       [[.notifications, .liveMode, .display],
+                        [.systemReadiness, .improveDetection, .helpSupport, .about], [.savedLog]])
+        // L1: this device's two groups open with PREFERENCES and SUPPORT the way the board's open
+        // with DETECTION and ON THE BOARD; the saved log keeps none. The sample tour drops System
+        // readiness but never the SUPPORT header.
+        XCTAssertEqual(beaconRowGroups(phone).map(\.header), [.preferencesHeader, .supportHeader, nil])
+        XCTAssertEqual(beaconRowGroups(phone).map(\.id), [5, 6, 7])
+        XCTAssertEqual(beaconRowGroups(rows(.phone, demo: true, improve: false)).map(\.header),
+                       [.preferencesHeader, .supportHeader])
+    }
+
+    /// The DEBUG `-beacon-segment phone` store-screenshot hook (C16). TWIN: Android
+    /// AcabAppStateTest.beaconSegmentExtraDefaultsToBoard. A parse that defaults to phone fails the
+    /// empty-arguments assertion; a parse without the bounds check traps on the last one.
+    func testBeaconLaunchSegmentParsesPhoneAndDefaultsToBoard() {
+        XCTAssertEqual(beaconLaunchSegment(["Beacons", "-tab", "3", "-beacon-segment", "phone"]), .phone)
+        XCTAssertEqual(beaconLaunchSegment(["-beacon-segment", "garbage"]), .board)
+        XCTAssertEqual(beaconLaunchSegment([]), .board)
+        XCTAssertEqual(beaconLaunchSegment(["-beacon-segment"]), .board,
+                       "a flag with no value reads nothing past the end")
+    }
+
+    /// The DEBUG `-beacon-push about` screenshot hook (F2): About only, nothing otherwise. A parse
+    /// that pushes by default fails the empty-arguments assertion; one that takes any value pushes
+    /// on "garbage"; a parse without the bounds check traps on the last one.
+    func testBeaconLaunchPushOpensAboutOnly() {
+        XCTAssertEqual(beaconLaunchPush(["Beacons", "-tab", "3", "-beacon-push", "about"]), .about)
+        XCTAssertNil(beaconLaunchPush(["-beacon-push", "garbage"]))
+        XCTAssertNil(beaconLaunchPush([]))
+        XCTAssertNil(beaconLaunchPush(["-beacon-push"]), "a flag with no value reads nothing past the end")
     }
 
     private func makeStatus(

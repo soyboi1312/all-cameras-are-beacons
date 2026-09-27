@@ -354,8 +354,9 @@ struct Detection: Identifiable, Equatable {
     let bootCount: UInt32?       // json "boot"
 
     // True for any record filed through the offline-buffer replay path, i.e. captured by
-    // the board while the phone was away. Drives the "OFFLINE" chip in the log. Set from
-    // the replay handshake (mirrors isHistory) and persisted so a reloaded row keeps it.
+    // the board while the phone was away. Drives the OFFLINE word in the Log row's provenance
+    // overline (logRowOverline) and the Log's Offline only filter. Set from the replay
+    // handshake (mirrors isHistory) and persisted so a reloaded row keeps it.
     let offline: Bool            // json "off"; falls back to hist on decode
 
     /// Stable identity. Drones group by UAS-ID so they survive MAC rotation, matching the firmware's
@@ -399,16 +400,10 @@ struct Detection: Identifiable, Equatable {
         return h < 48 ? "\(h)h" : "\(h / 24)d"
     }
 
-    /// Compact LOC-badge text for a stale-fix position. A LIVE detection reads "4m ago" (the
-    /// fix trails roughly now). An OFFLINE/replayed record was captured at an unknown PAST
-    /// time, so "ago" would falsely imply the position is recent; show the fix-to-sighting
-    /// lag instead ("fix 4m"). nil when the fix is fresh or there's no location.
-    var locationAgeText: String? {
-        guard let m = gpsFixAgeMagnitude else { return nil }
-        return offline ? "fix \(m)" : "\(m) ago"
-    }
-
-    /// Longer form for the detail card, same live/offline split as `locationAgeText`.
+    /// Longer form for the detail card. A LIVE detection reads 'location as of 4m ago'; an
+    /// OFFLINE/replayed record was captured at an unknown past time, so it reads 'location from a
+    /// fix 4m old' instead of an 'ago' that would imply the position is recent. nil when the fix
+    /// is fresh or there's no location.
     var locationAgeDetail: String? {
         guard let m = gpsFixAgeMagnitude else { return nil }
         return offline ? "location from a fix \(m) old" : "location as of \(m) ago"
@@ -442,6 +437,17 @@ struct Detection: Identifiable, Equatable {
     /// hasName reports false renders the category in NEITHER the title nor the subtitle. Keep
     /// this defined in terms of displayName.
     var hasName: Bool { displayName != type.label }
+
+    /// The name a row, card or dossier DRAWS as its title: displayName, except that a row nothing
+    /// names reads the category's title fallback ("body cam", "network camera") instead of the
+    /// export label ("Body Camera"). Titles only: displayName stays the value for hasName, the
+    /// managed-list labels, notification text, CSV / GPX, search and the map pin compares.
+    /// displayName is evaluated once (this runs per Log row on the ~3 Hz publish).
+    /// TWIN: android OuiVendors.kt `Detection.titleName`.
+    var titleName: String {
+        let n = displayName
+        return n == type.label ? type.titleFallback : n
+    }
 
     /// Readable label for the drone's ODID operational status.
     var ridStatusLabel: String? {
@@ -613,7 +619,7 @@ extension Detection: Codable {
         }
         approx     = (try? k.decode(Bool.self, forKey: .approx)) ?? false
         // Live wire records carry neither key -> false. Replayed records carry hist=true.
-        // Our on-disk checkpoint writes "off" explicitly so a reloaded row keeps the chip.
+        // Our on-disk checkpoint writes "off" explicitly so a reloaded row keeps its OFFLINE mark.
         offline    = (try? k.decode(Bool.self, forKey: .off)) ?? isHistory
     }
 
@@ -680,7 +686,7 @@ extension Detection {
         case 0x0075: return "Samsung"
         case 0x00E0: return "Google"
         case 0x0006: return "Microsoft"
-        case 0x0D53: return "Luxottica (Ray-Ban Meta)"
+        case 0x0D53: return "Luxottica"
         case 0x03C2: return "Snap (Spectacles)"
         case 0x060C: return "Vuzix"
         case 0x058E: return "Meta Platforms Technologies"

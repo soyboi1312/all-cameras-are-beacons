@@ -1,6 +1,8 @@
 package tech.acab.app.ui
 
+import android.Manifest
 import android.content.Intent
+import android.content.pm.PackageManager
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
@@ -11,6 +13,9 @@ import androidx.compose.foundation.relocation.bringIntoViewRequester
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.BasicTextField
 import androidx.compose.foundation.verticalScroll
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.outlined.Search
+import androidx.compose.material3.Icon
 import androidx.compose.material3.Text
 import androidx.compose.material3.minimumInteractiveComponentSize
 import androidx.compose.runtime.*
@@ -28,11 +33,18 @@ import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.style.TextDecoration
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import androidx.core.content.ContextCompat
 import androidx.core.net.toUri
+import tech.acab.app.ble.AcabBleManager
+import tech.acab.app.ble.ConnState
+import tech.acab.app.ble.DetectionNotifier
 import tech.acab.app.model.FaqContent
 import tech.acab.app.model.FaqQuestion
 import tech.acab.app.model.FaqSupportRow
 import tech.acab.app.ui.theme.Acab
+
+/** TWIN: iOS improveDetectionAvailable(isSessionReady:isDemoMode:) in HelpView.swift. */
+internal fun improveDetectionAvailable(state: ConnState, demoMode: Boolean): Boolean = state == ConnState.READY && !demoMode
 
 /**
  * Bundled Help + FAQ. Mirrors iOS HelpView: same content file, same sections, same search
@@ -70,8 +82,8 @@ fun HelpScreen(
         }
     }
 
-    // Own a bounded viewport and scroll the FAQ inside it. The tour is a sibling in this root Box,
-    // so fillMaxSize means the visible Help route, not an unbounded parent scrolling Column.
+    // Own a bounded viewport and scroll the FAQ inside it, so fillMaxSize means the visible Help
+    // route, not an unbounded parent scrolling Column. The replay sheet is a Dialog window.
     Box(modifier.fillMaxSize()) {
         Column(
             Modifier.fillMaxSize()
@@ -90,7 +102,12 @@ fun HelpScreen(
                 .padding(horizontal = 12.dp),
             verticalAlignment = Alignment.CenterVertically,
         ) {
-            Text("?", color = Acab.faint, fontSize = 13.sp, fontFamily = Acab.mono)
+            // The field's leading glyph is the magnifier, the M3 search affordance (2026-09-26
+            // review P3-10): a "?" here read as a help affordance, not search. Decorative: the
+            // field itself is spoken as "Search help". TWIN: iOS HelpView's search field draws
+            // the system magnifier.
+            Icon(Icons.Outlined.Search, contentDescription = null, tint = Acab.faint,
+                modifier = Modifier.size(18.dp))
             Spacer(Modifier.width(9.dp))
             BasicTextField(
                 value = query,
@@ -112,7 +129,7 @@ fun HelpScreen(
             )
             if (query.isNotEmpty()) {
                 Text(
-                    "clear",
+                    "Clear",
                     color = Acab.dim, fontSize = 11.sp, fontFamily = Acab.mono,
                     modifier = Modifier.minimumInteractiveComponentSize().clickable { query = "" },
                 )
@@ -189,7 +206,25 @@ fun HelpScreen(
             Spacer(Modifier.height(6.dp))
         }
 
-        if (tourOpen) FirstRunTourOverlay(onFinish = { tourOpen = false })
+        // "replay the setup checklist": the setup checklist, read-only (no buttons, no chevrons, and
+        // closing it persists nothing). The two permission facts are read once, when it opens.
+        if (tourOpen) {
+            // Same check as MainActivity.hasLocationPermission.
+            val locationGranted = remember {
+                ContextCompat.checkSelfPermission(context, Manifest.permission.ACCESS_FINE_LOCATION) ==
+                    PackageManager.PERMISSION_GRANTED ||
+                    ContextCompat.checkSelfPermission(context, Manifest.permission.ACCESS_COARSE_LOCATION) ==
+                    PackageManager.PERMISSION_GRANTED
+            }
+            val notificationsAvailable = remember { DetectionNotifier.liveChannelDeliverable(context) }
+            ChecklistSheet(
+                AcabBleManager.getInstance(context),
+                replay = true,
+                locationGranted = locationGranted,
+                notificationsAvailable = notificationsAvailable,
+                onDismiss = { tourOpen = false },
+            )
+        }
     }
 }
 

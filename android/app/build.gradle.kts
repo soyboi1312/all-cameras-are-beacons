@@ -34,9 +34,9 @@ android {
         // layout all need eyes on a real 16 device.
         targetSdk = 36
         // versionCode is INDEPENDENT of versionName and must climb on every Play upload; Play
-        // rejects a re-upload at a used code. 28 shipped as 2.0.8.
-        versionCode = 29
-        versionName = "2.0.9"
+        // rejects a re-upload at a used code. 28 shipped as 2.0.8, 29 as 2.0.9 (tag android-v2.0.9).
+        versionCode = 30
+        versionName = "2.1.0"
     }
 
     signingConfigs {

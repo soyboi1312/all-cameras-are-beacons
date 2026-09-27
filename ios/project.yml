@@ -27,7 +27,7 @@ packages:
 
 settings:
   base:
-    MARKETING_VERSION: "2.0.9"
+    MARKETING_VERSION: "2.1.0"
     # The build number RESTARTS AT 0 for each new MARKETING_VERSION, and only climbs when a SECOND
     # build of the SAME version has to go up. App Store Connect requires the build to be unique
     # within a version string, NOT across the app, so 0 is always free on a version that has never
@@ -43,8 +43,8 @@ settings:
     # clobbered by the next `xcodegen generate` AND it only touches the app target, leaving
     # BeaconsWidget behind -> "extension version must match parent app". Both targets read
     # $(CURRENT_PROJECT_VERSION), so setting it HERE and regenerating keeps them in lockstep.
-    CURRENT_PROJECT_VERSION: "1"   # 2.0.9 build 1, set 2026-09-21. No 2.0.9 build has uploaded yet;
-                                   # the last 2.0.8 upload was build 3.
+    CURRENT_PROJECT_VERSION: "0"   # 2.1.0 build 0, set 2026-09-25: a new MARKETING_VERSION restarts at 0
+                                   # (the rule above). The last 2.0.9 build set here was 1.
     SWIFT_VERSION: "5.0"
     CODE_SIGN_STYLE: Automatic
     DEVELOPMENT_TEAM: "49B9T69XPF"        # baked in so `xcodegen generate` keeps signing
@@ -99,9 +99,15 @@ targets:
           - bluetooth-central
           - location
         UIAppFonts:
-          - SpaceGrotesk-Regular.ttf
-          - SpaceGrotesk-Medium.ttf
+          # The connect-screen wordmark (ACABWordmark, Components.swift), restored 2026-09-26
+          # (R16). Shared with the widget, which sets its digits in it.
           - SpaceGrotesk-Bold.ttf
+          # The Status motto only (PunkLine, Components.swift), restored 2026-09-25. App only:
+          # the widget never draws the motto, so its UIAppFonts list below leaves it out.
+          - SpaceGrotesk-Medium.ttf
+          # JetBrains Mono, the instrument layer (ACABTheme.telemetry): kickers, telemetry,
+          # numbers and identifiers. Medium is shared with the widget; the other three cuts
+          # are app-only (the weight map and the higher-contrast weight step reach them).
           - JetBrainsMono-Regular.ttf
           - JetBrainsMono-Medium.ttf
           - JetBrainsMono-SemiBold.ttf
@@ -113,6 +119,12 @@ targets:
             CFBundleURLSchemes:
               - beacons
         UILaunchScreen: {}
+        # The app is dark-only, but .preferredColorScheme(.dark) applies only after launch.
+        # An empty UILaunchScreen draws systemBackground, which is white on a phone set to Light,
+        # so every cold launch flashed white before the black first screen. Pinning the style
+        # makes the launch screen, alerts and UIKit-presented controllers dark from the start;
+        # dark systemBackground is 000000, the same as ACABTheme.bg, so no UIColorName is needed.
+        UIUserInterfaceStyle: Dark
         UIApplicationSceneManifest:
           UIApplicationSupportsMultipleScenes: false
         UISupportedInterfaceOrientations:

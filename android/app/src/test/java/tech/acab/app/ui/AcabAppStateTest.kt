@@ -1,11 +1,16 @@
 package tech.acab.app.ui
 
+import org.json.JSONObject
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
 import tech.acab.app.ble.AlertMode
+import tech.acab.app.ble.BoardKind
 import tech.acab.app.ble.ConnState
+import tech.acab.app.beaconSegmentExtra
+import tech.acab.app.model.DeviceStatus
 
 class AcabAppStateTest {
     @Test
@@ -114,14 +119,14 @@ class AcabAppStateTest {
             desertSilenceSlot(restoreOffered = true, noticeApplies = noticeOnMesh))
     }
 
-    /** THE BOARD BEING AWAY IS WHEN THE OFFER MATTERS MOST. Both of its in-panel homes sit inside
-     *  the config panel, whose fold rows take `enabled = boardControlsAvailable` and COLLAPSE when
-     *  that is false, so the offer stops drawing entirely (iOS disables the same panel as one
-     *  unit), and a board reboot or a factory reset is exactly what arms the offer. So the detached
-     *  surface has to appear in precisely that window.
+    /** THE BOARD BEING AWAY IS WHEN THE OFFER MATTERS MOST. Both of its in-page homes are the
+     *  Desert and Alerts pages, which beaconPageToDraw withholds while boardControlsAvailable is
+     *  false, so the offer stops drawing entirely (iOS disables its board controls), and a board
+     *  reboot or a factory reset is exactly what arms the offer. So the detached surface has to
+     *  appear in precisely that window.
      *
      *  The middle assertion is also the invariant that keeps the screen from showing the offer
-     *  twice: this predicate is the NEGATION of the panel's gate, so a live in-panel copy and the
+     *  twice: this predicate is the NEGATION of the pages' gate, so a live in-page copy and the
      *  detached one can never both draw. Dropping the `!` flips the first two assertions together.
      *  iOS twin: testTheRestoreOfferGetsItsOwnSurfaceExactlyWhileTheBoardIsAway. */
     @Test
@@ -162,12 +167,36 @@ class AcabAppStateTest {
             restoreOffered = false, mainShellVisible = true))
     }
 
+    /** The Improve detection route (the THIS PHONE row, the Help support row and the dossier's
+     *  related help) needs a READY link to a real beacon: the sample tour has no board to
+     *  contribute from. Wrong input: `state != ConnState.DISCONNECTED` lets CONNECTING through
+     *  and fails the last assertion. iOS twin: OnboardingPolicyTests
+     *  testImproveDetectionRequiresAReadyRealBeacon. */
+    @Test
+    fun improveDetectionRequiresAReadyRealBeacon() {
+        assertTrue(improveDetectionAvailable(ConnState.READY, demoMode = false))
+        assertFalse("the sample tour has no board to contribute from",
+            improveDetectionAvailable(ConnState.READY, demoMode = true))
+        assertFalse("no link yet", improveDetectionAvailable(ConnState.CONNECTING, demoMode = false))
+    }
+
+    /** The store-screenshot intent extra opens THIS PHONE only on the exact word "phone"; any other
+     *  value, and no extra at all, opens BOARD, the session default. Wrong input: a PHONE default
+     *  fails the last two assertions. iOS twin: BeaconPresentationTests
+     *  testBeaconLaunchSegmentParsesPhoneAndDefaultsToBoard. */
+    @Test
+    fun beaconSegmentExtraDefaultsToBoard() {
+        assertEquals(BeaconSegment.PHONE, beaconSegmentExtra("phone"))
+        assertEquals(BeaconSegment.BOARD, beaconSegmentExtra("garbage"))
+        assertEquals(BeaconSegment.BOARD, beaconSegmentExtra(null))
+    }
+
     /** THE RULE, as the two panel gates together: while a mode is owed, SOME surface answers for it
      *  in every state the app can be in, and never two at once.
      *
      *  Exactly one of four owners holds the offer in each row: the OTA wait screen while an update
      *  holds the link down, the pre-connect slot when the shell is gone for any other reason, the
-     *  detached slot when the shell is up but the config panel is board-gated shut, and the in-card
+     *  detached slot when the shell is up but the board pages are withheld, and the in-card
      *  copies when it is not. The board's availability is deliberately irrelevant once the shell is
      *  gone, because a board cannot be available without a link.
      *
@@ -177,7 +206,7 @@ class AcabAppStateTest {
      *  helpers, so widening either gate makes two owners draw at once.
      *
      *  OWNERSHIP, NOT PIXELS: the last column means the Desert card's silence slot and the Alerts
-     *  card carry it, each behind its own fold row, with the collapsed alerts kicker saying a
+     *  card carry it, each on its own pushed page, with the Alerts row value saying a
      *  restore is waiting. What this asserts is that no state is left with nobody holding it, and
      *  that no state hands it to two owners at once. It CANNOT see a deleted render site - the
      *  gates keep answering either way; check-signature-drift.py's "Android pre-connect decision"
@@ -304,22 +333,37 @@ class AcabAppStateTest {
      *  a reword on one side only would send one phone's owner looking for a button by another name. */
     @Test
     fun desertRestoreOfferCopyIsExact() {
+        // The sentence is a template that names the board ({noun}, decisions R14); null reads as
+        // beacon. TWIN: iOS DeviceViewRenderingTests.testDesertRestoreOfferCopyIsExact.
         assertEquals(
-            "desert mode ended on the beacon, so your alert mode is still silent. the app does not change it on its own. restore alerts puts back the mode you had before desert mode.",
-            DESERT_RESTORE_OFFER,
+            "desert mode ended on the {noun}, so your alert mode is still silent. the app does not change it on its own. Restore Alerts puts back the mode you had before desert mode.",
+            DESERT_RESTORE_OFFER_TEMPLATE,
         )
-        assertEquals("RESTORE ALERTS", DESERT_RESTORE_OFFER_ACTION)
-        assertEquals('d', DESERT_RESTORE_OFFER.first())
+        assertEquals(
+            "desert mode ended on the beacon, so your alert mode is still silent. the app does not change it on its own. Restore Alerts puts back the mode you had before desert mode.",
+            desertRestoreOffer(null),
+        )
+        assertEquals(
+            "desert mode ended on the OUI-Spy, so your alert mode is still silent. the app does not change it on its own. Restore Alerts puts back the mode you had before desert mode.",
+            desertRestoreOffer(BoardKind.OUI_SPY),
+        )
+        assertEquals(
+            "desert mode ended on the Mesh-Detect, so your alert mode is still silent. the app does not change it on its own. Restore Alerts puts back the mode you had before desert mode.",
+            desertRestoreOffer(BoardKind.MESH_DETECT),
+        )
+        assertEquals("Restore Alerts", DESERT_RESTORE_OFFER_ACTION)
+        assertEquals('d', DESERT_RESTORE_OFFER_TEMPLATE.first())
         for (banned in listOf('\u2014', '\u2013', '\u2019', '!')) {
-            assertFalse("banned character $banned", DESERT_RESTORE_OFFER.contains(banned))
+            assertFalse("banned character $banned", DESERT_RESTORE_OFFER_TEMPLATE.contains(banned))
             assertFalse("banned character $banned", DESERT_RESTORE_OFFER_ACTION.contains(banned))
         }
         // It asserts the MODE, not the sound. reconcileBuzzer has a terminal state where the board
         // refuses the mute and keeps beeping while the mode reads SILENT; a claim about sound would
         // be false exactly there, on the one product where that is the worst thing to get wrong.
-        assertTrue(DESERT_RESTORE_OFFER.contains("your alert mode is still silent"))
-        // And it names its own control, so the sentence and the button cannot drift apart.
-        assertTrue(DESERT_RESTORE_OFFER.contains(DESERT_RESTORE_OFFER_ACTION.lowercase()))
+        assertTrue(DESERT_RESTORE_OFFER_TEMPLATE.contains("your alert mode is still silent"))
+        // And it names its own control in the control's own case, so the sentence and the button
+        // cannot drift apart.
+        assertTrue(DESERT_RESTORE_OFFER_TEMPLATE.contains(DESERT_RESTORE_OFFER_ACTION))
     }
 
     @Test
@@ -363,28 +407,20 @@ class AcabAppStateTest {
         assertFalse(canRetryAllMissingPermissions(emptyList()))
     }
 
+    /** The checklist opens only on a READY, real session whose seen flag is unset. Wrong input: a
+     *  gate that ignores `seen` shows an upgrader who finished the old tour the checklist again (the
+     *  fourth assertion fails); one that ignores the state opens it before the encrypted link is up
+     *  (the second fails). Then automatic Live Mode waits for completion, as before.
+     *  iOS twin: OnboardingPolicyTests testChecklistGateReadsBothDurableKeys. */
     @Test
-    fun androidBackDefersTourWithoutSpendingFirstRunMarker() {
-        // The whole truth table, four distinct inputs. The last row used to be a byte-identical
-        // repeat of the first, captioned "a new session clears the deferred flag while the
-        // persistent seen flag remains false" - a LIFECYCLE claim about where the two flags are
-        // stored, which a pure predicate cannot make and this file does not test. The rule is
-        // real: deferred is rememberSaveable composition state in AcabApp, seen is the
-        // "first_run_tour_seen" preference owned by FirstRunTour. Promote deferred to that same
-        // preference and every assertion here still passes.
-        assertTrue(shouldPresentFirstRunTour(seen = false, deferred = false))
-        assertFalse(shouldPresentFirstRunTour(seen = false, deferred = true))
-        assertFalse(shouldPresentFirstRunTour(seen = true, deferred = false))
-        assertFalse(shouldPresentFirstRunTour(seen = true, deferred = true))
-    }
+    fun checklistOpensOnlyForUnseenReadyRealSessions() {
+        assertTrue(shouldOpenChecklist(ConnState.READY, demoMode = false, seen = false))
+        assertFalse(shouldOpenChecklist(ConnState.CONNECTING, demoMode = false, seen = false))
+        assertFalse(shouldOpenChecklist(ConnState.READY, demoMode = true, seen = false))
+        assertFalse("an upgrader who finished the old tour never sees it",
+            shouldOpenChecklist(ConnState.READY, demoMode = false, seen = true))
 
-    @Test
-    fun readyStateOpensTourBeforeShellEffectAndTourMustBeSpentBeforeDefaultLive() {
-        assertTrue(shouldOpenRealFirstRunTour(ConnState.READY, false, false, false))
-        assertFalse(shouldOpenRealFirstRunTour(ConnState.CONNECTING, false, false, false))
-        assertFalse(shouldOpenRealFirstRunTour(ConnState.READY, true, false, false))
-
-        // Back defers the visible tour, but unseen onboarding still blocks both Live surfaces.
+        // An unfinished checklist blocks automatic Live Mode.
         assertFalse(shouldAttemptDefaultLive(
             state = ConnState.READY,
             demoMode = false,
@@ -393,6 +429,7 @@ class AcabAppStateTest {
             wanted = true,
             active = false,
             attempted = false,
+            locationPromptPending = false,
         ))
         assertTrue(shouldAttemptDefaultLive(
             state = ConnState.READY,
@@ -402,6 +439,7 @@ class AcabAppStateTest {
             wanted = true,
             active = false,
             attempted = false,
+            locationPromptPending = false,
         ))
         assertFalse(shouldAttemptDefaultLive(
             state = ConnState.READY,
@@ -411,14 +449,102 @@ class AcabAppStateTest {
             wanted = true,
             active = false,
             attempted = false,
+            locationPromptPending = false,
         ))
     }
 
+    /** The checklist's Continue asks for Location as the sheet closes, and the Live rationale must
+     *  not stack with that system dialog: with every other input set to start, a pending Location
+     *  prompt holds the start, and its result releases it. Wrong input: a shouldAttemptDefaultLive
+     *  that ignores the new input fails the first assertion. */
     @Test
-    fun finishSetupCardIsRealModeOnlyAndDismissible() {
-        assertTrue(shouldShowFinishSetupCard(demo = false, dismissed = false))
-        assertFalse(shouldShowFinishSetupCard(demo = true, dismissed = false))
-        assertFalse(shouldShowFinishSetupCard(demo = false, dismissed = true))
+    fun defaultLiveWaitsForTheChecklistLocationPrompt() {
+        assertFalse(shouldAttemptDefaultLive(
+            state = ConnState.READY, demoMode = false, tourSeen = true, promptDeferred = false,
+            wanted = true, active = false, attempted = false, locationPromptPending = true,
+        ))
+        assertTrue(shouldAttemptDefaultLive(
+            state = ConnState.READY, demoMode = false, tourSeen = true, promptDeferred = false,
+            wanted = true, active = false, attempted = false, locationPromptPending = false,
+        ))
+    }
+
+    /** One set of scan-button words on both phones, with a neutral "Continue" before the system
+     *  has asked. A running scan wins over the permission, as on iOS. Wrong input: checking the
+     *  permission first fails the third assertion. iOS twin: OnboardingPolicyTests
+     *  testBluetoothPrePermissionActionUsesNeutralContinueTitle. */
+    @Test
+    fun scanButtonTitleMatchesIos() {
+        assertEquals("Continue", scanButtonTitle(isScanning = false, granted = false))
+        assertEquals("Scan for Beacons", scanButtonTitle(isScanning = false, granted = true))
+        assertEquals("Stop Scanning", scanButtonTitle(isScanning = true, granted = false))
+        assertEquals("Stop Scanning", scanButtonTitle(isScanning = true, granted = true))
+    }
+
+    /** Authorized wins over denied, then denied over undecided. Wrong input: checking isDenied
+     *  first fails the last assertion. iOS twin: OnboardingPolicyTests
+     *  testLocationChoiceHasExplicitContinueAndNotNowState. */
+    @Test
+    fun locationChoiceHasExplicitContinueAndNotNowState() {
+        assertEquals(FinishSetupLocationChoice.CONTINUE_OR_NOT_NOW,
+            finishSetupLocationChoice(isAuthorized = false, isDenied = false))
+        assertEquals(FinishSetupLocationChoice.OPEN_SETTINGS_OR_DONE,
+            finishSetupLocationChoice(isAuthorized = false, isDenied = true))
+        assertEquals(FinishSetupLocationChoice.DONE,
+            finishSetupLocationChoice(isAuthorized = true, isDenied = false))
+        assertEquals(FinishSetupLocationChoice.DONE,
+            finishSetupLocationChoice(isAuthorized = true, isDenied = true))
+    }
+
+    /** Continue requests Location only for a checklist that was really shown, on a ready, real
+     *  session. Each input on its own must be able to stop it. Wrong input: a predicate that
+     *  ignores sheetWasPresented fails the fourth assertion. iOS twin: OnboardingPolicyTests
+     *  testLocationPromptRequiresAVisibleCompletedFinishSetupSheet. */
+    @Test
+    fun locationPromptRequiresAVisibleCompletedChecklist() {
+        assertTrue(shouldRequestOnboardingLocation(
+            continueChosen = true, isSessionReady = true, sheetWasPresented = true, isDemoMode = false))
+        assertFalse("Not Now never requests", shouldRequestOnboardingLocation(
+            continueChosen = false, isSessionReady = true, sheetWasPresented = true, isDemoMode = false))
+        assertFalse("the link dropped before the sheet closed", shouldRequestOnboardingLocation(
+            continueChosen = true, isSessionReady = false, sheetWasPresented = true, isDemoMode = false))
+        assertFalse("no sheet, no request", shouldRequestOnboardingLocation(
+            continueChosen = true, isSessionReady = true, sheetWasPresented = false, isDemoMode = false))
+        assertFalse("sample data never asks", shouldRequestOnboardingLocation(
+            continueChosen = true, isSessionReady = true, sheetWasPresented = true, isDemoMode = true))
+    }
+
+    /** The detectors row counts the six category detectors and never the body-cam sub-toggle
+     *  (moto) or the drone refinement (droui); both fixtures turn those two ON, so counting either
+     *  moves 5 to 6 and 1 to 2. Wrong inputs: counting moto or droui; "1 detectors on".
+     *  iOS twin: OnboardingPolicyTests testChecklistDetectorsTitleCountsEnabledDetectors. */
+    @Test
+    fun checklistDetectorsTitleCountsEnabledDetectors() {
+        assertNull(enabledDetectorCount(null))
+        // Sentence case since the 2026-09-26 review (P3-11): the uncounted title is a row title.
+        assertEquals("Detectors on", checklistDetectorsTitle(null))
+        val five = DeviceStatus.fromJson(JSONObject(
+            """{"fw":"beacon board 2.0.9","flock":true,"drone":true,"bodycam":true,"tracker":false,"glasses":true,"ncam":true,"moto":true,"droui":true}"""))
+        assertEquals(5, enabledDetectorCount(five))
+        assertEquals("5 detectors on", checklistDetectorsTitle(enabledDetectorCount(five)))
+        val one = DeviceStatus.fromJson(JSONObject(
+            """{"fw":"beacon board 2.0.9","flock":true,"drone":false,"bodycam":false,"tracker":false,"glasses":false,"ncam":false,"moto":true,"droui":true}"""))
+        assertEquals("1 detector on", checklistDetectorsTitle(enabledDetectorCount(one)))
+        assertEquals("0 detectors on", checklistDetectorsTitle(0))
+    }
+
+    /** J7: the replay with no live board (sample data, or before a connect) is a preview; the
+     *  replay over a real frame, and the post-connect sheet, never are. Wrong input: the old sheet
+     *  drew unticked checks under "your beacon is listening" with no board at all. iOS twin:
+     *  checklistIsPreview(replay:frame:) in ChecklistView.swift. */
+    @Test
+    fun checklistReplayWithoutABoardIsAPreview() {
+        val frame = DeviceStatus.fromJson(JSONObject(
+            """{"fw":"beacon board 2.0.9","flock":true,"drone":true,"bodycam":true,"tracker":false,"glasses":true,"ncam":false}"""))
+        assertTrue(checklistIsPreview(replay = true, frame = null))
+        assertFalse(checklistIsPreview(replay = true, frame = frame))
+        assertFalse(checklistIsPreview(replay = false, frame = null))
+        assertFalse(checklistIsPreview(replay = false, frame = frame))
     }
 
     @Test
@@ -431,11 +557,58 @@ class AcabAppStateTest {
             finishSetupLiveState(wanted = true, active = false, notificationsAvailable = true))
         assertEquals(FinishSetupLiveState.ACTIVE,
             finishSetupLiveState(wanted = true, active = true, notificationsAvailable = true))
-        assertEquals("OFF",
-            finishSetupPhoneAlertsLabel(enabled = false, notificationsAvailable = false))
-        assertEquals("BLOCKED",
-            finishSetupPhoneAlertsLabel(enabled = true, notificationsAvailable = false))
-        assertEquals("ON",
-            finishSetupPhoneAlertsLabel(enabled = true, notificationsAvailable = true))
+    }
+
+    /** U2-a: the checklist rows read the iOS sentences (ChecklistRows in ChecklistView.swift),
+     *  byte for byte, with Android's recorded differences (Map-only Location line, the
+     *  notification-blocked Live Mode line, the unknown buffer arm). Wrong inputs, each red: a null
+     *  buffer drawing "CHECK"; blocked notifications drawing the unblocked sentence; a count of 1
+     *  drawing "categories"; sample data drawing the blocked sentence. */
+    @Test
+    fun checklistRowsReadTheIosSentences() {
+        assertEquals("allowed; Map is ready", checklistLocationDetail(granted = true))
+        assertEquals("optional; not decided yet", checklistLocationDetail(granted = false))
+
+        assertEquals("off until you choose categories under Beacon",
+            checklistNotificationDetail(count = 0, blockedBySystem = false, demo = false))
+        assertEquals("off until you choose categories under Beacon",
+            checklistNotificationDetail(count = 0, blockedBySystem = true, demo = false))
+        assertEquals("3 chosen, but Android is blocking them; turn notifications on for beacons in Settings",
+            checklistNotificationDetail(count = 3, blockedBySystem = true, demo = false))
+        assertEquals("1 category enabled on this phone",
+            checklistNotificationDetail(count = 1, blockedBySystem = false, demo = false))
+        assertEquals("3 categories enabled on this phone",
+            checklistNotificationDetail(count = 3, blockedBySystem = false, demo = false))
+        // Sample data never reads "blocked" (TWIN: iOS ChecklistRows.notificationDetail gates the
+        // arm on !ble.demoMode). Wrong input, red: the blocked arm not gated on demo.
+        assertEquals("3 categories enabled on this phone",
+            checklistNotificationDetail(count = 3, blockedBySystem = true, demo = true))
+        assertEquals("1 category enabled on this phone",
+            checklistNotificationDetail(count = 1, blockedBySystem = true, demo = true))
+        assertEquals("off until you choose categories under Beacon",
+            checklistNotificationDetail(count = 0, blockedBySystem = true, demo = true))
+
+        assertEquals("active on supported system surfaces",
+            checklistLiveModeDetail(FinishSetupLiveState.ACTIVE))
+        assertEquals("off by choice; change it later under Beacon",
+            checklistLiveModeDetail(FinishSetupLiveState.OFF))
+        assertEquals("on by default, but its notification is blocked by Android",
+            checklistLiveModeDetail(FinishSetupLiveState.BLOCKED))
+        assertEquals("ready to start with this beacon",
+            checklistLiveModeDetail(FinishSetupLiveState.WAITING))
+        assertEquals("ready to start with this OUI-Spy",
+            checklistLiveModeDetail(FinishSetupLiveState.WAITING, BoardKind.OUI_SPY))
+        assertEquals("ready to start with this Mesh-Detect",
+            checklistLiveModeDetail(FinishSetupLiveState.WAITING, BoardKind.MESH_DETECT))
+
+        assertEquals("on; the beacon retains hits while this phone is away", checklistBufferDetail(true))
+        assertEquals("off; turn it on under Beacon if you want away-time hits retained", checklistBufferDetail(false))
+        assertEquals("not known until your beacon reports it", checklistBufferDetail(null))
+        assertEquals("on; the OUI-Spy retains hits while this phone is away",
+            checklistBufferDetail(true, BoardKind.OUI_SPY))
+        assertEquals("not known until your Mesh-Detect reports it",
+            checklistBufferDetail(null, BoardKind.MESH_DETECT))
+        assertEquals("the off arm names no board", "off; turn it on under Beacon if you want away-time hits retained",
+            checklistBufferDetail(false, BoardKind.OUI_SPY))
     }
 }

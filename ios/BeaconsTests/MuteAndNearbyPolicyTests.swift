@@ -35,6 +35,28 @@ final class MuteAndNearbyPolicyTests: XCTestCase {
         XCTAssertTrue(lastSeenIsStale(nil, now: now))
     }
 
+    /// The Log's Active cut: a binary search over newest-first stamps made non-increasing by
+    /// newestFirstEnvelope. Fails if the boundary uses `>=` (fixture (a) gives 2) or if the
+    /// envelope skips its running minimum (fixture (b) gives 5).
+    /// TWIN: Android MuteAndNearbyPolicyTest.activeBoundaryIsABinarySearchOverNewestFirstStamps,
+    /// same fixtures (it also rules out a wrapping Long.MIN_VALUE sentinel, which iOS cannot have).
+    func testActiveBoundaryIsABinarySearchOverNewestFirstStamps() {
+        let now = Date(timeIntervalSince1970: 1_758_700_000)
+        // (a) the one-sided rule: a stamp exactly 45 s old is still active, 46 s is not.
+        let a = newestFirstEnvelope([now, now.addingTimeInterval(-10),
+                                     now.addingTimeInterval(-45), now.addingTimeInterval(-46)])
+        XCTAssertEqual(activeBoundary(a, now: now), 3)
+        // (b) a missing stamp: it and every row after it drop out of the Active prefix.
+        let b = newestFirstEnvelope([now, nil, now.addingTimeInterval(-10),
+                                     now.addingTimeInterval(-20), now.addingTimeInterval(-30)])
+        XCTAssertEqual(b, [now, .distantPast, .distantPast, .distantPast, .distantPast])
+        XCTAssertEqual(activeBoundary(b, now: now), 1)
+        // The edges: nothing stale and everything stale.
+        XCTAssertEqual(activeBoundary(newestFirstEnvelope([now, now]), now: now), 2)
+        XCTAssertEqual(activeBoundary(newestFirstEnvelope([nil, now]), now: now), 0)
+        XCTAssertEqual(activeBoundary([], now: now), 0)
+    }
+
     func testSampleRowsDoNotAgeOutOfLiveActivity() {
         let now = Date(timeIntervalSince1970: 1_000_000)
         let old = now.addingTimeInterval(-activeNearbyInterval - 1)
@@ -244,5 +266,33 @@ final class MuteAndNearbyPolicyTests: XCTestCase {
         XCTAssertTrue(effectiveLiveModeCategories([]).isEmpty)
         XCTAssertEqual(effectiveLiveModeCategories([WidgetCategory.camera.rawValue]),
                        Set([WidgetCategory.camera.rawValue]))
+    }
+
+    /// U1-a: the sample log opens with the rows the seed flags `"new": true` counted as New, 4 of
+    /// 6, on both apps. placeDemoDetections stamps a flagged row at the seed instant and an
+    /// unflagged one 2 s earlier, then drops the in-memory watermark 1 s before the seed; isUnseen
+    /// compares `first > watermark`, which this mirrors. The literal table pins which rows the seed
+    /// flags, so a flag moved in the seed moves the count here too.
+    /// Wrong inputs: a watermark at the seed instant with no unflagged offset (New = 0), or a rule
+    /// that ignores the flag (New = 6).
+    /// TWIN: android MuteAndNearbyPolicyTest's DEMO_SAMPLE_ROWS table test (the same table).
+    func testSampleBaselineMakesTheFlaggedRowsNew() throws {
+        let rows = try demoSampleRows().map {
+            try JSONDecoder().decode(Detection.self, from: JSONSerialization.data(withJSONObject: $0))
+        }
+        let table: [(mac: String, flaggedNew: Bool)] = [
+            ("AC:AB:00:7F:2A:10", true), ("DA:7E:E0:44:21:09", true), ("00:25:DF:BA:7C:33", false),
+            ("4C:00:12:19:AA:BB", false), ("1A:2B:3C:4D:5E:6F", true), ("44:19:B6:22:0A:5C", true),
+        ]
+        XCTAssertEqual(rows.map { $0.mac }, table.map { $0.mac })
+        XCTAssertEqual(rows.map { $0.isNew }, table.map { $0.flaggedNew })
+
+        let seededAt = Date(timeIntervalSinceReferenceDate: 780_000_000)
+        let watermark = sampleSeenWatermark(seededAt: seededAt)
+        let newMacs = rows.filter {
+            sampleFirstSeen(flaggedNew: $0.isNew, seededAt: seededAt) > watermark
+        }.map { $0.mac }
+        XCTAssertEqual(newMacs, ["AC:AB:00:7F:2A:10", "DA:7E:E0:44:21:09",
+                                 "1A:2B:3C:4D:5E:6F", "44:19:B6:22:0A:5C"])
     }
 }

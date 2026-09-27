@@ -93,7 +93,7 @@ class AcabLinkService : Service() {
         val text: String,
         val breakdown: String,
     ) {
-        fun fingerprint(): String = if (!drive) "ota|$redact"
+        fun fingerprint(): String = if (!drive) "ota|$redact|$text"
         else "$connected|$total|$redact|$text|$breakdown"
     }
 
@@ -181,7 +181,10 @@ class AcabLinkService : Service() {
         )
 
     private fun render(inp: RenderInput): RenderedFace {
-        if (!inp.drive) return RenderedFace(false, false, 0, inp.redact, "", "")
+        // The keep-alive face names the board being updated: the connect target's kind, which
+        // every Status frame refreshes (a frame also triggers this render). Null reads as beacon.
+        if (!inp.drive) return RenderedFace(false, false, 0, inp.redact,
+            renderBoardCopy(OTA_HOLD_TEXT_TEMPLATE, ble.targetKind.value), "")
         val cats = enabledDriveCats()
         val counts = inp.nearby.detections.groupingBy { it.type.category }.eachCount()
         val total = driveTotal(counts, cats)
@@ -286,7 +289,7 @@ class AcabLinkService : Service() {
     private fun build(face: RenderedFace): Notification {
         // Only an in-flight firmware update is holding the service (Drive mode off): show a
         // plain keep-alive face, no counters.
-        if (!face.drive) return buildOtaHold()
+        if (!face.drive) return buildOtaHold(face.text)
         val tap = tapIntent()
         val b = NotificationCompat.Builder(this, CHANNEL_ID)
             .setSmallIcon(R.drawable.ic_stat_beacons)
@@ -329,12 +332,13 @@ class AcabLinkService : Service() {
         return "last ${newest.category} ${relativeAgo(newest.at)}"
     }
 
-    /** The face shown while only a firmware update holds the service: a static keep-alive. */
-    private fun buildOtaHold(): Notification =
+    /** The face shown while only a firmware update holds the service: a static keep-alive whose
+     *  line ([text], OTA_HOLD_TEXT_TEMPLATE) names the board's kind. */
+    private fun buildOtaHold(text: String): Notification =
         NotificationCompat.Builder(this, CHANNEL_ID)
             .setSmallIcon(R.drawable.ic_stat_beacons)
             .setContentTitle("FIRMWARE UPDATE")
-            .setContentText("Sending the update to your board.")
+            .setContentText(text)
             .setOngoing(true)
             .setOnlyAlertOnce(true)
             .setShowWhen(false)
@@ -472,6 +476,10 @@ class AcabLinkService : Service() {
         /** Public: DetectionNotifier.liveChannelDeliverable checks THIS channel's importance,
          *  so deliverability is always judged against the id the service actually posts on. */
         const val CHANNEL_ID = "acab.drive"
+        /** The firmware-update keep-alive line, per kind (renderBoardCopy; null reads as beacon).
+         *  It used to say "your board", the one ongoing-notification line that names the device.
+         *  Sentence case like the other faces here. */
+        internal const val OTA_HOLD_TEXT_TEMPLATE = "Sending the update to your {noun}."
         private const val NOTIF_ID = 1001
 
         /** The buckets drive mode speaks, in the order the expanded shade lists them. The

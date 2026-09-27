@@ -401,6 +401,28 @@ class MapPinTest {
         assertEquals(PinAge.RECENT, ageAt(PIN_RECENT_MAX_MS))
         assertEquals(PinAge.STALE, ageAt(PIN_RECENT_MAX_MS + 1))
         assertEquals(PinAge.STALE, ageAt(24L * 60L * 60_000L))
+        // Android's FRESH cue is the frozen ring: only the FRESH tier draws the ringed set, so
+        // the three tiers reach three different bitmaps on this platform.
+        assertEquals(PinArtVariant.RINGED, pinArtVariant(PinAge.FRESH))
+        assertEquals(PinArtVariant.PLAIN, pinArtVariant(PinAge.RECENT))
+        assertEquals(PinArtVariant.DIMMED, pinArtVariant(PinAge.STALE))
+    }
+
+    /** The legend's "dimmed" row follows the pins the rebuild DREW, and the Compose flag is
+     *  written only when it flips. FAILS IF the flag is returned without comparing (the second
+     *  call would write again) or the scan reads every stamp instead of the drawn ids (an undrawn
+     *  stale row would raise the flag). */
+    @Test
+    fun stalePinFlagWritesOnlyOnChange() {
+        val now = 1_800_000_000_000L
+        val twoHours = 2L * 60L * 60_000L
+        val tenMinutes = 10L * 60_000L
+        assertEquals(true, mapStalePinFlag(false, mapOf("p" to now - twoHours), listOf("p"), now))
+        assertEquals(null, mapStalePinFlag(true, mapOf("p" to now - twoHours), listOf("p"), now))
+        assertEquals(false, mapStalePinFlag(true,
+            mapOf("p" to now - tenMinutes, "q" to now - tenMinutes), listOf("p", "q"), now))
+        assertEquals(null, mapStalePinFlag(false,
+            mapOf("p" to now - twoHours, "q" to now - tenMinutes), listOf("q"), now))
     }
 
     /** No stamp is not evidence of liveness. RECENT, never FRESH, and never STALE either: we
@@ -474,5 +496,41 @@ class MapPinTest {
         assertTrue(dim.red > dim.green && dim.red > dim.blue)
         // Fully opaque. A stale pin recedes by tone alone; it is never faded toward the tiles.
         assertEquals(flock.alpha, dim.alpha, 0.0f)
+    }
+
+    /** U2-e: the fixed ALL chip counts every in-scope row whatever the filter and reads selected
+     *  only with no filter; the chosen category leads the carousel and alone reads selected; no
+     *  "FILTER · x" chip exists. Wrong inputs: ALL counting the filtered rows (1), or ALL left
+     *  selected while a filter is on. TWIN: iOS MapTabView's ALL chip (snap.totalLocated). */
+    @Test
+    fun allChipCountsTheScopeAndOnlyTheChosenCategoryReadsSelected() {
+        val counts = mapOf("ALPR" to 1, "DRONE" to 1, "TRACKER" to 3, WATCHED_FILTER_KEY to 0)
+        val filtered = mapCategoryChipModels(filter = "ALPR", allCount = 5, catCounts = counts)
+        assertEquals(MapChipModel(null, "ALL", 5, selected = false), filtered.first())
+        assertEquals(MapChipModel("ALPR", "ALPR", 1, selected = true), filtered[1])
+        assertEquals(listOf("ALPR"), filtered.filter { it.selected }.map { it.key })
+        assertTrue(filtered.none { it.label.startsWith("FILTER") })
+        // WATCHED at zero draws no chip.
+        assertTrue(filtered.none { it.key == WATCHED_FILTER_KEY })
+
+        val unfiltered = mapCategoryChipModels(filter = null, allCount = 5, catCounts = counts)
+        assertEquals(MapChipModel(null, "ALL", 5, selected = true), unfiltered.first())
+        assertTrue(unfiltered.drop(1).none { it.selected })
+        assertEquals(listOf("ALPR", "DRONE", "TRACKER"), unfiltered.drop(1).map { it.key })
+
+        // The active filter keeps its chip at zero, first in the carousel.
+        val emptied = mapCategoryChipModels(filter = "GLASSES", allCount = 5, catCounts = counts)
+        assertEquals(MapChipModel("GLASSES", "GLASSES", 0, selected = true), emptied[1])
+    }
+
+    /** U3-e: the legend's "Drone operator" key follows the operator markers the rebuild drew,
+     *  written only on a flip. Wrong input: a key shown with no operator marker drawn. TWIN: iOS
+     *  mapHasOperatorPins. */
+    @Test
+    fun operatorKeyFlagFlipsOnlyWithTheDrawnOperatorMarkers() {
+        assertEquals(true, mapOperatorPinFlag(previous = false, drawnOperatorCount = 1))
+        assertEquals(null, mapOperatorPinFlag(previous = true, drawnOperatorCount = 1))
+        assertEquals(false, mapOperatorPinFlag(previous = true, drawnOperatorCount = 0))
+        assertEquals(null, mapOperatorPinFlag(previous = false, drawnOperatorCount = 0))
     }
 }

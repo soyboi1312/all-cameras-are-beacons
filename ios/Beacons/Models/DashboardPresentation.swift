@@ -31,7 +31,7 @@ struct DashboardSnapshot {
     var strongestUnclassified: DashboardSighting?
 
     var strongest: DashboardSighting? { strongestMatch ?? strongestUnclassified ?? strongestAmbient }
-    /// First caption line under the radar. TWIN: android StatusScreen.kt
+    /// First caption line, the footer of the Status legend cell. TWIN: android StatusScreen.kt
     /// `StatusNearbySummary.radarCaption`, byte-identical; both suites pin the literal.
     var radarCaption: String { "\(dots.count) of \(total) dots · \(Self.dotLimit) max" }
     /// Second caption line. The second clause is the sentence that tells the user the 14-dot cap
@@ -49,7 +49,7 @@ struct DashboardSnapshot {
     static let ambientCardTitle = "AMBIENT"
     static let ambientCardDetail = "Desert-mode broadcasts"
 
-    /// The far-right recency kicker beside the scan label, naming the window every count on this
+    /// The recency kicker under the scan label, naming the window every count on this
     /// screen is filtered to. Built from `activeNearbyInterval` (BLEManager.swift), the default
     /// window of the lastSeenIsStale call `dashboardSnapshot` drops quiet rows with, so the words
     /// cannot drift from the filter. A static let: built once, not on every ~3 Hz body pass.
@@ -176,9 +176,12 @@ func dashboardSnapshot(_ detections: [Detection], now: Date, isDemoMode: Bool,
     return result
 }
 
-/// TWIN: android StatusScreen.kt `statusLastHeardAge`, same strings in the same hero slot -
-/// reword one and reword the other. The minute/hour/day branches are defensive totality: the
-/// caller only ever hands this a row inside the 45 s freshness window.
+/// Compact clock copy for a live row. Future/skewed stamps are treated as just now.
+///
+/// TWIN: android StatusScreen.kt `statusLastHeardAge`, same strings and the same branches (just
+/// now, seconds, minutes, hours, "more than a day ago") in the same hero slot - reword one and
+/// reword the other. The minute, hour and day branches are defensive totality: the caller only
+/// ever hands this a row inside the 45 s freshness window, so they are not a rendered cue today.
 func dashboardLastHeardLabel(_ date: Date?, now: Date, isDemoMode: Bool) -> String {
     if isDemoMode { return "sample sighting · not live" }
     guard let date else { return "last heard unknown" }
@@ -193,4 +196,51 @@ func dashboardLastHeardLabel(_ date: Date?, now: Date, isDemoMode: Bool) -> Stri
 
 func dashboardTileOpensSettings(enabled: Bool?, count: Int) -> Bool {
     enabled == false && count == 0
+}
+
+/// The Status first-zero line (C9): on a connected, ready, real session whose board is scanning
+/// and has nothing heard in the Active window, the strongest slot says what zero means instead of
+/// standing empty. It IS FirstRunTour.quietSentence, which FirstRunTourView.swift keeps with the
+/// setup checklist's copy, referenced, not copied, so Status cannot drift from that constant.
+/// `connected` is the value the Status LinkChip is handed; `scanning` is the radio presentation's
+/// `isScanning`, the same flag that turns the sweep. Sample mode never shows it: a sample session
+/// is not a real zero. The quiet sentence says the beacon listened and heard nothing, so it never
+/// stands under a parked sweep (radios off, a BLE fault with Wi-Fi off, a co-processor or
+/// firmware update): that would be a false all-clear, and statusNotScanningLine owns the slot.
+/// TWIN: android StatusScreen.kt `statusFirstZeroLine`, same four inputs, same sentence.
+func statusFirstZeroLine(connected: Bool, isDemoMode: Bool, scanning: Bool, total: Int) -> String? {
+    connected && !isDemoMode && scanning && total == 0 ? FirstRunTour.quietSentence : nil
+}
+
+/// The strongest slot while a connected, real board is NOT scanning and nothing is nearby: the
+/// radio presentation's plain `detail` for why (for example "Both beacon detection radios are
+/// switched off."), so a 0 under a parked sweep never reads as an all-clear. Nil in sample mode,
+/// while anything is nearby, before the link is up, and whenever statusFirstZeroLine owns the
+/// slot. TWIN: android StatusScreen.kt `statusNotScanningLine`, same five inputs; its detail is
+/// StatusScanPresentation.notScanningDetail, byte-identical to the same arm's `detail` in
+/// beaconRadioPresentation. PLATFORM DIFFERENCE: iOS `connected` (the LinkChip's value) is true
+/// in the gap before the board's first status frame, so here the slot can also read that arm's
+/// detail ("The secure link is ready; waiting for the board's first status frame."); Android's
+/// `connected` needs a frame, so its slot never shows it.
+func statusNotScanningLine(connected: Bool, isDemoMode: Bool, scanning: Bool, total: Int,
+                           detail: String) -> String? {
+    connected && !isDemoMode && !scanning && total == 0 ? detail : nil
+}
+
+/// The Status scan telegram under the header row, or nil when Status draws none. Sample data
+/// says so already (the banner, the SAMPLE pill, the strongest row's "sample sighting · not
+/// live"), so the bare "SAMPLE DATA" kicker is not drawn there; the radio variants ("SAMPLE DATA ·
+/// BLUETOOTH ONLY", "· WI-FI ONLY", "· RADIOS OFF") still draw, because they say what the sample
+/// radio switches do to the sweep. The presenter keeps returning "SAMPLE DATA" (the Beacon tab's
+/// Scan radios row still shows it). TWIN: android StatusScreen.kt `statusScanKicker`.
+func dashboardScanKicker(scanLabel: String, isDemoMode: Bool) -> String? {
+    isDemoMode && scanLabel == "SAMPLE DATA" ? nil : scanLabel
+}
+
+/// The strongest cell's header: "STRONGEST <kind> · RECENT" in a real session, and no suffix in
+/// sample data, where the row's own line reads "sample sighting · not live" and RECENT would
+/// contradict it. `kind` is MATCH, UNCLASSIFIED or AMBIENT. TWIN: android StatusScreen.kt
+/// `statusStrongestHeader`.
+func dashboardStrongestHeader(kind: String, isDemoMode: Bool) -> String {
+    isDemoMode ? "STRONGEST \(kind)" : "STRONGEST \(kind) · RECENT"
 }

@@ -2,16 +2,22 @@ package tech.acab.app.ui
 
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
+import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
 import tech.acab.app.ble.AcabBleManager
 import tech.acab.app.ble.DetectionExportRowSnapshot
 import tech.acab.app.ble.DetectionExportSnapshot
+import tech.acab.app.ble.LOG_ACTIVE_SECTION_HEADER
+import tech.acab.app.ble.activeBoundary
 import tech.acab.app.ble.frozenNewIdSet
+import tech.acab.app.ble.newestFirstEnvelope
 import tech.acab.app.model.Detection
 import tech.acab.app.model.DeviceNames
 import tech.acab.app.model.DeviceType
 import tech.acab.app.model.TimeBasis
+import java.time.ZoneId
+import java.time.ZonedDateTime
 
 class LogExportLensTest {
     private fun row(
@@ -53,6 +59,9 @@ class LogExportLensTest {
         offline = offline,
     )
 
+    /** Offline is a filter that composes with any scope, not a scope of its own: offline only
+     *  under All keeps the replayed tracker, and under New it still needs the row to be unseen.
+     *  A predicate that ignores offlineOnly returns both trackers. */
     @Test
     fun categoryAndScopeApplyToTheSuppliedLiveOrPausedFeed() {
         val alpr = row("a", DeviceType.FLOCK_CAMERA)
@@ -67,7 +76,14 @@ class LogExportLensTest {
         )
         assertEquals(
             listOf(trackerOffline),
-            filterLogRows(live, "TRACKER", LogScope.Offline, emptySet()),
+            filterLogRows(live, "TRACKER", LogScope.All, emptySet(), offlineOnly = true),
+        )
+        assertEquals(
+            listOf(trackerOffline),
+            filterLogRows(
+                live, "TRACKER", LogScope.New, setOf(trackerOffline.id, trackerLive.id),
+                offlineOnly = true,
+            ),
         )
 
         // A paused export supplies its frozen feed; a later live row is not available for the
@@ -191,11 +207,11 @@ class LogExportLensTest {
         assertEquals(emptyList<Detection>(), filterLogRows(rows, null, LogScope.All, emptySet(), query = "unverified"))
     }
 
-    /** The lens-summary line under the search field names the list it counted, the FROZEN one
-     *  while paused, and carries the category: the header kicker counts the live store the way
-     *  the NEW tally does, so this line is where "5 of 5 paused" beside "200 NEW" says nothing
-     *  was lost. Byte-identical to iOS `logLensSummary` in DetectionsView.swift, text and spoken
-     *  form; a changed word here is a changed word there. */
+    /** The lens-summary line, the list's footer, counts the lens the list shows, which is the
+     *  FROZEN feed while paused, names that feed and carries the category, so "5 of 5 paused"
+     *  says the list is a snapshot, not that sightings were lost. Byte-identical to iOS
+     *  `logLensSummary` in DetectionsView.swift, text and spoken form; a changed word here is a
+     *  changed word there. */
     @Test
     fun theLensSummaryLineNamesTheListItCounted() {
         assertEquals("3 of 10 retained", logLensSummaryText(3, 10, paused = false, category = null))
@@ -354,5 +370,242 @@ class LogExportLensTest {
             listOf(1_800_000_000_001L, 1_800_000_000_000L),
             exported.rows.map { it.firstSeenMs },
         )
+    }
+
+    /** Active keeps only live rows inside the window. A replayed row is never Active, even with
+     *  its id in the set (the caller adds nothing replayed, but the predicate must not trust
+     *  that). Dropping the `!d.offline` clause from logScopeKeeps keeps the replayed row. */
+    @Test
+    fun activeScopeCutKeepsOnlyFreshLiveRows() {
+        val a = row("AA:00:00:00:00:01", DeviceType.TRACKER)
+        val b = row("AA:00:00:00:00:02", DeviceType.TRACKER)
+        val c = row("AA:00:00:00:00:03", DeviceType.TRACKER, offline = true)
+        val activeIds = setOf(a.id, c.id)
+        assertEquals(listOf(a), logScopeCut(listOf(a, b, c), LogScope.Active, emptySet(), activeIds))
+        assertEquals(listOf(a), filterLogRows(listOf(a, b, c), null, LogScope.Active, emptySet(), activeIds = activeIds))
+    }
+
+    /** The segment counts come from the lens (here the TRACKER category), not from the store:
+     *  counting over the whole feed gives active 2, new 3. */
+    @Test
+    fun scopeCountsComeFromTheLensNotTheStore() {
+        val t1 = row("AA:00:00:00:00:11", DeviceType.TRACKER)
+        val t2 = row("AA:00:00:00:00:12", DeviceType.TRACKER)
+        val t3 = row("AA:00:00:00:00:13", DeviceType.TRACKER)
+        val p1 = row("AA:00:00:00:00:14", DeviceType.FLOCK_CAMERA)
+        val p2 = row("AA:00:00:00:00:15", DeviceType.FLOCK_CAMERA)
+        val feed = listOf(t1, t2, t3, p1, p2)
+        val newIds = setOf(t1.id, t2.id, p1.id)
+        val activeIds = setOf(t3.id, p2.id)
+        val lensAll = filterLogRows(feed, "TRACKER", LogScope.All, newIds)
+        assertEquals(LogScopeCounts(active = 1, new = 2), logScopeCounts(lensAll, newIds, activeIds))
+    }
+
+    /** "active · N", "new · N", "all": All carries no count. TWIN: iOS logScopeSegmentLabel. */
+    @Test
+    fun logScopeSegmentLabelCountsOnlyActiveAndNew() {
+        assertEquals("active · 3", logScopeSegmentLabel(LogScope.Active, 3))
+        assertEquals("new · 0", logScopeSegmentLabel(LogScope.New, 0))
+        assertEquals("all", logScopeSegmentLabel(LogScope.All, 5))
+    }
+
+    /** The drawn segment label binds the count to its dot (a wrap breaks before the dot, never
+     *  between the dot and the count), and the row's supporting line holds each dot to the word
+     *  before it. Both are display-only transforms: the pure labels above stay iOS-identical. */
+    @Test
+    fun displayTransformsBindMiddleDots() {
+        assertEquals("active · 5", segmentLabelForDisplay(logScopeSegmentLabel(LogScope.Active, 5)))
+        assertEquals("all", segmentLabelForDisplay(logScopeSegmentLabel(LogScope.All, 5)))
+        assertEquals("recent · 0", segmentLabelForDisplay(mapScopeSegmentLabel(MapHistoryScope.Recent, 0)))
+        assertEquals(
+            "Tracker · manufacturer data · 60%",
+            keepingMiddleDotsAttached("Tracker · manufacturer data · 60%"),
+        )
+    }
+
+    /** Newest splits into heard in the last 45 s / earlier today / older, in feed order, with
+     *  empty sections left out. r3 was first filed from a bracketed replay and then heard live
+     *  today, so its live stamp is trusted (the `!d.offline` arm; the basis map holds the
+     *  FIRST-seen basis). r4 is a bracketed replay heard today: untrusted, so older. r5 is a
+     *  reconstructed replay from this morning: trusted. r6 has no basis entry (Exact). r7 is
+     *  from yesterday. Ignoring the basis gives [2, 4, 1]; a stamp map without the replayed rows
+     *  gives [2, 2, 3]; dropping the live arm gives [2, 2, 3]. */
+    @Test
+    fun newestSortSplitsActiveThenTodayThenOlder() {
+        val zone = ZoneId.of("America/Los_Angeles")
+        val now = ZonedDateTime.of(2026, 9, 24, 12, 0, 0, 0, zone)
+        fun at(hour: Int, dayOffset: Long = 0) =
+            now.plusDays(dayOffset).withHour(hour).toInstant().toEpochMilli()
+        val nowMs = now.toInstant().toEpochMilli()
+        val r1 = row("AA:00:00:00:00:21", DeviceType.TRACKER)
+        val r2 = row("AA:00:00:00:00:22", DeviceType.TRACKER)
+        val r3 = row("AA:00:00:00:00:23", DeviceType.TRACKER)
+        val r4 = row("AA:00:00:00:00:24", DeviceType.TRACKER, offline = true)
+        val r5 = row("AA:00:00:00:00:25", DeviceType.TRACKER, offline = true)
+        val r6 = row("AA:00:00:00:00:26", DeviceType.TRACKER)
+        val r7 = row("AA:00:00:00:00:27", DeviceType.TRACKER)
+        val stamps = mapOf(
+            r1.id to nowMs - 5_000L,
+            r2.id to nowMs - 10_000L,
+            r3.id to at(10),
+            r4.id to at(11),
+            r5.id to at(8),
+            r6.id to at(9),
+            r7.id to at(15, dayOffset = -1),
+        )
+        val timeBases = mapOf(
+            r3.id to TimeBasis.Bracketed(1L, 2L),
+            r4.id to TimeBasis.Bracketed(1L, 2L),
+            r5.id to TimeBasis.Reconstructed(at(8), 60),
+        )
+        val activeIds = setOf(r1.id, r2.id)
+        val basis: (String) -> TimeBasis = { timeBases[it] ?: TimeBasis.Exact }
+
+        val all = listOf(r1, r2, r3, r4, r5, r6, r7)
+        val sections = logSections(all, LogScope.All, activeIds, stamps::get, basis, nowMs, zone)
+        assertEquals(
+            listOf(LOG_ACTIVE_SECTION_HEADER, LOG_EARLIER_TODAY_HEADER, LOG_OLDER_HEADER),
+            sections.map { it.title },
+        )
+        assertEquals(listOf(listOf(r1, r2), listOf(r3, r5, r6), listOf(r4, r7)), sections.map { it.rows })
+
+        // New keeps the three sections, exactly as All does (decision L6 changes only Active).
+        assertEquals(sections, logSections(all, LogScope.New, activeIds, stamps::get, basis, nowMs, zone))
+
+        val onlyOld = logSections(listOf(r7), LogScope.All, emptySet(), stamps::get, basis, nowMs, zone)
+        assertEquals(listOf(LOG_OLDER_HEADER), onlyOld.map { it.title })
+    }
+
+    /** Decision L6: under the Active segment the Log draws NO time-section header. Every shown row
+     *  there was heard in the last 45 s, so the builder returns ONE untitled section holding the
+     *  shown rows in feed order, and the list skips the header of an untitled section. Wrong input:
+     *  a builder that ignores the scope returns [LOG_ACTIVE_SECTION_HEADER] here (a header drawn
+     *  under Active) and fails the first assertion. An empty Active cut has no section.
+     *  TWIN: iOS DetectionLogLensTests.testActiveScopeIsOneUntitledSection. */
+    @Test
+    fun activeScopeIsOneUntitledSection() {
+        val zone = ZoneId.of("America/Los_Angeles")
+        val nowMs = ZonedDateTime.of(2026, 9, 24, 12, 0, 0, 0, zone).toInstant().toEpochMilli()
+        val r1 = row("AA:00:00:00:00:31", DeviceType.TRACKER)
+        val r2 = row("AA:00:00:00:00:32", DeviceType.TRACKER)
+        val stamps = mapOf(r1.id to nowMs - 5_000L, r2.id to nowMs - 10_000L)
+        val basis: (String) -> TimeBasis = { TimeBasis.Exact }
+        val sections = logSections(
+            listOf(r1, r2), LogScope.Active, setOf(r1.id, r2.id), stamps::get, basis, nowMs, zone)
+        assertEquals(listOf<String?>(null), sections.map { it.title })
+        assertEquals(listOf(listOf(r1, r2)), sections.map { it.rows })
+        assertTrue(logSections(emptyList(), LogScope.Active, emptySet(), stamps::get, basis, nowMs, zone).isEmpty())
+    }
+
+    /** One overline, one order on both apps: OFFLINE, MUTED, then the basis word. */
+    @Test
+    fun rowOverlineNamesProvenanceInOneOrder() {
+        assertEquals("OFFLINE · MUTED · RECON", logRowOverline(true, true, TimeBasis.Reconstructed(0, 0)))
+        assertNull(logRowOverline(false, false, TimeBasis.Exact))
+        assertNull(logRowOverline(false, false, null))
+        assertEquals("RANGE", logRowOverline(false, false, TimeBasis.Bracketed(1L, 2L)))
+        assertEquals("OFFLINE · NO TIME", logRowOverline(true, false, TimeBasis.Unknown))
+    }
+
+    /** The spoken verdict bands are iOS DetectionRow.confidenceWord's: under 50 weak, under 80
+     *  partial, 80 up strong. A `<= 50` weak band fails the 50 row. */
+    @Test
+    fun confidenceWordBandsMatchIos() {
+        assertEquals("weak match, verify", confidenceWord(49))
+        assertEquals("partial match", confidenceWord(50))
+        assertEquals("partial match", confidenceWord(79))
+        assertEquals("strong match", confidenceWord(80))
+    }
+
+    /** A paused Active export freezes the Active cut at the pause instant. The frozen stamps are
+     *  evaluated against pausedAtMs, not a later clock (at t0 + 60 s the cut would empty), the
+     *  export takes the cut, never the whole lens (three rows), and resume clears the instant. */
+    @Test
+    fun pausedActiveExportFreezesTheActiveCut() {
+        val t0 = 1_758_700_000_000L
+        val replayed = row("AA:00:00:00:00:31", DeviceType.TRACKER, offline = true)
+        val fresh = row("AA:00:00:00:00:32", DeviceType.TRACKER)
+        val stale = row("AA:00:00:00:00:33", DeviceType.TRACKER)
+        fun snap(d: Detection, lastSeen: Long) = DetectionExportRowSnapshot(
+            d, firstSeenMs = lastSeen, timeBasis = TimeBasis.Exact, observerCoord = null, lastSeenMs = lastSeen)
+        val snapshot = DetectionExportSnapshot(listOf(
+            snap(replayed, t0 - 5_000L), snap(fresh, t0 - 10_000L), snap(stale, t0 - 60_000L)))
+        val vm = LogViewModel()
+        vm.pause(snapshot, atMs = t0)
+        assertEquals(t0, vm.pausedAtMs)
+
+        val feedLive = vm.frozen.filter { !it.offline }
+        val last = vm.frozenExport!!.lastSeenMsById()
+        val env = newestFirstEnvelope(feedLive.map { last[it.id] })
+        val k = activeBoundary(env, vm.pausedAtMs!!)
+        assertEquals(1, k)
+        assertEquals(0, activeBoundary(env, t0 + 60_000L))
+
+        // The replayed id is added on purpose: the cut itself must drop it.
+        val activeIds = feedLive.take(k).map { it.id }.toSet() + replayed.id
+        val lensAll = filterLogRows(vm.frozen, null, LogScope.All, emptySet())
+        val shown = logScopeCut(lensAll, LogScope.Active, emptySet(), activeIds)
+        assertEquals(listOf(fresh), vm.exportSnapshot(shown)!!.rows.map { it.detection })
+
+        vm.resume()
+        assertNull(vm.pausedAtMs)
+    }
+
+    /** The Log tools menu gates. In sample mode Mark Seen is offered (markAllSeen moves the
+     *  watermark in memory only there, as iOS does) and Clear Log is absent (it would imply the
+     *  retained log is erased); an empty real log disables the menu, so nothing is offered
+     *  (clear = true is inert there; the old icon-only clear pill stayed reachable, a deliberate
+     *  change); a paused, emptied frozen feed still offers Resume. The old `markSeen = hasRows &&
+     *  !demo` fails the first case. */
+    @Test
+    fun toolsMenuKeepsTheOldChipGates() {
+        assertEquals(
+            LogToolGates(menu = true, pause = true, select = true, markSeen = true, export = true, clear = false),
+            logToolGates(hasRows = true, feedHasRows = true, paused = false, demo = true),
+        )
+        assertEquals(
+            LogToolGates(menu = false, pause = false, select = false, markSeen = false, export = false, clear = true),
+            logToolGates(hasRows = false, feedHasRows = false, paused = false, demo = false),
+        )
+        val pausedEmpty = logToolGates(hasRows = true, feedHasRows = false, paused = true, demo = false)
+        assertTrue(pausedEmpty.pause)
+        assertTrue(pausedEmpty.menu)
+    }
+    /** The footer and the export header name a category filter by the words its chip shows, never
+     *  by its internal key: the CAMERA key's chip says NETWORK CAM, so the footer must too, and the
+     *  export header says the same words in menu case (LogCategory.menuLabel), "Export Network Cam". Wrong
+     *  input: the old call site handed the raw key and drew "1 of 6 retained · CAMERA". TWIN: the
+     *  iOS LOG-4 test in DetectionLogLensTests. */
+    @Test
+    fun theFooterAndExportHeaderNameTheCategoryByItsLabel() {
+        assertEquals("NETWORK CAM", logCategoryLabel("CAMERA"))
+        assertEquals("1 of 6 retained · NETWORK CAM",
+            logLensSummaryText(1, 6, paused = false, category = logCategoryLabel("CAMERA")))
+        assertEquals("1 matching detections of 6 retained · NETWORK CAM",
+            logLensSummaryDescription(1, 6, paused = false, category = logCategoryLabel("CAMERA")))
+        assertEquals("Export Network Cam", logExportMenuHeader("CAMERA"))
+        assertEquals("Export Drone", logExportMenuHeader("DRONE"))
+        assertEquals("Export", logExportMenuHeader(null))
+        // a deep-linked key the menu does not list keeps its key, as its chip does
+        assertEquals("SOMETHING", logCategoryLabel("SOMETHING"))
+        assertNull(logCategoryLabel(null))
+    }
+
+    /** "Clear Filters" appears only while a filter is on; an empty segment with no filter on offers
+     *  "Show All", and a segment is never called a filter. Wrong input: the old panel drew Clear
+     *  Filters for an empty New segment with nothing set. TWIN: the iOS CON-13 test. */
+    @Test
+    fun clearFiltersOnlyWhenAFilterIsOn() {
+        assertEquals(LogNoMatchAction.ShowAll,
+            logNoMatchAction(LogScope.New, catFilter = null, query = "", offlineOnly = false))
+        assertEquals(LogNoMatchAction.ShowAll,
+            logNoMatchAction(LogScope.Active, catFilter = null, query = "  ", offlineOnly = false))
+        assertEquals(LogNoMatchAction.ClearFilters,
+            logNoMatchAction(LogScope.New, catFilter = "ALPR", query = "", offlineOnly = false))
+        assertEquals(LogNoMatchAction.ClearFilters,
+            logNoMatchAction(LogScope.All, catFilter = null, query = "axon", offlineOnly = false))
+        assertEquals(LogNoMatchAction.ClearFilters,
+            logNoMatchAction(LogScope.Active, catFilter = null, query = "", offlineOnly = true))
+        assertNull(logNoMatchAction(LogScope.All, catFilter = null, query = "", offlineOnly = false))
     }
 }

@@ -318,6 +318,125 @@ final class DashboardPresentationTests: XCTestCase {
         XCTAssertEqual(DashboardSnapshot.seenWindowKicker, "SEEN < 45s")
     }
 
+    /// The Log's first time-section header is built from activeNearbyInterval, so retuning the
+    /// window moves the copy with it; this pins the shipped number.
+    /// TWIN: Android StatusBeaconPresentationTest.activeSectionHeaderNamesTheWindow.
+    func testActiveSectionHeaderNamesTheWindow() {
+        XCTAssertEqual(BLEManager.activeSectionHeader, "heard in the last 45 s")
+    }
+
+    /// The first-zero line (C9) exists only for a connected, real, scanning, empty session, and
+    /// it IS FirstRunTour.quietSentence, not a copy. Android pins the same cases in
+    /// StatusRadarScopeSemanticsTest.firstZeroLineOnlyForAConnectedEmptyRealSession.
+    func testFirstZeroLineOnlyForAConnectedEmptyRealSession() {
+        XCTAssertEqual(statusFirstZeroLine(connected: true, isDemoMode: false, scanning: true, total: 0),
+                       FirstRunTour.quietSentence)
+        XCTAssertNil(statusFirstZeroLine(connected: true, isDemoMode: true, scanning: true, total: 0))
+        XCTAssertNil(statusFirstZeroLine(connected: true, isDemoMode: false, scanning: true, total: 1))
+        XCTAssertNil(statusFirstZeroLine(connected: false, isDemoMode: false, scanning: true, total: 0))
+    }
+
+    /// The false all-clear (STA-1): a connected board with both radios switched off, 0 nearby.
+    /// The quiet sentence ("zero nearby means no supported broadcast was recognized ...") must not
+    /// stand under the parked sweep; the slot says why the board is not scanning instead, in the
+    /// radio presentation's own words. Wrong input: before the scanning gate this returned the
+    /// quiet sentence. TWIN: android StatusRadarScopeSemanticsTest's not-scanning case.
+    func testRadiosOffZeroShowsWhyNotTheQuietSentence() throws {
+        let status = try makeStatus(ble: false, wifi: false)
+        let radio = beaconRadioPresentation(connectionState: .connected, sessionReady: true,
+            isReconnecting: false, isDemoMode: false, status: status, combinedUpdateRunning: false)
+        XCTAssertFalse(radio.isScanning)
+        XCTAssertNil(statusFirstZeroLine(connected: true, isDemoMode: false,
+                                         scanning: radio.isScanning, total: 0))
+        XCTAssertEqual(statusNotScanningLine(connected: true, isDemoMode: false,
+                                             scanning: radio.isScanning, total: 0,
+                                             detail: radio.detail),
+                       "Both beacon detection radios are switched off.")
+        // The not-scanning line never doubles the quiet sentence, a sample session or a count.
+        XCTAssertNil(statusNotScanningLine(connected: true, isDemoMode: false, scanning: true,
+                                           total: 0, detail: radio.detail))
+        XCTAssertNil(statusNotScanningLine(connected: true, isDemoMode: true, scanning: false,
+                                           total: 0, detail: radio.detail))
+        XCTAssertNil(statusNotScanningLine(connected: true, isDemoMode: false, scanning: false,
+                                           total: 2, detail: radio.detail))
+        XCTAssertNil(statusNotScanningLine(connected: false, isDemoMode: false, scanning: false,
+                                           total: 0, detail: radio.detail))
+    }
+
+    /// STA-2: two dots that hash to the same ring and the same angle (two MACs with one hash
+    /// bucket) must not draw on top of each other. The priority dot (index 0) keeps its hash
+    /// angle; the second steps along the ring until it is at least one dot diameter away.
+    /// Wrong input: without the step both centres are the same point (distance 0).
+    /// TWIN: android StatusRadarScopeSemanticsTest's radarDotPositions case.
+    func testRadarDotsOnOneRingAndAngleComeOutOneDiameterApart() {
+        let c = CGPoint(x: 179, y: 179)
+        let ring: CGFloat = 358.0 / 6.0   // the STRONG ring of a 358pt scope
+        let r = RadarScope.dotSize / 2
+        let placed = RadarScope.dotPositions(angles: [40, 40, 40], ringRadii: [ring, ring, ring],
+                                             centre: c, dotRadius: r, obstacles: [])
+        XCTAssertEqual(placed.count, 3)
+        // The priority dot keeps its home.
+        XCTAssertEqual(placed[0].x, c.x + CGFloat(cos(40.0 * .pi / 180)) * ring, accuracy: 0.001)
+        XCTAssertEqual(placed[0].y, c.y + CGFloat(sin(40.0 * .pi / 180)) * ring, accuracy: 0.001)
+        for i in 0..<placed.count {
+            // Every dot stays on its own ring.
+            XCTAssertEqual(hypot(placed[i].x - c.x, placed[i].y - c.y), ring, accuracy: 0.001)
+            for j in 0..<i {
+                XCTAssertGreaterThanOrEqual(
+                    hypot(placed[i].x - placed[j].x, placed[i].y - placed[j].y), 2 * r,
+                    "dots \(j) and \(i) overlap")
+            }
+        }
+    }
+
+    /// STA-2: a dot whose hash spot is under an obstacle frame (the TOTAL NEARBY caption's bare
+    /// text frame here; the words carry no plate since R18) steps clear of it, and a ring with no
+    /// clear spot keeps the hash angle instead of dropping the dot.
+    func testRadarDotStepsOffAnObstacleAndAFullRingKeepsItsHome() {
+        let c = CGPoint(x: 100, y: 100)
+        let r = RadarScope.dotSize / 2
+        // A text frame straddling the ring at 90 degrees (straight down from the centre).
+        let caption = CGRect(x: 80, y: 140, width: 40, height: 30)
+        let placed = RadarScope.dotPositions(angles: [90], ringRadii: [50], centre: c,
+                                             dotRadius: r, obstacles: [caption])
+        let p = placed[0]
+        let nx = min(max(p.x, caption.minX), caption.maxX) - p.x
+        let ny = min(max(p.y, caption.minY), caption.maxY) - p.y
+        XCTAssertGreaterThanOrEqual(hypot(nx, ny), r, "the dot still touches the caption")
+        XCTAssertEqual(hypot(p.x - c.x, p.y - c.y), 50, accuracy: 0.001)
+        // An obstacle that covers the whole disc: nowhere is clear, so the dot keeps its home.
+        let full = RadarScope.dotPositions(angles: [90], ringRadii: [50], centre: c, dotRadius: r,
+                                           obstacles: [CGRect(x: 0, y: 0, width: 200, height: 200)])
+        XCTAssertEqual(full[0].x, 100, accuracy: 0.001)
+        XCTAssertEqual(full[0].y, 150, accuracy: 0.001)
+    }
+
+    /// J7: the FAQ's "Replay the setup checklist" with no live board (sample data or no link, so no
+    /// frame) is a preview, which draws the preview line and neutral rows instead of unticked
+    /// checks. A replay with a live frame, and the real post-connect sheet, are never previews.
+    /// Wrong input: before the gate the frameless replay drew empty check circles under "your
+    /// beacon is listening". TWIN: android FirstRunTour's checklistIsPreview test.
+    func testChecklistReplayWithoutABoardIsAPreview() throws {
+        let frame = try makeStatus(ble: true, wifi: true)
+        XCTAssertTrue(checklistIsPreview(replay: true, frame: nil))
+        XCTAssertFalse(checklistIsPreview(replay: true, frame: frame))
+        XCTAssertFalse(checklistIsPreview(replay: false, frame: nil))
+        XCTAssertFalse(checklistIsPreview(replay: false, frame: frame))
+        XCTAssertEqual(renderBoardCopy(FirstRunTour.checklistPreviewNote, nil),
+                       "preview: this is what you see after your beacon connects.")
+        XCTAssertEqual(renderBoardCopy(FirstRunTour.checklistPreviewNote, .ouiSpy),
+                       "preview: this is what you see after your OUI-Spy connects.")
+        XCTAssertEqual(renderBoardCopy(FirstRunTour.checklistPreviewNote, .meshDetect),
+                       "preview: this is what you see after your Mesh-Detect connects.")
+    }
+
+    /// The quiet sentence names the Active window through the constant, not a literal. Android:
+    /// StatusBeaconPresentationTest.quietSentenceNamesTheWindow.
+    func testQuietSentenceNamesTheWindow() {
+        XCTAssertTrue(FirstRunTour.quietSentence.hasPrefix("quiet does not mean clear. zero nearby means"))
+        XCTAssertTrue(FirstRunTour.quietSentence.contains("in the last 45 seconds."))
+    }
+
     private func makeStatus(ble: Bool, wifi: Bool, coproc: Bool? = nil, nrfUpdating: Bool? = nil,
                             extra: [String: Any] = [:]) throws -> DeviceStatus {
         var object: [String: Any] = ["fw": "beacon board", "ble": ble, "wifi": wifi]
@@ -326,5 +445,89 @@ final class DashboardPresentationTests: XCTestCase {
         for (key, value) in extra { object[key] = value }
         return try JSONDecoder().decode(
             DeviceStatus.self, from: JSONSerialization.data(withJSONObject: object))
+    }
+
+    /// U1-d: Status drops the bare SAMPLE DATA telegram in sample data (the banner, the pill and
+    /// the row say sample already) and keeps the radio variants and every live label.
+    /// Wrong input: hiding every sample label. TWIN: android StatusBeaconPresentationTest.
+    func testSampleDataHidesOnlyTheBareScanKicker() {
+        XCTAssertNil(dashboardScanKicker(scanLabel: "SAMPLE DATA", isDemoMode: true))
+        XCTAssertEqual(dashboardScanKicker(scanLabel: "SAMPLE DATA · BLUETOOTH ONLY", isDemoMode: true),
+                       "SAMPLE DATA · BLUETOOTH ONLY")
+        XCTAssertEqual(dashboardScanKicker(scanLabel: "SAMPLE DATA · RADIOS OFF", isDemoMode: true),
+                       "SAMPLE DATA · RADIOS OFF")
+        XCTAssertEqual(dashboardScanKicker(scanLabel: "SCANNING · BLE · WI-FI", isDemoMode: false),
+                       "SCANNING · BLE · WI-FI")
+    }
+
+    /// U1-d: the strongest header carries no suffix in sample data and "· RECENT" in a real
+    /// session. Wrong input: the old "· SAMPLE" suffix. TWIN: android StatusBeaconPresentationTest.
+    func testStrongestHeaderDropsTheSuffixInSampleData() {
+        XCTAssertEqual(dashboardStrongestHeader(kind: "MATCH", isDemoMode: true), "STRONGEST MATCH")
+        XCTAssertEqual(dashboardStrongestHeader(kind: "MATCH", isDemoMode: false),
+                       "STRONGEST MATCH · RECENT")
+        XCTAssertEqual(dashboardStrongestHeader(kind: "AMBIENT", isDemoMode: true), "STRONGEST AMBIENT")
+    }
+
+    /// M3: the sweep angle is fract(t / 4.5 s) x 360 of an ABSOLUTE clock reading. A beam that is
+    /// re-created (a re-mount, a tab return, a scanning flicker) reads the same absolute time as
+    /// the one it replaced, so at t = 10 s it reads 80 degrees, where a beam timed from its own
+    /// mount would restart at 0. Wrong input: an angle from a per-view start time.
+    /// TWIN: android StatusRadarScopeSemanticsTest (radarSweepDegrees, 4_500 ms).
+    func testRadarSweepAngleComesFromTheAbsoluteClock() {
+        XCTAssertEqual(RadarScope.sweepPeriod, 4.5)
+        // The FIRST reading is a real reference-date clock, mid-turn: a beam that takes its own
+        // first frame as 0 (a per-view start time) reads 0 here instead of 220.
+        XCTAssertEqual(radarSweepDegrees(at: 780_000_010.25), 220, accuracy: 1e-3,
+                       "a new beam joins the turn already in progress")
+        XCTAssertEqual(radarSweepDegrees(at: 0), 0, accuracy: 1e-9)
+        XCTAssertEqual(radarSweepDegrees(at: 2.25), 180, accuracy: 1e-9)
+        XCTAssertEqual(radarSweepDegrees(at: 4.5), 0, accuracy: 1e-9)
+        XCTAssertEqual(radarSweepDegrees(at: 10.0), 80, accuracy: 1e-6)
+        XCTAssertEqual(radarSweepDegrees(at: -1.125), 270, accuracy: 1e-9)
+        // Continuity: the beam before a re-mount and the beam after it, read at the same absolute
+        // time, agree, and a later frame moves forward from there (a real reference-date clock).
+        let t = 780_000_010.25
+        let before = radarSweepDegrees(at: t)
+        let after = radarSweepDegrees(at: t)
+        XCTAssertEqual(before, after)
+        XCTAssertEqual(radarSweepDegrees(at: t + 0.2) - before, 16, accuracy: 1e-3,
+                       "0.2 s of a 4.5 s turn is 16 degrees further on")
+    }
+
+    /// M2: the tab roots draw one header row below the accessibility sizes and fall back to the
+    /// system bar at them. Wrong input: always true (the title would clip at AX sizes).
+    func testTabHeaderIsOneRowOnlyBelowAccessibilitySizes() {
+        XCTAssertTrue(tabHeaderUsesSingleRow(.large))
+        XCTAssertTrue(tabHeaderUsesSingleRow(.xLarge))
+        XCTAssertTrue(tabHeaderUsesSingleRow(.xxxLarge))
+        XCTAssertFalse(tabHeaderUsesSingleRow(.accessibility1))
+        XCTAssertFalse(tabHeaderUsesSingleRow(.accessibility5))
+    }
+
+    /// The owner dropped the middle ring's word (2026-09-25): the radar labels only the inner ring
+    /// STRONG and the disc edge WEAK, and the dots still snap to all three rings. Wrong input that
+    /// must fail here: putting ("GOOD", 2) back into RadarScope.ringWords. TWIN: android
+    /// StatusRadarScopeSemanticsTest.radarRingWordsAreStrongAndWeakOnly.
+    func testRadarRingWordsAreStrongAndWeakOnly() {
+        XCTAssertEqual(RadarScope.ringWords.map { $0.word }, ["STRONG", "WEAK"])
+        XCTAssertEqual(RadarScope.ringWords.map { $0.ring }, [1, 3])
+    }
+
+    /// The owner cut the Status radar by about a quarter (2026-09-25, decisions R12): its side is
+    /// 0.75 of the content column, capped at 315 (0.75 x the old 420 cap). The literals are
+    /// asserted, not the constants against themselves: the rule is SHARED with Android
+    /// (STATUS_RADAR_SIDE_FRACTION, STATUS_RADAR_MAX_SIDE, statusRadarSide). Wrong input that must
+    /// fail here: the old whole-column side (fraction 1, cap 420), which is 358 on a 390pt phone's
+    /// 358pt column. TWIN: android StatusRadarScopeSemanticsTest
+    /// .radarSideIsThreeQuartersOfTheColumnCappedAt315.
+    func testRadarSideIsThreeQuartersOfTheColumnCappedAt315() {
+        XCTAssertEqual(RadarSideLayout.fraction, 0.75)
+        XCTAssertEqual(RadarSideLayout.cap, 315)
+        XCTAssertEqual(RadarSideLayout.side(column: 358), 268.5, accuracy: 0.001)   // 390pt phone
+        XCTAssertEqual(RadarSideLayout.side(column: 420), 315, accuracy: 0.001)     // exactly the cap
+        XCTAssertEqual(RadarSideLayout.side(column: 800), 315, accuracy: 0.001)     // iPad column
+        XCTAssertEqual(RadarSideLayout.side(column: .infinity), 315)                // ideal-size query
+        XCTAssertEqual(RadarSideLayout.side(column: 0), 0)
     }
 }

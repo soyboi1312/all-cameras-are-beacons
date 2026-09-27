@@ -93,7 +93,7 @@ struct ContributeView: View {
     // re-read after Stop, so rows evicted between Stop and Share (ignore, clear log) can no longer
     // vanish out of the export while the header still claims the frozen count. Unredacted on
     // purpose: the location toggles stay live in review, so redaction happens per-share, not at
-    // Stop. Cleared by Start over and confirmed Discard.
+    // Stop. Cleared by Start Over and confirmed Discard.
     @State private var frozenCsv = ""
     // The frozen CSV's data-row count, counted ONCE at Stop for the same reason photoThumb is
     // decoded once (above): review is a live SwiftUI body. `ble` is an @EnvironmentObject, so
@@ -208,8 +208,8 @@ struct ContributeView: View {
             Text(buildError ?? "Nothing was shared. Try again.")
         }
         .onReceive(ticker) { _ in if phase == .capturing { nowMs = Self.nowMillis() } }
-        // One confirmation for every destructive way out of a live capture (Discard, Start over,
-        // START A NEW CAPTURE): a field capture cannot be re-taken from the couch, so it is never
+        // One confirmation for every destructive way out of a live capture (Discard, Start Over,
+        // Start a New Capture): a field capture cannot be re-taken from the couch, so it is never
         // dropped on a single tap. Idle - and the empty review with nothing worth keeping - pass
         // straight through (see captureWorthKeeping). Mirrors Android's confirmDiscard dialog.
         .confirmationDialog("Discard this capture?",
@@ -219,7 +219,7 @@ struct ContributeView: View {
             Button("Discard", role: .destructive) {
                 if let target = confirmDiscard { confirmDiscard = nil; performDiscard(target) }
             }
-            Button("Keep capture", role: .cancel) { confirmDiscard = nil }
+            Button("Keep Capture", role: .cancel) { confirmDiscard = nil }
         } message: {
             Text("The captured window and its details will be lost. This can't be undone.")
         }
@@ -228,9 +228,9 @@ struct ContributeView: View {
         // switch, so an unconditional cleanup here deleted the attached photo out from under a
         // LIVE capture mid-walk (and the still-retained photoItem then blocked re-picking the
         // same photo). Gated on idle, an in-progress capture keeps its photo and share dirs
-        // across tab switches; confirmed Discard and Start over run cleanupTemp explicitly
+        // across tab switches; confirmed Discard and Start Over run cleanupTemp explicitly
         // instead (performDiscard). A capture abandoned mid-flow by leaving the tab for good can
-        // strand temp files; the real Clear log deletes its share dirs and the next launch sweeps
+        // strand temp files; the real Clear Log deletes its share dirs and the next launch sweeps
         // share dirs and loose photos older than 1 hour (ExportTempCache). onDisappear still
         // does NOT fire while a share or mail sheet is presented over this view (the presenter
         // stays "appeared"), so an in-flight share's files are never deleted here either.
@@ -247,7 +247,7 @@ struct ContributeView: View {
             Text("connect a real beacon before starting a capture.")
                 .font(ACABTheme.mono(11)).foregroundStyle(ACABTheme.warn)
         }
-        primaryButton("START CAPTURE") { startCapture() }
+        primaryButton("Start Capture") { startCapture() }
             .disabled(!canStartCapture)
             .opacity(canStartCapture ? 1 : 0.5)
         discardLink
@@ -256,11 +256,10 @@ struct ContributeView: View {
     // ---- CAPTURING: live count + elapsed, until the user stops -------------------------------
     @ViewBuilder private var capturingStep: some View {
         Text("CAPTURING").font(ACABTheme.mono(11, weight: .bold)).foregroundStyle(ACABTheme.accentText)
-            .tracking(1)
         Text("Walk around the device, then stop.").font(ACABTheme.mono(13)).foregroundStyle(ACABTheme.dim)
         Text("\(liveCount) observation\(liveCount == 1 ? "" : "s") heard  ·  \(Self.elapsed(startMs, nowMs))")
             .font(ACABTheme.mono(16, weight: .bold)).foregroundStyle(ACABTheme.text)
-        primaryButton("STOP CAPTURE") {
+        primaryButton("Stop Capture") {
             let stopped = Self.nowMillis()
             // One manager call freezes live-ledger membership, row fields, exact timestamps, and
             // matching capture-local phone positions before ingest can advance another row.
@@ -307,13 +306,12 @@ struct ContributeView: View {
     // would ride the share must be reviewable, even when the CSV is empty.
     @ViewBuilder private var emptyReviewStep: some View {
         Text("NOTHING HEARD").font(ACABTheme.mono(11, weight: .bold)).foregroundStyle(ACABTheme.dim)
-            .tracking(1)
         Text("Nothing was heard in this window. That means no compatible broadcast was recognized "
            + "while you captured - it doesn't prove nothing is there. Try capturing closer to the "
            + "device, or for longer.")
             .font(ACABTheme.mono(13)).foregroundStyle(ACABTheme.text)
             .fixedSize(horizontal: false, vertical: true)
-        primaryButton("START A NEW CAPTURE") { requestNewCapture() }
+        primaryButton("Start a New Capture") { requestNewCapture() }
             .disabled(preparing)
             .opacity(preparing ? 0.5 : 1)
         kindSection
@@ -331,7 +329,7 @@ struct ContributeView: View {
         // Sharing an empty capture stays possible (a confirmed visual with zero RF is itself a
         // data point) but deliberately reads as the secondary path.
         Button { buildAndShare(mode: .send) } label: {
-            Text("Share the empty capture anyway")
+            Text("Share the Empty Capture Anyway")
                 .font(ACABTheme.mono(12)).foregroundStyle(ACABTheme.faint)
                 .frame(maxWidth: .infinity).frame(minHeight: 44)
                 .contentShape(Rectangle())
@@ -340,7 +338,7 @@ struct ContributeView: View {
         .disabled(exportBusy)
         .opacity(exportBusy ? 0.5 : 1)
         Button { buildAndShare(mode: .save) } label: {
-            Text("SAVE A COPY")
+            Text("Save a Copy")
                 .font(ACABTheme.mono(12, weight: .bold)).foregroundStyle(ACABTheme.dim)
                 .frame(maxWidth: .infinity).padding(.vertical, 12)
                 .frame(minHeight: 44)
@@ -375,7 +373,7 @@ struct ContributeView: View {
                 .frame(minHeight: 44)
                 .background(on ? ACABTheme.bg3 : ACABTheme.bg2, in: RoundedRectangle(cornerRadius: 12))
                 .overlay(RoundedRectangle(cornerRadius: 12)
-                    .strokeBorder(on ? ACABTheme.accent : ACABTheme.line, lineWidth: 1))
+                    .strokeBorder(on ? ACABTheme.tint : ACABTheme.line, lineWidth: 1))
                 .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
@@ -418,7 +416,7 @@ struct ContributeView: View {
                 }
                 Spacer(minLength: 8)
                 PhotosPicker(selection: $photoItem, matching: .images) {
-                    Text("REPLACE").font(replaceFont).tracking(1)
+                    Text("Replace").font(replaceFont)
                         .foregroundStyle(ACABTheme.dim)
                         .padding(.horizontal, 8).padding(.vertical, 5)
                         .overlay(Capsule().strokeBorder(ACABTheme.line, lineWidth: 1))
@@ -431,10 +429,10 @@ struct ContributeView: View {
                     // path as a deselection, which bumps the generation and deletes the file.
                     if photoItem != nil { photoItem = nil } else { loadPhoto(nil) }
                 } label: {
-                    Text("REMOVE").font(ACABTheme.mono(10, weight: .bold)).tracking(1)
+                    Text("Remove").font(ACABTheme.mono(10, weight: .bold))
                         .foregroundStyle(ACABTheme.accentText)
                         .padding(.horizontal, 8).padding(.vertical, 5)
-                        .overlay(Capsule().strokeBorder(ACABTheme.lineStrong, lineWidth: 1))
+                        .overlay(Capsule().strokeBorder(ACABTheme.line, lineWidth: 1))
                         .frame(minHeight: 44)   // 44pt hit target
                         .contentShape(Rectangle())
                 }
@@ -447,7 +445,7 @@ struct ContributeView: View {
         } else {
             let attachFont = ACABTheme.mono(12)
             PhotosPicker(selection: $photoItem, matching: .images) {
-                Label(photoLoading ? "Preparing photo\u{2026}" : "Attach a photo (optional)",
+                Label(photoLoading ? "Preparing Photo\u{2026}" : "Attach a Photo (Optional)",
                       systemImage: photoLoading ? "hourglass" : "photo")
                     .font(attachFont).foregroundStyle(ACABTheme.dim)
                     .frame(maxWidth: .infinity).padding(.vertical, 11)
@@ -459,7 +457,7 @@ struct ContributeView: View {
         }
         if photoLoading {
             HStack(spacing: 8) {
-                ProgressView().controlSize(.small).tint(ACABTheme.accent)
+                ProgressView().controlSize(.small).tint(ACABTheme.tint)
                 Text("Decoding and removing location metadata. Share and Save stay off until the photo is ready.")
                     .font(ACABTheme.mono(10)).foregroundStyle(ACABTheme.dim)
                     .fixedSize(horizontal: false, vertical: true)
@@ -503,7 +501,7 @@ struct ContributeView: View {
                 Text(hint).font(ACABTheme.mono(10)).foregroundStyle(ACABTheme.faint)
             }
         }
-        .tint(ACABTheme.accent)
+        .tint(ACABTheme.tint)
         .disabled(preparing)
         .opacity(preparing ? 0.65 : 1)
     }
@@ -521,7 +519,7 @@ struct ContributeView: View {
         .overlay(RoundedRectangle(cornerRadius: 12).strokeBorder(ACABTheme.line, lineWidth: 1))
     }
 
-    // Review & share (submit) / save a copy / start over / discard. SAVE A COPY is a standing
+    // Review & share (submit) / save a copy / start over / discard. Save a Copy is a standing
     // action because the Mail path used to make Save to Files unreachable: canSendMail() == true
     // meant the composer always opened and the share sheet (the only surface offering Files)
     // never did. It always opens the file share sheet, Mail configured or not.
@@ -534,11 +532,11 @@ struct ContributeView: View {
             }
             .frame(maxWidth: .infinity).padding(.vertical, 12)
         }
-        primaryButton("REVIEW & SHARE") { buildAndShare(mode: .send) }
+        primaryButton("Review & Share") { buildAndShare(mode: .send) }
             .disabled(exportBusy)
             .opacity(exportBusy ? 0.5 : 1)
         Button { buildAndShare(mode: .save) } label: {
-            Text("SAVE A COPY").font(ACABTheme.mono(12, weight: .bold)).foregroundStyle(ACABTheme.dim)
+            Text("Save a Copy").font(ACABTheme.mono(12, weight: .bold)).foregroundStyle(ACABTheme.dim)
                 .frame(maxWidth: .infinity).padding(.vertical, 12)
                 .frame(minHeight: 44)
                 .overlay(RoundedRectangle(cornerRadius: 12).strokeBorder(ACABTheme.line, lineWidth: 1))
@@ -550,7 +548,7 @@ struct ContributeView: View {
         HStack {
             // Both destructive exits route through the discard confirmation (see body).
             Button { requestStartOver() } label: {
-                Text("Start over").font(ACABTheme.mono(12)).foregroundStyle(ACABTheme.faint)
+                Text("Start Over").font(ACABTheme.mono(12)).foregroundStyle(ACABTheme.faint)
                     .padding(.vertical, 8)
                     .frame(minHeight: 44)   // 44pt targets for the quiet links too
                     .contentShape(Rectangle())
@@ -577,7 +575,7 @@ struct ContributeView: View {
             Text(title).font(ACABTheme.mono(13, weight: .bold)).foregroundStyle(ACABTheme.text)
                 .frame(maxWidth: .infinity).padding(.vertical, 12)
                 .frame(minHeight: 44)   // 44pt target
-                .overlay(RoundedRectangle(cornerRadius: 12).strokeBorder(ACABTheme.accent, lineWidth: 1))
+                .overlay(RoundedRectangle(cornerRadius: 12).strokeBorder(ACABTheme.tint, lineWidth: 1))
                 .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
@@ -620,7 +618,7 @@ struct ContributeView: View {
         guard !preparing else { return }
         // Pass-through routes through performDiscard too (not a bare dismiss): phase must return
         // to .idle so the idle-gated onDisappear cleanup can release any stranded share dir from
-        // an earlier "Share the empty capture anyway".
+        // an earlier "Share the Empty Capture Anyway".
         if captureWorthKeeping { confirmDiscard = .close } else { performDiscard(.close) }
     }
     private func requestStartOver() {
@@ -826,11 +824,11 @@ struct ContributeView: View {
     }
 
     /// Remove the temp files this view owns: the current EXIF-stripped photo and every per-share
-    /// directory. Called from performDiscard (a confirmed Discard / Start over) and from
+    /// directory. Called from performDiscard (a confirmed Discard / Start Over) and from
     /// onDisappear only when the flow is IDLE - a live capture must survive tab switches (see
     /// body). Never runs while a share is in flight: the sheets keep this view "appeared" and
     /// the discard buttons are unreachable behind them. Files stranded despite this are bounded
-    /// by ExportTempCache (the real Clear log deletes share dirs; a launch sweep removes share
+    /// by ExportTempCache (the real Clear Log deletes share dirs; a launch sweep removes share
     /// dirs and loose photos older than 1 hour).
     private func cleanupTemp() {
         // Invalidate any picker Task still loading. Its UUID path is private to that Task, so when
@@ -932,7 +930,7 @@ struct ContributeView: View {
                 return
             }
 
-            // File path: SAVE A COPY always, and SEND when no Mail account exists. Materialise
+            // File path: Save a Copy always, and SEND when no Mail account exists. Materialise
             // into a FRESH per-share directory so the files are IMMUTABLE for the receiving
             // activity. loadPhoto only ever touches beacons-observation-<UUID>.jpg in the temp
             // ROOT, never this directory, so no picker Task can replace or delete these between
@@ -946,7 +944,7 @@ struct ContributeView: View {
                                       buildError = "The export file couldn't be created. Nothing was shared." }
                 return
             }
-            // Leaf names come from ExportTempCache so Clear log and the launch sweep recognise
+            // Leaf names come from ExportTempCache so Clear Log and the launch sweep recognise
             // this dir as ours (a dir with any other leaf is skipped).
             let csvURL = dir.appendingPathComponent(ExportTempCache.contributionCSVLeaf)
             guard (try? csvData.write(to: csvURL,
@@ -990,7 +988,7 @@ struct ContributeView: View {
             if let photoShareURL { items.append(photoShareURL) }
             let bundle = ShareBundle(items: items)
             await MainActor.run {
-                shareDirs.append(dir)   // owned by this view; removed by cleanupTemp (else Clear log / launch sweep)
+                shareDirs.append(dir)   // owned by this view; removed by cleanupTemp (else Clear Log / launch sweep)
                 preparing = false
                 share = bundle
             }

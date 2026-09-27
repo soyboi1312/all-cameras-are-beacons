@@ -1,5 +1,6 @@
 package tech.acab.app.ui
 
+import tech.acab.app.ble.ACTIVE_NEARBY_WINDOW_MS
 import tech.acab.app.ble.MAP_RECENT_WINDOW_MS
 import tech.acab.app.ble.MapDetectionEvidence
 import tech.acab.app.model.Detection
@@ -12,17 +13,38 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.collectLatest
 
-/** User-facing history lens for Map only. Logbook always retains and displays its full evidence
- * feed unless the user applies its own filters. */
-internal enum class MapHistoryScope { Recent, All }
+/** User-facing history lens for Map only. The Log always retains and displays its full evidence
+ * feed unless the user applies its own filters. Declaration order is the segment order on the map
+ * (active · N / recent · N / all · N), and the choice is persisted by [name] under "history_scope"
+ * in the "acab.map" prefs, so a case is never renamed. TWIN: iOS `MapHistoryScope`
+ * (`case active, recent, all`) in MapTabView.swift. */
+internal enum class MapHistoryScope { Active, Recent, All }
 
+/** Whether a row last heard at [lastSeenAt] belongs to [scope] at [now]. Active and Recent share
+ * one shape over their own windows ([ACTIVE_NEARBY_WINDOW_MS], the 45 s Status uses, and
+ * [MAP_RECENT_WINDOW_MS]): an undated row and a stamp ahead of [now] are both out.
+ *
+ * [demo] is the sample-data bypass on every non-All scope: in sample data every row is active,
+ * dated or not, the same bypass Status (StatusScreen `nearby`) and the Log (LogScreen's Active
+ * boundary, `if (demo) feedLive.size`) apply to the 45 s window. The seed stamps its rows once, so
+ * without it the Map alone would fall to "active · 0" 45 s into the tour while the other two tabs
+ * still show every row (C10 / C11). Recent takes the same bypass, because Active (45 s) is a subset
+ * of Recent (15 min): without it the default Recent scope emptied 15 minutes into the tour and the
+ * segments read "active · 5 / recent · 0", which cannot be true (review finding MAP-01). All is
+ * unchanged. TWIN: iOS `mapScopeIncludes(lastSeen:basis:scope:now:isDemoMode:)` in MapTabView.swift
+ * (MAP-01 asks it for the same bypass on every non-All scope). */
 internal fun mapHistoryIncludes(
     lastSeenAt: Long?,
     scope: MapHistoryScope,
     now: Long,
     recentWindowMs: Long = MAP_RECENT_WINDOW_MS,
-): Boolean = scope == MapHistoryScope.All ||
-    (lastSeenAt != null && now - lastSeenAt in 0..recentWindowMs)
+    activeWindowMs: Long = ACTIVE_NEARBY_WINDOW_MS,
+    demo: Boolean = false,
+): Boolean = when (scope) {
+    MapHistoryScope.All -> true
+    MapHistoryScope.Recent -> demo || (lastSeenAt != null && now - lastSeenAt in 0..recentWindowMs)
+    MapHistoryScope.Active -> demo || (lastSeenAt != null && now - lastSeenAt in 0..activeWindowMs)
+}
 
 /** Stable ordered membership for the history lens. [latestLastSeen] is an authoritative slow
  * refresh, separate from the geometry snapshot, so continuously-heard stationary rows stay Recent
@@ -32,21 +54,23 @@ internal fun mapHistoryIds(
     scope: MapHistoryScope,
     now: Long,
     latestLastSeen: Map<String, Long>,
+    demo: Boolean = false,
 ): List<String> = if (scope == MapHistoryScope.All) {
     rows.map { it.detection.id }
 } else {
     rows.mapNotNull { row ->
         row.detection.id.takeIf {
-            mapHistoryIncludes(latestLastSeen[it], scope, now)
+            mapHistoryIncludes(latestLastSeen[it], scope, now, demo = demo)
         }
     }
 }
 
-/** The clock the Recent lens compares stamps against: wall-clock, read at the moment of the
- * comparison. MapScreen also keeps a slow 30 s tick (`historyNow`) that INVALIDATES membership
- * while the radio is quiet; that tick is never the comparison clock, because a row heard since the
- * tick carries a stamp newer than it and [mapHistoryIncludes] rejects a stamp ahead of `now`, which
- * would hide exactly the freshest sightings from the default lens for up to 30 s. TWIN: iOS
+/** The clock the Active and Recent lenses compare stamps against: wall-clock, read at the moment
+ * of the comparison. MapScreen also keeps a tick (`historyNow`: 1 s under Active, 30 s under Recent
+ * and All) that INVALIDATES membership while the radio is quiet; that tick is never the comparison
+ * clock, because a row heard since the tick carries a stamp newer than it and [mapHistoryIncludes]
+ * rejects a stamp ahead of `now`, which would hide exactly the freshest sightings from the lens
+ * until the next tick. TWIN: iOS
  * `makeSnapshot` in MapTabView.swift reads `let now = Date()` inside the projection pass and hands
  * that to `mapHistoryScopeIncludes` for the same reason. */
 internal fun recentScopeClock(): Long = System.currentTimeMillis()
@@ -57,7 +81,95 @@ internal fun recentScopeIds(
     rows: List<MapDetectionEvidence>,
     scope: MapHistoryScope,
     latestLastSeen: Map<String, Long>,
-): List<String> = mapHistoryIds(rows, scope, recentScopeClock(), latestLastSeen)
+    demo: Boolean = false,
+): List<String> = mapHistoryIds(rows, scope, recentScopeClock(), latestLastSeen, demo)
+
+/** One map evidence snapshot split by [hasMapRepresentation] (MapScreen.kt): `first` holds the
+ * located rows, which feed the pins, the ALL chip, the category chips and the scope segments;
+ * `second` holds the unlocated rows, which feed ONLY the headline's "without a location" count. */
+internal fun splitMapEvidence(
+    rows: List<MapDetectionEvidence>,
+): Pair<List<MapDetectionEvidence>, List<MapDetectionEvidence>> = rows.partition { row ->
+    val d = row.detection
+    hasMapRepresentation(d.type, row.coordinate, d.pilotLat, d.pilotLon)
+}
+
+/** The located rows [scope] keeps, [scopedIds] being its membership ([recentScopeIds], unused under
+ * All). Its size is the ALL chip's number: the located rows in the current scope before the
+ * category chip, the rows the pins represent with no chip on and the selected scope's segment
+ * count. TWIN: iOS `MapSnapshot.totalLocated` in MapTabView.swift (the `total += 1` after the
+ * mapCoord and scope guards in makeSnapshot). An unlocated row never counts here. */
+internal fun mapScopedLocated(
+    located: List<MapDetectionEvidence>,
+    scope: MapHistoryScope,
+    scopedIds: List<String>,
+): List<MapDetectionEvidence> = if (scope == MapHistoryScope.All) {
+    located
+} else {
+    val allowed = scopedIds.toHashSet()
+    located.filter { it.detection.id in allowed }
+}
+
+/** A stored "history_scope" value, back to its scope. An unknown or missing value (a pref written
+ * by a future build, a hand-edited file) falls back to Recent, the default lens, never a crash. */
+internal fun parseMapHistoryScope(stored: String?): MapHistoryScope =
+    runCatching { MapHistoryScope.valueOf(stored ?: "Recent") }.getOrDefault(MapHistoryScope.Recent)
+
+/** What the scope segments and the honesty headline print. [active], [recent] and [all] count the
+ * located rows through the current category chip per scope (what each segment would show);
+ * [withoutLocation] counts the unlocated rows through the same chip and the SELECTED scope. */
+internal data class MapScopeCounts(val active: Int, val recent: Int, val all: Int, val withoutLocation: Int)
+
+/** One pass over [locatedIds] tallies Active and Recent through [mapHistoryIncludes] against
+ * [lastSeenMs] (the trusted stamps, `mapLastSeenSnapshot`); `all` is every located row; one pass
+ * over [unlocatedIds] counts those in the selected [scope]. Allocates no intermediate collection.
+ * [demo] is [mapHistoryIncludes]'s sample-data bypass, so in sample data `active` and `recent`
+ * both equal `all` and each segment agrees with the pins its scope draws. TWIN: iOS `MapSnapshot` activeCount /
+ * recentCount / allCount / withoutLocation (MapTabView.swift), counted through the same bypass in
+ * `mapScopeIncludes(lastSeen:basis:scope:now:isDemoMode:)`. */
+internal fun mapScopeCounts(
+    lastSeenMs: Map<String, Long>,
+    locatedIds: Collection<String>,
+    unlocatedIds: Collection<String>,
+    scope: MapHistoryScope,
+    nowMs: Long,
+    demo: Boolean = false,
+): MapScopeCounts {
+    var active = 0
+    var recent = 0
+    for (id in locatedIds) {
+        val seen = lastSeenMs[id]
+        if (mapHistoryIncludes(seen, MapHistoryScope.Active, nowMs, demo = demo)) active++
+        if (mapHistoryIncludes(seen, MapHistoryScope.Recent, nowMs, demo = demo)) recent++
+    }
+    var without = 0
+    for (id in unlocatedIds) {
+        if (mapHistoryIncludes(lastSeenMs[id], scope, nowMs, demo = demo)) without++
+    }
+    return MapScopeCounts(active, recent, locatedIds.size, without)
+}
+
+/** The scope segment labels. TWIN: iOS `mapScopeSegmentLabel(_:count:)` in MapTabView.swift, and
+ * the drift row "map scope segment labels" reads this exact shape (expression body, `}` at column 0). */
+internal fun mapScopeSegmentLabel(scope: MapHistoryScope, count: Int): String = when (scope) {
+    MapHistoryScope.Active -> "active · $count"
+    MapHistoryScope.Recent -> "recent · $count"
+    MapHistoryScope.All -> "all · $count"
+}
+
+/** The legend card's honesty headline, its first line: the located rows in scope and category,
+ * and the rows that have no location at all. TWIN: iOS `mapHonestyHeadline(onMap:withoutLocation:)`; the drift row
+ * "map honesty headline" reads this exact expression body.
+ *
+ * PLATFORM DIFFERENCE in the numbers passed in: a Remote ID drone with ONLY an operator coordinate
+ * (no drone position and no observer fix) is located here, because mapRepresentationCoord
+ * (MapScreen.kt) falls back to the operator position for a drone, so it counts in "N on the map"
+ * and in the active / recent / all segments and draws its operator marker. iOS has no map
+ * coordinate for that row, so there it counts as "without a location" and joins no segment count
+ * (the iOS mapHonestyHeadline doc records the same difference). Every other row splits the same
+ * way on both phones. */
+internal fun mapHonestyHeadline(onMap: Int, withoutLocation: Int): String =
+    "$onMap on the map · $withoutLocation without a location"
 
 /** Ceiling on how often a detection-driven revision may rebuild the map, by retained row count.
  * THE SHARED LADDER: iOS `mapDetectionRefreshInterval(rowCount:)` in MapTabView.swift returns the

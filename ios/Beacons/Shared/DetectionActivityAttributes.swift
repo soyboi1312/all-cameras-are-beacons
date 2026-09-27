@@ -18,7 +18,8 @@ import Foundation
 struct DetectionActivityAttributes: ActivityAttributes {
     typealias ContentState = DetectionState
 
-    /// Static for the whole session.
+    /// Static for the whole session. The board's kind noun ("beacon", "OUI-Spy", "Mesh-Detect";
+    /// BLEManager.beginDriveModeIfReady), never the raw advertised name.
     let deviceName: String
     let sessionStart: Date
 

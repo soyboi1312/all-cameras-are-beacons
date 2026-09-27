@@ -159,13 +159,18 @@ class RememberedBoardTest {
     }
 
     @Test fun sharedCopyMatchesIos() {
-        // ios/Beacons/BLE/RememberedBoard.swift RememberedBoardCopy pins the same literals; a drift
-        // here is cross-platform drift.
-        assertEquals("your beacon", RememberedBoardCopy.LABEL)
+        // ios/BeaconsTests/RememberedBoardTests.swift testRememberedRowCopy pins the same literals;
+        // a drift here is cross-platform drift. The title names the remembered board's kind (null
+        // reads as beacon); the subtitle carries only the live-signal state, never the advertised
+        // name (decisions R14).
+        assertEquals("your {noun}", RememberedBoardCopy.LABEL_TEMPLATE)
+        assertEquals("your beacon", RememberedBoardCopy.label(null))
+        assertEquals("your beacon", RememberedBoardCopy.label(BoardKind.BEACON))
+        assertEquals("your OUI-Spy", RememberedBoardCopy.label(BoardKind.OUI_SPY))
+        assertEquals("your Mesh-Detect", RememberedBoardCopy.label(BoardKind.MESH_DETECT))
         assertEquals("no live signal \u00B7 tap to connect", RememberedBoardCopy.NO_SIGNAL)
         assertEquals("tap to connect", RememberedBoardCopy.SEEN)
-        assertEquals("ACAB-01 \u00B7 no live signal \u00B7 tap to connect",
-            RememberedBoardCopy.subtitle("ACAB-01", advertSeen = false))
-        assertEquals("tap to connect", RememberedBoardCopy.subtitle(" ", advertSeen = true))
+        assertEquals("no live signal \u00B7 tap to connect", RememberedBoardCopy.subtitle(advertSeen = false))
+        assertEquals("tap to connect", RememberedBoardCopy.subtitle(advertSeen = true))
     }
 }

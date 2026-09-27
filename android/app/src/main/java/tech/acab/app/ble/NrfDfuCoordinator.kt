@@ -62,6 +62,14 @@ internal fun nrfStartStallAction(
     NrfStartStallAction.IGNORE
 }
 
+/** A co-processor update retried on the same link as a quarantined attempt (startUpdate). [kind]
+ *  is the connected board's (boardKindProvider, AcabBleManager.targetKind); null reads as beacon.
+ *  The board-update twin is OTA_RECONNECT_BEFORE_RETRY_TEMPLATE (AcabBleManager.kt), worded the
+ *  same apart from the update it names. One template, byte for byte on both apps.
+ *  TWIN: iOS startNrfUpdate's nrfQuarantinedPeripheralID guard (ios/Beacons/BLE/BLEManager+NrfDFU.swift). */
+internal const val NRF_DFU_RECONNECT_BEFORE_RETRY_TEMPLATE =
+    "reconnect to the {noun} before retrying the co-processor update. this clears any delayed update replies from the previous attempt."
+
 data class NrfDfuProgress(
     val phase: NrfDfuPhase = NrfDfuPhase.IDLE,
     val pct: Int = 0,
@@ -94,6 +102,8 @@ class NrfDfuCoordinator(
     private val statusRevisionProvider: () -> Long,
     /** Confirmed foreground-service promotion, rechecked on Main at the trigger write. */
     private val protectedHoldReady: () -> Boolean,
+    /** The connected board's kind (AcabBleManager.targetKind), for copy only; null reads as beacon. */
+    private val boardKindProvider: () -> BoardKind? = { null },
 ) {
     private val _progress = MutableStateFlow(NrfDfuProgress())
     val progress: StateFlow<NrfDfuProgress> = _progress.asStateFlow()
@@ -226,7 +236,7 @@ class NrfDfuCoordinator(
         val session = linkSessionProvider()
         if (quarantinedSession == session) {
             set(NrfDfuPhase.FAILED, 0,
-                "Reconnect to the beacon before retrying the co-processor update. This clears any delayed update replies from the previous attempt.")
+                renderBoardCopy(NRF_DFU_RECONNECT_BEFORE_RETRY_TEMPLATE, boardKindProvider()))
             return
         }
         val liveStatus = statusProvider()

@@ -438,6 +438,125 @@ final class MapPinRulesTests: XCTestCase {
                                               scope: .all, now: now))
     }
 
+    /// Active is the Recent shape on the shared 45 s window: a trustworthy stamp, not in the
+    /// future, no older than activeNearbyInterval. The segment order and the persisted raw values
+    /// are part of the contract too (`map.historyScope` stores "recent" / "all").
+    func testActiveMapScopeRequiresTrustworthyTimeWithinFortyFiveSeconds() {
+        XCTAssertEqual(activeNearbyInterval, 45,
+                       "the spoken 'forty-five seconds' in mapAccessibilityLabel must move with this window")
+        XCTAssertEqual(MapHistoryScope.allCases, [.active, .recent, .all])
+        XCTAssertEqual(MapHistoryScope.recent.rawValue, "recent")
+        XCTAssertEqual(MapHistoryScope.all.rawValue, "all")
+        XCTAssertEqual(MapHistoryScope(rawValue: "active"), .active)
+        XCTAssertTrue(mapHistoryScopeIncludes(lastSeen: ago(0), basis: .exact,
+                                              scope: .active, now: now))
+        XCTAssertTrue(mapHistoryScopeIncludes(lastSeen: ago(45),
+                                              basis: .reconstructed(precisionSec: 2),
+                                              scope: .active, now: now))
+        XCTAssertFalse(mapHistoryScopeIncludes(lastSeen: ago(46), basis: .exact,
+                                               scope: .active, now: now))
+        XCTAssertFalse(mapHistoryScopeIncludes(lastSeen: now.addingTimeInterval(1), basis: .exact,
+                                               scope: .active, now: now))
+        XCTAssertFalse(mapHistoryScopeIncludes(lastSeen: ago(10),
+                                               basis: .bracketed(after: ago(60), before: now),
+                                               scope: .active, now: now))
+        XCTAssertFalse(mapHistoryScopeIncludes(lastSeen: ago(10), basis: .unknown,
+                                               scope: .active, now: now))
+        XCTAssertFalse(mapHistoryScopeIncludes(lastSeen: nil, basis: .exact,
+                                               scope: .active, now: now))
+        // The same 46 s stamp is still inside Recent: only the window differs.
+        XCTAssertTrue(mapHistoryScopeIncludes(lastSeen: ago(46), basis: .exact,
+                                              scope: .recent, now: now))
+    }
+
+    /// Sample data counts and shows every row as Active on the Map, the bypass Status and the Log
+    /// apply to the 45 s window (the seed stamps its rows once). The bypass covers Recent too
+    /// (MAP-01), because Active is a subset of Recent; All keeps every row anyway. Without sample
+    /// data both windows are the plain rules. Wrong input: dropping the `isDemoMode` arm fails the
+    /// first three assertions; narrowing it to Active alone fails the Recent one.
+    /// TWIN: Android MapProjectionTest.demoModeCountsAndShowsEverySampleRowAsActive.
+    func testDemoModeCountsAndShowsEverySampleRowAsActive() {
+        XCTAssertTrue(mapScopeIncludes(lastSeen: ago(60), basis: .exact, scope: .active,
+                                       now: now, isDemoMode: true))
+        XCTAssertTrue(mapScopeIncludes(lastSeen: ago(20 * 60), basis: .exact, scope: .active,
+                                       now: now, isDemoMode: true))
+        XCTAssertTrue(mapScopeIncludes(lastSeen: nil, basis: .unknown, scope: .active,
+                                       now: now, isDemoMode: true))
+        XCTAssertTrue(mapScopeIncludes(lastSeen: ago(20 * 60), basis: .exact, scope: .recent,
+                                       now: now, isDemoMode: true))
+        XCTAssertFalse(mapScopeIncludes(lastSeen: ago(20 * 60), basis: .exact, scope: .recent,
+                                        now: now, isDemoMode: false))
+        XCTAssertTrue(mapScopeIncludes(lastSeen: ago(60), basis: .exact, scope: .recent,
+                                       now: now, isDemoMode: true))
+        XCTAssertTrue(mapScopeIncludes(lastSeen: nil, basis: .unknown, scope: .all,
+                                       now: now, isDemoMode: true))
+        XCTAssertFalse(mapScopeIncludes(lastSeen: ago(60), basis: .exact, scope: .active,
+                                        now: now, isDemoMode: false))
+        XCTAssertFalse(mapScopeIncludes(lastSeen: nil, basis: .unknown, scope: .active,
+                                        now: now, isDemoMode: false))
+        XCTAssertTrue(mapScopeIncludes(lastSeen: ago(10), basis: .exact, scope: .active,
+                                       now: now, isDemoMode: false))
+    }
+
+    /// MAP-01: the segments must nest in sample data at any age. Active (45 s) is a subset of
+    /// Recent (15 min), so 20 minutes after the seed stamped its rows the tour must still read
+    /// active <= recent <= all, with every sample row in each. Wrong input: with the bypass on
+    /// Active only, this gave active 5 and recent 0.
+    /// TWIN: Android MapProjectionTest's sample-data nesting case.
+    func testSampleDataScopesNestTwentyMinutesAfterSeeding() {
+        let stamps: [(Date?, TimeBasis)] = [
+            (ago(20 * 60), .exact), (ago(20 * 60), .exact), (ago(21 * 60), .reconstructed(precisionSec: 2)),
+            (ago(20 * 60), .exact), (nil, .unknown),
+        ]
+        func count(_ scope: MapHistoryScope) -> Int {
+            stamps.filter { mapScopeIncludes(lastSeen: $0.0, basis: $0.1, scope: scope,
+                                             now: now, isDemoMode: true) }.count
+        }
+        let active = count(.active), recent = count(.recent), all = count(.all)
+        XCTAssertLessThanOrEqual(active, recent)
+        XCTAssertLessThanOrEqual(recent, all)
+        XCTAssertEqual(recent, stamps.count, "a sample tour's Recent scope must not empty out")
+    }
+
+    /// Decision B1: the main Map's "phone breadcrumb trails" option starts OFF, the fallback
+    /// `@AppStorage("map.showBreadcrumbs")` uses when the user never flipped it. Wrong input: the
+    /// old default, true, fails this. TWIN: Android MapProjectionTest.
+    /// mainMapBreadcrumbTrailsDefaultOff (MAP_SHOW_BREADCRUMBS_DEFAULT).
+    func testMainMapBreadcrumbTrailsDefaultOff() {
+        XCTAssertFalse(MapTabView.showBreadcrumbsDefault)
+    }
+
+    /// The tick's window over sorted stamps is exactly the Active membership, and it moves when a
+    /// future stamp enters as the clock passes it (a one-sided boundary would not).
+    func testActiveWindowMatchesTheActiveMembership() {
+        let stamps = [now.addingTimeInterval(1), now, ago(45), ago(46)]
+        let window = activeWindow(stamps, now: now)
+        XCTAssertEqual(window, 1..<3)
+        XCTAssertEqual(window.count, stamps.filter {
+            mapHistoryScopeIncludes(lastSeen: $0, basis: .exact, scope: .active, now: now)
+        }.count)
+        XCTAssertEqual(activeWindow(stamps, now: now.addingTimeInterval(2)), 0..<2)
+        XCTAssertEqual(activeWindow([], now: now), 0..<0)
+        XCTAssertEqual(activeWindow([ago(60), ago(90)], now: now), 0..<0)
+        XCTAssertEqual(activeWindow([now.addingTimeInterval(5), now.addingTimeInterval(3)], now: now),
+                       2..<2)
+    }
+
+    func testMapScopeSegmentLabelFormatsAllThree() {
+        XCTAssertEqual(mapScopeSegmentLabel(.active, count: 4), "active · 4")
+        XCTAssertEqual(mapScopeSegmentLabel(.recent, count: 5), "recent · 5")
+        XCTAssertEqual(mapScopeSegmentLabel(.all, count: 5), "all · 5")
+        XCTAssertEqual(mapScopeSegmentLabel(.all, count: 0), "all · 0")
+    }
+
+    /// Plain Ints, never locale-grouped: "1234", not "1,234".
+    func testMapHonestyHeadlineNamesBothCounts() {
+        XCTAssertEqual(mapHonestyHeadline(onMap: 5, withoutLocation: 1),
+                       "5 on the map · 1 without a location")
+        XCTAssertEqual(mapHonestyHeadline(onMap: 1234, withoutLocation: 0),
+                       "1234 on the map · 0 without a location")
+    }
+
     func testDetectionRefreshCadenceAdaptsAtDenseBoundaries() {
         XCTAssertEqual(mapDetectionRefreshInterval(rowCount: 499), 0.3)
         XCTAssertEqual(mapDetectionRefreshInterval(rowCount: 500), 0.5)
@@ -991,8 +1110,104 @@ final class MapPinRulesTests: XCTestCase {
     //     manager at all; or
     //   * the widget sink behind writeWidgetSummary made injectable, so a test can hand the
     //     manager one that goes nowhere.
-    // Neither exists yet, so the honest state is: this rule currently has no automated test.
+    // Neither exists yet for this stamp (the rows now come from the pure demoSampleRows and the
+    // first-seen stamp from sampleFirstSeen, both tested in MuteAndNearbyPolicyTests, but the
+    // lastSeen write is still inside placeDemoDetections), so the honest state is: this rule
+    // currently has no automated test.
     // Restoring `age(Date(), Date()) == .fresh` in its place would NOT close the gap - it only
     // re-states the fresh boundary testFreshTierIsUnderFiveMinutes already owns, and it would go
     // on passing with the seed's stamping deleted, which is worse than an admitted gap.
+
+    // MARK: - Legend and options lines
+
+    /// U3-e: the legend's "Drone operator" key shows only while a drawn drone carries an operator
+    /// marker (a pilot coordinate). Wrong input: the key shown with no operator.
+    /// TWIN rule: android MapScreen.kt `mapOperatorPinFlag` (u-spec U3-e).
+    func testOperatorLegendKeyNeedsADrawnOperatorMarker() throws {
+        func drone(_ mac: String, pilot: Bool) throws -> Detection {
+            var json: [String: Any] = ["t": 4, "s": 2, "meth": 7, "c": 99, "mac": mac,
+                                       "rssi": -61, "lat": 37.78, "lon": -122.41, "n": 1]
+            if pilot { json["plat"] = 37.782; json["plon"] = -122.415 }
+            return try Detection.decodeWireJSON(JSONSerialization.data(withJSONObject: json))
+        }
+        let bare = try drone("DA:7E:00:00:00:01", pilot: false)
+        let flown = try drone("DA:7E:00:00:00:02", pilot: true)
+        XCTAssertFalse(mapHasOperatorPins([Detection]()))
+        XCTAssertFalse(mapHasOperatorPins([bare]))
+        XCTAssertTrue(mapHasOperatorPins([bare, flown]))
+    }
+
+    /// U2-g: the lower-confidence toggle's line agrees in number ("1 pin is", "pins are"), in both
+    /// states, with grouped digits. Wrong input: the old "1 lower-confidence pin are hidden".
+    /// TWIN: android MapScreen.kt's lower-confidence toggle line (u-spec U2-g, the same words).
+    func testLowerConfidenceLineAgreesInNumber() {
+        XCTAssertEqual(alprLowerConfidenceLine(count: 1, showing: false),
+                       "1 lower-confidence pin is hidden. some are not cameras.")
+        XCTAssertEqual(alprLowerConfidenceLine(count: 20605, showing: false),
+                       "\(20605.formatted()) lower-confidence pins are hidden. some are not cameras.")
+        XCTAssertEqual(alprLowerConfidenceLine(count: 1, showing: true),
+                       "showing 1 pin without structured manufacturer attribution or from legacy aliases, drawn hollow. some are not cameras.")
+        XCTAssertEqual(alprLowerConfidenceLine(count: 20605, showing: true),
+                       "showing \(20605.formatted()) pins without structured manufacturer attribution or from legacy aliases, drawn hollow. some are not cameras.")
+    }
+
+    // MARK: - Map legend button and card
+
+    /// The info button's spoken value: open or closed, and while the known-ALPR dataset
+    /// downloads, the loading suffix (a download no longer opens the card, so the spinner badge
+    /// and this suffix are all that show it). Wrong input: the downloading branch dropped, which
+    /// leaves VoiceOver silent about the download. TWIN: android MapFloatingControlsTest
+    /// `legendStateDescriptionMatchesIos`, the same four strings.
+    func testLegendValueSaysOpenAndDownloading() {
+        XCTAssertEqual(MapTabView.legendLoadingValue, "loading camera data")
+        XCTAssertEqual(mapLegendAccessibilityValue(open: false, downloading: false), "collapsed")
+        XCTAssertEqual(mapLegendAccessibilityValue(open: true, downloading: false), "expanded")
+        XCTAssertEqual(mapLegendAccessibilityValue(open: false, downloading: true),
+                       "collapsed, loading camera data")
+        XCTAssertEqual(mapLegendAccessibilityValue(open: true, downloading: true),
+                       "expanded, loading camera data")
+    }
+
+    /// The legend card's cap: unbounded until the region is measured; 55% of the region at
+    /// default sizes, clamped to the room above the card's bottom inset (less 8), so it stops
+    /// under the scope header; 45% at accessibility sizes, never below the header row plus one
+    /// key row and the paddings (summary + 84), so the honesty line is never cut, and never
+    /// above the room either (R21 review: the floor left unbounded ran the card 3.3pt over the
+    /// chips at AX5 under the sample banner on an iPhone 17 Pro). Wrong inputs: the room clamp
+    /// removed (the short region returns 220, running the card up over the scope header); the
+    /// AX floor removed (the short AX region returns 135, cutting the headline); the floor left
+    /// above the room (the AX region under a 100pt header returns 184, not its 102 of room).
+    /// TWIN: android MapFloatingControlsTest `legendCardCapKeepsTheMapAndTheHeadline` (Android's
+    /// floor still wins over its room, so the last case here has no twin).
+    func testLegendCardCapKeepsTheMapAndTheHeadline() {
+        XCTAssertEqual(mapLegendCardCap(regionHeight: 0, summaryHeight: 60, accessibilitySize: false,
+                                        bottomInset: 90), .infinity)
+        XCTAssertEqual(mapLegendCardCap(regionHeight: 0, summaryHeight: 60, accessibilitySize: true,
+                                        bottomInset: 90), .infinity)
+        // A tall region: the share binds.
+        XCTAssertEqual(mapLegendCardCap(regionHeight: 700, summaryHeight: 60, accessibilitySize: false,
+                                        bottomInset: 90), 385, accuracy: 0.001)
+        // A short region: the card stops 8pt under the region's top (400 - 250 - 8).
+        XCTAssertEqual(mapLegendCardCap(regionHeight: 400, summaryHeight: 60, accessibilitySize: false,
+                                        bottomInset: 250), 142, accuracy: 0.001)
+        // Accessibility sizes: 45% while that clears the floor...
+        XCTAssertEqual(mapLegendCardCap(regionHeight: 700, summaryHeight: 100, accessibilitySize: true,
+                                        bottomInset: 90), 315, accuracy: 0.001)
+        // ...and the floor (100 + 12 + 44 + 12 + 16) when 45% of a short region is below it.
+        XCTAssertEqual(mapLegendCardCap(regionHeight: 300, summaryHeight: 100, accessibilitySize: true,
+                                        bottomInset: 90), 184, accuracy: 0.001)
+        // ...but the floor never lifts the card over the floating header: with a 100pt header
+        // the room is 300 - 100 - 90 - 8 = 102, and that bounds the card (legendCard then
+        // scrolls the header with the keys).
+        XCTAssertEqual(mapLegendCardCap(regionHeight: 300, summaryHeight: 100, accessibilitySize: true,
+                                        topInset: 100, bottomInset: 90), 102, accuracy: 0.001)
+    }
+
+    /// The map's constant bottom inset lifts MapKit's logo and Legal line the HIG's 10pt above
+    /// the floating buttons row, and each button is at least the HIG's 44pt target. Wrong input:
+    /// the inset without the 10 (the attribution sits on the info button's top edge).
+    func testFloatingControlsInsetClearsTheButtonsByTheHigTen() {
+        XCTAssertGreaterThanOrEqual(mapControlSize, 44)
+        XCTAssertEqual(mapFloatingControlsInset, mapControlMargin + mapControlSize + 10)
+    }
 }

@@ -13,6 +13,7 @@ import org.junit.Assert.assertNotSame
 import org.junit.Assert.assertSame
 import org.junit.Assert.assertTrue
 import org.junit.Test
+import tech.acab.app.ble.ACTIVE_NEARBY_WINDOW_MS
 import tech.acab.app.ble.MAP_RECENT_WINDOW_MS
 import tech.acab.app.ble.MapDetectionEvidence
 import tech.acab.app.model.Detection
@@ -211,9 +212,10 @@ class MapProjectionTest {
     @Test
     fun recentWindowIncludesBoundaryButRejectsFutureAndUndatedRows() {
         // The window itself, as a LITERAL. The boundary assertions below derive their edges from
-        // the constant, so they stay green whatever its value becomes; the Map options sheet
-        // promises "Recent · 15 minutes" and docs/map-performance.md repeats it, so the number is
-        // a promise to the user and not an implementation detail.
+        // the constant, so they stay green whatever its value becomes; FAQ q-map-performance
+        // ("recent (the default) is the last 15 minutes") and the Map's spoken "recent fifteen
+        // minutes" state it, and docs/map-performance.md repeats it, so the number is a promise to
+        // the user and not an implementation detail (the "recent" scope segment names the window).
         assertEquals(15 * 60_000L, MAP_RECENT_WINDOW_MS)
         val now = 1_800_000_000_000L
         assertTrue(mapHistoryIncludes(now, MapHistoryScope.Recent, now))
@@ -224,17 +226,22 @@ class MapProjectionTest {
         assertTrue(mapHistoryIncludes(null, MapHistoryScope.All, now))
     }
 
-    /** MapScreen keeps a 30 s invalidation tick (`historyNow`); the comparison clock is the
-     * separate wall-clock read inside [recentScopeIds]. A row heard since the tick carries a stamp
-     * newer than the tick, and [mapHistoryIncludes] rejects a stamp ahead of `now`, so comparing
-     * against the tick hides exactly the freshest sightings for up to 30 s (the pin-stops-appearing
-     * defect this pins shut). FAILS IF [recentScopeClock] returns anything older than the newest
+    /** MapScreen keeps a 30 s (1 s under Active) invalidation tick (`historyNow`); the comparison
+     * clock is the separate wall-clock read inside [recentScopeIds]. A row heard since the tick
+     * carries a stamp newer than the tick, and [mapHistoryIncludes] rejects a stamp ahead of `now`,
+     * so comparing against the tick hides exactly the freshest sightings until the next tick
+     * (the pin-stops-appearing defect this pins shut). FAILS IF [recentScopeClock] returns anything older than the newest
      * stamp (a cached tick, `System.currentTimeMillis() - 30_000L`), or [recentScopeIds] stops
      * routing through it. */
     @Test
     fun recentScopeComparesAgainstWallClockNotTheInvalidationTick() {
+        // Read the helper BETWEEN two wall-clock reads, in that order. The `in lo..hi` form
+        // evaluates `hi` before its left operand, so a millisecond that ticked over between the
+        // two calls failed the assert even with a correct helper.
         val before = System.currentTimeMillis()
-        assertTrue(recentScopeClock() in before..System.currentTimeMillis())
+        val clock = recentScopeClock()
+        val after = System.currentTimeMillis()
+        assertTrue(clock in before..after)
 
         // Heard one second ago: newer than a tick that fired ten seconds before it, older than
         // wall-clock. Exactly the row the default Recent lens must not lose.
@@ -247,6 +254,153 @@ class MapProjectionTest {
         assertTrue(mapHistoryIds(rows, MapHistoryScope.Recent, tick, latest).isEmpty())
         assertEquals(listOf(row.detection.id), recentScopeIds(rows, MapHistoryScope.Recent, latest))
         assertEquals(listOf(row.detection.id), recentScopeIds(rows, MapHistoryScope.All, emptyMap()))
+        // The Active lens routes through the same clock: the tick would hide the 1 s-old row,
+        // the wall-clock read keeps it.
+        assertTrue(mapHistoryIds(rows, MapHistoryScope.Active, tick, latest).isEmpty())
+        assertEquals(listOf(row.detection.id), recentScopeIds(rows, MapHistoryScope.Active, latest))
+    }
+
+    /** The Active window, as a LITERAL: FAQ q-map-performance ("active is the last 45 seconds",
+     * the "active" scope segment's window) and the spoken "active forty-five seconds" hardcode it. Boundary in, one millisecond past it out, future and undated out, and each scope
+     * uses its own window (a 46 s-old row is Recent, not Active). FAILS IF the Active arm reads
+     * the Recent window. */
+    @Test
+    fun activeWindowIncludesBoundaryButRejectsStaleAndFutureRows() {
+        assertEquals(45_000L, ACTIVE_NEARBY_WINDOW_MS)
+        val now = 1_800_000_000_000L
+        assertTrue(mapHistoryIncludes(now, MapHistoryScope.Active, now))
+        assertTrue(mapHistoryIncludes(now - 45_000L, MapHistoryScope.Active, now))
+        assertFalse(mapHistoryIncludes(now - 45_001L, MapHistoryScope.Active, now))
+        assertFalse(mapHistoryIncludes(now + 1, MapHistoryScope.Active, now))
+        assertFalse(mapHistoryIncludes(null, MapHistoryScope.Active, now))
+        assertFalse(mapHistoryIncludes(now - 46_000L, MapHistoryScope.Active, now))
+        assertTrue(mapHistoryIncludes(now - 46_000L, MapHistoryScope.Recent, now))
+    }
+
+    /** One stamp map feeds every segment count. Located a (10 s), b (60 s), c (20 min), d
+     * (undated); unlocated e (10 s), f (undated). Under Recent: active 1, recent 2, all 4, and
+     * withoutLocation counts only the unlocated rows in the SELECTED scope (e). FAILS IF Active
+     * counts with the 15-minute window (active 2) or withoutLocation ignores the scope (2). */
+    @Test
+    fun mapScopeCountsTallyEveryScopeFromOneMap() {
+        val now = 1_800_000_000_000L
+        val lastSeen = mapOf(
+            "a" to now - 10_000L,
+            "b" to now - 60_000L,
+            "c" to now - 20 * 60_000L,
+            "e" to now - 10_000L,
+        )
+        val located = listOf("a", "b", "c", "d")
+        val unlocated = listOf("e", "f")
+        assertEquals(MapScopeCounts(active = 1, recent = 2, all = 4, withoutLocation = 1),
+            mapScopeCounts(lastSeen, located, unlocated, MapHistoryScope.Recent, now))
+        assertEquals(2, mapScopeCounts(lastSeen, located, unlocated, MapHistoryScope.All, now).withoutLocation)
+        assertEquals(1, mapScopeCounts(lastSeen, located, unlocated, MapHistoryScope.Active, now).withoutLocation)
+    }
+
+    /** V-A6, the sample-data bypass (C10 / C11, MAP-01): in sample data every row is Active and
+     * Recent, dated or not, the way Status and the Log count it; All is unchanged, and a live
+     * session keeps both windows. Same stamps as above. Under demo: active 4 = recent 4 = all 4,
+     * and the Active scope's withoutLocation counts both unlocated rows; mapHistoryIds under
+     * Active keeps an undated row. FAILS IF the bypass is dropped (active 1), is missing from
+     * Recent (recent 2 under active 4, the "active · 5 / recent · 0" of MAP-01) or leaks into a
+     * live session (active 4 without demo). TWIN: iOS mapScopeIncludes(isDemoMode:) in
+     * MapTabView.swift, pinned by MapPinRulesTests.testDemoModeCountsAndShowsEverySampleRowAsActive. */
+    @Test
+    fun demoModeCountsAndShowsEverySampleRowAsActive() {
+        val now = 1_800_000_000_000L
+        val lastSeen = mapOf(
+            "a" to now - 10_000L,
+            "b" to now - 60_000L,
+            "c" to now - 20 * 60_000L,
+            "e" to now - 10_000L,
+        )
+        val located = listOf("a", "b", "c", "d")
+        val unlocated = listOf("e", "f")
+        assertEquals(MapScopeCounts(active = 4, recent = 4, all = 4, withoutLocation = 2),
+            mapScopeCounts(lastSeen, located, unlocated, MapHistoryScope.Recent, now, demo = true))
+        assertEquals(2, mapScopeCounts(
+            lastSeen, located, unlocated, MapHistoryScope.Active, now, demo = true).withoutLocation)
+        assertEquals(1, mapScopeCounts(lastSeen, located, unlocated, MapHistoryScope.Recent, now).active)
+
+        assertTrue(mapHistoryIncludes(null, MapHistoryScope.Active, now, demo = true))
+        assertTrue(mapHistoryIncludes(now - 20 * 60_000L, MapHistoryScope.Active, now, demo = true))
+        assertTrue(mapHistoryIncludes(now - 20 * 60_000L, MapHistoryScope.Recent, now, demo = true))
+        assertFalse(mapHistoryIncludes(now - 20 * 60_000L, MapHistoryScope.Recent, now))
+        assertFalse(mapHistoryIncludes(null, MapHistoryScope.Active, now))
+
+        val undated = MapDetectionEvidence(detection(8), coordinate = 32.7 to -117.1, lastSeenAt = null)
+        assertEquals(listOf(undated.detection.id), mapHistoryIds(
+            listOf(undated), MapHistoryScope.Active, now, latestLastSeen = emptyMap(), demo = true))
+        assertTrue(mapHistoryIds(
+            listOf(undated), MapHistoryScope.Active, now, latestLastSeen = emptyMap()).isEmpty())
+    }
+
+    /** The ALL chip counts the located rows in the current scope, before the category chip: the
+     * rows the pins represent with no chip on and the selected scope's segment count. Three
+     * located rows (two heard in the last minute, one 20 minutes ago) and two unlocated rows (one
+     * recent). Recent: ALL 2 = the recent segment 2; All: ALL 3 = the all segment 3; the two
+     * unlocated rows only reach "without a location". FAILS IF the count reads the whole snapshot
+     * (unlocated rows too: 3 under Recent, 5 under All) or ignores the scope (3 under Recent).
+     * TWIN: iOS MapSnapshot.totalLocated (MapTabView.swift makeSnapshot). */
+    @Test
+    fun allChipCountsLocatedRowsInScopeOnly() {
+        val now = 1_800_000_000_000L
+        val stamps = listOf(now - 10_000L, now - 60_000L, now - 20 * 60_000L, now - 10_000L, null)
+        val rows = stamps.mapIndexed { index, stamp ->
+            MapDetectionEvidence(detection(index), if (index < 3) (32.7 to -117.1) else null, stamp)
+        }
+        val (located, unlocated) = splitMapEvidence(rows)
+        assertEquals(3, located.size)
+        assertEquals(2, unlocated.size)
+        val lastSeen = rows.mapNotNull { r -> r.lastSeenAt?.let { r.detection.id to it } }.toMap()
+        for ((scope, expected) in listOf(MapHistoryScope.Recent to 2, MapHistoryScope.All to 3)) {
+            val ids = mapHistoryIds(located, scope, now, lastSeen)
+            val allChip = mapScopedLocated(located, scope, ids).size
+            assertEquals(expected, allChip)
+            val segments = mapScopeCounts(lastSeen, located.map { it.detection.id },
+                unlocated.map { it.detection.id }, scope, now)
+            val segment = if (scope == MapHistoryScope.All) segments.all else segments.recent
+            assertEquals(segment, allChip)
+            assertEquals(allChip, mapCategoryChipModels(null, allChip, emptyMap()).first().count)
+        }
+        assertEquals(1, mapScopeCounts(lastSeen, located.map { it.detection.id },
+            unlocated.map { it.detection.id }, MapHistoryScope.Recent, now).withoutLocation)
+    }
+
+    /** Decision B1: the main Map's "phone breadcrumb trails" option starts OFF, the fallback
+     * mapPrefs.getBoolean("show_breadcrumbs", ...) uses when the user never flipped it. FAILS IF
+     * the old default, true, comes back. TWIN: iOS MapPinRulesTests.
+     * testMainMapBreadcrumbTrailsDefaultOff (MapTabView.showBreadcrumbsDefault). */
+    @Test
+    fun mainMapBreadcrumbTrailsDefaultOff() {
+        assertFalse(MAP_SHOW_BREADCRUMBS_DEFAULT)
+    }
+
+    /** The persisted scope is read back through one pure function. An unknown or missing value
+     * falls back to Recent, never a crash. FAILS IF it becomes a bare valueOf (throws). */
+    @Test
+    fun unknownStoredHistoryScopeFallsBackToRecent() {
+        assertEquals(MapHistoryScope.Recent, parseMapHistoryScope("garbage"))
+        assertEquals(MapHistoryScope.Recent, parseMapHistoryScope(null))
+        assertEquals(MapHistoryScope.Active, parseMapHistoryScope("Active"))
+        assertEquals(MapHistoryScope.All, parseMapHistoryScope("All"))
+        assertEquals(MapHistoryScope.Recent, parseMapHistoryScope("Recent"))
+    }
+
+    /** The segment labels, lowercase-first with a middle dot. TWIN: iOS mapScopeSegmentLabel. */
+    @Test
+    fun mapScopeSegmentLabelFormatsAllThree() {
+        assertEquals("active \u00B7 3", mapScopeSegmentLabel(MapHistoryScope.Active, 3))
+        assertEquals("recent \u00B7 0", mapScopeSegmentLabel(MapHistoryScope.Recent, 0))
+        assertEquals("all \u00B7 12", mapScopeSegmentLabel(MapHistoryScope.All, 12))
+    }
+
+    /** The honesty headline names both counts in order. TWIN: iOS mapHonestyHeadline. */
+    @Test
+    fun mapHonestyHeadlineNamesBothCounts() {
+        assertEquals("5 on the map \u00B7 1 without a location", mapHonestyHeadline(5, 1))
+        assertEquals("1 on the map \u00B7 0 without a location", mapHonestyHeadline(1, 0))
     }
 
     @Test
@@ -386,5 +540,19 @@ class MapProjectionTest {
         assertTrue("idle revision waited ${installedAt[2] - emittedLastAt} ms",
             installedAt[2] - emittedLastAt < 300L)
         follower.cancel()
+    }
+    /** MAP-01: in sample data the segments keep active <= recent <= all, 20 minutes after the
+     * seed stamped its rows (past the 15 minute Recent window). Wrong input: the bypass on Active
+     * only gave active 3 with recent 0. TWIN: the iOS MAP-01 test in MapPinRulesTests. */
+    @Test
+    fun sampleDataScopesStayNested20MinutesAfterSeeding() {
+        val now = 1_800_000_000_000L
+        val seeded = now - 20 * 60_000L
+        val lastSeen = mapOf("a" to seeded, "b" to seeded, "c" to seeded)
+        val counts = mapScopeCounts(lastSeen, listOf("a", "b", "c"), emptyList(),
+            MapHistoryScope.Recent, now, demo = true)
+        assertTrue("active ${counts.active} > recent ${counts.recent}", counts.active <= counts.recent)
+        assertTrue("recent ${counts.recent} > all ${counts.all}", counts.recent <= counts.all)
+        assertEquals(3, counts.recent)
     }
 }

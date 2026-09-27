@@ -20,26 +20,27 @@ import tech.acab.app.R
 import tech.acab.app.net.ALPR_TIER_LEGACY_FORMAT
 import tech.acab.app.ui.theme.Acab
 import tech.acab.app.ui.theme.AcabPalette
-import kotlin.math.roundToInt
 
-/** Shared palette contract for text floating over map tiles. The surface is deliberately opaque:
- * contrast must not change with a pale road tile, satellite imagery, or the dark tile filter. */
+/** Shared palette contract for the native map callout (DarkMapInfoWindow). The surface is
+ * deliberately opaque: contrast must not change with a pale road tile, satellite imagery, or the
+ * dark tile filter. Role colours (surfaceContainer, onSurface, onSurfaceVariant) and no border:
+ * Route A draws no hairlines (L1), and the callout's elevation separates it from the tiles. */
 internal data class MapInfoColors(
     val surface: Color,
     val primaryText: Color,
     val secondaryText: Color,
-    val border: Color,
 )
 
 internal fun mapInfoColors(palette: AcabPalette): MapInfoColors = MapInfoColors(
-    surface = palette.bg2,
-    primaryText = palette.text,
-    secondaryText = palette.dim,
-    border = palette.lineStrong,
+    surface = palette.surfaceContainer,
+    primaryText = palette.onSurface,
+    secondaryText = palette.onSurfaceVariant,
 )
 
-/** Dark replacement for osmdroid's bundled light-grey bubble and hardcoded black type. Shared by
- * ALPR reference rings and Remote-ID operator explanations on the main map. */
+/** Dark replacement for osmdroid's bundled light-grey bubble and hardcoded black type, for the
+ * Remote-ID operator explanations on the main map. The known-ALPR rings no longer use it: a ring tap
+ * opens the Compose callout MapScreen draws above the OSM credit ([AlprOverlayHolder.onRingTap]),
+ * because this bubble drew under the floating chrome and ran off the screen edge (MAP-02). */
 internal class DarkMapInfoWindow(mapView: MapView) :
     MarkerInfoWindow(R.layout.map_info_window, mapView) {
     private var applied: MapInfoColors? = null
@@ -56,7 +57,6 @@ internal class DarkMapInfoWindow(mapView: MapView) :
             shape = GradientDrawable.RECTANGLE
             setColor(colors.surface.toArgb())
             cornerRadius = 12f * density
-            setStroke((1f * density).roundToInt().coerceAtLeast(1), colors.border.toArgb())
         }
         mView.findViewById<TextView>(R.id.bubble_title)?.setTextColor(colors.primaryText.toArgb())
         mView.findViewById<TextView>(R.id.bubble_description)
@@ -86,27 +86,35 @@ internal class DarkMapInfoWindow(mapView: MapView) :
 /** Source credit, one copy, tail of every reference-ring snippet. */
 private const val ALPR_CREDIT = "DeFlock / OSM ODbL"
 
-/** RING-PEEK, in words. The wide rim is a purely visual cue, so the info window (and TalkBack
+/** RING-PEEK, in words. The wide rim is a purely visual cue, so the ring's callout (and TalkBack
  *  reading it out) carries the same fact, the way iOS appends it to the ring's VoiceOver label.
  *  Says what was HEARD, not what was verified: a wide ring means a live detection landed on this
  *  mapped location, never that the mapped camera is confirmed or that the heard device is it. */
 internal const val ALPR_PEEK_SNIPPET = "wide ring: a live detection was heard at this mapped location"
 
+/** The callout title for a dataset row of tier 0, 1 or 2, BYTE-IDENTICAL to iOS
+ *  ALPRAttribution.headline(tier:maker:) in ALPRDataset.swift, default arm included (iOS reads
+ *  every other tier as tier 0; [alprMarkerText] only hands this 0, 1 and 2). A maker on a tier 0 or
+ *  2 row carries a "?": the tag names it, nothing structured backs it. */
+internal fun alprAttributionHeadline(tier: Int, maker: String): String = when (tier) {
+    1 -> if (maker.isEmpty()) "mapped ALPR · sourced from DeFlock" else "$maker · mapped ALPR, via DeFlock"
+    2 -> if (maker.isEmpty()) "ALPR candidate · legacy OSM tag" else "$maker? · legacy-tag ALPR candidate"
+    else -> if (maker.isEmpty()) "mapped ALPR · canonical OSM tag" else "$maker? · canonical OSM ALPR"
+}
+
 /** User-visible attribution copy for one dataset row. These tiers describe source structure, not
- * external verification, so the words confirmed/unverified deliberately never appear. [peek] adds
- * the ring-peek sentence for a ring a live detection pin is standing on, and nothing else: the
- * title and the tier body stay byte-identical, because the peek says something about the DETECTION,
- * not about this row's attribution. */
+ * external verification, so the words confirmed/unverified deliberately never appear. Tiers 0, 1
+ * and 2 take the iOS titles ([alprAttributionHeadline]); the legacy dataset format and an unknown
+ * tier are Android-only states and keep their own titles. [peek] adds the ring-peek sentence for a
+ * ring a live detection pin is standing on, and nothing else: the title and the tier body stay
+ * byte-identical, because the peek says something about the DETECTION, not about this row's
+ * attribution. */
 internal fun alprMarkerText(rawTier: Int, maker: String, peek: Boolean = false): Pair<String, String> {
     val title = when {
-        rawTier == 0 -> "ALPR camera, no structured manufacturer"
-        rawTier == 2 && maker.isNotEmpty() -> "$maker legacy ALPR candidate"
-        rawTier == 2 -> "Legacy ALPR candidate"
+        rawTier == 0 || rawTier == 1 || rawTier == 2 -> alprAttributionHeadline(rawTier, maker)
         rawTier == ALPR_TIER_LEGACY_FORMAT && maker.isNotEmpty() ->
             "$maker ALPR camera, legacy dataset format"
         rawTier == ALPR_TIER_LEGACY_FORMAT -> "ALPR camera, legacy dataset format"
-        rawTier == 1 && maker.isNotEmpty() -> "$maker ALPR camera, manufacturer attributed"
-        rawTier == 1 -> "ALPR camera, manufacturer attributed"
         maker.isNotEmpty() -> "$maker ALPR record, unknown attribution tier"
         else -> "ALPR record, unknown attribution tier"
     }
@@ -237,7 +245,23 @@ class AlprOverlayHolder {
     private val handler = Handler(Looper.getMainLooper())
     private var attachedTo: MapView? = null
     private var mapListener: MapListener? = null   // kept so detach() can remove it (no post-detach rebuilds)
-    private var infoWindow: DarkMapInfoWindow? = null
+
+    /** A ring tap: the tapped ring's title and snippet ([alprMarkerText]) for MapScreen's Compose
+     *  callout. Fired again, with the new words, when the peek pass rewrites the SELECTED ring's
+     *  copy (a live pin arrives on it or leaves it), so the open callout never reads stale. */
+    var onRingTap: ((title: String, snippet: String) -> Unit)? = null
+    // The selected ring, by coordinate: a re-cull (pan, zoom) rebuilds every Marker, so identity
+    // would not survive it. NaN = nothing selected.
+    private var selectedLat = Double.NaN
+    private var selectedLon = Double.NaN
+
+    /** Forget the selected ring (MapScreen closed the callout), so later peek passes stay quiet. */
+    fun clearSelection() {
+        selectedLat = Double.NaN
+        selectedLon = Double.NaN
+    }
+
+    private fun isSelected(r: RingMarker): Boolean = r.lat == selectedLat && r.lon == selectedLon
 
     // Latest inputs, pushed from the Compose update pass.
     private var nodes: IntArray = IntArray(0)   // interleaved latE7, lonE7
@@ -283,8 +307,7 @@ class AlprOverlayHolder {
     }
 
     /** Add our folder to the map (once) and start listening for pan/zoom. */
-    internal fun attach(map: MapView, infoWindow: DarkMapInfoWindow) {
-        this.infoWindow = infoWindow
+    internal fun attach(map: MapView) {
         if (attachedTo === map) return
         attachedTo = map
         if (!map.overlays.contains(folder)) map.overlays.add(folder)
@@ -394,8 +417,9 @@ class AlprOverlayHolder {
                     // this hardware whether or not one is standing there, and a user who reads a
                     // pin as a detection concludes the device is broken.
                     // The two BODY lines below are word-identical to iOS. The TITLES are not, and
-                    // deliberately: this is an osmdroid info-window title, iOS is a floating
-                    // capsule, so they carry the same fact in the form each affordance wants.
+                    // deliberately: they were written for osmdroid's info-window title, and they
+                    // now head MapScreen's Compose callout (MapAlprCallout); they carry the same
+                    // fact as the iOS callout's headline in their own words.
                     // TIER FIRST, then maker. Testing maker first titled a hand-typed node
                     // "Flock Safety ALPR camera" while the snippet underneath said no
                     // manufacturer was recorded. Mirrors iOS MapTabView.
@@ -403,8 +427,16 @@ class AlprOverlayHolder {
                         title = markerTitle
                         snippet = markerSnippet
                     }
-                    this@AlprOverlayHolder.infoWindow?.let(::setInfoWindow)
-                    setOnMarkerClickListener { m, _ -> m.showInfoWindow(); true }
+                    // No osmdroid bubble: the tap hands the words to MapScreen's Compose callout
+                    // (onRingTap), which sits above the OSM credit with a close control instead
+                    // of under the floating chrome. Consumed, so osmdroid never opens its default
+                    // InfoWindow either.
+                    setOnMarkerClickListener { m, _ ->
+                        selectedLat = lat
+                        selectedLon = lon
+                        onRingTap?.invoke(m.title.orEmpty(), m.snippet.orEmpty())
+                        true
+                    }
                 }
                 folder.add(marker)
                 rings.add(RingMarker(lat, lon, tier, maker, primary, marker))
@@ -443,13 +475,14 @@ class AlprOverlayHolder {
                 else -> ic.unverified
             }
             // The enlarged rim is a sighted-only cue, so the copy carries the same fact for the
-            // info window and TalkBack. Re-show an OPEN bubble: it renders title/snippet at open
-            // time, so without this the one ring the user is actually reading keeps stale copy.
+            // callout and TalkBack. Re-send the SELECTED ring's words: the callout shows what it
+            // was handed at tap time, so without this the one ring the user is actually reading
+            // keeps stale copy.
             alprMarkerText(r.tier, r.maker, peek).let { (markerTitle, markerSnippet) ->
                 r.marker.title = markerTitle
                 r.marker.snippet = markerSnippet
+                if (isSelected(r)) onRingTap?.invoke(markerTitle, markerSnippet)
             }
-            if (r.marker.isInfoWindowShown) r.marker.showInfoWindow()
         }
         if (changed) map.invalidate()
         reportPeekCount(peeking)
@@ -482,7 +515,8 @@ class AlprOverlayHolder {
         enabled = false
         showUnverified = false
         icons = null
-        infoWindow = null
+        onRingTap = null
+        clearSelection()
         peekPins = DoubleArray(0)
         peekBands = AlprPeekBands(DoubleArray(0))
         // Nothing is drawn any more, so say so before the callback goes: a legend row left

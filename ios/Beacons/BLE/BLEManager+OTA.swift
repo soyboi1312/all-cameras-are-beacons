@@ -102,6 +102,13 @@ extension BLEManager {
     /// (Android bounds its own wait-for-status the same way).
     private static let otaPostRebootStatusWait: TimeInterval = 30
 
+    /// A board update retried on the link that owned a quarantined attempt (startFirmwareUpdate).
+    /// A TEMPLATE, kept byte-identical to Android's OTA_RECONNECT_BEFORE_RETRY_TEMPLATE
+    /// (AcabBleManager.kt) and pinned by check-signature-drift.py; renderBoardCopy fills {noun}
+    /// with the connected board's kind, and nil reads as beacon.
+    static let otaReconnectBeforeRetryTemplate =
+        "reconnect to the {noun} before retrying the board update. this clears any delayed update replies from the previous attempt."
+
     /// Cancellation stops being safe once the final `end` control has been written. At that point
     /// the board may already be validating, committing, or rebooting even though the public state
     /// still reads `.sending(100)` until its `done` notification arrives.
@@ -126,7 +133,8 @@ extension BLEManager {
             return
         }
         guard otaQuarantinedPeripheralID != link.peripheral.identifier else {
-            otaState = .failed(reason: "Reconnect to the board before starting another update. This clears any delayed reply from the previous attempt.")
+            otaState = .failed(reason: renderBoardCopy(Self.otaReconnectBeforeRetryTemplate,
+                                                       boardKind(for: link.peripheral.identifier)))
             return
         }
         // entry.ota must be true AND the image verifiable. The Device screen already gates on

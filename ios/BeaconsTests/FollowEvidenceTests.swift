@@ -487,4 +487,36 @@ final class FollowEvidenceTests: XCTestCase {
         let ok = score(ladder(step: 0.0050, count: 5), elapsed: 86400)
         XCTAssertTrue(ok.eligible)
     }
+
+    // MARK: The dossier panel's reading of the states
+
+    /// What DetectionDetailView's SEEN WITH YOU section shows for each FollowPanelState, through
+    /// dossierFollowCopy. Only a firing band gets a label; none, the refusal and the two no-crumb
+    /// states each keep their OWN sentence. Uses fixture B's vector for the firing band.
+    /// Wrong input it catches: `.notMeasured` mapped to `(nil, FollowEvidence.body(.unscored))`,
+    /// which narrates a row the scorer refused as one it scored and cleared.
+    func testDossierPanelHeadsOnlyAFiringBandAndEveryStateKeepsItsOwnSentence() {
+        let nearby = score(ladder(step: 0.0030, count: 3), elapsed: 1200)
+        let firing = dossierFollowCopy(.scored(nearby))
+        XCTAssertEqual(firing.label, "near you more than once")
+        XCTAssertEqual(firing.sentence, FollowEvidence.body(nearby))
+
+        let noneSentence = "It has been near you, but not across enough ground to read anything into yet."
+        let none = dossierFollowCopy(.scored(.unscored))
+        XCTAssertNil(none.label)
+        XCTAssertEqual(none.sentence, noneSentence)
+
+        let refusal = dossierFollowCopy(.notMeasured)
+        XCTAssertNil(refusal.label)
+        XCTAssertEqual(refusal.sentence, FollowEvidence.notMeasuredLine)
+        XCTAssertNotEqual(refusal.sentence, noneSentence)
+
+        let noLocation = dossierFollowCopy(.noLocation)
+        XCTAssertNil(noLocation.label)
+        XCTAssertEqual(noLocation.sentence, FollowEvidence.noLocationLine)
+
+        let noFix = dossierFollowCopy(.noFix)
+        XCTAssertNil(noFix.label)
+        XCTAssertEqual(noFix.sentence, FollowEvidence.noFixLine)
+    }
 }

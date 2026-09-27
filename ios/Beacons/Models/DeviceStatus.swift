@@ -122,13 +122,6 @@ struct DeviceStatus: Equatable {
     /// is to say so and stop trusting the parse, rather than keep reading fields whose meaning may
     /// have changed underneath. Mirrors the firmware-update nudge, pointed the other way.
     var needsNewerApp: Bool { protoVersion > DeviceStatus.supportedProtoVersion }
-
-    var uptimeText: String {
-        let h = uptime / 3600, m = (uptime % 3600) / 60, s = uptime % 60
-        if h > 0 { return "\(h)h \(m)m" }
-        if m > 0 { return "\(m)m \(s)s" }
-        return "\(s)s"
-    }
 }
 
 extension DeviceStatus: Decodable {
@@ -201,7 +194,7 @@ extension DeviceStatus: Decodable {
 }
 
 /// A user-visible consequence of the board's offline-buffer health fields. Keeping this policy
-/// beside the decoded status makes the Logbook and board control show the same ordered warnings.
+/// beside the decoded status makes the Log and board control show the same ordered warnings.
 enum BufferHealthNotice: Hashable {
     case keyNotAccepted
     case storageFailed

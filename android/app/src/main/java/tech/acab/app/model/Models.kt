@@ -55,6 +55,26 @@ enum class DeviceType(val raw: Int) {
             UNKNOWN      -> "Unknown"
         }
 
+    /** The row TITLE a detection falls back to when it has no name, serial or maker
+     *  ([tech.acab.app.model.titleName]). One arm per case, in `label`'s order; only BODY_CAM
+     *  ("body cam") and NETWORK_CAMERA ("network camera") differ from `label`, the display names
+     *  the app uses for those two categories everywhere else. DISPLAY ONLY: `label` stays the CSV
+     *  / GPX type value, the managed-list label and the notification text, and `hasName` still
+     *  compares against `label`. BYTE-IDENTICAL to iOS DeviceType.titleFallback, case for case. */
+    val titleFallback: String
+        get() = when (this) {
+            FLOCK_CAMERA -> "ALPR Camera"
+            FLOCK_RAVEN  -> "Flock Raven"
+            BODY_CAM     -> "body cam"
+            DRONE        -> "Drone"
+            TRACKER      -> "Tracker"
+            NEARBY_DEVICE-> "Nearby Device"
+            WATCHED      -> "Watched device"
+            GLASSES      -> "Recording glasses"
+            NETWORK_CAMERA -> "network camera"
+            UNKNOWN      -> "Unknown"
+        }
+
     /** `label` as it reads INSIDE a lowercase sentence, e.g. the Related help disclosure's
      *  "3 answers for ALPR camera". Hand-written per case rather than `label.lowercase()`,
      *  which flattened the proper nouns: Flock Raven became "flock raven" and the ALPR
@@ -70,7 +90,7 @@ enum class DeviceType(val raw: Int) {
         get() = when (this) {
             FLOCK_CAMERA -> "ALPR camera"
             FLOCK_RAVEN  -> "Flock Raven"
-            BODY_CAM     -> "body camera"
+            BODY_CAM     -> "body cam"
             DRONE        -> "drone"
             TRACKER      -> "tracker"
             NEARBY_DEVICE-> "nearby device"
@@ -81,8 +101,8 @@ enum class DeviceType(val raw: Int) {
         }
 
     /** `category` as it reads in DISPLAY text, where the surrounding voice is lowercase: the
-     *  dossier badge pill ("ALPR · PLATE READER") and the Status nearest card ("ALPR · NODE
-     *  2A10"). Same rule and same reason as `inlineLabel` above: `category.lowercase()` turned
+     *  dossier's top-bar title ("ALPR") and the Status nearest card ("ALPR · NODE
+     *  2A10", "network camera · NODE 0A5C"). Same rule and same reason as `inlineLabel` above: `category.lowercase()` turned
      *  the ALPR initialism into "alpr".
      *
      *  This is DISPLAY ONLY and is never a key. `category` itself is unchanged and stays the
@@ -100,7 +120,7 @@ enum class DeviceType(val raw: Int) {
             NEARBY_DEVICE-> "nearby"
             WATCHED      -> "watched"
             GLASSES      -> "glasses"
-            NETWORK_CAMERA -> "camera"
+            NETWORK_CAMERA -> "network camera"
             UNKNOWN      -> "unknown"
         }
 
@@ -155,21 +175,6 @@ enum class DeviceType(val raw: Int) {
             GLASSES -> "GLASSES"
             NETWORK_CAMERA -> "CAMERA"
             NEARBY_DEVICE, WATCHED, UNKNOWN -> null
-        }
-
-    /** Short label for the detail badge, like the iOS app. */
-    val classLabel: String
-        get() = when (this) {
-            FLOCK_CAMERA -> "PLATE READER"
-            FLOCK_RAVEN  -> "AUDIO SENSOR"
-            BODY_CAM     -> "BODY CAMERA"
-            DRONE        -> "AERIAL · RID"
-            TRACKER      -> "ITEM TRACKER"
-            NEARBY_DEVICE-> "DEVICE"
-            WATCHED      -> "STARRED"
-            GLASSES      -> "SMART GLASSES"
-            NETWORK_CAMERA -> "NETWORK CAMERA"
-            UNKNOWN      -> "UNKNOWN"
         }
 
     /** Who makes the gear, shown when an ALPR class has a known brand. */
@@ -315,16 +320,10 @@ data class Detection(
         return if (h < 48) "${h}h" else "${h / 24}d"
     }
 
-    /** Compact LOC-badge text. A LIVE detection reads "4m ago" (the fix trails roughly now);
-     *  an OFFLINE/replayed record was captured at an unknown PAST time, so "ago" would falsely
-     *  imply recency - show the fix-to-sighting lag ("fix 4m") instead. null when the fix is
-     *  fresh or there's no coordinate. */
-    val locationAgeText: String? get() {
-        val m = gpsFixAgeMagnitude ?: return null
-        return if (offline) "fix $m" else "$m ago"
-    }
-
-    /** Longer form for the detail card, same live/offline split as [locationAgeText]. */
+    /** Longer form for the detail card. A LIVE detection reads "location as of 4m ago"; an
+     *  OFFLINE/replayed record was captured at an unknown past time, so it reads "location from a
+     *  fix 4m old" instead of an "ago" that would imply the position is recent. null when the fix
+     *  is fresh or there's no coordinate. Twin: iOS Detection.locationAgeDetail. */
     val locationAgeDetail: String? get() {
         val m = gpsFixAgeMagnitude ?: return null
         return if (offline) "location from a fix $m old" else "location as of $m ago"
@@ -539,7 +538,7 @@ fun bleCompanyName(id: Int): String? = when (id) {
     0x0075 -> "Samsung"
     0x00E0 -> "Google"
     0x0006 -> "Microsoft"
-    0x0D53 -> "Luxottica (Ray-Ban Meta)"
+    0x0D53 -> "Luxottica"
     0x03C2 -> "Snap (Spectacles)"
     0x060C -> "Vuzix"
     0x058E -> "Meta Platforms Technologies"
@@ -716,7 +715,7 @@ data class DeviceStatus(
 }
 
 /** A user-visible consequence of the board's offline-buffer health fields. These are modelled
- *  rather than assembled ad hoc in each screen because BOTH the Logbook and the board control
+ *  rather than assembled ad hoc in each screen because BOTH the Log and the board control
  *  must tell the same truth, and the cross-platform tests pin the wording and priority. */
 enum class BufferHealthNotice(
     val title: String,

@@ -1,8 +1,9 @@
 <?xml version="1.0" encoding="utf-8"?>
 <!--
   osmdroid's stock bubble hardcodes black text on a light-grey nine-patch. Map callouts live over
-  unpredictable tiles, so this view owns an opaque app-themed surface and explicit readable type.
-  The four bubble_* IDs are the contract consumed by MarkerInfoWindow.
+  unpredictable tiles, so this view owns an opaque app-themed surface and system type (Roboto).
+  The colours below are fallbacks: DarkMapInfoWindow.applyColors sets them at runtime from
+  mapInfoColors(Acab.palette). The four bubble_* IDs are the contract consumed by MarkerInfoWindow.
 -->
 <LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
     android:layout_width="wrap_content"
@@ -31,11 +32,10 @@
         android:layout_width="wrap_content"
         android:layout_height="wrap_content"
         android:maxWidth="272dp"
-        android:fontFamily="@font/space_grotesk_medium"
-        android:textColor="#FFF4EEF0"
+        android:fontFamily="sans-serif-medium"
+        android:textColor="#FFF1DEDE"
         android:textSize="14sp"
-        android:lineSpacingExtra="2dp"
-        android:textStyle="bold" />
+        android:lineSpacingExtra="2dp" />
 
     <TextView
         android:id="@+id/bubble_description"
@@ -43,9 +43,9 @@
         android:layout_height="wrap_content"
         android:layout_marginTop="5dp"
         android:maxWidth="272dp"
-        android:fontFamily="@font/space_grotesk_regular"
-        android:textColor="#FFAA9FA2"
-        android:textSize="13sp"
+        android:fontFamily="sans-serif"
+        android:textColor="#FFD8C2BF"
+        android:textSize="14sp"
         android:lineSpacingExtra="3dp" />
 
     <TextView
@@ -54,9 +54,9 @@
         android:layout_height="wrap_content"
         android:layout_marginTop="5dp"
         android:maxWidth="272dp"
-        android:fontFamily="@font/jetbrains_mono_regular"
-        android:textColor="#FFAA9FA2"
-        android:textSize="11sp"
+        android:fontFamily="sans-serif"
+        android:textColor="#FFD8C2BF"
+        android:textSize="12sp"
         android:lineSpacingExtra="2dp"
         android:visibility="gone" />
 

@@ -7,6 +7,7 @@ import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
 import tech.acab.app.model.Detection
+import tech.acab.app.model.TimeBasis
 import tech.acab.app.model.historyBeginFromOrAbsent
 import tech.acab.app.model.historyBeginGenerationOrAbsent
 
@@ -51,6 +52,30 @@ class AcabBleManagerExportTest {
      * BigDecimal representation. */
     private fun decode(json: String): Detection =
         Detection.fromWireJson(json, JSONObject(json))
+
+    /** The paused Log reads lastSeen from the frozen snapshot, so the snapshot must carry it, and
+     *  lastSeenMsById must drop a row that has none (never keep it as 0), the shape the live
+     *  AcabBleManager.logLastSeenSnapshot returns, so the paused and live Log read one map shape.
+     *  The field is not a CSV column. What this cannot cover: renderDetectionsCsv is a manager method and this JVM
+     *  suite builds no AcabBleManager (it needs a Context), so the header is checked
+     *  through DETECTION_CSV_COLUMNS, the list the renderer writes (the "detection CSV columns"
+     *  drift row pins that list against iOS). TWIN: iOS
+     *  ExportTests.testExportSnapshotCarriesLastSeenAndTheCsvIgnoresIt, which runs buildCSV. */
+    @Test fun frozenSnapshotCarriesLastSeenAndTheCsvIgnoresIt() {
+        val heard = decode(nearbyJson)
+        val quiet = decode(droneJson)
+        val t = 1_780_000_000_123L
+        val snapshot = DetectionExportSnapshot(listOf(
+            DetectionExportRowSnapshot(heard, firstSeenMs = t - 5_000L, timeBasis = TimeBasis.Exact,
+                observerCoord = null, lastSeenMs = t),
+            DetectionExportRowSnapshot(quiet, firstSeenMs = t - 9_000L, timeBasis = TimeBasis.Exact,
+                observerCoord = null),
+        ))
+        assertEquals(mapOf(heard.id to t), snapshot.lastSeenMsById())
+        assertNull(snapshot.rows[1].lastSeenMs)
+        assertTrue("the frozen stamp must not become a CSV column",
+            DETECTION_CSV_COLUMNS.none { "last" in it })
+    }
 
     @Test fun nonDroneRow_leavesEveryDroneAndOperatorColumnBlank() {
         val c = droneExportCoords(decode(nearbyJson))

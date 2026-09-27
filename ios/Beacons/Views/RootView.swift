@@ -9,87 +9,102 @@ func shouldPresentSampleTour(isDemoMode: Bool, tourRequested: Bool) -> Bool {
 enum OnboardingPresentation: Equatable {
     case none
     case waitForSetupHelp
-    case firstRunTour
-    case finishSetup
+    case checklist
 }
 
-/// One owner chooses every first-run sheet. Finish setup wins over an unseen tour because Root
-/// persists that state first; this also covers a process death between arming Finish setup and
-/// marking the tour seen. An already-presented sheet blocks every other surface.
+/// One owner chooses the post-connect checklist. Nothing before encrypted readiness, nothing in
+/// sample data, nothing while the checklist is already up, and it waits behind setup help. The
+/// sample tour is not an input: it is presented only in sample data, which returns .none first.
 func onboardingPresentation(isSessionReady: Bool, isDemoMode: Bool,
                             hasSeenTour: Bool, finishSetupPending: Bool,
-                            setupHelpPresented: Bool, tourPresented: Bool,
-                            finishSetupPresented: Bool) -> OnboardingPresentation {
-    guard isSessionReady, !isDemoMode else { return .none }
-    guard !tourPresented, !finishSetupPresented else { return .none }
-    if finishSetupPending {
-        return setupHelpPresented ? .waitForSetupHelp : .finishSetup
-    }
-    guard !hasSeenTour else { return .none }
-    return setupHelpPresented ? .waitForSetupHelp : .firstRunTour
+                            setupHelpPresented: Bool, checklistPresented: Bool) -> OnboardingPresentation {
+    guard isSessionReady, !isDemoMode, !checklistPresented else { return .none }
+    guard firstRunOnboardingShouldRemainActive(hasSeenTour: hasSeenTour,
+                                               finishSetupPending: finishSetupPending) else { return .none }
+    return setupHelpPresented ? .waitForSetupHelp : .checklist
 }
 
+/// True until the checklist completes. Seen is the checklist's marker; pending is the
+/// pre-checklist build's Finish setup key, so a user it left mid-onboarding still gets the
+/// checklist once. Gates automatic Live Mode and the Location request (setFirstRunOnboardingActive).
 func firstRunOnboardingShouldRemainActive(hasSeenTour: Bool,
                                           finishSetupPending: Bool) -> Bool {
     !hasSeenTour || finishSetupPending
 }
 
+/// `finishSetupWasPresented` means "the checklist was presented"; the name is kept so the
+/// signature and its test stay as they are.
 func shouldRequestOnboardingLocation(continueChosen: Bool, isSessionReady: Bool,
                                      finishSetupWasPresented: Bool, isDemoMode: Bool,
                                      isAppActive: Bool) -> Bool {
     continueChosen && finishSetupWasPresented && isSessionReady && !isDemoMode && isAppActive
 }
 
-func realTourCompletionCanPersist(isSampleData: Bool, isSessionReady: Bool) -> Bool {
-    !isSampleData && isSessionReady
+func checklistCompletionCanPersist(isReplay: Bool, isDemoMode: Bool, isSessionReady: Bool) -> Bool {
+    !isReplay && !isDemoMode && isSessionReady
 }
 
-/// Persist in the safe order: Finish setup pending first, tour seen second. Every process-death
-/// point is then recoverable. Sample tours, Help replay, and a tour whose secure session vanished
-/// leave both stores untouched.
+/// Completion writes seen, then clears pending. Both orders end in the same state; the order only
+/// matters for a process death between the two writes. This build never arms pending, so for a
+/// fresh install that death leaves seen = true and no pending key, and the checklist does not
+/// return. A pre-checklist upgrader whose pending key was set sees it once more, which keeps the
+/// Live Mode and Location gate held rather than releasing it without the rationale. Replay, sample
+/// data and a session that lost readiness write nothing. RootView is the only production caller
+/// and passes isReplay: false; the input keeps the replay rule in the tested policy.
 @discardableResult
-func persistRealTourCompletion(isSampleData: Bool, isSessionReady: Bool,
-                               defaults: UserDefaults = .standard) -> Bool {
-    guard realTourCompletionCanPersist(isSampleData: isSampleData,
-                                       isSessionReady: isSessionReady) else { return false }
-    FinishSetupOnboarding.arm(in: defaults)
+func persistChecklistCompletion(isReplay: Bool, isDemoMode: Bool, isSessionReady: Bool,
+                                defaults: UserDefaults = .standard) -> Bool {
+    guard checklistCompletionCanPersist(isReplay: isReplay, isDemoMode: isDemoMode,
+                                        isSessionReady: isSessionReady) else { return false }
     FirstRunTour.markSeen(in: defaults)
+    FinishSetupOnboarding.complete(in: defaults)
     return true
 }
 
-/// Converge the inverse interrupted-write window too. If the app died after Finish setup was armed
-/// but before the tour marker landed, closing the recovered checklist repairs seen first, then
-/// clears pending. A death between these writes safely presents the checklist once more.
-func persistFinishSetupCompletion(defaults: UserDefaults = .standard) {
-    FirstRunTour.markSeen(in: defaults)
-    FinishSetupOnboarding.complete(in: defaults)
+/// How a pinned banner (reconnect, sample data, offline sync) enters and leaves. The slide moves
+/// on the y-axis on every reconnect, so Reduce Motion replaces it with a fade, as the HIG asks
+/// ("Replacing transitions in x-, y-, and z-axes with fades to avoid motion").
+enum PinnedBannerMotion: Equatable {
+    case slideFromTop
+    case fade
+
+    var transition: AnyTransition {
+        switch self {
+        case .slideFromTop: return .move(edge: .top).combined(with: .opacity)
+        case .fade:         return .opacity
+        }
+    }
+}
+
+func pinnedBannerMotion(reduceMotion: Bool) -> PinnedBannerMotion {
+    reduceMotion ? .fade : .slideFromTop
 }
 
 /// Connect screen until a board is connected, then the main tabs.
 struct RootView: View {
     @EnvironmentObject var ble: BLEManager
-    /// One-time orientation, armed the first time a real board connects. Kept here (not in
-    /// MainTabView) so it presents over the tabs the instant they appear, which is exactly the
-    /// "I'm connected, now what?" moment new users were getting stuck at.
-    @State private var showFirstRunTour = false
-    @State private var tourIsSampleData = false
+    /// The post-connect checklist, presented over the tabs the instant a real session is ready (the
+    /// "I'm connected, now what?" moment). Kept here, not in MainTabView, so it covers the tabs.
+    @State private var showChecklist = false
+    /// The non-persisting sample-data tour (sample data only).
+    @State private var showSampleTour = false
     @State private var showSetupHelp = false
-    @State private var showFinishSetup = false
-    @State private var finishSetupWasPresented = false
+    @State private var checklistWasPresented = false
     @State private var requestLocationAfterSetup = false
+    /// A checklist chevron's Beacon row, posted only after the sheet is gone and completed.
+    @State private var pendingBeaconFocus: BeaconFocus?
     // Once the tab shell has existed, keep that exact instance mounted. A transient BLE dropout
     // should cover it with recovery UI, not destroy its NavigationStacks and an in-progress
     // ContributeView capture. This intentionally lasts for the process; the hidden shell is cheap
     // and retaining user-entered field work is more important than rebuilding it after reconnect.
     @State private var hasMountedMain = false
-    /// Bold Text. Mirrored into TypePrefs (the observable the static font helpers read) so a
-    /// change made in Settings reaches every custom-font Text without a relaunch.
-    @Environment(\.legibilityWeight) private var legibilityWeight
-    /// Higher contrast, mirrored into TypePrefs beside `bold`: the palette swap is a colour
-    /// change, and this is what also carries it into type weight. Reading the environment (not
-    /// ContrastPreference) covers both inputs at once, because the in-app switch reaches views
-    /// as the same window trait the iOS setting sets.
+    /// Higher contrast, mirrored into TypePrefs (the observable the font helpers read): the
+    /// palette swap is a colour change, and this is what also carries it into type weight.
+    /// Reading the environment (not ContrastPreference) covers both inputs at once, because the
+    /// in-app switch reaches views as the same window trait the iOS setting sets.
     @Environment(\.colorSchemeContrast) private var colorSchemeContrast
+    /// Reduce Motion swaps the pinned banners' slide-in for a fade (pinnedBannerMotion).
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
     private var hasUsableSession: Bool {
         (ble.sessionReady && ble.connectionState == .connected)
             || (ble.demoMode && ble.connectionState == .connected)
@@ -125,14 +140,7 @@ struct RootView: View {
     // new modifier on whichever half it belongs to instead of regrowing one chain.
     var body: some View {
         shell
-        .sheet(isPresented: $showFirstRunTour, onDismiss: finishTourDismissed) {
-            FirstRunTourView(
-                isSampleData: tourIsSampleData,
-                onFinish: {
-                    persistRealTourCompletion(isSampleData: tourIsSampleData,
-                                              isSessionReady: ble.sessionReady)
-                })
-        }
+        .sheet(isPresented: $showSampleTour) { FirstRunTourView() }
         .sheet(isPresented: $showSetupHelp, onDismiss: setupHelpDismissed) {
             NavigationStack {
                 HelpView(
@@ -142,28 +150,18 @@ struct RootView: View {
                         isDemoMode: ble.demoMode))
                     .toolbar {
                         ToolbarItem(placement: .cancellationAction) {
-                            Button("close") { showSetupHelp = false }
+                            Button("Close") { showSetupHelp = false }
                         }
                     }
             }
             .preferredColorScheme(.dark)
         }
-        .sheet(isPresented: $showFinishSetup, onDismiss: finishSetupDismissed) {
-            FinishSetupView(
-                onContinueLocation: {
-                    requestLocationAfterSetup = true
-                    showFinishSetup = false
-                },
-                onNotNow: {
-                    showFinishSetup = false
-                })
-                .environmentObject(ble)
-        }
+        .sheet(isPresented: $showChecklist, onDismiss: checklistDismissed) { checklistSheet }
         .alert("Couldn't save managed devices", isPresented: Binding(
             get: { ble.managedListPersistenceError != nil },
             set: { if !$0 { ble.dismissManagedListPersistenceError() } }
         )) {
-            Button("Retry now") { ble.retryManagedListPersistence() }
+            Button("Retry Now") { ble.retryManagedListPersistence() }
             Button("OK", role: .cancel) { ble.dismissManagedListPersistenceError() }
         } message: {
             Text(ble.managedListPersistenceError ?? "The managed-device change has not been saved yet.")
@@ -177,7 +175,7 @@ struct RootView: View {
         .onAppear {
             // Default true keeps cold-launch reconciliation safe until Root has decided whether
             // first-run onboarding is due. Returning users release immediately; a first-time user
-            // stays gated through the tour and finish-setup rationale.
+            // stays gated until the checklist closes.
             ble.setFirstRunOnboardingActive(firstRunOnboardingShouldRemainActive(
                 hasSeenTour: FirstRunTour.hasSeen,
                 finishSetupPending: FinishSetupOnboarding.isPending))
@@ -226,6 +224,14 @@ struct RootView: View {
                 if ready {
                     hasMountedMain = true
                 }
+                // A link drop takes the checklist down with it: the sheet belongs to a ready
+                // session, and left up it would float over the reconnect or connect screen.
+                // checklistDismissed then persists nothing (the session is no longer ready) and
+                // posts no Beacon row focus, so the router reopens the sheet on the next ready
+                // session. TWIN: android AcabApp composes ChecklistSheet only under
+                // ConnState.READY, and its ChecklistSheet KDoc says a close cut short by the sheet
+                // leaving composition completes nothing.
+                if !ready && showChecklist { showChecklist = false }
                 routeOnboardingIfNeeded(isSessionReady: ready)
             }
             // Sample data gets the same orientation every time it is entered, but completing or
@@ -239,15 +245,12 @@ struct RootView: View {
             }
     }
 
-    /// Stage one of `shell`: the layout plus the two type-preference mirrors.
+    /// Stage one of `shell`: the layout plus the higher-contrast type-preference mirror.
     private var shellMirrors: some View {
         shellLayout
             .animation(.easeInOut, value: ble.offlineSyncBanner)
             .onChange(of: colorSchemeContrast, initial: true) { (_: ColorSchemeContrast, c: ColorSchemeContrast) in
                 TypePrefs.shared.highContrast = (c == .increased)
-            }
-            .onChange(of: legibilityWeight, initial: true) { (_: LegibilityWeight?, w: LegibilityWeight?) in
-                TypePrefs.shared.bold = (w == .bold)
             }
     }
 
@@ -267,7 +270,7 @@ struct RootView: View {
                     if !mainIsUsable {
                         ConnectView(showAlertRestore: connectScreenCarriesRestore,
                                     onOpenSetupHelp: {
-                            guard !showFirstRunTour, !showFinishSetup else { return }
+                            guard !showSampleTour, !showChecklist else { return }
                             showSetupHelp = true
                         })
                             .background(ACABTheme.bg.ignoresSafeArea())
@@ -278,6 +281,25 @@ struct RootView: View {
         }
     }
 
+    /// The checklist sheet's content, its own property so `body` keeps a short chain (Xcode 26.6
+    /// type-check budget). The closure parameter is typed on purpose, as in `shell`.
+    private var checklistSheet: some View {
+        ChecklistView(
+            replay: false,
+            onContinueLocation: {
+                requestLocationAfterSetup = true
+                showChecklist = false
+            },
+            onNotNow: {
+                showChecklist = false
+            },
+            onOpenBeaconRow: { (focus: BeaconFocus) in
+                pendingBeaconFocus = focus
+                showChecklist = false
+            })
+            .environmentObject(ble)
+    }
+
     private func routeOnboardingIfNeeded(isSessionReady: Bool) {
         switch onboardingPresentation(
             isSessionReady: isSessionReady,
@@ -285,18 +307,12 @@ struct RootView: View {
             hasSeenTour: FirstRunTour.hasSeen,
             finishSetupPending: FinishSetupOnboarding.isPending,
             setupHelpPresented: showSetupHelp,
-            tourPresented: showFirstRunTour,
-            finishSetupPresented: showFinishSetup) {
-        case .none:
+            checklistPresented: showChecklist) {
+        case .none, .waitForSetupHelp:
             break
-        case .waitForSetupHelp:
-            break
-        case .firstRunTour:
-            tourIsSampleData = false
-            showFirstRunTour = true
-        case .finishSetup:
-            finishSetupWasPresented = true
-            showFinishSetup = true
+        case .checklist:
+            checklistWasPresented = true
+            showChecklist = true
         }
     }
 
@@ -307,23 +323,28 @@ struct RootView: View {
         }
     }
 
-    private func finishTourDismissed() {
-        // Finish setup was armed before the real tour marked itself seen. Wait one run-loop turn
-        // for the tour sheet to leave, then let the single router present the durable next step.
-        DispatchQueue.main.async {
-            routeOnboardingIfNeeded(isSessionReady: ble.sessionReady)
-        }
-    }
-
-    private func finishSetupDismissed() {
-        let completedPresentedSheet = finishSetupWasPresented
-        finishSetupWasPresented = false
+    private func checklistDismissed() {
+        let completedPresentedSheet = checklistWasPresented
+        checklistWasPresented = false
+        var completionPersisted = false
         if completedPresentedSheet {
-            persistFinishSetupCompletion()
+            completionPersisted = persistChecklistCompletion(isReplay: false, isDemoMode: ble.demoMode,
+                                                             isSessionReady: ble.sessionReady)
         }
         ble.setFirstRunOnboardingActive(firstRunOnboardingShouldRemainActive(
             hasSeenTour: FirstRunTour.hasSeen,
             finishSetupPending: FinishSetupOnboarding.isPending))
+        // A chevron closed the sheet: switch to its Beacon row only now, after completion and
+        // release, and only when that completion persisted. A close that completed nothing (the
+        // link dropped under the sheet) leaves the tab shell hidden behind the connect screen, so
+        // a focus posted to it would land on a page nobody can see.
+        if let focus = pendingBeaconFocus {
+            pendingBeaconFocus = nil
+            if completionPersisted {
+                BeaconFocus.pending = focus
+                NotificationCenter.default.post(name: BeaconFocus.notification, object: nil)
+            }
+        }
         let continueChosen = requestLocationAfterSetup
         requestLocationAfterSetup = false
         guard shouldRequestOnboardingLocation(
@@ -333,7 +354,7 @@ struct RootView: View {
             isDemoMode: ble.demoMode,
             isAppActive: UIApplication.shared.applicationState == .active) else { return }
         // Let the checklist finish dismissing before iOS presents its permission sheet. The user
-        // sees the rationale first and never gets a system prompt over either onboarding surface.
+        // sees the rationale first and never gets a system prompt over the checklist.
         DispatchQueue.main.async {
             guard shouldRequestOnboardingLocation(
                 continueChosen: true,
@@ -364,21 +385,22 @@ struct RootView: View {
         let reconnecting = hasMountedMain && ble.isReconnecting
         let sampleData = hasMountedMain && ble.demoMode
         if reconnecting || sampleData || ble.offlineSyncBanner != nil {
+            let transition = pinnedBannerMotion(reduceMotion: reduceMotion).transition
             VStack(spacing: 8) {
                 if reconnecting {
                     LinkRecoveryBannerView()
-                        .transition(.move(edge: .top).combined(with: .opacity))
+                        .transition(transition)
                 }
                 if sampleData {
                     SampleDataBannerView()
-                        .transition(.move(edge: .top).combined(with: .opacity))
+                        .transition(transition)
                 }
                 if let summary = ble.offlineSyncBanner {
                     OfflineSyncBannerView(summary: summary)
-                        .transition(.move(edge: .top).combined(with: .opacity))
+                        .transition(transition)
                 }
             }
-            .padding(.horizontal, 14)
+            .padding(.horizontal, ACABTheme.pad)
             .padding(.bottom, 8)
         }
     }
@@ -386,9 +408,8 @@ struct RootView: View {
     private func presentSampleTourIfNeeded() {
         guard shouldPresentSampleTour(isDemoMode: ble.demoMode,
                                       tourRequested: ble.demoTourRequested),
-              !showSetupHelp, !showFirstRunTour, !showFinishSetup else { return }
-        tourIsSampleData = true
-        showFirstRunTour = true
+              !showSetupHelp, !showSampleTour, !showChecklist else { return }
+        showSampleTour = true
     }
 
     @ViewBuilder private var connectedContent: some View {
@@ -405,35 +426,84 @@ struct RootView: View {
     }
 }
 
+/// The sample banner's words, one message and one button, identical on both apps. TWIN: Android
+/// MainScreen.kt `SAMPLE_BANNER_MESSAGE` / `SAMPLE_BANNER_EXIT_LABEL`. Sample tour card 3 names
+/// the same control ("an Exit Sample Data banner stays at the top of the app"). The button is
+/// Title Case like every other button, and the message is Title Case too (owner, 2026-09-25): it
+/// is the banner's name for the mode, read as a label beside its button, not body copy.
+let sampleBannerMessage = "Sample Data, Not Nearby Devices"
+let sampleBannerExitLabel = "Exit Sample Data"
+
 /// Sample mode is intentionally realistic, which also makes it easy to forget that no live board
 /// is attached. Keep a compact escape on every tab instead of burying it at the bottom of Beacon.
 private struct SampleDataBannerView: View {
     @EnvironmentObject var ble: BLEManager
+    @Environment(\.dynamicTypeSize) private var dynamicTypeSize
 
     var body: some View {
-        HStack(spacing: 10) {
-            Image(systemName: "sparkles")
-                .font(.system(size: 14, weight: .semibold)).foregroundStyle(ACABTheme.accent)
-            VStack(alignment: .leading, spacing: 2) {
-                Text("Sample data")
-                    .font(ACABTheme.mono(11.5, weight: .bold)).foregroundStyle(ACABTheme.text)
-                Text("No live beacon is connected.")
-                    .font(ACABTheme.mono(10)).foregroundStyle(ACABTheme.dim)
+        Group {
+            if dynamicTypeSize.isAccessibilitySize {
+                // At accessibility sizes a side glyph and the button column squeezed the text to
+                // one short word per line. Stack instead, as LinkRecoveryBannerView does: the
+                // message at full width, wrapping instead of truncating, then the button on its
+                // own trailing row.
+                VStack(alignment: .leading, spacing: 4) {
+                    message.fixedSize(horizontal: false, vertical: true)
+                    HStack {
+                        Spacer(minLength: 0)
+                        exitButton
+                    }
+                }
+            } else {
+                // One row when the message and the button fit side by side; otherwise the button
+                // drops to its own trailing row under the message.
+                ViewThatFits(in: .horizontal) {
+                    HStack(spacing: 10) {
+                        glyph
+                        message
+                        Spacer(minLength: 4)
+                        exitButton
+                    }
+                    VStack(alignment: .leading, spacing: 4) {
+                        HStack(spacing: 10) {
+                            glyph
+                            message.fixedSize(horizontal: false, vertical: true)
+                        }
+                        HStack {
+                            Spacer(minLength: 0)
+                            exitButton
+                        }
+                    }
+                }
             }
-            Spacer(minLength: 4)
-            Button("EXIT") { ble.exitDemo() }
-                .font(ACABTheme.mono(10, weight: .bold)).tracking(0.7)
-                .foregroundStyle(ACABTheme.accentText)
-                .frame(minWidth: 54, minHeight: 44)
-                .contentShape(Rectangle())
-                .accessibilityLabel("Exit sample data")
-                .accessibilityHint("Returns to beacon setup")
         }
-        .padding(.horizontal, 14).padding(.vertical, 7)
-        .background(ACABTheme.bg2, in: RoundedRectangle(cornerRadius: ACABTheme.radiusSm))
-        .overlay(RoundedRectangle(cornerRadius: ACABTheme.radiusSm)
-            .strokeBorder(ACABTheme.lineStrong, lineWidth: 1))
-        .shadow(color: .black.opacity(0.35), radius: 12, y: 4)
+        .padding(.horizontal, 14).padding(.vertical, 8)
+        .background(ACABTheme.bg2, in: RoundedRectangle(cornerRadius: ACABTheme.radius, style: .continuous))
+        .accessibilityElement(children: .contain)
+        // Pinned above every tab and never scrolls away (a fixed VStack cell, not an inset), so
+        // its type stops at accessibility2: persistent chrome must leave the tab its screen.
+        .dynamicTypeSize(...DynamicTypeSize.accessibility2)
+    }
+
+    private var glyph: some View {
+        Image(systemName: "sparkles")
+            .font(ACABTheme.font(.subheadline, weight: .semibold)).foregroundStyle(ACABTheme.tint)
+            .accessibilityHidden(true)
+    }
+
+    private var message: some View {
+        Text(sampleBannerMessage)
+            .font(ACABTheme.font(.subheadline, weight: .semibold)).foregroundStyle(ACABTheme.text)
+    }
+
+    private var exitButton: some View {
+        Button(sampleBannerExitLabel) { ble.exitDemo() }
+            .font(ACABTheme.font(.subheadline, weight: .semibold))
+            .foregroundStyle(ACABTheme.tint)
+            .frame(minWidth: 54, minHeight: 44)
+            .contentShape(Rectangle())
+            .accessibilityLabel("Exit Sample Data")
+            .accessibilityHint("Returns to beacon setup")
     }
 }
 
@@ -442,71 +512,93 @@ private struct SampleDataBannerView: View {
 /// and retains the same escape ConnectView offered without replacing the user's navigation tree.
 private struct LinkRecoveryBannerView: View {
     @EnvironmentObject var ble: BLEManager
+    @Environment(\.dynamicTypeSize) private var dynamicTypeSize
 
     var body: some View {
-        HStack(spacing: 10) {
-            ProgressView().controlSize(.small).tint(ACABTheme.accent)
-            VStack(alignment: .leading, spacing: 2) {
-                Text("Reconnecting to your beacon")
-                    .font(ACABTheme.mono(11.5, weight: .bold)).foregroundStyle(ACABTheme.text)
-                Text("Your open screen and capture are preserved.")
-                    .font(ACABTheme.mono(10)).foregroundStyle(ACABTheme.dim)
+        Group {
+            if dynamicTypeSize.isAccessibilitySize {
+                // Same reason as SampleDataBannerView: at accessibility sizes the long button
+                // column squeezed the text to a word per line. Stack the text at full width, then
+                // the button on its own trailing row.
+                VStack(alignment: .leading, spacing: 4) {
+                    HStack(alignment: .firstTextBaseline, spacing: 10) {
+                        ProgressView().controlSize(.small).tint(ACABTheme.tint)
+                        title.fixedSize(horizontal: false, vertical: true)
+                    }
+                    subtitle.fixedSize(horizontal: false, vertical: true)
+                    HStack {
+                        Spacer(minLength: 0)
+                        stopButton
+                    }
+                }
+            } else {
+                HStack(spacing: 10) {
+                    ProgressView().controlSize(.small).tint(ACABTheme.tint)
+                    VStack(alignment: .leading, spacing: 2) { title; subtitle }
+                    Spacer(minLength: 4)
+                    stopButton
+                }
             }
-            Spacer(minLength: 4)
-            Button("STOP RECONNECTING") { ble.disconnect() }
-                .font(ACABTheme.mono(9.5, weight: .bold)).tracking(0.5)
-                .foregroundStyle(ACABTheme.dim)
-                .frame(minHeight: 44)
         }
         .padding(.horizontal, 14).padding(.vertical, 8)
-        .background(ACABTheme.bg2, in: RoundedRectangle(cornerRadius: ACABTheme.radiusSm))
-        .overlay(RoundedRectangle(cornerRadius: ACABTheme.radiusSm)
-            .strokeBorder(ACABTheme.lineStrong, lineWidth: 1))
-        .shadow(color: .black.opacity(0.35), radius: 12, y: 4)
+        .background(ACABTheme.bg2, in: RoundedRectangle(cornerRadius: ACABTheme.radius, style: .continuous))
         .accessibilityElement(children: .contain)
+        // Pinned above every tab like the sample banner, so the same accessibility2 type cap.
+        .dynamicTypeSize(...DynamicTypeSize.accessibility2)
+    }
+
+    /// Names the board that dropped (BLEManager.targetKind: the reconnect target, whose kind was
+    /// carried from the live session before its status frame was cleared). Lowercase-first, one
+    /// template, ConnectCopy.reconnectBannerTitle. TWIN: Android MainScreen.kt
+    /// RECONNECT_BANNER_TITLE_TEMPLATE, byte-identical.
+    private var title: some View {
+        Text(renderBoardCopy(ConnectCopy.reconnectBannerTitle, ble.targetKind))
+            .font(ACABTheme.font(.subheadline, weight: .semibold)).foregroundStyle(ACABTheme.text)
+    }
+
+    private var subtitle: some View {
+        Text(ConnectCopy.reconnectBannerSubtitle)
+            .font(ACABTheme.font(.footnote)).foregroundStyle(ACABTheme.dim)
+    }
+
+    private var stopButton: some View {
+        Button("Stop Reconnecting") { ble.disconnect() }
+            .font(ACABTheme.font(.footnote, weight: .semibold))
+            .foregroundStyle(ACABTheme.dim)
+            .frame(minHeight: 44)
     }
 }
 
-/// Four-tab shell (Status, Map, Log, Device) with a frosted tab bar.
+/// Does leaving the Log tab advance the seen watermark? Outside sample data, yes: a New dot means
+/// "arrived since you last looked". In sample data, no: the seed's baseline (the rows it flags new)
+/// stays until the user taps Mark Seen. TWIN: Android MainScreen's Tab.LOG `openedInDemo` gate.
+func logTabLeaveMarksSeen(isDemoMode: Bool) -> Bool { !isDemoMode }
+
+/// Four-tab shell (Status, Map, Log, Beacon) on the system tab bar; selected colour from .tint.
 struct MainTabView: View {
     @EnvironmentObject var ble: BLEManager
     @State private var tab: Int
     @State private var openDetectorsToken = 0
+    // The setup checklist's two Beacon chevrons (Phone notifications, Live Mode); see openBeaconFocus.
+    @State private var openNotifyToken = 0
+    @State private var openLiveModeToken = 0
     /// The four .tag values below. An app built with the iOS 27 SDK traps when a TabView selection
     /// names a tab that is not visible, so every seed that comes from outside the body (the DEBUG
     /// -tab launch argument and the acab.pendingTab hand-off) is checked against this first.
     private static let tabTags = 0...3
 
-    init() {
-        var initial = 0
+    init() { _tab = State(initialValue: Self.launchTab ?? 0) }
+
+    /// DEBUG `-tab N` launch argument, parsed once per process: this init runs on every RootView
+    /// body pass (~3 Hz while detections flow) because connectedContent constructs MainTabView() inline.
+    private static let launchTab: Int? = {
         #if DEBUG
         let args = ProcessInfo.processInfo.arguments
         if let i = args.firstIndex(of: "-tab"), i + 1 < args.count, let n = Int(args[i + 1]),
-           Self.tabTags.contains(n) { initial = n }
+           tabTags.contains(n) { return n }
         #endif
-        _tab = State(initialValue: initial)
-
-        let a = UITabBarAppearance()
-        a.configureWithTransparentBackground()
-        a.backgroundEffect = UIBlurEffect(style: .systemUltraThinMaterialDark)
-        // Dynamic UIColors, not UIColor(Color) snapshots: UIKit re-resolves these when the
-        // accessibilityContrast trait changes (system Increase Contrast, or the in-app switch
-        // via ContrastPreference), so the tab bar follows the palette like every SwiftUI view.
-        a.backgroundColor = ACABTheme.uiTabBarBackground
-
-        let item = UITabBarItemAppearance()
-        item.normal.iconColor = ACABTheme.uiFaint
-        item.normal.titleTextAttributes = [.foregroundColor: ACABTheme.uiFaint]
-        item.selected.iconColor = ACABTheme.uiAccent
-        item.selected.titleTextAttributes = [.foregroundColor: ACABTheme.uiAccent]
-        a.stackedLayoutAppearance = item
-        a.inlineLayoutAppearance = item
-        a.compactInlineLayoutAppearance = item
-
-        // has to go on UITabBar.appearance() before the view first renders
-        UITabBar.appearance().standardAppearance = a
-        UITabBar.appearance().scrollEdgeAppearance = a
-    }
+        return nil
+    }()
 
     var body: some View {
         TabView(selection: $tab) {
@@ -519,16 +611,20 @@ struct MainTabView: View {
                 .tabItem { Label("Map", systemImage: "map.fill") }.tag(1)
             DetectionsView()
                 .tabItem { Label("Log", systemImage: "list.bullet.rectangle.fill") }.tag(2)
-            DeviceView(openDetectorsToken: openDetectorsToken)
+            DeviceView(openDetectorsToken: openDetectorsToken, openNotifyToken: openNotifyToken,
+                       openLiveModeToken: openLiveModeToken)
                 .tabItem { Label("Beacon", systemImage: "cpu.fill") }.tag(3)   // label only; DeviceView identifier stays
         }
-        .tint(ACABTheme.accent)
+        .tint(ACABTheme.tint)
         // A New dot means "arrived since you last looked at the log": advance the seen-watermark
         // when the user LEAVES the Log tab. Opening a dossier keeps the selection on tag 2, so
         // this only fires on a real tab switch, never when drilling into a row. Mirrors Android's
-        // Tab.LOG onDispose in MainScreen.
-        .onChange(of: tab) { old, new in
-            if old == 2 && new != 2 { ble.markAllSeen() }
+        // Tab.LOG onDispose in MainScreen. Never in sample data (logTabLeaveMarksSeen): the sample
+        // log keeps the seed's own baseline until the user taps Mark Seen.
+        .onChange(of: tab) { (old: Int, new: Int) in
+            if old == 2 && new != 2 && logTabLeaveMarksSeen(isDemoMode: ble.demoMode) {
+                ble.markAllSeen()
+            }
         }
         // Cold path: a Live Activity tap landed before we mounted (cold launch, or
         // ConnectView was up). RootView parked the target tab in this flag; consume it.
@@ -544,7 +640,7 @@ struct MainTabView: View {
             UserDefaults.standard.removeObject(forKey: "acab.pendingTab")
             tab = 2
         }
-        // A dossier's "OPEN IN MAP" tap: switch to the Map tab. MapTabView picks up
+        // A dossier's "Open in Map" tap: switch to the Map tab. MapTabView picks up
         // the stashed coordinate itself (see MapFocus in MapTabView.swift).
         .onReceive(NotificationCenter.default.publisher(for: MapFocus.notification)) { _ in
             tab = 1
@@ -554,68 +650,128 @@ struct MainTabView: View {
         .onReceive(NotificationCenter.default.publisher(for: LogFocus.notification)) { _ in
             tab = 2
         }
+        // A checklist chevron (Phone notifications / Live Mode): switch to the Beacon tab, which
+        // selects THIS <IDIOM> and pushes the row itself (see BeaconFocus in SettingsView.swift).
+        // checklistDismissed posts this only after the sheet is gone.
+        .onReceive(NotificationCenter.default.publisher(for: BeaconFocus.notification)) { (_: Notification) in
+            openBeaconFocus()
+        }
+    }
+
+    /// Consume the one pending BeaconFocus request exactly once: bump the matching token (DeviceView
+    /// handles it like openDetectorsToken) and select the Beacon tab.
+    private func openBeaconFocus() {
+        guard let focus = BeaconFocus.pending else { return }
+        BeaconFocus.pending = nil
+        switch focus {
+        case .notifications: openNotifyToken += 1
+        case .liveMode:      openLiveModeToken += 1
+        }
+        tab = 3
     }
 }
 
+/// The offline-sync banner's line: `count` records were replayed, `unreplayed` the board promised
+/// but did not send; `kind` is the board that buffered them (nil reads as beacon). The unreplayed
+/// clause discloses this attempt's shortfall, not permanent loss. Current firmware leaves an
+/// over-MTU row uncommitted in the ring so a later larger-MTU/corrected attempt can retry it.
+/// Only the all-unreplayed arm names the board. TWIN: Android MainScreen.kt offlineSyncMessage,
+/// byte-identical.
+func offlineSyncMessage(count: Int, unreplayed: Int, kind: BoardKind?) -> String {
+    let noun = count == 1 ? "detection" : "detections"
+    if count == 0 && unreplayed > 0 {
+        let bnoun = unreplayed == 1 ? "detection" : "detections"
+        return renderBoardCopy("\(unreplayed) buffered \(bnoun) couldn't be replayed from the {noun}",
+                               kind)
+    }
+    if unreplayed > 0 {
+        return "\(count) \(noun) recorded while you were away"
+            + " (\(unreplayed) more couldn't be replayed)"
+    }
+    return "\(count) \(noun) recorded while you were away"
+}
+
 /// Transient, dismissible banner announcing how many detections the board buffered while
-/// the phone was away. "view" deep-links to the Log tab's NEW lens via the same mechanism
+/// the phone was away. "View" deep-links to the Log tab's NEW lens via the same mechanism
 /// the Live Activity uses; the x just clears it. One-shot, never persisted across launches.
 struct OfflineSyncBannerView: View {
     let summary: OfflineSyncSummary
     @EnvironmentObject var ble: BLEManager
+    @Environment(\.dynamicTypeSize) private var dynamicTypeSize
 
+    /// Names the board that buffered the rows (BLEManager.connectedKind).
     private var message: String {
-        // The unreplayed clause discloses this attempt's shortfall, not permanent loss. Current
-        // firmware leaves an over-MTU row uncommitted in the ring so a later larger-MTU/corrected
-        // attempt can retry it. Keep the present-attempt copy byte-identical to Android's banner.
-        let noun = summary.count == 1 ? "detection" : "detections"
-        if summary.count == 0 && summary.unreplayed > 0 {
-            let bnoun = summary.unreplayed == 1 ? "detection" : "detections"
-            return "\(summary.unreplayed) buffered \(bnoun) couldn't be replayed from the beacon"
-        }
-        if summary.unreplayed > 0 {
-            return "\(summary.count) \(noun) recorded while you were away"
-                + " (\(summary.unreplayed) more couldn't be replayed)"
-        }
-        return "\(summary.count) \(noun) recorded while you were away"
+        offlineSyncMessage(count: summary.count, unreplayed: summary.unreplayed,
+                           kind: ble.connectedKind)
     }
 
     var body: some View {
-        HStack(spacing: 10) {
-            Image(systemName: "tray.and.arrow.down.fill")
-                .font(.system(size: 15, weight: .semibold))
-                .foregroundStyle(ACABTheme.accent)
-            Text(message)
-                .font(ACABTheme.mono(11.5))
-                .foregroundStyle(ACABTheme.text)
-                .fixedSize(horizontal: false, vertical: true)
-            Spacer(minLength: 6)
-            Button(action: viewNew) {
-                Text("view")
-                    .font(ACABTheme.mono(11, weight: .bold)).tracking(0.5)
-                    .foregroundStyle(ACABTheme.onAccent)
-                    .padding(.horizontal, 12).frame(height: 30)
-                    .background(ACABTheme.accent, in: Capsule())
-                    // 44pt hit target around the 30pt capsule; the drawn pill is unchanged.
-                    .frame(minHeight: 44)
-                    .contentShape(Rectangle())
+        Group {
+            if dynamicTypeSize.isAccessibilitySize {
+                // Same reason as SampleDataBannerView: at accessibility sizes the glyph, the pill
+                // and the dismiss button squeezed the message to a narrow column. Stack the
+                // message at full width, then the two buttons on their own trailing row.
+                VStack(alignment: .leading, spacing: 4) {
+                    messageText
+                    HStack(spacing: 10) {
+                        Spacer(minLength: 0)
+                        viewButton
+                        dismissButton
+                    }
+                }
+            } else {
+                HStack(spacing: 10) {
+                    Image(systemName: "tray.and.arrow.down.fill")
+                        .font(ACABTheme.font(.subheadline, weight: .semibold))
+                        .foregroundStyle(ACABTheme.tint)
+                    messageText
+                    Spacer(minLength: 6)
+                    viewButton
+                    dismissButton
+                }
             }
-            .buttonStyle(.plain)
-            Button { ble.clearOfflineSyncBanner() } label: {
-                Image(systemName: "xmark")
-                    .font(.system(size: 12, weight: .bold))
-                    .foregroundStyle(ACABTheme.dim)
-                    .frame(width: 44, height: 44)
-                    .contentShape(Rectangle())
-            }
-            .buttonStyle(.plain)
-            .accessibilityLabel("Dismiss")
         }
-        .padding(.horizontal, 14).padding(.vertical, 10)
-        .background(ACABTheme.bg2, in: RoundedRectangle(cornerRadius: ACABTheme.radiusSm, style: .continuous))
-        .overlay(RoundedRectangle(cornerRadius: ACABTheme.radiusSm, style: .continuous)
-            .strokeBorder(ACABTheme.lineStrong, lineWidth: 1))
-        .shadow(color: .black.opacity(0.35), radius: 12, y: 4)
+        .padding(.horizontal, 14).padding(.vertical, 8)
+        .background(ACABTheme.bg2, in: RoundedRectangle(cornerRadius: ACABTheme.radius, style: .continuous))
+        // Pinned above every tab like the other two banners, so the same accessibility2 type cap.
+        .dynamicTypeSize(...DynamicTypeSize.accessibility2)
+    }
+
+    private var messageText: some View {
+        Text(message)
+            .font(ACABTheme.font(.subheadline))
+            .foregroundStyle(ACABTheme.text)
+            .fixedSize(horizontal: false, vertical: true)
+    }
+
+    private var viewButton: some View {
+        Button(action: viewNew) {
+            // A custom pill, not .borderedProminent: that draws white on the tint, which is
+            // far under AA; onAccent on tint is pinned by ContrastPaletteTests.
+            Text("View")
+                .font(ACABTheme.font(.subheadline, weight: .semibold))
+                .foregroundStyle(ACABTheme.onAccent)
+                // A floor, not a fixed height: at large type the label is taller than 30pt, and a
+                // fixed capsule left the onAccent ink outside the tint fill.
+                .padding(.horizontal, 12).padding(.vertical, 4).frame(minHeight: 30)
+                .background(ACABTheme.tint, in: Capsule())
+                // 44pt hit target around the 30pt capsule; the drawn pill is unchanged.
+                .frame(minHeight: 44)
+                .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+    }
+
+    private var dismissButton: some View {
+        Button { ble.clearOfflineSyncBanner() } label: {
+            Image(systemName: "xmark")
+                .font(ACABTheme.font(.footnote, weight: .bold))
+                .foregroundStyle(ACABTheme.dim)
+                .frame(width: 44, height: 44)
+                .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .accessibilityLabel("Dismiss")
     }
 
     /// Reuse the Live-Activity deep-link path: park the NEW filter + Log tab, then post the

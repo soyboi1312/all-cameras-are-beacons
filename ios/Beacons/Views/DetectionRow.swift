@@ -1,10 +1,23 @@
 import SwiftUI
 
-/// One Logbook row: category glyph, node handle, how it was seen, and current signal.
+/// The provenance words above a Log row's title, in ONE order on both phones: OFFLINE (where the
+/// row came from), MUTED (why a retained row is absent from nearby surfaces), then what its
+/// first-seen time is worth (TimeBasisCopy.tag: RECON / RANGE / NO TIME). nil when no word applies.
+/// TWIN: Android `logRowOverline` in LogScreen.kt (contracts 3.6), same words, same order.
+func logRowOverline(offline: Bool, muted: Bool, basis: TimeBasis) -> String? {
+    var words: [String] = []
+    if offline { words.append("OFFLINE") }
+    if muted { words.append("MUTED") }
+    if let tag = TimeBasisCopy.tag(for: basis) { words.append(tag) }
+    return words.isEmpty ? nil : words.joined(separator: " \u{00B7} ")
+}
+
+/// One Log row: category glyph, a provenance overline, the name, how it was seen with its
+/// confidence, and the current signal number. MapTabView's cluster sheet draws it too.
 struct DetectionRow: View {
     let detection: Detection
-    /// How honest the row's timestamp is. Defaults to .exact for the call sites that show live
-    /// rows only (the map's cluster sheet), where the caveat would be noise.
+    /// How honest the row's timestamp is. .exact adds no time word. Every caller passes the row's
+    /// first-seen basis (the Log's row(_:), MapTabView's cluster sheet).
     var timeBasis: TimeBasis = .exact
     /// Active mute state is supplied only by the Log. Other call sites keep their active-surface
     /// presentation and default to false.
@@ -12,7 +25,10 @@ struct DetectionRow: View {
     private var d: Detection { detection }
     @Environment(\.dynamicTypeSize) private var dynamicTypeSize
 
-    @ViewBuilder
+    /// The existing mute explanation, spoken as the row's hint: the overline's MUTED word alone
+    /// does not tell a VoiceOver user why this retained row is absent from nearby surfaces.
+    static let mutedHint = "This active mute hides the device from nearby status and alerts"
+
     var body: some View {
         Group {
             if dynamicTypeSize.isAccessibilitySize {
@@ -21,174 +37,140 @@ struct DetectionRow: View {
                 compactLayout
             }
         }
-        .padding(.vertical, 11)
+        .padding(.vertical, 6)
         .contentShape(Rectangle())
+        .accessibilityElement(children: .combine)
+        .accessibilityHint(isMuted ? Self.mutedHint : "")
     }
 
-    /// The familiar dense row at ordinary text sizes.
+    /// The row at ordinary text sizes. No chevron: in the Log the List's NavigationLink draws the
+    /// system disclosure indicator.
     private var compactLayout: some View {
-        HStack(spacing: 12) {
-            CatGlyph(type: d.type, size: 40, filled: true)
-
-            VStack(alignment: .leading, spacing: 3) {
-                HStack(spacing: 6) {
-                    // Lead with the advertised name / UAS-ID / broadcast manufacturer when we
-                    // have one, else the device class. displayName falls back to type.label on
-                    // its own, so the old hasName ternary was already a no-op and is now actively
-                    // wrong: it would strip a maker-led title back to "Network camera".
-                    Text(d.displayName)
-                        .font(ACABTheme.display(15, weight: .semibold)).foregroundStyle(ACABTheme.text)
-                        .lineLimit(1).minimumScaleFactor(0.8)
-                    metadataBadges
-                    // No per-row "new" dot: it marked everything until the seen-watermark was
-                    // fixed, and even corrected it duplicated the NEW scope chip. What is new
-                    // lives in that filter now.
-                }
-                HStack(spacing: 6) {
-                    // When a name leads, keep the device class visible as the subtitle.
-                    Text(subtitle)
-                        .font(ACABTheme.mono(10.5)).foregroundStyle(ACABTheme.faint).lineLimit(1)
-                    // Confidence, so the list answers "is this definitely something, or just
-                    // suspected?" without opening the dossier. Bands and colours are LIFTED FROM
-                    // DetectionDetailView.verdictColor (<50 weak / <80 partial / >=80 strong) so a
-                    // row and its dossier can never disagree.
-                    // HIDDEN at 0: Desert-mode nearby devices carry confidence 0 by construction
-                    // (no signature was matched), and a wall of "0%" chips would be pure noise.
-                    confidenceChip
-                    locationChip
-                }
+        HStack(alignment: .center, spacing: 12) {
+            // Hidden: the category is already spoken through the title or the subtitle, and the
+            // symbol's own label would be read before the overline.
+            CatGlyph(type: d.type, style: .bare)
+                .accessibilityHidden(true)
+            VStack(alignment: .leading, spacing: 2) {
+                overlineText
+                titleText
+                supportingText
             }
-
             Spacer(minLength: 8)
-
-            signalReadout
-            Image(systemName: "chevron.right")
-                .font(.system(size: 11, weight: .semibold)).foregroundStyle(ACABTheme.faint)
+            signalText
         }
     }
 
-    /// At accessibility sizes, fixed one-line metadata would either vanish or squeeze the title
-    /// to a few characters. Give every fact its own vertical room and keep signal at the trailing
-    /// edge of the final row. The name leaves the glyph row too: beside the 40pt glyph and the
-    /// chevron it broke mid-word at the largest size on a 390pt phone ("FlockSafet" / "y").
-    /// DashboardView nearestCard stacks the same way; keep the two in step.
-    /// TWIN: Android StackedDetectionRow in LogScreen.kt, which DetectionRow draws from its own
-    /// measured font scale (DETECTION_ROW_STACK_FONT_SCALE). Chip order follows each platform's
-    /// compact row, so MUTED comes after OFFLINE here and before EXP there.
+    /// At accessibility sizes every fact gets its own line, in the compact order, with the signal
+    /// at the trailing edge of the last line. The name never shares a line with the glyph: beside
+    /// the glyph it broke mid-word at the largest size on a 390pt phone ("FlockSafet" / "y").
+    /// TWIN: Android StackedDetectionRow in LogScreen.kt, same order (glyph, overline, title,
+    /// subtitle, confidence, signal).
     private var accessibilityLayout: some View {
-        VStack(alignment: .leading, spacing: 10) {
-            HStack(spacing: 12) {
-                CatGlyph(type: d.type, size: 40, filled: true)
-                Spacer(minLength: 0)
-                // Hidden: up here it would be spoken before the name.
-                Image(systemName: "chevron.right")
-                    .font(.system(size: 11, weight: .semibold)).foregroundStyle(ACABTheme.faint)
-                    .accessibilityHidden(true)
-            }
-
-            // No lineLimit or scale factor: a cap would cut a long name short. At full row width
-            // a name of words wraps between them; a single token wider than the row (a drone's
-            // Remote ID serial) still has to wrap inside itself.
-            Text(d.displayName)
-                .font(ACABTheme.display(15, weight: .semibold))
-                .foregroundStyle(ACABTheme.text)
-                .fixedSize(horizontal: false, vertical: true)
-
-            VStack(alignment: .leading, spacing: 7) {
-                Text("NODE \(d.nodeName)")
-                    .font(ACABTheme.mono(11)).foregroundStyle(ACABTheme.dim)
-                    .fixedSize(horizontal: false, vertical: true)
-                if d.type.isExperimental { ExpTag() }
-                if d.offline { OfflineTag() }
-                if isMuted { mutedBadge }
-                TimeBasisTag(basis: timeBasis)
-                Text(subtitle)
-                    .font(ACABTheme.mono(10.5)).foregroundStyle(ACABTheme.faint)
-                    .fixedSize(horizontal: false, vertical: true)
-                if d.confidence > 0 { confidenceChip }
-                if d.locationAgeText != nil { locationChip }
-            }
-
+        VStack(alignment: .leading, spacing: 6) {
+            CatGlyph(type: d.type, style: .bare)
+                .accessibilityHidden(true)  // same reason as compactLayout
+            overlineText
+            titleText
+            subtitleText
+            confidenceText
             HStack {
                 Spacer()
-                signalReadout
+                signalText
             }
         }
     }
 
-    private var subtitle: String {
+    @ViewBuilder private var overlineText: some View {
+        if let o = logRowOverline(offline: d.offline, muted: isMuted, basis: timeBasis) {
+            Text(o)
+                .font(ACABTheme.telemetry(.caption2, weight: .semibold))
+                .tracking(ACABTheme.telemetryTracking)
+                .foregroundStyle(ACABTheme.dim)
+                .fixedSize(horizontal: false, vertical: true)
+        }
+    }
+
+    /// Lead with the advertised name / UAS-ID / broadcast manufacturer when there is one, else the
+    /// device class's title fallback (Detection.titleName: "body cam", "network camera"; the
+    /// export label stays in displayName). No lineLimit or scale factor: a cap would cut a long
+    /// name short.
+    private var titleText: some View {
+        Text(d.titleName)
+            .font(ACABTheme.font(.body))
+            .foregroundStyle(ACABTheme.text)
+            .fixedSize(horizontal: false, vertical: true)
+    }
+
+    /// The compact row's secondary line: the subtitle and the confidence drawn as ONE Text
+    /// ("BLE \u{00B7} OUI match \u{00B7} 65%"), so a long subtitle wraps as a whole instead of
+    /// wrapping around a percent column that moves from row to row. One verbatim string, not
+    /// Text + Text (deprecated since iOS 26); the whole line takes the tabular digits. Spoken as
+    /// the subtitle, then the confidence words. The percent is hidden at 0 (see confidenceText).
+    /// Drawn through keepingMiddleDotsAttached (SettingsView.swift): a no-break space before each
+    /// dot, so a wrap never starts the second line with an orphan "· 65%". The spoken label keeps
+    /// the plain subtitle.
+    private var supportingText: some View {
+        let sub = subtitle
+        let pct = d.confidence
+        return Text(verbatim: keepingMiddleDotsAttached(pct > 0 ? "\(sub) \u{00B7} \(pct)%" : sub))
+            .font(ACABTheme.font(.subheadline, tabular: true))
+            .foregroundStyle(ACABTheme.dim)
+            .fixedSize(horizontal: false, vertical: true)
+            .accessibilityLabel(pct > 0 ? "\(sub), \(confidenceSpoken)" : sub)
+    }
+
+    private var subtitleText: some View {
+        Text(verbatim: keepingMiddleDotsAttached(subtitle))
+            .font(ACABTheme.font(.subheadline))
+            .foregroundStyle(ACABTheme.dim)
+            .fixedSize(horizontal: false, vertical: true)
+    }
+
+    /// Confidence as plain secondary text, so the list answers "is this definitely something, or
+    /// just suspected?" without opening the dossier. HIDDEN at 0: Desert-mode nearby devices
+    /// carry confidence 0 by construction (no signature was matched), and a wall of "0%" would be
+    /// pure noise. The verdict word is spoken, never drawn.
+    @ViewBuilder private var confidenceText: some View {
+        if d.confidence > 0 {
+            Text("\(d.confidence)%")
+                .font(ACABTheme.telemetry(.subheadline, weight: .regular))
+                .foregroundStyle(ACABTheme.dim)
+                .fixedSize()
+                .accessibilityLabel(confidenceSpoken)
+        }
+    }
+
+    /// The bare signal number (Int's description uses the ASCII hyphen-minus); the unit is spoken.
+    private var signalText: some View {
+        Text("\(d.rssi)")
+            .font(ACABTheme.telemetry(.subheadline, weight: .regular))
+            .foregroundStyle(ACABTheme.dim)
+            .fixedSize()
+            .accessibilityLabel("Signal strength \(d.rssi) decibels relative to one milliwatt")
+    }
+
+    /// The named row leads with DeviceType.inlineLabel ("ALPR camera", "body cam", "network
+    /// camera"), the lowercase-first form every row uses, never `label`, which mixes Title Case
+    /// and sentence case in one list ("ALPR Camera" beside "Network camera"). `label` stays the
+    /// export, search and managed-list word. TWIN: android LogScreen.kt `detectionRowSubtitle`,
+    /// the same choice (drift 'inlineLabel' and the row "Log row subtitle leads with
+    /// inlineLabel"). Pure and static so DetectionRowSubtitleTests can pin it.
+    private var subtitle: String { Self.subtitle(for: d) }
+
+    static func subtitle(for d: Detection) -> String {
         d.hasName
-            ? "\(d.type.label) \u{00B7} \(d.method.label)"
+            ? "\(d.type.inlineLabel) \u{00B7} \(d.method.label)"
             : "\(d.source.label) \u{00B7} \(d.method.label)"
     }
 
-    @ViewBuilder private var metadataBadges: some View {
-        Text("NODE \(d.nodeName)")
-            .font(ACABTheme.mono(11)).foregroundStyle(ACABTheme.dim)
-        if d.type.isExperimental { ExpTag() }
-        if d.offline { OfflineTag() }
-        if isMuted { mutedBadge }
-        // OFFLINE says where the row came from; this says what its time is worth.
-        TimeBasisTag(basis: timeBasis)
+    private var confidenceSpoken: String {
+        "confidence \(d.confidence) percent, \(confidenceWord)"
     }
 
-    /// Kept compact because it shares the metadata line with NODE / OFFLINE / time basis. The
-    /// explicit spoken state matters: colour and the crossed-bell concept alone do not tell a
-    /// VoiceOver user why this retained history row is absent from nearby surfaces.
-    private var mutedBadge: some View {
-        Text("MUTED")
-            .font(ACABTheme.mono(8, weight: .bold)).tracking(0.7)
-            .foregroundStyle(ACABTheme.dim)
-            .padding(.horizontal, 5).padding(.vertical, 2)
-            .background(ACABTheme.bg3, in: Capsule())
-            .overlay(Capsule().strokeBorder(ACABTheme.lineStrong, lineWidth: 1))
-            .accessibilityElement(children: .ignore)
-            .accessibilityLabel("Muted device")
-            .accessibilityHint("This active mute hides the device from nearby status and alerts")
-    }
-
-    @ViewBuilder private var confidenceChip: some View {
-        if d.confidence > 0 {
-            Text("\(d.confidence)%")
-                .font(ACABTheme.mono(9, weight: .bold)).tracking(0.5)
-                .foregroundStyle(confidenceTint)
-                .padding(.horizontal, 5).padding(.vertical, 1.5)
-                .background(confidenceTint.opacity(0.14), in: Capsule())
-                .monospacedDigit()
-                .accessibilityLabel("confidence \(d.confidence) percent, \(confidenceWord)")
-        }
-    }
-
-    @ViewBuilder private var locationChip: some View {
-        if let age = d.locationAgeText {
-            Text("LOC \(age)")
-                .font(ACABTheme.mono(9, weight: .bold)).tracking(0.5)
-                .foregroundStyle(ACABTheme.warn)
-                .padding(.horizontal, 5).padding(.vertical, 1.5)
-                .background(ACABTheme.warn.opacity(0.14), in: Capsule())
-                .accessibilityLabel("Location age \(age)")
-        }
-    }
-
-    private var signalReadout: some View {
-        VStack(alignment: .trailing, spacing: 5) {
-            Text("\(d.rssi)")
-                .font(ACABTheme.mono(13, weight: .semibold))
-                .foregroundStyle(d.type.textTint).monospacedDigit()
-            SignalBars(bars: d.signalBars, tint: d.type.tint)
-        }
-        .accessibilityElement(children: .ignore)
-        .accessibilityLabel("Signal strength \(d.rssi) decibels relative to one milliwatt")
-    }
-
-    /// Same bands as DetectionDetailView.verdictColor - keep the two in step if either moves.
-    private var confidenceTint: Color {
-        switch d.confidence {
-        case ..<50: return ACABTheme.warn
-        case ..<80: return ACABTheme.dim
-        default:    return ACABTheme.text
-        }
-    }
+    /// Same bands as the dossier's confidence verdict in DetectionDetailView.swift (<50 / <80).
+    /// Spoken only; the row draws the number. TWIN: Android `confidenceWord(pct:)` in
+    /// LogScreen.kt (contracts 3.6; drift 'confidence verdict words').
     private var confidenceWord: String {
         switch d.confidence {
         case ..<50: return "weak match, verify"

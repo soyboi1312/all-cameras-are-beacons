@@ -81,7 +81,7 @@ struct HelpView: View {
         }
         .navigationTitle("Help + support")
         .navigationBarTitleDisplayMode(.inline)
-        .sheet(isPresented: $showTour) { FirstRunTourView() }
+        .sheet(isPresented: $showTour) { ChecklistView(replay: true).environmentObject(BLEManager.shared) }
     }
 
     // MARK: search
@@ -115,7 +115,7 @@ struct HelpView: View {
         .frame(minHeight: 44)
         .background(ACABTheme.bg2, in: RoundedRectangle(cornerRadius: ACABTheme.radiusSm, style: .continuous))
         .overlay(RoundedRectangle(cornerRadius: ACABTheme.radiusSm, style: .continuous)
-            .strokeBorder(searchFocused ? ACABTheme.lineStrong : ACABTheme.line, lineWidth: 1))
+            .strokeBorder(searchFocused ? ACABTheme.tint : ACABTheme.line, lineWidth: 1))
         .animation(.easeOut(duration: 0.15), value: searchFocused)
     }
 
@@ -161,7 +161,7 @@ struct HelpView: View {
             } label: {
                 VStack(alignment: .leading, spacing: 3) {
                     if let k = sectionKicker {
-                        Text(k).font(ACABTheme.mono(9, weight: .medium)).tracking(1.4)
+                        Text(k).font(ACABTheme.mono(9, weight: .medium))
                             .foregroundStyle(ACABTheme.faint)
                     }
                     HStack(alignment: .top, spacing: 10) {
@@ -173,7 +173,7 @@ struct HelpView: View {
                             .frame(maxWidth: .infinity, alignment: .leading)
                         Image(systemName: "chevron.down")
                             .font(.system(size: 12, weight: .semibold))
-                            .foregroundStyle(open ? ACABTheme.accent : ACABTheme.faint)
+                            .foregroundStyle(open ? ACABTheme.tint : ACABTheme.faint)
                             .rotationEffect(.degrees(open ? 180 : 0))
                             .padding(.top, 2)
                     }
@@ -195,7 +195,7 @@ struct HelpView: View {
                     .transition(.opacity)
             }
         }
-        .background(open ? ACABTheme.accent.opacity(0.04) : .clear)
+        .background(open ? ACABTheme.tint.opacity(0.04) : .clear)
         .id(q.id)          // the deep-link + scrollTo anchor
     }
 
@@ -205,7 +205,7 @@ struct HelpView: View {
         VStack(alignment: .leading, spacing: 0) {
             Kicker("SUPPORT")
                 .padding(.horizontal, 16).padding(.top, 16).padding(.bottom, 6)
-            Text("spotted a false positive, or a device it missed? tell me what it flagged and what it actually was.")
+            Text("spotted a false positive, or a device it missed? tell me what it flagged and what the device was.")
                 .font(ACABTheme.mono(11)).foregroundStyle(ACABTheme.dim)
                 .lineSpacing(5)
                 .fixedSize(horizontal: false, vertical: true)
@@ -224,7 +224,7 @@ struct HelpView: View {
         // An external row is a Link so the OS handles http/mailto; an in-app one is a Button.
         // The trailing glyph follows that split, not the styling: ↗ means "this leaves the app".
         if row.external, let s = row.url, let url = URL(string: s) {
-            Link(destination: url) { supportRowBody(row, glyph: "arrow.up.right", tint: ACABTheme.accent) }
+            Link(destination: url) { supportRowBody(row, glyph: "arrow.up.right", tint: ACABTheme.tint) }
                 .buttonStyle(.plain)
         } else if row.action == "improveDetection" {
             // Opens the contribution composer by pushing it onto the same navigation stack HelpView

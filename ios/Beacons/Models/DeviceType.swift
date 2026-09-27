@@ -61,8 +61,30 @@ enum DeviceType: Int, CaseIterable, Identifiable, Codable {
         }
     }
 
+    /// The row title when nothing names the device (Detection.titleName): `label`, except two
+    /// arms that read as display words, "body cam" (not "Body Camera") and "network camera" (not
+    /// "Network camera"). `label` itself never changes: the CSV / GPX type column and the
+    /// managed-list labels carry it. One arm per case, in `label`'s order, so the drift check can
+    /// compare the platforms arm for arm. BYTE-IDENTICAL to android Models.kt
+    /// DeviceType.titleFallback.
+    var titleFallback: String {
+        switch self {
+        case .flockCamera: return "ALPR Camera"
+        case .flockRaven:  return "Flock Raven"
+        case .axonBodyCam: return "body cam"
+        case .drone:       return "Drone"
+        case .tracker:     return "Tracker"
+        case .nearbyDevice:return "Nearby Device"
+        case .watched:     return "Watched device"
+        case .recordingGlasses: return "Recording glasses"
+        case .networkCamera: return "network camera"
+        case .unknown:     return "Unknown"
+        }
+    }
+
     /// `label` as it reads INSIDE a lowercase sentence, e.g. the Related help disclosure's
-    /// "3 answers for ALPR camera". Hand-written per case rather than `label.lowercased()`,
+    /// "3 answers for ALPR camera" and "5 answers for body cam" (the brand's "body cam", never
+    /// the export label's "Body Camera"). Hand-written per case rather than `label.lowercased()`,
     /// which flattened the proper nouns: Flock Raven became "flock raven" and the ALPR
     /// initialism became "alpr". faq-content.json states the rule this obeys, "lowercase-plain,
     /// honest about limits; proper nouns keep their casing". No single transform derives it,
@@ -76,7 +98,7 @@ enum DeviceType: Int, CaseIterable, Identifiable, Codable {
         switch self {
         case .flockCamera: return "ALPR camera"
         case .flockRaven:  return "Flock Raven"
-        case .axonBodyCam: return "body camera"
+        case .axonBodyCam: return "body cam"
         case .drone:       return "drone"
         case .tracker:     return "tracker"
         case .nearbyDevice:return "nearby device"
@@ -88,9 +110,11 @@ enum DeviceType: Int, CaseIterable, Identifiable, Codable {
     }
 
     /// `category` as it reads in DISPLAY text, where the surrounding voice is lowercase: the
-    /// dossier badge pill ("ALPR · PLATE READER") and the Status nearest card ("ALPR · NODE
-    /// 2A10"). Same rule and same reason as `inlineLabel` above: `category.lowercased()` turned
-    /// the ALPR initialism into "alpr".
+    /// dossier's inline navigation title ("body cam") and the Status nearest card ("ALPR · NODE
+    /// 2A10", "network camera · NODE 0A5C"). Same rule and same reason as `inlineLabel` above:
+    /// `category.lowercased()` turned the ALPR initialism into "alpr". The network camera reads
+    /// "network camera", not the bare "camera", which a user reads as any camera, an ALPR one
+    /// included.
     ///
     /// This is DISPLAY ONLY and is never a key. `category` itself is unchanged and stays the
     /// identifier the Log/Map filters, the category counts, the widget rows and the drive
@@ -109,7 +133,7 @@ enum DeviceType: Int, CaseIterable, Identifiable, Codable {
         case .nearbyDevice:return "nearby"
         case .watched:     return "watched"
         case .recordingGlasses: return "glasses"
-        case .networkCamera: return "camera"
+        case .networkCamera: return "network camera"
         case .unknown:     return "unknown"
         }
     }

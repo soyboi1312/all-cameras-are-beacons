@@ -144,9 +144,18 @@ final class RememberedBoardTests: XCTestCase {
 
     // MARK: shared copy (Android twin must match byte for byte)
 
+    /// TWIN: Android RememberedBoardTest.sharedCopyMatchesIos. The title names the remembered
+    /// board's kind and unknown reads as beacon; the subtitle carries only the live-signal state,
+    /// never the advertised name (decisions R14).
     func testRememberedRowCopy() {
-        XCTAssertEqual(RememberedBoardCopy.label, "your beacon")
+        XCTAssertEqual(RememberedBoardCopy.labelTemplate, "your {noun}")
+        XCTAssertEqual(RememberedBoardCopy.label(kind: nil), "your beacon")
+        XCTAssertEqual(RememberedBoardCopy.label(kind: .beacon), "your beacon")
+        XCTAssertEqual(RememberedBoardCopy.label(kind: .ouiSpy), "your OUI-Spy")
+        XCTAssertEqual(RememberedBoardCopy.label(kind: .meshDetect), "your Mesh-Detect")
         XCTAssertEqual(RememberedBoardCopy.noSignal, "no live signal \u{00B7} tap to connect")
         XCTAssertEqual(RememberedBoardCopy.seen, "tap to connect")
+        XCTAssertEqual(RememberedBoardCopy.subtitle(hasSignal: true), "tap to connect")
+        XCTAssertEqual(RememberedBoardCopy.subtitle(hasSignal: false), "no live signal \u{00B7} tap to connect")
     }
 }

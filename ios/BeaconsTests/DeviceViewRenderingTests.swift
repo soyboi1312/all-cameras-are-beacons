@@ -88,10 +88,10 @@ final class DeviceViewRenderingTests: XCTestCase {
         XCTAssertEqual(desertSilenceSlot(restoreOffered: true, noticeApplies: noticeOnMesh), .offer)
     }
 
-    /// THE BOARD BEING AWAY IS WHEN THE OFFER MATTERS MOST. Both of its in-panel homes sit inside
-    /// hardwareConfigPanel, which is `.disabled` as one unit when the link or the status frame is
-    /// gone (Android collapses the same rows outright), and a board reboot or a factory reset is
-    /// exactly what arms the offer. So the detached surface has to appear in precisely that window.
+    /// THE BOARD BEING AWAY IS WHEN THE OFFER MATTERS MOST. Both of its in-card homes are the
+    /// Desert and Alerts sub-screens, which DeviceView disables as one set with their rows when the
+    /// link or the status frame is gone (Android withholds the same pages outright), and a board
+    /// reboot or a factory reset is exactly what arms the offer. So the detached surface has to appear in precisely that window.
     ///
     /// The middle assertion is also the invariant that keeps the screen from showing the offer
     /// twice: this predicate is the NEGATION of the panel's gate, so a live in-panel copy and the
@@ -151,8 +151,8 @@ final class DeviceViewRenderingTests: XCTestCase {
     /// whileAModeIsOwedExactlyOneSurfaceAnswersForItInEveryState in AcabAppStateTest.kt.
     ///
     /// OWNERSHIP, NOT PIXELS: the third column means the Desert card's silence slot and the Alerts
-    /// card carry it, each behind its own fold row, with the collapsed alerts kicker saying a
-    /// restore is waiting. What this asserts is that no state is left with nobody holding it, and
+    /// card carry it, each behind its own pushed row, with the Alerts row's value saying a restore
+    /// is waiting. What this asserts is that no state is left with nobody holding it, and
     /// that no state hands it to two owners at once.
     ///
     /// Deleting either panel leaves a state with no surface and fails the coverage assertion;
@@ -210,10 +210,17 @@ final class DeviceViewRenderingTests: XCTestCase {
     /// Two more cross-platform strings, so their bytes are pinned here and against the same literals
     /// in Android's AcabAppStateTest. The offer sentence names the control that sits under it, so a
     /// reword on one side only would send one phone's owner looking for a button by another name.
+    /// The sentence is a template that names the board ({noun}, decisions R14); nil reads as beacon.
     func testDesertRestoreOfferCopyIsExact() {
         XCTAssertEqual(desertRestoreOffer,
-                       "desert mode ended on the beacon, so your alert mode is still silent. the app does not change it on its own. restore alerts puts back the mode you had before desert mode.")
-        XCTAssertEqual(desertRestoreOfferAction, "RESTORE ALERTS")
+                       "desert mode ended on the {noun}, so your alert mode is still silent. the app does not change it on its own. Restore Alerts puts back the mode you had before desert mode.")
+        XCTAssertEqual(renderBoardCopy(desertRestoreOffer, nil),
+                       "desert mode ended on the beacon, so your alert mode is still silent. the app does not change it on its own. Restore Alerts puts back the mode you had before desert mode.")
+        XCTAssertEqual(renderBoardCopy(desertRestoreOffer, .ouiSpy),
+                       "desert mode ended on the OUI-Spy, so your alert mode is still silent. the app does not change it on its own. Restore Alerts puts back the mode you had before desert mode.")
+        XCTAssertEqual(renderBoardCopy(desertRestoreOffer, .meshDetect),
+                       "desert mode ended on the Mesh-Detect, so your alert mode is still silent. the app does not change it on its own. Restore Alerts puts back the mode you had before desert mode.")
+        XCTAssertEqual(desertRestoreOfferAction, "Restore Alerts")
         XCTAssertEqual(desertRestoreOffer.first, "d")
         for banned in ["\u{2014}", "\u{2013}", "\u{2019}", "!"] {
             XCTAssertFalse(desertRestoreOffer.contains(banned), "banned character \(banned)")
@@ -223,24 +230,46 @@ final class DeviceViewRenderingTests: XCTestCase {
         // refuses the mute and keeps beeping while the mode reads Silent; a claim about sound would
         // be false exactly there, on the one product where that is the worst thing to get wrong.
         XCTAssertTrue(desertRestoreOffer.contains("your alert mode is still silent"))
-        // And it names its own control, so the sentence and the button cannot drift apart.
-        XCTAssertTrue(desertRestoreOffer.contains(desertRestoreOfferAction.lowercased()))
+        // And it names its own control in the control's own case, so the sentence and the button
+        // cannot drift apart.
+        XCTAssertTrue(desertRestoreOffer.contains(desertRestoreOfferAction))
     }
 
     /// DeviceView previously crashed while Swift resolved the concrete metadata for its combined
     /// disclosure panel. Mounting the view is the regression assertion because that failure occurs
-    /// before the first frame is drawn or any disclosure row is opened.
+    /// before the first frame is drawn or any disclosure row is opened. It mounts each segment and
+    /// the regular-width columns, because the rows are built per branch.
+    /// Twin of Android AcabAppStateTest's shouldHandleOpenToken check: a deep-link token opens
+    /// its row once, so a re-run of the onChange action after Back or a tab switch never re-pushes.
+    func testBeaconDeepLinkTokenIsHandledOncePerValue() {
+        XCTAssertFalse(DeviceView.shouldHandleOpenToken(0, handledWatermark: 0))
+        XCTAssertTrue(DeviceView.shouldHandleOpenToken(1, handledWatermark: 0))
+        XCTAssertFalse(DeviceView.shouldHandleOpenToken(1, handledWatermark: 1))
+        XCTAssertTrue(DeviceView.shouldHandleOpenToken(2, handledWatermark: 1))
+    }
+
     func testDeviceViewMaterializesWithoutMetadataCrash() {
-        let root = DeviceView()
-            .environmentObject(BLEManager.shared)
-            .environmentObject(FirmwareManifestStore.shared)
-
-        let host = UIHostingController(rootView: root)
-        host.loadViewIfNeeded()
-        host.view.frame = CGRect(x: 0, y: 0, width: 390, height: 844)
-        host.view.setNeedsLayout()
-        host.view.layoutIfNeeded()
-
-        XCTAssertEqual(host.view.bounds.size, CGSize(width: 390, height: 844))
+        var hosts: [UIViewController] = []
+        func mount<V: View>(_ view: V, _ size: CGSize) {
+            let host = UIHostingController(rootView: view
+                .environmentObject(BLEManager.shared)
+                .environmentObject(FirmwareManifestStore.shared))
+            host.loadViewIfNeeded()
+            host.view.frame = CGRect(origin: .zero, size: size)
+            host.view.setNeedsLayout()
+            host.view.layoutIfNeeded()
+            XCTAssertEqual(host.view.bounds.size, size)
+            hosts.append(host)
+        }
+        let phone = CGSize(width: 390, height: 844)
+        // BOARD, the default segment (XCTest passes no -beacon-segment argument).
+        mount(DeviceView(), phone)
+        // THIS <IDIOM>: the 2026-08-06 crash came on a branch flip, and a BOARD mount never builds
+        // these rows. rowView's per-arm AnyView boxing is the guard; this mount is the runtime check.
+        mount(DeviceView(initialSegment: .phone), phone)
+        // Regular width: the two-column branch builds both segments' rows at once.
+        mount(DeviceView().environment(\.horizontalSizeClass, .regular), CGSize(width: 1024, height: 1366))
+        // The hosts stay alive until every mount has laid out.
+        XCTAssertEqual(hosts.count, 3)
     }
 }

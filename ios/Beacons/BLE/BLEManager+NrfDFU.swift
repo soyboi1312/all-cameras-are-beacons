@@ -30,6 +30,15 @@ enum NrfDfuState: Equatable {
 }
 
 extension BLEManager {
+    /// A co-processor update retried on the link that owned a quarantined attempt
+    /// (startNrfUpdate). A TEMPLATE, kept byte-identical to Android's
+    /// NRF_DFU_RECONNECT_BEFORE_RETRY_TEMPLATE (NrfDfuCoordinator.kt) and pinned by
+    /// check-signature-drift.py; renderBoardCopy fills {noun} with the connected board's kind, and
+    /// nil reads as beacon. The board-update twin is otaReconnectBeforeRetryTemplate
+    /// (BLEManager+OTA.swift), worded the same apart from the update it names.
+    static let nrfReconnectBeforeRetryTemplate =
+        "reconnect to the {noun} before retrying the co-processor update. this clears any delayed update replies from the previous attempt."
+
     var nrfUpdateCanCancel: Bool {
         nrfDfuState.isCancellable && (nrfFlasher?.canCancelSafely ?? true)
     }
@@ -74,7 +83,8 @@ extension BLEManager {
             return
         }
         guard nrfQuarantinedPeripheralID != ownerID else {
-            nrfDfuState = .failed(reason: "Reconnect to the board before starting another co-processor update. This clears any delayed reply from the previous attempt.")
+            nrfDfuState = .failed(reason: renderBoardCopy(Self.nrfReconnectBeforeRetryTemplate,
+                                                          boardKind(for: ownerID)))
             return
         }
         nrfDfuGeneration &+= 1

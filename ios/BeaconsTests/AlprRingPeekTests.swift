@@ -17,10 +17,10 @@ import CoreLocation
 /// suite can carry the same offsets without a data file.
 ///
 /// WHAT IS NOT SHARED: the enlarged DIAMETER. The rule is shared - the rim has to visibly clear the
-/// pin's own artwork, glow included, with a readable gap - but the two platforms draw different
-/// pins, so each derives its own number from its own artwork (iOS 48pt off a 28pt disc in a 6pt
-/// shadow; Android 49dp off a 41dp pulse ring). Do NOT "fix" one to match the
-/// other: a matched number here would mean one of the two rims is wrong on screen.
+/// pin's own artwork with a readable gap - but the two platforms draw different pins. iOS derives
+/// its number from its own pin artwork (MapPinArtwork: a 30pt disc and white ring under a 4pt
+/// neutral drop shadow offset 2pt); Android derives its own from its own pin. Do NOT "fix" one to
+/// match the other: a matched number here would mean one of the two rims is wrong on screen.
 final class AlprRingPeekTests: XCTestCase {
 
     // San Diego, the app's own fallback region centre.
@@ -43,19 +43,20 @@ final class AlprRingPeekTests: XCTestCase {
 
     /// The enlarged diameter is iOS's OWN number, not a shared one, so what is asserted here is the
     /// RULE it has to satisfy: the rim must clear the pin's whole visual footprint with a readable
-    /// gap. MapPin is a 28pt disc under .shadow(radius: 6), so the pin's tinted glow reaches
-    /// radius 14 + 6 = 20pt - and in the headline case (a live ALPR hit) that glow is flockTone,
-    /// the very tone of a confirmed ring, so a rim inside it is not tight, it is invisible.
+    /// gap. The footprint is read from the artwork itself (MapPinArtwork), never copied: the disc
+    /// radius plus the drop shadow's reach (blur radius plus the magnitude of its y offset).
     /// ALPRDot strokes with strokeBorder (inside the frame), so the rim's INNER edge sits at
-    /// diameter/2 - 2.2. The 36pt first cut put that at 15.8pt, more than 4pt inside the glow.
+    /// diameter/2 - rimLineWidth. An artwork change that is not followed by a re-derived
+    /// diameter fails here.
     func testPeekDiameterClearsTheWholePinFootprint() {
-        let pinGlowRadius: CGFloat = 28 / 2 + 6       // disc radius + shadow spread
-        let rimInnerEdge = ALPRRingPeek.diameter / 2 - 2.2   // ALPRDot's strokeBorder line width
-        XCTAssertGreaterThan(rimInnerEdge, pinGlowRadius + 1.5,
-                             "the peek rim has to stand off the pin's glow by a readable gap")
-        // And it stays a ring around a pin, not a second blob: comfortably under the ping ring's
-        // full extent (28pt scaled to 1.9), which sweeps past it and fades out.
-        XCTAssertLessThan(ALPRRingPeek.diameter, 28 * 1.9)
+        let pinReach = MapPinArtwork.discDiameter / 2 + MapPinArtwork.shadowRadius
+            + abs(MapPinArtwork.shadowOffsetY)
+        let rimInnerEdge = ALPRRingPeek.diameter / 2 - ALPRRingPeek.rimLineWidth
+        XCTAssertGreaterThan(rimInnerEdge, pinReach + 1.5,
+                             "the peek rim has to stand off the pin's disc and drop shadow by a readable gap")
+        // And it stays a ring around a pin, not a second blob: under the ping ring's full extent
+        // (the disc scaled to pingScale), which sweeps past it and fades out.
+        XCTAssertLessThan(ALPRRingPeek.diameter, MapPinArtwork.discDiameter * MapPinArtwork.pingScale)
     }
 
     /// A pin at the mapped coordinate, and a pin inside the radius, both peek. The band bucketing

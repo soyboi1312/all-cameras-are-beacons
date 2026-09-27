@@ -7,8 +7,8 @@ import Foundation
 ///
 /// NEUTRAL BY RULE: no check mark and no "all clear" green. This line shows when nothing
 /// supported has been recognized, which is not the same as nothing being there ("quiet does not
-/// mean clear", FirstRunTourView), and the SAME line shows when the beacon is not connected at
-/// all, which proves nothing either way. Until 2026-09-20 both states drew a green
+/// mean clear", FirstRunTour.quietSentence), and the SAME line shows when the beacon is not
+/// connected at all, which proves nothing either way. Until 2026-09-20 both states drew a green
 /// `checkmark.shield.fill` and read as an all-clear on a surface people glance at with the app
 /// closed. The symbol is the half shield the Live Activity already draws on a zero
 /// (DetectionLiveActivity), so the two glanceable surfaces agree.

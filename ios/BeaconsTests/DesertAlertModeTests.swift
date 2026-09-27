@@ -24,13 +24,14 @@ import XCTest
 /// anywhere, here or in any suite. `desertSilenceSlot`, `desertRestoreNeedsDetachedSurface` and
 /// `desertRestoreNeedsPreConnectSurface` in DeviceViewRenderingTests pin the decisions those
 /// surfaces render, not the rendering. That AlertRestorePanel is what the detached gate draws, and
-/// that it sits immediately above statsGrid in the compact stack and above the two-column split in
-/// the regular one, is held by the "desert restore offer" row of
-/// firmware/tools/check-signature-drift.py. NOTHING holds the pre-connect call site: that
-/// RootView hands ConnectView its answer, and that ConnectView draws AlertRestorePanel first, are
-/// checked by eye only, because the drift script cannot read either file without both being added
-/// to firmware-ci.yml's two path lists. Nothing here runs `ingestStatus`, so its CALL to
-/// reconcileDesert is unpinned too.
+/// that it sits immediately above crossCuttingBanners in the compact stack and leads the regular
+/// one (panel, banners, hero, then the two-column split), is held by the "desert restore offer"
+/// row of firmware/tools/check-signature-drift.py.
+/// The copy that heads a locked board sub-screen (DeviceView.subScreen) is checked by eye only.
+/// The pre-connect call site is held by the same row, not here: its "iOS pre-connect decision"
+/// side pins that RootView hands ConnectView its answer, and its "iOS connect screen" side pins
+/// that ConnectView draws AlertRestorePanel first. Nothing here runs `ingestStatus`, and no
+/// needle names its CALL to reconcileDesert, so that call is unpinned.
 final class DesertAlertModeTests: XCTestCase {
 
     private let desertCaptured = DesertAlertModeState(saved: .buzzer, offered: nil)

@@ -252,16 +252,130 @@ internal enum class PairingFailure {
     SECURE_LINK_NOT_READY,
 }
 
-internal fun pairingFailureHint(failure: PairingFailure): String = when (failure) {
-    PairingFailure.START_REJECTED ->
-        "Android could not start pairing. Keep the beacon powered and nearby, then try again."
-    PairingFailure.CANCELED_OR_FAILED ->
-        "Pairing was canceled or failed. Keep the beacon powered and nearby, approve Android's pairing request if it appears, then try again."
-    PairingFailure.TIMED_OUT ->
-        "Pairing took too long. Keep the beacon powered and nearby, approve Android's pairing request if it appears, then try again."
-    PairingFailure.SECURE_LINK_NOT_READY ->
-        "Android connected, but the beacon's secure link did not become ready. Keep it powered and nearby, then try again."
+/** The recovery line for each pairing terminal cause, for the board being connected ([kind] is
+ *  AcabBleManager.targetKind; null reads as beacon). Lowercase-first templates rendered through
+ *  renderBoardCopy. The causes are Android's own bond state machine, so these have no byte twin
+ *  on iOS (its failure hints live on BLEManager.beaconConnectionRecovery), but the recovery
+ *  wording ("keep the {noun} powered on and nearby") is the shared phrase. */
+internal const val PAIRING_START_REJECTED_TEMPLATE =
+    "Android could not start pairing. keep the {noun} powered on and nearby, then try again."
+internal const val PAIRING_CANCELED_OR_FAILED_TEMPLATE =
+    "pairing was canceled or failed. keep the {noun} powered on and nearby, approve {os_pairing_request} if it appears, then try again."
+internal const val PAIRING_TIMED_OUT_TEMPLATE =
+    "pairing took too long. keep the {noun} powered on and nearby, approve {os_pairing_request} if it appears, then try again."
+internal const val PAIRING_SECURE_LINK_NOT_READY_TEMPLATE =
+    "Android connected, but the {noun}'s secure link did not become ready. keep it powered on and nearby, then try again."
+
+internal fun pairingFailureHint(failure: PairingFailure, kind: BoardKind? = null): String = renderBoardCopy(
+    when (failure) {
+        PairingFailure.START_REJECTED -> PAIRING_START_REJECTED_TEMPLATE
+        PairingFailure.CANCELED_OR_FAILED -> PAIRING_CANCELED_OR_FAILED_TEMPLATE
+        PairingFailure.TIMED_OUT -> PAIRING_TIMED_OUT_TEMPLATE
+        PairingFailure.SECURE_LINK_NOT_READY -> PAIRING_SECURE_LINK_NOT_READY_TEMPLATE
+    },
+    kind,
+)
+
+/** Where a connect attempt stopped, in four words both apps share. The stage of a hint decides
+ *  whether the second-phone pairing note shows under it (showsPairWindowNote). The platforms'
+ *  failure causes differ (Android's are the watchdog, PairingFailure and the Detections
+ *  subscription; iOS's are its BeaconConnectionFailure cases), so each app maps its own causes
+ *  onto these stages; the stages and the predicate are the twin. TWIN: iOS ConnectFailureStage
+ *  (BLEManager.swift). */
+enum class ConnectFailureStage {
+    /** No usable link: the fresh-connect watchdog in AcabBleManager.connect gave up. */
+    LINK,
+    /** The link came up, but bonding or the secure link did not finish before the session was
+     *  ready: every PairingFailure, and the board refusing the Detections subscription (iOS maps a
+     *  refused Detections notify to `.securePairing`, the same stage). */
+    PAIRING,
+    /** The board answered, but its Detections characteristic or that characteristic's CCCD is
+     *  missing (onSubscribeFailed). */
+    PROFILE,
+    /** The encrypted Detections subscription succeeded, then the session's own setup failed: the
+     *  buffer-key store, the offline-history handshake, or a clear-log reply. */
+    SECURE_SETUP,
 }
+
+/** A connect-failure hint as AcabBleManager.connectHint publishes it: the sentence the connect
+ *  screen shows, and the stage it diagnoses. AcabApp's ConnectionHintPanel passes the stage to
+ *  showsPairWindowNote to decide the note under the sentence. One value, so the two cannot
+ *  disagree. TWIN: iOS ConnectHint (BLEManager.swift). */
+data class ConnectHint(val text: String, val stage: ConnectFailureStage)
+
+/** Does the "already paired to another phone?" note belong under a hint from this stage? Only
+ *  where a second phone's pairing can be the cause. A board that already has an owner turns a new
+ *  phone away outside its two-minute window (acabPairAdmit in the firmware's pair_window.h): the
+ *  phone then sees a connect that never completes (LINK), or a link that drops before secure
+ *  pairing finishes (PAIRING). A board that answered with a wrong profile, or a session that was
+ *  already encrypted and bonded, did not refuse this phone, so the note would send the user to
+ *  power-cycle for nothing. TWIN: iOS showsPairWindowNote (BLEManager.swift). The contract is this
+ *  case list: true for LINK and PAIRING, false for PROFILE and SECURE_SETUP. */
+internal fun showsPairWindowNote(stage: ConnectFailureStage): Boolean = when (stage) {
+    ConnectFailureStage.LINK, ConnectFailureStage.PAIRING -> true
+    ConnectFailureStage.PROFILE, ConnectFailureStage.SECURE_SETUP -> false
+}
+
+/** The hint for one PairingFailure, naming [kind] (the target's; null reads as beacon). Every
+ *  pairing terminal cause is the PAIRING stage. */
+internal fun pairingFailureConnectHint(failure: PairingFailure, kind: BoardKind?): ConnectHint =
+    ConnectHint(pairingFailureHint(failure, kind), ConnectFailureStage.PAIRING)
+
+/** The hint when the fresh-connect watchdog in AcabBleManager.connect gives up, naming [kind]
+ *  (the target's; null reads as beacon). The LINK stage, and its sentence IS the pair-window
+ *  sentence, so ConnectionHintPanel leaves its own note out (the note's text is already the
+ *  hint). iOS never uses pairWindowHint as a hint: its `.timeout` and `.transport` hints are
+ *  ConnectHint.failure, also `.link`. */
+internal fun linkWatchdogConnectHint(kind: BoardKind?): ConnectHint =
+    ConnectHint(AcabBleManager.pairWindowHint(kind), ConnectFailureStage.LINK)
+
+/** Why the session's own setup failed after the encrypted Detections subscription succeeded:
+ *  every cause is the SECURE_SETUP stage, where a second phone is never the cause. */
+internal enum class SecureSetupFailure {
+    /** startBufferHandshake could not resolve a durable buffer key (the Keystore is locked or
+     *  unreadable). */
+    BUFFER_KEY_UNAVAILABLE,
+    /** The board rejected the offline-history clear write (ConfigWritePurpose.CLEAR_LOG). */
+    CLEAR_LOG_REJECTED,
+    /** A buffer handshake write failed (failBufferHandshake). */
+    BUFFER_HANDSHAKE_FAILED,
+}
+
+/** The hint for one SecureSetupFailure. Each sentence is fixed text, not a per-kind template.
+ *  TWIN: iOS ConnectHint.secureSetup (BLEManager.swift), whose call sites pass the same three
+ *  sentences. */
+internal fun secureSetupConnectHint(failure: SecureSetupFailure): ConnectHint = ConnectHint(
+    when (failure) {
+        SecureSetupFailure.BUFFER_KEY_UNAVAILABLE -> AcabBleManager.BUFFER_KEY_UNAVAILABLE_HINT
+        SecureSetupFailure.CLEAR_LOG_REJECTED -> "Offline history was not cleared. Reconnect and try again."
+        SecureSetupFailure.BUFFER_HANDSHAKE_FAILED ->
+            "Secure offline-history setup failed. Reconnect and try again before relying on replay."
+    },
+    ConnectFailureStage.SECURE_SETUP,
+)
+
+/** The hint when the Detections subscription did not take (onSubscribeFailed), naming [kind].
+ *  [missing]: the characteristic or its CCCD is absent, so the board's profile is wrong
+ *  (PROFILE); otherwise the board or the stack refused the write, which iOS reads as a
+ *  secure-pairing failure (PAIRING). */
+internal fun detectionsSubscribeFailedHint(missing: Boolean, kind: BoardKind?): ConnectHint = ConnectHint(
+    renderBoardCopy(DETECTIONS_SUBSCRIBE_FAILED_TEMPLATE, kind),
+    if (missing) ConnectFailureStage.PROFILE else ConnectFailureStage.PAIRING,
+)
+
+/** The connected board refused the Detections subscription (onSubscribeFailed). [kind] is the
+ *  target's; null reads as beacon. */
+internal const val DETECTIONS_SUBSCRIBE_FAILED_TEMPLATE =
+    "this {noun} connected but will not send detections. turn it off and on, then try again."
+
+/** A board update retried on the same link as a quarantined attempt (startOta). [kind] is the
+ *  connected board's (targetKind, refreshed by every fw frame); null reads as beacon. Lowercase
+ *  first like the other per-kind templates; the co-processor twin is
+ *  NRF_DFU_RECONNECT_BEFORE_RETRY_TEMPLATE (NrfDfuCoordinator.kt). One template, byte for byte on
+ *  both apps. TWIN: iOS startFirmwareUpdate's otaQuarantinedPeripheralID guard
+ *  (ios/Beacons/BLE/BLEManager+OTA.swift). */
+internal const val OTA_RECONNECT_BEFORE_RETRY_TEMPLATE =
+    "reconnect to the {noun} before retrying the board update. this clears any delayed update replies from the previous attempt."
 
 /** A same-address BOND_NONE is terminal only after this attempt observed a real BONDING state. */
 internal fun shouldAcceptCurrentBondNone(
@@ -290,9 +404,14 @@ internal fun shouldStopScanBeforeDemo(state: ConnState): Boolean = state == Conn
 internal fun awaitingSecureReadiness(state: ConnState): Boolean =
     state == ConnState.CONNECTING || state == ConnState.BONDING
 
-internal fun scanStartFailureHint(featureUnsupported: Boolean): String =
+/** Why a scan did not start. [kind] is the screen's kind at that moment (the remembered board's,
+ *  since a scan that never started heard no rows); null reads as beacon. */
+internal const val SCAN_UNSUPPORTED_TEMPLATE =
+    "this phone does not support the Bluetooth scan needed to find your {noun}."
+
+internal fun scanStartFailureHint(featureUnsupported: Boolean, kind: BoardKind? = null): String =
     if (featureUnsupported) {
-        "This phone does not support the Bluetooth scan needed to find your beacon."
+        renderBoardCopy(SCAN_UNSUPPORTED_TEMPLATE, kind)
     } else {
         "Android could not start Bluetooth scanning. Make sure Bluetooth is on, then try again."
     }
@@ -509,7 +628,18 @@ data class FoundBoard(val device: BluetoothDevice, val name: String, val rssi: I
                       val owned: Boolean = false,
                       /** False only for the remembered row when no advert from it was seen this
                        *  scan. [rssi] is meaningless then and the row must not render it. */
-                      val advertSeen: Boolean = true)
+                      val advertSeen: Boolean = true,
+                      /** The kind this row's REAL advertised name implies (BoardKind.fromAdvertName
+                       *  over ScanRecord.deviceName only), carried forward per address from the last
+                       *  frame whose name named a kind (carriedAdvertHint). A copy hint, never a
+                       *  pairing input; for the remembered board it outranks the stored kind before
+                       *  connect (resolveBoardKind), since it is what the board advertises now; null for a
+                       *  nameless advert and for the remembered row until an advert merges in. Retired
+                       *  once a ready session with this board reports a fw label that names a kind
+                       *  (retirePreSessionKindHint): by then it is no longer a live sighting.
+                       *  [name] keeps its "ACAB" fallback for display plumbing, which is exactly why
+                       *  the hint is its own field. */
+                      val kindHint: BoardKind? = null)
 
 /** The board this phone last bonded with, remembered so the picker can offer it without an advert.
  *
@@ -527,18 +657,46 @@ data class FoundBoard(val device: BluetoothDevice, val name: String, val rssi: I
  *  (CoreBluetooth never exposes one) and cannot read the bond list, so the key and the forget signal
  *  differ: iOS forgets on a bond-gone connect failure, Android when bondedDevices no longer holds the
  *  board. The rest is shared and must match: REMEMBER at a bonded READY on a real link (a different
- *  board replaces it), SHOW first as one row merged by identity, titled "your beacon" with the
+ *  board replaces it), SHOW first as one row merged by identity, titled "your <kind>"
+ *  (RememberedBoardCopy.label, "your beacon" while the kind is unknown) with the
  *  RememberedBoardCopy subtitle, and CONNECT through the ordinary picked-board path. */
-internal data class RememberedBoard(val address: String, val name: String)
+internal data class RememberedBoard(
+    val address: String,
+    val name: String,
+    /** The board's kind, from its Status fw label ONLY (rememberedBoardAfterStatus), never from an
+     *  advert hint or the stored name ("ACAB" is also the nameless fallback, so a stored "ACAB" is
+     *  ambiguous). Null until the first frame of a real session stamps it, and for every record
+     *  saved before this field existed, which then reads as beacon exactly as before. Once the
+     *  Level 1 firmware stops advertising a bonded board's name, this is the ONLY source for
+     *  "your OUI-Spy" before connect, so this app change must ship before that firmware. While the
+     *  board still advertises a name, that live hint outranks this value before connect
+     *  (resolveBoardKind), so a reflashed board reads by its new image at once; the next READY
+     *  session's first frame then re-stamps this value. Kept per record, so a later remembered
+     *  LIST carries it per entry. */
+    val kind: BoardKind? = null,
+)
 
 /** SharedPreferences keys (the private "acab" file) for [RememberedBoard]. Named once so the seed
- *  read, the write and the forget cannot drift onto different spellings. */
+ *  read, the write and the forget cannot drift onto different spellings. The kind key holds
+ *  BoardKind.raw; iOS keeps the same raw value under rememberedBoardKind. */
 internal const val PREF_REMEMBERED_BOARD_ADDRESS = "remembered_board_address"
 internal const val PREF_REMEMBERED_BOARD_NAME = "remembered_board_name"
+internal const val PREF_REMEMBERED_BOARD_KIND = "remembered_board_kind"
 
 /** The row title when neither the link nor the remembered value has a name: the same fallback the
  *  scan callback uses for a nameless advert. */
 internal const val REMEMBERED_BOARD_FALLBACK_NAME = "ACAB"
+
+/** LOAD. The remembered record from its three stored prefs values, or null when no address is
+ *  stored. Migration: a record saved before the kind key existed, or an unknown raw value from a
+ *  newer build, loads with an unknown kind and reads as beacon until the next connect stamps it.
+ *  The kind is never inferred from the stored name. iOS twin: RememberedBoardStore.load in
+ *  ios/Beacons/BLE/RememberedBoard.swift. */
+internal fun rememberedBoardFromStored(address: String?, name: String?, kindRaw: String?): RememberedBoard? {
+    val id = address?.takeIf { it.isNotBlank() } ?: return null
+    return RememberedBoard(id, name?.takeIf { it.isNotBlank() } ?: REMEMBERED_BOARD_FALLBACK_NAME,
+        kind = BoardKind.fromRaw(kindRaw))
+}
 
 /** REMEMBER. What to hold after a link reaches READY. Returns [current] unchanged (same instance)
  *  when nothing should move, so the caller can skip the write by identity.
@@ -560,8 +718,43 @@ internal fun rememberedBoardAfterReady(
         ?: current?.name?.takeIf { sameBoard }
         ?: REMEMBERED_BOARD_FALLBACK_NAME
     if (sameBoard && current!!.name == name) return current
-    return RememberedBoard(address, name)
+    // The same board keeps its stamped kind, like the name rule above. A different board starts
+    // unknown: its first Status frame stamps it about a second later (rememberedBoardAfterStatus),
+    // and until then the connect target's own kind covers the checklist title.
+    return RememberedBoard(address, name, kind = current?.kind?.takeIf { sameBoard })
 }
+
+/** STAMP. What to hold after a Status frame of a READY, non-demo session from [address]: the
+ *  remembered record with the kind its fw label implies. Returns [current] unchanged (same
+ *  instance) when nothing should move, so the caller skips the write by identity: sample data, no
+ *  record, a frame from a board other than the remembered one, a label that names no kind, or a
+ *  kind already stored. Only the fw label is ever stored, never an advert hint.
+ *  iOS twin: BLEManager.stampRememberedBoardKind(from:) (ios/Beacons/BLE/BLEManager.swift). */
+internal fun rememberedBoardAfterStatus(
+    current: RememberedBoard?,
+    address: String?,
+    firmwareLabel: String?,
+    demoMode: Boolean,
+): RememberedBoard? {
+    if (demoMode || current == null || address.isNullOrBlank()) return current
+    if (!current.address.equals(address, ignoreCase = true)) return current
+    val kind = BoardKind.fromFirmwareLabel(firmwareLabel) ?: return current
+    if (kind == current.kind) return current
+    return current.copy(kind = kind)
+}
+
+/** RETIRE: does this Status frame retire the connected board's pre-session scan hint
+ *  (AcabBleManager.retirePreSessionKindHint)? Only a real, ready session counts (never sample
+ *  data), only when the row still carries a hint, and only a fw label that names a kind: that
+ *  label has just stamped the stored kind and the target kind, so a sighting from before the
+ *  session must not outrank it after a drop or a disconnect. A label that names no kind leaves
+ *  the hint in place. TWIN: iOS statusFrameRetiresKindHint in ios/Beacons/BLE/RememberedBoard.swift. */
+internal fun statusFrameRetiresKindHint(
+    firmwareLabel: String?,
+    rowHint: BoardKind?,
+    sessionReady: Boolean,
+    demoMode: Boolean,
+): Boolean = sessionReady && !demoMode && rowHint != null && BoardKind.fromFirmwareLabel(firmwareLabel) != null
 
 /** What a lookup of the remembered board decided. */
 internal enum class RememberedBoardLookup {
@@ -629,16 +822,21 @@ internal fun pickerRows(found: List<FoundBoard>, remembered: FoundBoard?): List<
 /** Shared picker copy for the remembered row. iOS twin: ios/Beacons/BLE/RememberedBoard.swift
  *  RememberedBoardCopy, byte-identical. The dot is U+00B7. Lowercase-first, no em-dashes. */
 internal object RememberedBoardCopy {
-    const val LABEL = "your beacon"
+    /** The row title, rendered per kind through renderBoardCopy ("your OUI-Spy"). */
+    const val LABEL_TEMPLATE = "your {noun}"
     const val NO_SIGNAL = "no live signal \u00B7 tap to connect"
     const val SEEN = "tap to connect"
 
-    /** The row's secondary line: "<name> · <state>", or just the state when the name is blank.
-     *  Mirrors ConnectView.boardRowSubtitle. */
-    fun subtitle(name: String, advertSeen: Boolean): String {
-        val state = if (advertSeen) SEEN else NO_SIGNAL
-        return if (name.isBlank()) state else "$name \u00B7 $state"
-    }
+    /** The row title for the remembered board's kind (its live advert hint, else the stored fw
+     *  kind; resolveBoardKind); null reads "your beacon". */
+    fun label(kind: BoardKind?): String = renderBoardCopy(LABEL_TEMPLATE, kind)
+
+    /** The row's secondary line: the live-signal state alone. It used to lead with the advertised
+     *  name ("ACAB · tap to connect"), which contradicted a "your OUI-Spy" title and never told two
+     *  boards apart, since every board of one kind advertises the same name.
+     *  Mirrors iOS RememberedBoardCopy.subtitle(hasSignal:), drawn by ConnectView.swift
+     *  boardPickerRowSubtitle. */
+    fun subtitle(advertSeen: Boolean): String = if (advertSeen) SEEN else NO_SIGNAL
 }
 
 /** The most recent LIVE sighting (category + wall-clock last-seen), for the Drive-mode
@@ -992,9 +1190,26 @@ internal data class DetectionExportRowSnapshot(
     val firstSeenMs: Long?,
     val timeBasis: TimeBasis,
     val observerCoord: Pair<Double, Double>?,
+    /** When the row was last heard, frozen with the rest of the row so a paused Log keeps its
+     *  Active cut and time sections as they were at the pause. Not a CSV column:
+     *  [AcabBleManager.renderDetectionsCsv] never reads it. No second time basis sits beside it:
+     *  the Log's trust rule is the row's own offline flag plus [timeBasis], live and paused alike.
+     *  TWIN: iOS BLEManager.CSVRowInput.lastSeen (iOS also freezes lastSeenBasis, because its Log
+     *  resolves the basis of this stamp rather than reading the offline flag). */
+    val lastSeenMs: Long? = null,
 )
 
-internal data class DetectionExportSnapshot(val rows: List<DetectionExportRowSnapshot>)
+internal data class DetectionExportSnapshot(val rows: List<DetectionExportRowSnapshot>) {
+    /** The frozen last-seen stamps by id, rows without one dropped (never kept as 0), the shape
+     *  [AcabBleManager.logLastSeenSnapshot] returns live. One pass over the rows: call it once per
+     *  snapshot (a remember keyed on the frozen export), never per row or per tick.
+     *  TWIN: iOS DetectionExportSnapshot.lastSeen(for:). */
+    fun lastSeenMsById(): Map<String, Long> {
+        val out = HashMap<String, Long>(rows.size)
+        for (row in rows) row.lastSeenMs?.let { out[row.detection.id] = it }
+        return out
+    }
+}
 
 /** Process-level location ownership rule. A visible READY link may use the Activity's
  * while-in-use grant; background Drive mode may use it only after its foreground service is
@@ -1257,15 +1472,21 @@ enum class MuteRuleStatus {
 /** "Heard recently enough to count as nearby now": the ONE Android owner of that window. It is the
  *  default for [lastSeenIsNearby] (Live Mode's ongoing notification, through
  *  [AcabBleManager.nearbySnapshot]), [lastSeenIsStale], [AcabBleManager.freshIdSet] (the Status
- *  counts) and [AcabBleManager.isStale] (the dossier's SIGNAL LIVE/STALE kicker in DetailScreen),
+ *  counts) and [AcabBleManager.isStale] (the dossier's SIGNAL section LIVE/STALE word in DetailScreen),
  *  so those cannot drift apart, and StatusScreen builds its "SEEN < 45s"
- *  STATUS_SEEN_WINDOW_KICKER from it. Kept pure for policy tests. TWIN: iOS
+ *  STATUS_SEEN_WINDOW_KICKER from it, and [LOG_ACTIVE_SECTION_HEADER] the Log copy "heard in the
+ *  last 45 s"; [activeBoundary] (the Log's Active cut) defaults to it. Kept pure for policy tests.
+ *  TWIN: iOS
  *  `activeNearbyInterval` in BLEManager.swift (45 s), the default for its lastSeenIsNearby (Live
  *  Mode), lastSeenIsStale (Status) and BLEManager.isStale(for:olderThan:asOf:) (its dossier
  *  kicker), and the source of DashboardSnapshot.seenWindowKicker. check-signature-drift.py
  *  ("active nearby window") compares the pair, seconds times 1000 against milliseconds, so a
  *  retune on one phone fails it. */
 internal const val ACTIVE_NEARBY_WINDOW_MS = 45_000L
+/** The Log's first time-section header under the Newest sort, built from
+ *  [ACTIVE_NEARBY_WINDOW_MS] so the copy cannot disagree with the window that fills the section.
+ *  TWIN: iOS BLEManager.activeSectionHeader in BLEManager.swift. */
+internal val LOG_ACTIVE_SECTION_HEADER = "heard in the last ${ACTIVE_NEARBY_WINDOW_MS / 1_000L} s"
 /** Default Map history lens. A row must have a trustworthy wall-clock last-seen inside this
  * window to appear in Recent; approximate replay ordering keys belong to All history only.
  *
@@ -1314,6 +1535,48 @@ internal fun lastSeenIsStale(
 ): Boolean {
     if (lastSeenAt == null) return true
     return now - lastSeenAt > olderThanMs
+}
+
+/** The Log's newest-first stamps made safe for [activeBoundary]'s binary search. A null stamp
+ *  becomes 0L, then a running minimum from the front makes the result non-increasing. The feed is
+ *  published newest-first, but a row can be heard again after that publish, so its current stamp
+ *  can be newer than its position says; the envelope files it with its predecessor. The error is
+ *  "stale for at most one publish interval", never "a stale row counted fresh". O(n): call it once
+ *  per feed emission, never per tick.
+ *
+ *  Why 0L (the epoch) and not Long.MIN_VALUE: [lastSeenIsStale] computes `now - lastSeenAt`, and
+ *  `now - Long.MIN_VALUE` wraps to a large negative number, so that sentinel would read FRESH.
+ *  Against an epoch-ms clock (every caller passes System.currentTimeMillis() or a stamp taken from
+ *  it) `now - 0L` is far over the window, so 0L reads stale with no special case.
+ *  TWIN: iOS newestFirstEnvelope in BLEManager.swift (sentinel .distantPast). */
+internal fun newestFirstEnvelope(stamps: List<Long?>): LongArray {
+    val out = LongArray(stamps.size)
+    var floor = Long.MAX_VALUE
+    for (i in stamps.indices) {
+        floor = minOf(floor, stamps[i] ?: 0L)
+        out[i] = floor
+    }
+    return out
+}
+
+/** How many leading rows of a non-increasing stamp array ([newestFirstEnvelope]'s output) are
+ *  still inside the window: the first index that [lastSeenIsStale] calls stale, `stamps.size` when
+ *  none is, 0 when all are. The same one-sided rule Status uses, so a 45 s old stamp is still
+ *  active and the 0L sentinel is stale with no special case. Binary search, O(log n), no
+ *  allocation, so the Log's 1 s tick can run it without walking rows.
+ *  TWIN: iOS activeBoundary in BLEManager.swift. */
+internal fun activeBoundary(
+    stamps: LongArray,
+    nowMs: Long,
+    olderThanMs: Long = ACTIVE_NEARBY_WINDOW_MS,
+): Int {
+    var lo = 0
+    var hi = stamps.size
+    while (lo < hi) {
+        val mid = (lo + hi) ushr 1
+        if (lastSeenIsStale(stamps[mid], nowMs, olderThanMs)) hi = mid else lo = mid + 1
+    }
+    return lo
 }
 
 /** A device the user has chosen to silence. Optional fields keep old permanent rows compatible. */
@@ -1395,6 +1658,65 @@ internal fun unrepresentedBoardRuleCount(
 /** Sample detections temporarily replace the in-memory store, but must never mutate the retained
  * real log or its New watermark on disk. */
 internal fun persistedLogMutationAllowed(demoMode: Boolean): Boolean = !demoMode
+
+/** The sample seed's "new" baseline. Twin of iOS `sampleFirstSeen(flaggedNew:seededAt:)` and
+ * `sampleSeenWatermark(seededAt:)` (BLEManager.swift); same offsets on both, in ms here and in
+ * seconds there. A row the seed flags `"new": true` is first seen AT the seed time; an unflagged
+ * row 2 s before it; the in-memory watermark sits 1 s before it. The Log's New lens compares
+ * `first > watermark`, so exactly the flagged rows read new and the rest read seen. The 2 s shift
+ * is invisible: Last seen reads "now" in sample data and a First seen under 5 s also reads "now". */
+internal fun sampleFirstSeenMs(flaggedNew: Boolean, seededAtMs: Long): Long =
+    if (flaggedNew) seededAtMs else seededAtMs - 2_000L
+
+/** See [sampleFirstSeenMs]. Memory only: sample data never writes a watermark to prefs. */
+internal fun sampleSeenWatermarkMs(seededAtMs: Long): Long = seededAtMs - 1_000L
+
+/** The six sample detections, one per category the Status strip, the Log tools menu and the Map
+ * chips all show: ALPR, DRONE, BODY CAM, TRACKER, GLASSES and network camera. Exactly six, so the
+ * demo status "total" matches the seed count and lines up with the iOS tour's seed set (iOS
+ * `demoSampleRows()` in BLEManager.swift carries the same rows). Four carry `"new": true`
+ * (ALPR, drone, glasses, netcam); [sampleFirstSeenMs] turns that flag into the Log's New count. */
+internal val DEMO_SAMPLE_ROWS: List<String> = listOf(
+    // Wire values are the firmware's own, to the same standard as the netcam row below.
+    // A BLE advert whose name trips the loose "Flock" prefix (flock_signatures.h's
+    // FLOCK_NAME_PREFIX entry) AND carries mfg 0x09C8 lands on flock_detect.cpp's
+    // `(nm == NM_LITERAL || mfgHit) ? 80 : 70` arm, so: s=0 SRC_BLE, meth=2 M_NAME,
+    // c=80, cid=0x09C8 (the only ID in FLOCK_MFG_IDS, and what earns the 80 over 70).
+    // This row used to read meth=1/c=95, which no board can put on the wire three times
+    // over: 95 is above the ALPR ceiling of 88 (the WiFi SSID arm), both OUI arms ride
+    // at 65 (BLE) and 68 (WiFi), and the name arm returns BEFORE the OUI arm, so a
+    // device broadcasting "FlockSafety" can never be reported as an OUI hit at all.
+    // The twin row in iOS demoSampleRows() carries the same values.
+    """{"t":1,"s":0,"meth":2,"c":80,"mac":"AC:AB:00:7F:2A:10","rssi":-54,"name":"FlockSafety","cid":2504,"lat":37.7799,"lon":-122.4202,"n":12,"new":true}""",
+    """{"t":4,"s":2,"meth":7,"c":99,"mac":"DA:7E:E0:44:21:09","rssi":-61,"id":"1581F4FED0A2B7","lat":37.7816,"lon":-122.4169,"plat":37.7821,"plon":-122.4151,"alt":84,"n":1,"new":true}""",
+    // The body cam row is the firmware's Axon OUI-only arm (axon_detect.cpp, the
+    // sigHit branch): an address on Axon's registered 00:25:DF block, s=0 SRC_BLE,
+    // meth=1 M_OUI, c=75 (AXON_REGISTRY_CANDIDATE's baseConfidence), detail "Axon OUI"
+    // verbatim, so bodyCamSigDetail resolves and the dossier names the signature. -88
+    // dBm is what the owner-verified OUI-only field hits read. It used to carry meth=3 /
+    // c=45 and no detail, which no board sends for a body cam, and the dossier then
+    // called this LIVE row a replay from the offline buffer (J3). The twin row in iOS
+    // demoSampleRows() carries the same values.
+    """{"t":3,"s":0,"meth":1,"c":75,"mac":"00:25:DF:BA:7C:33","rssi":-88,"det":"Axon OUI","n":1}""",
+    """{"t":5,"s":0,"meth":3,"c":85,"mac":"4C:00:12:19:AA:BB","rssi":-72,"det":"Apple Find My (offline)","cid":76,"lat":37.7791,"lon":-122.4196,"n":3}""",
+    // VERBATIM from glasses_signatures.h. These seeds must carry the firmware's real
+    // strings, not a prettified paraphrase: `maker` parses them, so a paraphrase would
+    // demo the OLD behaviour (a row reading "Recording glasses") while real hardware
+    // shows the new one. This one resolves to "Meta".
+    // MAC/rssi/lat/lon are the iOS row's, verbatim: the two tours must seed the SAME six
+    // devices, and this row was the only one that had drifted (a different MAC, so a
+    // different Detection id, plus its own rssi and its own spot on the map). iOS also
+    // carries "rnd": true here; Android has no `rnd` wire field and derives randomization
+    // from the LAA bit instead (Models.kt), and 0x1A has it set, so both read randomized.
+    """{"t":9,"s":0,"meth":3,"c":60,"mac":"1A:2B:3C:4D:5E:6F","rssi":-71,"det":"Meta: possible recording glasses or Quest","cid":1422,"lat":37.7795,"lon":-122.4193,"n":2,"new":true}""",
+    // Branded IP-camera OUI seen on the host WiFi (matched by source MAC), so the NETCAM
+    // tile and NETWORK CAM map chip both show up on the tour. The MAC is a real Hikvision
+    // block, so this row demonstrates the maker-led title end to end. Wire values are the
+    // firmware's own: s=1 is SRC_WIFI (netcamClassifyWiFi never emits a BLE source) and
+    // c=65 is NETCAM_OUI_CONFIDENCE, the registry tier a validated=0 block lands on; the
+    // twin row in iOS demoSampleRows() carries the same values.
+    """{"t":10,"s":1,"meth":1,"c":65,"mac":"44:19:B6:22:0A:5C","rssi":-70,"det":"Hikvision on wifi","lat":37.7788,"lon":-122.4183,"n":2,"new":true}""",
+)
 
 internal enum class ManagedListEditMode { PREVIEW_ONLY, LOADING_FAIL_CLOSED, DURABLE }
 
@@ -1756,6 +2078,24 @@ class AcabBleManager(private val context: Context) {
     private val _rememberedRow = MutableStateFlow<FoundBoard?>(null)
     val rememberedRow: StateFlow<FoundBoard?> = _rememberedRow.asStateFlow()
 
+    /** The remembered record's stored kind (RememberedBoard.kind), published whenever the record
+     *  changes (seed, READY, the first-frame stamp, forget), so the connect screen reads "your
+     *  OUI-Spy" without a relaunch. Independent of [rememberedRow]: the record outlives a hidden
+     *  row (radio off, no permission), and the Bluetooth-off line still names the owner's board.
+     *  Seeded by the [rememberedBoard] initializer, which is declared after it. */
+    private val _rememberedKind = MutableStateFlow<BoardKind?>(null)
+    val rememberedKind: StateFlow<BoardKind?> = _rememberedKind.asStateFlow()
+
+    /** The kind of the board being connected, paired, reconnected or last failed on: resolved at
+     *  [connect] from the picked row (its live advert hint, else the stored kind for the
+     *  remembered board; resolveBoardKind),
+     *  replaced by the live fw kind on every Status frame, and KEPT through a drop (the status is
+     *  cleared then), so the reconnect panel, the reconnect banner, the OTA wait screen and every
+     *  failure hint name the right board. Only the next connect replaces it. Main-thread and binder
+     *  writes both go through the StateFlow, which is thread-safe. */
+    private val _targetKind = MutableStateFlow<BoardKind?>(null)
+    val targetKind: StateFlow<BoardKind?> = _targetKind.asStateFlow()
+
     private val _scanHint = MutableStateFlow<String?>(null)
     val scanHint: StateFlow<String?> = _scanHint.asStateFlow()
 
@@ -1806,6 +2146,7 @@ class AcabBleManager(private val context: Context) {
             linkReady = { gatt != null && _state.value == ConnState.READY },
             statusRevisionProvider = { statusRevision.get() },
             protectedHoldReady = { driveServiceActive },
+            boardKindProvider = { _targetKind.value },
         )
     }
 
@@ -1893,6 +2234,9 @@ class AcabBleManager(private val context: Context) {
     // and the baseline is the smallest stamp seen, not the largest. Starts at the base (nothing
     // marked seen yet) so a first drain reads as new rather than as already-read.
     private var approxWatermark = HIST_PSEUDO_BASE
+    // (seenWatermark, approxWatermark) as they stood when sample data opened; exitDemo restores
+    // them. Null outside sample data. Main-thread only, like the demo entry and exit it serves.
+    private var demoSeenWatermarkSnapshot: Pair<Long, Long>? = null
 
     // ---- offline-log replay UX ----
     // True from the moment a reconnect requests the buffer replay (sendHandshake) until the
@@ -1980,13 +2324,11 @@ class AcabBleManager(private val context: Context) {
      *  read is this field, never prefs. Written from finishReady (a binder thread) and cleared from
      *  refreshRememberedBoard (main), hence @Volatile. Declared after [prefs] because a property
      *  initializer that ran before it would read a null file. */
-    @Volatile private var rememberedBoard: RememberedBoard? = run {
-        val address = prefs.getString(PREF_REMEMBERED_BOARD_ADDRESS, null)?.takeIf { it.isNotBlank() }
-        address?.let {
-            RememberedBoard(it, prefs.getString(PREF_REMEMBERED_BOARD_NAME, null)
-                ?.takeIf { n -> n.isNotBlank() } ?: REMEMBERED_BOARD_FALLBACK_NAME)
-        }
-    }
+    @Volatile private var rememberedBoard: RememberedBoard? = rememberedBoardFromStored(
+        address = prefs.getString(PREF_REMEMBERED_BOARD_ADDRESS, null),
+        name = prefs.getString(PREF_REMEMBERED_BOARD_NAME, null),
+        kindRaw = prefs.getString(PREF_REMEMBERED_BOARD_KIND, null),
+    ).also { _rememberedKind.value = it?.kind }
     private fun newManagedListClearIntent(key: String) = ManagedListClearIntent(
         readStored = { prefs.getBoolean("${key}_clear_pending", false) },
         writeStored = { pending ->
@@ -2641,7 +2983,10 @@ class AcabBleManager(private val context: Context) {
                 teardownForBluetoothPermissionRevocation()
                 return
             }
-            val name = result.scanRecord?.deviceName ?: safeDeviceName(dev) ?: "ACAB"
+            // The REAL advertised name, kept apart from the display name below: the kind hint may
+            // read only this, never the cached GAP name or the "ACAB" fallback (BoardKind.fromAdvertName).
+            val advertName = result.scanRecord?.deviceName
+            val name = advertName ?: safeDeviceName(dev) ?: "ACAB"
             // Firmware version rides our 0xACAB scan-response manufacturer data (matches the iOS
             // parse). It arrives a callback or two after the first advert, so keep the last-seen
             // value if this frame doesn't carry it.
@@ -2670,7 +3015,11 @@ class AcabBleManager(private val context: Context) {
                 android.util.Log.d("ACAB-scan", "board $name addr=$address type=$kind rssi=${result.rssi}")
             }
             val prev = _found.value.firstOrNull { safeDeviceAddress(it.device) == address }
-            val board = FoundBoard(dev, name, result.rssi, fw ?: prev?.firmware, now)
+            // A frame with no name (a scan response, or a primary advert that dropped it) or with a
+            // name no kind claims keeps the hint an earlier frame from the same address gave, as
+            // the firmware field does (carriedAdvertHint; the iOS rule too).
+            val kindHint = carriedAdvertHint(advertName, prev?.kindHint)
+            val board = FoundBoard(dev, name, result.rssi, fw ?: prev?.firmware, now, kindHint = kindHint)
             // Drop entries not heard from recently. Keying on address is still right (it is what
             // distinguishes two real boards from each other), but with address privacy on, an
             // address the board has rotated away from would sit in the picker forever as a
@@ -2714,8 +3063,11 @@ class AcabBleManager(private val context: Context) {
             }
             // Anything else (registration failed, unsupported, internal error): the scan is
             // dead. Retain the terminal cause so UI does not misreport it as an empty scan.
+            // A scan that never started heard no rows, so the screen's kind is the remembered
+            // board's (resolveScreenKind rule 2), or beacon.
             _scanHint.value = scanStartFailureHint(
                 featureUnsupported = errorCode == ScanCallback.SCAN_FAILED_FEATURE_UNSUPPORTED,
+                kind = _rememberedKind.value,
             )
             _state.value = restingState()
         }
@@ -2806,6 +3158,9 @@ class AcabBleManager(private val context: Context) {
      *  Guarded like every other BluetoothDevice call here: without BLUETOOTH_CONNECT (API 31+) and
      *  the scan permission connect() needs, no row is listed and the memory is kept. */
     fun refreshRememberedBoard() {
+        // DEBUG hook (applyDebugBoardKind): the display-only row stands in for the record, and no
+        // bond lookup runs, so nothing can FORGET the real record on its behalf.
+        debugRememberedRow()?.let { _rememberedRow.value = it; return }
         val held = rememberedBoard ?: run { _rememberedRow.value = null; return }
         val permitted = hasConnectPermission() && hasScanPermission()
         val radioOn = permitted && runCatching { adapter?.isEnabled == true }.getOrDefault(false)
@@ -2842,7 +3197,27 @@ class AcabBleManager(private val context: Context) {
         prefs.edit()
             .remove(PREF_REMEMBERED_BOARD_ADDRESS)
             .remove(PREF_REMEMBERED_BOARD_NAME)
+            .remove(PREF_REMEMBERED_BOARD_KIND)
             .apply()
+        publishRememberedKind()
+    }
+
+    /** Republish [rememberedKind] from the held record (or the DEBUG stand-in). Called under
+     *  [rememberedBoardLock] after every record change, so the flow never trails the record. */
+    private fun publishRememberedKind() {
+        _rememberedKind.value = debugBoardKind ?: rememberedBoard?.kind
+    }
+
+    /** Persist [next] whole: address, name, and the kind key, removed while the kind is unknown so a
+     *  READY on a different board cannot leave the old board's kind behind. */
+    private fun writeRememberedBoard(next: RememberedBoard) {
+        val editor = prefs.edit()
+            .putString(PREF_REMEMBERED_BOARD_ADDRESS, next.address)
+            .putString(PREF_REMEMBERED_BOARD_NAME, next.name)
+        val kind = next.kind
+        if (kind != null) editor.putString(PREF_REMEMBERED_BOARD_KIND, kind.raw)
+        else editor.remove(PREF_REMEMBERED_BOARD_KIND)
+        editor.apply()
     }
 
     /** REMEMBER, from finishReady: this link is bonded and the ACAB service is confirmed (READY
@@ -2858,11 +3233,91 @@ class AcabBleManager(private val context: Context) {
             val next = rememberedBoardAfterReady(held, address, linkName, bonded, _demoMode.value)
             if (next === held || next == null) return
             rememberedBoard = next
-            prefs.edit()
-                .putString(PREF_REMEMBERED_BOARD_ADDRESS, next.address)
-                .putString(PREF_REMEMBERED_BOARD_NAME, next.name)
-                .apply()
+            writeRememberedBoard(next)
+            publishRememberedKind()
         }
+    }
+
+    /** True once this READY session's first Status frame has been offered to the kind stamp.
+     *  Cleared in finishReady, set by the Status handler, both on the GATT callback thread. */
+    @Volatile private var kindStampDone = false
+
+    /** STAMP, from the first Status frame of a READY, non-demo session (see
+     *  rememberedBoardAfterStatus): store the kind the fw label names on the remembered record,
+     *  once, and only when it is new. Same lock as the READY write, so a stamp can never land on a
+     *  record a concurrent READY just replaced. TWIN: iOS BLEManager.stampRememberedBoardKind(from:). */
+    private fun stampRememberedKind(device: BluetoothDevice?, firmwareLabel: String) {
+        val address = device?.let(::safeDeviceAddress)
+        synchronized(rememberedBoardLock) {
+            val held = rememberedBoard
+            val next = rememberedBoardAfterStatus(held, address, firmwareLabel, _demoMode.value)
+            if (next === held || next == null) return
+            rememberedBoard = next
+            writeRememberedBoard(next)
+            publishRememberedKind()
+        }
+    }
+
+    /** The scan row this session started from keeps its pre-connect hint after the scan stops, but
+     *  once this ready session's own fw label names a kind, a name heard BEFORE the session is no
+     *  longer the live evidence: the board may have been reflashed since, and the label has just
+     *  stamped the stored kind. Retire the hint, so after a drop or a disconnect the picker row
+     *  (pickerRowKind) does not rank a stale sighting above that stamp; the next scan hears the
+     *  name again. Before that label lands the hint stays, so a reflashed board's checklist does
+     *  not fall back to the old stored kind for the second before the first frame. Offered every
+     *  frame (a list lookup, and a write only when a hint goes); the rule is the pure
+     *  statusFrameRetiresKindHint (unit-tested). An atomic update, since this runs on the GATT
+     *  callback thread and the scan callback writes _found on its own.
+     *  TWIN: iOS BLEManager.retirePreSessionKindHint(firmwareLabel:). */
+    private fun retirePreSessionKindHint(device: BluetoothDevice?, firmwareLabel: String?) {
+        if (_found.value.isEmpty()) return
+        val address = device?.let(::safeDeviceAddress) ?: return
+        val ready = _state.value == ConnState.READY
+        val demo = _demoMode.value
+        _found.update { rows ->
+            val i = rows.indexOfFirst { safeDeviceAddress(it.device) == address }
+            if (i < 0 || !statusFrameRetiresKindHint(firmwareLabel, rows[i].kindHint, ready, demo)) rows
+            else rows.toMutableList().also { it[i] = it[i].copy(kindHint = null) }
+        }
+    }
+
+    // ---- DEBUG board-kind hook (MainActivity EXTRA_BOARD_KIND; iOS twin: the -boardKind launch
+    // argument parsed in ACABApp.swift) ----
+
+    /** The kind a DEBUG launch asked the screens to show, or null. Memory only: never written to
+     *  prefs, never read by a pairing path, and never set in a release build (applyDebugBoardKind
+     *  bails on !BuildConfig.DEBUG as well as the caller). */
+    @Volatile private var debugBoardKind: BoardKind? = null
+
+    /** DEBUG builds only: show the screens as if this phone remembered a board of [kind].
+     *  Two effects, both display-only: the connect screen lists a synthetic remembered row
+     *  ("your OUI-Spy", no live signal, no address line, a tap does nothing) with
+     *  [rememberedKind] reading [kind]; and sample data (seedDemoData) reports that kind's real fw label and advert name, so the
+     *  Beacon hero can be screenshotted per kind. The real remembered record is untouched. */
+    fun applyDebugBoardKind(kind: BoardKind) {
+        if (!tech.acab.app.BuildConfig.DEBUG) return
+        synchronized(rememberedBoardLock) {
+            debugBoardKind = kind
+            publishRememberedKind()
+        }
+        refreshRememberedBoard()
+    }
+
+    /** The DEBUG stand-in row, or null outside the hook. A locally administered placeholder address
+     *  no real board advertises; getRemoteDevice needs no permission and makes no radio call. */
+    private fun debugRememberedRow(): FoundBoard? {
+        val kind = debugBoardKind ?: return null
+        val device = runCatching { adapter?.getRemoteDevice(DEBUG_REMEMBERED_ADDRESS) }.getOrNull()
+            ?: return null
+        return FoundBoard(device, debugAdvertName(kind), rssi = Int.MIN_VALUE, owned = true, advertSeen = false)
+    }
+
+    /** What a board of [kind] advertises (BoardKind.fromAdvertName, read backwards), for the DEBUG
+     *  stand-ins only. */
+    private fun debugAdvertName(kind: BoardKind): String = when (kind) {
+        BoardKind.BEACON -> "beacon"
+        BoardKind.OUI_SPY -> "ACAB"
+        BoardKind.MESH_DETECT -> "ACAB-mesh"
     }
 
     // ---- connection ----
@@ -2872,11 +3327,20 @@ class AcabBleManager(private val context: Context) {
      *  has never bonded may only pair in the two minutes after power-on, and outside that the board
      *  refuses at connect (see ACAB_PAIR_WINDOW_MS in the firmware). The board cannot tell us why,
      *  because it hangs up before any characteristic exists to be read, so the app offers the one
-     *  recovery that covers this and most other stuck states. Mirrors iOS BLEManager.connectHint. */
-    private val _connectHint = MutableStateFlow<String?>(null)
-    val connectHint: StateFlow<String?> = _connectHint.asStateFlow()
+     *  recovery that covers this and most other stuck states. Mirrors iOS BLEManager.connectHint.
+     *  Each hint carries its ConnectFailureStage, so the connect screen draws the pair-window note
+     *  only where a second phone can be the cause (showsPairWindowNote). */
+    private val _connectHint = MutableStateFlow<ConnectHint?>(null)
+    val connectHint: StateFlow<ConnectHint?> = _connectHint.asStateFlow()
+
+    /** Publish a pairing terminal cause's hint, named for the board being connected. */
+    private fun showPairingFailure(failure: PairingFailure) {
+        _connectHint.value = pairingFailureConnectHint(failure, _targetKind.value)
+    }
 
     fun connect(board: FoundBoard) {
+        // The DEBUG stand-in row is display-only: a tap on it reaches no radio call.
+        if (debugBoardKind != null && safeDeviceAddress(board.device) == DEBUG_REMEMBERED_ADDRESS) return
         if (!hasConnectPermission() || !hasScanPermission()) {
             _state.value = ConnState.DISCONNECTED
             return
@@ -2901,6 +3365,15 @@ class AcabBleManager(private val context: Context) {
         _state.value = ConnState.CONNECTING
         target = board.device
         _deviceName.value = board.name
+        // Not connected yet, so no fw kind: the row's live advert hint, else the stored kind when
+        // this is the remembered board (the picker marks only that row owned), so a reflashed
+        // remembered board is named by what it advertises now. The first Status frame replaces it
+        // with the fw kind.
+        _targetKind.value = resolveBoardKind(
+            firmwareLabel = null,
+            storedKind = rememberedBoard?.kind?.takeIf { board.owned },
+            advertHint = board.kindHint,
+        )
         // (bondReceiver is registered for the process lifetime next to its declaration: every
         // path that can land STATE_CONNECTED on an unbonded board needs it, not just this one.)
         //
@@ -2923,7 +3396,7 @@ class AcabBleManager(private val context: Context) {
                     target = null
                     _deviceName.value = null
                     _state.value = ConnState.DISCONNECTED
-                    if (!sessionWasReady) _connectHint.value = PAIR_WINDOW_HINT
+                    if (!sessionWasReady) _connectHint.value = linkWatchdogConnectHint(_targetKind.value)
                     if (appForegrounded && hasScanPermission() && hasConnectPermission() &&
                         runCatching { adapter?.isEnabled == true }.getOrDefault(false)) startScan()
                 }
@@ -3277,7 +3750,7 @@ class AcabBleManager(private val context: Context) {
                 if (attemptGeneration == bondAttemptGeneration.get() &&
                     _state.value == ConnState.BONDING && targetAddress == expectedAddress &&
                     !userInitiatedDisconnect) {
-                    _connectHint.value = pairingFailureHint(PairingFailure.TIMED_OUT)
+                    showPairingFailure(PairingFailure.TIMED_OUT)
                     disconnect()
                 }
             }
@@ -3299,7 +3772,7 @@ class AcabBleManager(private val context: Context) {
                 if (generation == secureReadyGeneration.get() && awaitingReady &&
                     targetAddress == expectedAddress &&
                     !userInitiatedDisconnect) {
-                    _connectHint.value = pairingFailureHint(PairingFailure.SECURE_LINK_NOT_READY)
+                    showPairingFailure(PairingFailure.SECURE_LINK_NOT_READY)
                     disconnect()
                 }
             }
@@ -3369,7 +3842,7 @@ class AcabBleManager(private val context: Context) {
                                 d.connectGatt(context, false, gattCb, BluetoothDevice.TRANSPORT_LE)
                             }.getOrNull()
                             if (gatt == null) {
-                                _connectHint.value = pairingFailureHint(PairingFailure.SECURE_LINK_NOT_READY)
+                                showPairingFailure(PairingFailure.SECURE_LINK_NOT_READY)
                                 disconnect()
                             }
                         }
@@ -3395,7 +3868,7 @@ class AcabBleManager(private val context: Context) {
                             previousStateWasBonding = previousStateWasBonding,
                             platformStateIsNone = platformStateIsNone,
                         )) {
-                        _connectHint.value = pairingFailureHint(PairingFailure.CANCELED_OR_FAILED)
+                        showPairingFailure(PairingFailure.CANCELED_OR_FAILED)
                         disconnect()
                     }
                 }
@@ -3456,7 +3929,7 @@ class AcabBleManager(private val context: Context) {
                     armSecureReadyTimeout(g.device)
                     val discoveryStarted = runCatching { g.discoverServices() }.getOrDefault(false)
                     if (!discoveryStarted) {
-                        _connectHint.value = pairingFailureHint(PairingFailure.SECURE_LINK_NOT_READY)
+                        showPairingFailure(PairingFailure.SECURE_LINK_NOT_READY)
                         disconnect()
                     }
                 } else {
@@ -3468,7 +3941,7 @@ class AcabBleManager(private val context: Context) {
                     if (started) {
                         armBondTimeout(g.device, attemptGeneration)
                     } else {
-                        _connectHint.value = pairingFailureHint(PairingFailure.START_REJECTED)
+                        showPairingFailure(PairingFailure.START_REJECTED)
                         disconnect()
                     }
                 }
@@ -3510,9 +3983,9 @@ class AcabBleManager(private val context: Context) {
                 // the same board (else Drive mode dies and the UI flashes the scan screen mid-reboot).
                 cleanup(forAutoReconnect = doAutoReconnect || (reconnectForOta && wasTarget != null))
                 if (secureReadyDropped && !doAutoReconnect && !reconnectForOta) {
-                    _connectHint.value = pairingFailureHint(PairingFailure.SECURE_LINK_NOT_READY)
+                    showPairingFailure(PairingFailure.SECURE_LINK_NOT_READY)
                 } else if (pairingDropped && !doAutoReconnect && !reconnectForOta) {
-                    _connectHint.value = pairingFailureHint(PairingFailure.CANCELED_OR_FAILED)
+                    showPairingFailure(PairingFailure.CANCELED_OR_FAILED)
                 }
                 when {
                     reconnectForOta && wasTarget != null -> reconnectAfterOta(wasTarget)
@@ -3589,7 +4062,7 @@ class AcabBleManager(private val context: Context) {
                 // to the policy rather than "continue degraded" for all of them - continuing on a
                 // dead DETECTIONS stream is how a link reaches READY showing a connected board that
                 // will never report anything.
-                onSubscribeFailed(g, cccdFor, "status=$status after retry")
+                onSubscribeFailed(g, cccdFor, "status=$status after retry", missing = false)
                 return
             }
             when (cccdFor) {
@@ -3601,7 +4074,7 @@ class AcabBleManager(private val context: Context) {
                         // the board an ephemeral replacement: it would encrypt buffered evidence
                         // that this phone cannot decrypt after a restart. Keep an unreadable blob
                         // intact too; a transient Keystore failure is not authority to rotate it.
-                        _connectHint.value = BUFFER_KEY_UNAVAILABLE_HINT
+                        _connectHint.value = secureSetupConnectHint(SecureSetupFailure.BUFFER_KEY_UNAVAILABLE)
                         secureReadyTimeoutJob?.cancel()
                         secureReadyTimeoutJob = null
                         secureReadyArmed = false
@@ -3718,13 +4191,16 @@ class AcabBleManager(private val context: Context) {
      *  and a SYNCHRONOUS rejection inside subscribe() (missing characteristic, missing CCCD, or
      *  writeDescriptor refusing outright). The synchronous ones used to just free the queue slot
      *  and return, firing no callback at all - so the startup chain stalled forever with the
-     *  connect watchdog already cancelled, leaving the UI stuck mid-connect with no way out. */
-    private fun onSubscribeFailed(g: BluetoothGatt?, charUuid: java.util.UUID, why: String) {
+     *  connect watchdog already cancelled, leaving the UI stuck mid-connect with no way out.
+     *
+     *  [missing] is true when the characteristic or its CCCD is absent and false when the board
+     *  or the stack refused the write; only the Detections hint's stage reads it
+     *  (detectionsSubscribeFailedHint). */
+    private fun onSubscribeFailed(g: BluetoothGatt?, charUuid: java.util.UUID, why: String, missing: Boolean) {
         android.util.Log.w("ACAB-ble", "subscribe FAILED for $charUuid ($why)")
         when (charUuid) {
             AcabProfile.DETECTIONS -> {
-                _connectHint.value =
-                    "This board connected but will not send detections. Turn it off and on, then try again."
+                _connectHint.value = detectionsSubscribeFailedHint(missing, _targetKind.value)
                 userInitiatedDisconnect = true   // a deliberate teardown: do NOT auto-reconnect into it
                 runCatching { g?.disconnect() }
                 _state.value = ConnState.DISCONNECTED
@@ -3743,12 +4219,12 @@ class AcabBleManager(private val context: Context) {
         enqueueGatt { gg ->
             val c = charOf(gg, charUuid)
             if (c == null) {
-                onGattOpComplete(); onSubscribeFailed(gg, charUuid, "characteristic absent"); return@enqueueGatt
+                onGattOpComplete(); onSubscribeFailed(gg, charUuid, "characteristic absent", missing = true); return@enqueueGatt
             }
             gg.setCharacteristicNotification(c, true)
             val cccd = c.getDescriptor(AcabProfile.CCCD)
             if (cccd == null) {
-                onGattOpComplete(); onSubscribeFailed(gg, charUuid, "CCCD absent"); return@enqueueGatt
+                onGattOpComplete(); onSubscribeFailed(gg, charUuid, "CCCD absent", missing = true); return@enqueueGatt
             }
             val enable = BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE
             val queued = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
@@ -3761,7 +4237,7 @@ class AcabBleManager(private val context: Context) {
             // descriptor callback, so the op slot would never free and every later queued op
             // would silently pile up for the rest of the session. Free it ourselves (same
             // guard as readStatus/sendNextOtaChunk).
-            if (!queued) { onGattOpComplete(); onSubscribeFailed(gg, charUuid, "writeDescriptor rejected") }
+            if (!queued) { onGattOpComplete(); onSubscribeFailed(gg, charUuid, "writeDescriptor rejected", missing = false) }
         }
     }
 
@@ -3827,6 +4303,9 @@ class AcabBleManager(private val context: Context) {
         // Bonded + service confirmed: this is the board the picker offers next time, advert or not.
         // Before READY publishes, so the picker effect that fires on the READY edge sees it.
         rememberBoardAtReady(gatt?.device ?: target, _deviceName.value)
+        // The readStatus below (or the next notify) is this session's first frame: it stamps the
+        // record's kind (stampRememberedKind), which a different board just reset to unknown.
+        kindStampDone = false
         _state.value = ConnState.READY
         syncLocationOwnership()
         // Prime the Status characteristic once the CCCD chain is fully written (all queued
@@ -3920,7 +4399,7 @@ class AcabBleManager(private val context: Context) {
         }
         if (otaQuarantinedConnectGen == connectGen) {
             setOtaPhase(OtaPhase.FAILED,
-                message = "Reconnect to the beacon before retrying the board update. This clears any delayed update replies from the previous attempt.")
+                message = renderBoardCopy(OTA_RECONNECT_BEFORE_RETRY_TEMPLATE, _targetKind.value))
             return
         }
         // Request the keep-alive while this user action is unquestionably foreground. Download
@@ -4167,6 +4646,15 @@ class AcabBleManager(private val context: Context) {
         autoReconnecting = true
         val gen = ++autoReconnectGen
         target = device
+        // Normally the dropped session's fw kind is still held. When it never had one (no frame
+        // before the drop), the remembered record's stored kind names the reconnect target.
+        if (_targetKind.value == null) {
+            val held = rememberedBoard
+            val address = safeDeviceAddress(device)
+            if (held != null && address != null && held.address.equals(address, ignoreCase = true)) {
+                _targetKind.value = held.kind
+            }
+        }
         reconnectClientArmed = true   // the iOS reconnectTarget analog; onRadioOff reads this
         _deviceName.value = name ?: safeDeviceName(device)
         _state.value = ConnState.CONNECTING   // the service + widget read this as "Reconnecting…"
@@ -4605,6 +5093,16 @@ class AcabBleManager(private val context: Context) {
             AcabProfile.STATUS -> {
                 val s = DeviceStatus.fromJson(json)
                 _status.value = s
+                // The connected board's kind is its fw label from here on (targetKind outlives the
+                // drop that clears this status). The remembered record is stamped from the first
+                // frame of a READY session only; a frame that lands before READY is not a session.
+                // Both are a label compare, and the stamp is offered once per session.
+                BoardKind.fromFirmwareLabel(s.firmwareLabel)?.let { _targetKind.value = it }
+                retirePreSessionKindHint(gatt?.device ?: target, s.firmwareLabel)
+                if (!kindStampDone && _state.value == ConnState.READY) {
+                    kindStampDone = true
+                    stampRememberedKind(gatt?.device ?: target, s.firmwareLabel)
+                }
                 val revision = statusRevision.incrementAndGet()
                 nrfDfu.handleStatusUpdate(s, connectGen.toLong(), revision)
                 reconcileBuzzer(s)
@@ -5206,6 +5704,18 @@ class AcabBleManager(private val context: Context) {
         out
     }
 
+    /** The raw last-seen stamp of EVERY row of [dets], live and replayed, in ONE storeLock take;
+     *  rows with no stamp are dropped. For the Log's Active cut and time sections: call it once per
+     *  feed emission, never per tick or per row. Not [mapLastSeenSnapshot], which drops stamps the Map
+     *  may not date, and not [lastSeen], which takes the lock once per call. iOS needs no twin: its
+     *  Log reads the main-thread BLEManager.lastSeenDate(for:) once per row per feed emission. */
+    internal fun logLastSeenSnapshot(dets: List<Detection>): Map<String, Long> =
+        synchronized(storeLock) {
+            val out = HashMap<String, Long>(dets.size)
+            for (d in dets) lastSeenAt[d.id]?.let { out[d.id] = it }
+            out
+        }
+
     /** Forget one device everywhere: the store row and every per-device side map. The teardown
      *  for STORE_CAP eviction (its only caller today), so eviction can never drop a row from the
      *  store and leave its pin, closest-approach RSSI or breadcrumb trail behind. The ignore
@@ -5539,7 +6049,7 @@ class AcabBleManager(private val context: Context) {
             if (!success) {
                 android.util.Log.w("ACAB-ble", "offline-history clear write was rejected")
                 synchronized(this) { gattQueue.clear() }
-                _connectHint.value = "Offline history was not cleared. Reconnect and try again."
+                _connectHint.value = secureSetupConnectHint(SecureSetupFailure.CLEAR_LOG_REJECTED)
                 userInitiatedDisconnect = true
                 runCatching { g.disconnect() }
                 return
@@ -5559,8 +6069,7 @@ class AcabBleManager(private val context: Context) {
         android.util.Log.w("ACAB-ble", "buffer handshake failed at $failedAt")
         bufferHandshakeCompletion = null
         synchronized(this) { gattQueue.clear() }
-        _connectHint.value =
-            "Secure offline-history setup failed. Reconnect and try again before relying on replay."
+        _connectHint.value = secureSetupConnectHint(SecureSetupFailure.BUFFER_HANDSHAKE_FAILED)
         secureReadyTimeoutJob?.cancel()
         secureReadyTimeoutJob = null
         secureReadyArmed = false
@@ -5992,7 +6501,7 @@ class AcabBleManager(private val context: Context) {
         // failure we have: a device that makes noise while its owner believes it is silent.
         //
         // So the saved mode becomes an OFFER instead. Alerts stay exactly where they are, the five
-        // surfaces that carry the offer grow a one-tap control (DESERT_RESTORE_OFFER in
+        // surfaces that carry the offer grow a one-tap control (DESERT_RESTORE_OFFER_TEMPLATE in
         // DeviceScreen.kt: the Desert card's silence slot, the Alerts row, and the panel that leads
         // the Beacon tab, the pre-connect screen and the OTA wait screen when neither card is
         // reachable), and the mode only moves when the user takes it. desertAlertModeTransition
@@ -6698,6 +7207,7 @@ class AcabBleManager(private val context: Context) {
                 firstSeenMs = firstSeenAt[d.id],
                 timeBasis = histTime[d.id]?.basis ?: TimeBasis.Exact,
                 observerCoord = mapCoordForExport(d),
+                lastSeenMs = lastSeenAt[d.id],
             )
         })
 
@@ -7388,11 +7898,9 @@ class AcabBleManager(private val context: Context) {
     // ---- "mark all seen" baseline watermark ----
 
     /** Drop a baseline at the newest detection's first-seen time. The Log's "New only" view
-     *  then shows only detections first heard after this point (and not on the ignore list). */
+     *  then shows only detections first heard after this point (and not on the ignore list).
+     *  In sample data it moves the watermarks IN MEMORY ONLY (exitDemo restores the real ones). */
     fun markAllSeen() {
-        // Demo first-seen stamps belong to a disposable sample store. Letting them move either
-        // persisted axis would mark genuine retained detections seen after exitDemo reloads them.
-        if (!persistedLogMutationAllowed(_demoMode.value)) return
         // Two axes, two baselines. The buffered rows carry seq-derived ordering keys, not times,
         // so they only compare meaningfully against each other. Fall back to now on the live axis
         // when nothing live is in the store, or a store of buffered rows alone would drag the live
@@ -7407,6 +7915,10 @@ class AcabBleManager(private val context: Context) {
         // the most recent buffered record. Taking the max would baseline on the OLDEST one and
         // leave every later drain reading as already-seen.
         approxWatermark = stamps.filter { it <= HIST_PSEUDO_BASE }.minOrNull() ?: approxWatermark
+        // Demo first-seen stamps belong to a disposable sample store. Writing either axis to disk
+        // would mark genuine retained detections seen after exitDemo reloads them, so sample data
+        // stops here, after the in-memory move. Twin of iOS seenWatermarkWritesAllowed.
+        if (!persistedLogMutationAllowed(_demoMode.value)) return
         prefs.edit()
             .putLong("seenWatermark", _seenWatermark.value)
             .putLong("approxWatermark", approxWatermark)
@@ -7419,6 +7931,8 @@ class AcabBleManager(private val context: Context) {
      *  the watermark advances each time the user leaves the Log tab (see MainScreen's Tab.LOG
      *  onDispose), so a dot always means "arrived since you last looked". Mirrors iOS. */
     fun seedSeenWatermarkOnce() {
+        // Sample data: placeDemoDetections owns the sample baseline (the seed's flagged rows read
+        // new), and this once-only flag belongs to the real log, so never consume it here.
         if (!persistedLogMutationAllowed(_demoMode.value)) return
         if (prefs.getBoolean("seenWatermarkSeeded", false)) return
         markAllSeen()
@@ -7683,8 +8197,17 @@ class AcabBleManager(private val context: Context) {
         // Demo replaces the scan screen with a synthetic READY session. Retire the scanner first,
         // including its timeout and delayed retry generation, so LOW_LATENCY work cannot leak.
         if (shouldStopScanBeforeDemo(_state.value)) stopScan()
+        // Keep the real New baseline so exitDemo can put it back: placeDemoDetections and a sample
+        // MARK SEEN move both watermarks in memory. Only on entry, never on a re-seed while already
+        // in sample data (that would snapshot the sample baseline). Twin of iOS
+        // demoSeenWatermarkSnapshot (BLEManager.seedDemoData).
+        if (!_demoMode.value) demoSeenWatermarkSnapshot = _seenWatermark.value to approxWatermark
         _demoMode.value = true
-        _deviceName.value = "beacon"
+        // The DEBUG board-kind hook (applyDebugBoardKind) swaps in that kind's advert name and real
+        // fw label, so the Beacon hero can be screenshotted per kind; null in every release build,
+        // where sample data is always a beacon.
+        val debugKind = debugBoardKind?.takeIf { it != BoardKind.BEACON }
+        _deviceName.value = debugKind?.let(::debugAdvertName) ?: "beacon"
         // Mirror the iOS sample payload: the real board emits body-cam state under "axon" (the
         // key both apps read), and total matches the 6 sample detections placeDemoDetections seeds
         // (one per category the Status strip shows), so iOS and Android report the same demo total.
@@ -7692,7 +8215,13 @@ class AcabBleManager(private val context: Context) {
             // "moto" is present so the tour shows the Motorola sub-toggle. Omitting it would make
             // the demo board look like pre-split firmware and hide the control the tour exists to
             // introduce. "axon":true so the parent category is on and the sub-row is not dimmed.
-            """{"fw":"beacon board 2.0.9","up":4920,"total":6,"ble":true,"wifi":true,"axon":true,"moto":true,"tracker":true,"glasses":true,"ncam":true,"buzzer":true,"vol":70,"gps":true,"bat":82}"""))
+            """{"fw":"beacon board 2.0.9","up":4920,"total":6,"ble":true,"wifi":true,"axon":true,"moto":true,"tracker":true,"glasses":true,"ncam":true,"buzzer":true,"vol":70,"gps":true,"bat":82}""").apply {
+            when (debugKind) {
+                BoardKind.OUI_SPY -> put("fw", "ACAB-ouispy 2.0.9")
+                BoardKind.MESH_DETECT -> put("fw", "mesh-detect-ACAB 2.0.9")
+                BoardKind.BEACON, null -> Unit
+            }
+        })
         _state.value = ConnState.READY
         syncLocationOwnership()
         // placeDemoDetections clears + repopulates the same maps the async startup reload fills, so
@@ -7713,42 +8242,8 @@ class AcabBleManager(private val context: Context) {
      *  their relative spread. Falls back to the canned San Francisco coords when there's no fix. */
     private fun placeDemoDetections(baseLat: Double?, baseLon: Double?) {
         val sfLat = 37.7799; val sfLon = -122.4188    // coords the samples were authored at
-        // One sample per category the Status strip, Log tiles, and Map chips all show: ALPR,
-        // DRONE, BODY CAM, TRACKER, GLASSES, and Network camera. Exactly six, so the demo status
-        // "total" matches the seed count and lines up with the iOS tour's seed set.
-        val samples = listOf(
-            // Wire values are the firmware's own, to the same standard as the netcam row below.
-            // A BLE advert whose name trips the loose "Flock" prefix (flock_signatures.h's
-            // FLOCK_NAME_PREFIX entry) AND carries mfg 0x09C8 lands on flock_detect.cpp's
-            // `(nm == NM_LITERAL || mfgHit) ? 80 : 70` arm, so: s=0 SRC_BLE, meth=2 M_NAME,
-            // c=80, cid=0x09C8 (the only ID in FLOCK_MFG_IDS, and what earns the 80 over 70).
-            // This row used to read meth=1/c=95, which no board can put on the wire three times
-            // over: 95 is above the ALPR ceiling of 88 (the WiFi SSID arm), both OUI arms ride
-            // at 65 (BLE) and 68 (WiFi), and the name arm returns BEFORE the OUI arm, so a
-            // device broadcasting "FlockSafety" can never be reported as an OUI hit at all.
-            // The twin row in iOS BLEManager.seedDemoData carries the same values.
-            """{"t":1,"s":0,"meth":2,"c":80,"mac":"AC:AB:00:7F:2A:10","rssi":-54,"name":"FlockSafety","cid":2504,"lat":37.7799,"lon":-122.4202,"n":12,"new":true}""",
-            """{"t":4,"s":2,"meth":7,"c":99,"mac":"DA:7E:E0:44:21:09","rssi":-61,"id":"1581F4FED0A2B7","lat":37.7816,"lon":-122.4169,"plat":37.7821,"plon":-122.4151,"alt":84,"n":1,"new":true}""",
-            """{"t":3,"s":0,"meth":3,"c":45,"mac":"A0:0F:11:BA:7C:33","rssi":-88,"n":1}""",
-            """{"t":5,"s":0,"meth":3,"c":85,"mac":"4C:00:12:19:AA:BB","rssi":-72,"det":"Apple Find My (offline)","cid":76,"lat":37.7791,"lon":-122.4196,"n":3}""",
-            // VERBATIM from glasses_signatures.h. These seeds must carry the firmware's real
-            // strings, not a prettified paraphrase: `maker` parses them, so a paraphrase would
-            // demo the OLD behaviour (a row reading "Recording glasses") while real hardware
-            // shows the new one. This one resolves to "Meta".
-            // MAC/rssi/lat/lon are the iOS row's, verbatim: the two tours must seed the SAME six
-            // devices, and this row was the only one that had drifted (a different MAC, so a
-            // different Detection id, plus its own rssi and its own spot on the map). iOS also
-            // carries "rnd": true here; Android has no `rnd` wire field and derives randomization
-            // from the LAA bit instead (Models.kt), and 0x1A has it set, so both read randomized.
-            """{"t":9,"s":0,"meth":3,"c":60,"mac":"1A:2B:3C:4D:5E:6F","rssi":-71,"det":"Meta: possible recording glasses or Quest","cid":1422,"lat":37.7795,"lon":-122.4193,"n":2,"new":true}""",
-            // Branded IP-camera OUI seen on the host WiFi (matched by source MAC), so the NETCAM
-            // tile and NETWORK CAM map chip both show up on the tour. The MAC is a real Hikvision
-            // block, so this row demonstrates the maker-led title end to end. Wire values are the
-            // firmware's own: s=1 is SRC_WIFI (netcamClassifyWiFi never emits a BLE source) and
-            // c=65 is NETCAM_OUI_CONFIDENCE, the registry tier a validated=0 block lands on; the
-            // twin row in iOS BLEManager.seedDemoData carries the same values.
-            """{"t":10,"s":1,"meth":1,"c":65,"mac":"44:19:B6:22:0A:5C","rssi":-70,"det":"Hikvision on wifi","lat":37.7788,"lon":-122.4183,"n":2,"new":true}""",
-        )
+        // One seed time per call: every row's first / last seen and the in-memory watermark hang
+        // off it, so the New lens opens on exactly the rows DEMO_SAMPLE_ROWS flags new.
         val now = System.currentTimeMillis()
         val wobble = listOf(-6, -3, -7, -1, -4, 2, -2, 1, -3, 0, -1, 1, -2, 0)
         // Guard the store + side-map mutations with storeLock (matches resetInMemoryLog): the widget
@@ -7759,7 +8254,7 @@ class AcabBleManager(private val context: Context) {
             // the row it belonged to.
             for (m in perDeviceMaps) m.clear()
             lastPublishedMembership = MembershipSignature()
-            for (s in samples) {
+            for (s in DEMO_SAMPLE_ROWS) {
                 val o = JSONObject(s)
                 if (baseLat != null && baseLon != null && o.has("lat") && o.has("lon")) {
                     o.put("lat", baseLat + (o.getDouble("lat") - sfLat))   // keep the hit's relative offset, re-based on the user
@@ -7769,11 +8264,16 @@ class AcabBleManager(private val context: Context) {
                 }
                 val d = Detection.fromJson(o)
                 store[d.id] = d
-                firstSeenAt[d.id] = now; lastSeenAt[d.id] = now
+                firstSeenAt[d.id] = sampleFirstSeenMs(d.isNew, now); lastSeenAt[d.id] = now
                 rssiHistory[d.id] = wobble.map { (d.rssi + it).coerceIn(-99, -30) }.toMutableList()
             }
             spatialEvidenceGeneration++
         }
+        // The sample "new" baseline, in memory only (prefs keep the real watermark, restored by
+        // exitDemo from demoSeenWatermarkSnapshot). approxWatermark is untouched: every sample row
+        // sits on the live axis. A re-place after the first GPS fix (demoNeedsRelocate) re-applies
+        // this baseline, at most once, right after entry; iOS placeDemoDetections does the same.
+        _seenWatermark.value = sampleSeenWatermarkMs(now)
         publishNow()
     }
 
@@ -7792,6 +8292,13 @@ class AcabBleManager(private val context: Context) {
         // real drive's log with no prompt and no undo. Demo rows do have to LEAVE the store here
         // though, or the next checkpoint seals fabricated detections into the evidence file.
         resetInMemoryLog()
+        // Put back the real New baseline the sample seed and a sample MARK SEEN moved in memory
+        // (prefs were never written in sample data, so memory is the only place it changed).
+        demoSeenWatermarkSnapshot?.let { (seen, approx) ->
+            _seenWatermark.value = seen
+            approxWatermark = approx
+        }
+        demoSeenWatermarkSnapshot = null
         _status.value = null
         _deviceName.value = null
         _state.value = ConnState.DISCONNECTED
@@ -8394,7 +8901,7 @@ class AcabBleManager(private val context: Context) {
         d.pilotAlt?.let { put("palt", it) }
         d.ridStatus?.let { put("sta", it) }
         // Fix age, or a coordinate the board stamped from a two-hour-old fix reloads with no "as
-        // of" qualifier at all (locationAgeText needs gage) and reads as a fix taken on the spot.
+        // of" qualifier at all (locationAgeDetail needs gage) and reads as a fix taken on the spot.
         d.gpsAgeSec?.let { put("gage", it) }
         // approx says the record has no real capture time, only the synthetic seq-derived sort key
         // in _fs. Without the flag the CSV stops blanking the column and exports every buffered
@@ -8441,9 +8948,18 @@ class AcabBleManager(private val context: Context) {
     }
 
     companion object {
-        /** The one sentence a user needs when a connect will not take. Kept byte-identical to iOS
-         *  BLEManager.pairWindowHint: this is user-facing copy and the two apps must not diverge. */
-        const val PAIR_WINDOW_HINT = "turn the beacon off and on, then connect within two minutes."
+        /** The one sentence a user needs when a connect will not take, as a template: the connect
+         *  watchdog renders it for the target's kind, the pair-window note in the connect
+         *  screen's failure panel (AcabApp ConnectionHintPanel) for the screen's kind. Kept byte-identical to iOS BLEManager.pairWindowHint: this is
+         *  user-facing copy and the two apps must not diverge. */
+        const val PAIR_WINDOW_HINT_TEMPLATE = "turn the {noun} off and on, then connect within two minutes."
+
+        /** [PAIR_WINDOW_HINT_TEMPLATE] for [kind]; null reads as beacon. */
+        fun pairWindowHint(kind: BoardKind?): String = renderBoardCopy(PAIR_WINDOW_HINT_TEMPLATE, kind)
+
+        /** The DEBUG stand-in row's address (applyDebugBoardKind): locally administered (the 0x02
+         *  bit of the first octet), so no factory MAC can collide with it. */
+        internal const val DEBUG_REMEMBERED_ADDRESS = "02:00:00:00:00:01"
         const val BUFFER_KEY_UNAVAILABLE_HINT =
             "Secure buffer key storage is unavailable. Unlock your phone and reconnect."
 
