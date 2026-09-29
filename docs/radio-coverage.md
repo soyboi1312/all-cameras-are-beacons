@@ -191,4 +191,4 @@ hearing a device is not the same as keeping it. while the phone is away, the off
 
 the numbers and their evidence are in `DET_LOG_RATE_*` in [det_log.h](../firmware/lib/acab_core/det_log.h).
 
-return to [how much does it actually hear?](../README.md#how-much-does-it-actually-hear).
+return to [what it can hear](../README.md#what-it-can-hear).
