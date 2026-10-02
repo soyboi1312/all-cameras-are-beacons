@@ -8,27 +8,19 @@
 #include "acab_scanner.h"    // acabSanitizeAscii: clamp attacker-sourced names on ingest
 #include "ascii_match.h"     // shared acabAsciiCiContains (case-insensitive name substring)
 #include "desert_detect.h"   // Desert mode forces classification even when toggled off
-#include <Preferences.h>     // persist the Flock/ALPR toggle across reboots (NVS)
+#include "acab_nvs_toggle.h" // persist the Flock/ALPR toggle across reboots (NVS)
 #include <ctype.h>
 #include <stdio.h>
 #include <string.h>
 
 // Master on/off (default ON, field-validated). NVS-backed so an app-set Flock/ALPR
 // toggle survives a reboot (mirrors axon/tracker/glasses).
-static bool gEnabled = true;
-void flockSetEnabled(bool enabled) {
-    if (enabled == gEnabled) return;
-    gEnabled = enabled;
-    Preferences p; p.begin("acab-flock", false); p.putBool("on", enabled); p.end();
-}
-bool flockIsEnabled() { return gEnabled; }
+static AcabNvsToggle gEnabled{"acab-flock", "on", true};
+void flockSetEnabled(bool enabled) { gEnabled.set(enabled); }
+bool flockIsEnabled() { return gEnabled.on; }
 
 // Reload the persisted toggle on boot; if none saved yet, use defaultEnabled.
-void flockRestoreEnabled(bool defaultEnabled) {
-    Preferences p; p.begin("acab-flock", true);
-    gEnabled = p.getBool("on", defaultEnabled);
-    p.end();
-}
+void flockRestoreEnabled(bool defaultEnabled) { gEnabled.restore(defaultEnabled); }
 
 // ---------------------------------------------------------------------------
 // Signature tables now live in flock_signatures.h (public-sourced; see
@@ -252,7 +244,7 @@ static const char* estimateRavenFW(const AdvFields* f) {
 // ---------------------------------------------------------------------------
 bool flockClassifyBLE(const uint8_t mac[6], const uint8_t* adv, size_t advLen,
                       int rssi, AcabDetection* out) {
-    if (!gEnabled && !desertIsEnabled()) return false;
+    if (!gEnabled.on && !desertIsEnabled()) return false;
 
     AdvFields f;
     if (adv && advLen) parseAdv(adv, advLen, &f);
@@ -330,7 +322,7 @@ bool flockClassifyBLE(const uint8_t mac[6], const uint8_t* adv, size_t advLen,
 // ---------------------------------------------------------------------------
 bool flockClassifyWiFi(const uint8_t* frame, size_t len, int rssi,
                        AcabDetection* out) {
-    if (!gEnabled && !desertIsEnabled()) return false;
+    if (!gEnabled.on && !desertIsEnabled()) return false;
     if (!frame || len < 24) return false;
 
     uint8_t ftype    = (frame[0] >> 2) & 0x3;   // 0 = management

@@ -48,12 +48,6 @@ const char* otaResultStr(OtaResult r);
 // Progress/result notifier: the module emits small JSON strings ("{...}") for the app.
 // Set by the BLE service; may be null.
 void otaSetNotifier(void (*fn)(const char* json));
-// Emit one JSON line through that notifier (no-op when unset). Currently UNUSED: the beacon
-// board's blocking nRF SWD reflash that motivated it (non-session {"nrf":...} progress on the
-// OTA characteristic) was abandoned 2026-07-21 and its code deleted - the nRF now self-updates
-// over BLE DFU. Kept for the next non-session reporter; delete it with this comment if none
-// appears.
-void otaEmitNotify(const char* json);
 
 // Open a session. newVer must be strictly newer than the running ACAB_FW_VERSION unless
 // force. expectCrc32 is a standard zlib/PKZIP CRC-32 over the whole image (0 = skip check).
@@ -82,7 +76,6 @@ OtaResult otaFinish();
 bool otaPendingFinishExpired();
 void otaAbort();
 bool otaInProgress();
-uint32_t otaReceived();          // bytes written so far this session
 
 // --- rollback / health ---
 // Register the target's real health boundary. A trial cannot be confirmed until this returns true.

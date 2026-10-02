@@ -30,9 +30,10 @@
 #include "desert_detect.h"   // Desert mode forces classification even when toggled off
 #include <string.h>
 #include <stdio.h>
-#include <Preferences.h>   // persist the on/off toggle across reboots (NVS)
+#include "acab_nvs_toggle.h"   // persist the on/off toggle across reboots (NVS)
 
-static bool gEnabled = true;   // default ON: the company-ID match is specific, not a flood risk
+// Default ON: the company-ID match is specific, not a flood risk.
+static AcabNvsToggle gEnabled{"acab-glass", "on", true};
 
 // Bare matches on SHARED corporate IDs (sharedId in glasses_signatures.h) are compile-time
 // OFF: 0x058E is also the Meta Quest's own registration, and a Quest's rotating private
@@ -44,25 +45,13 @@ static const bool kGlassesSharedIdsEnabled = false;
 
 // NVS-backed so an app-set toggle survives a reboot. Only writes on a real change
 // (toggles are rare), so flash wear is negligible.
-void glassesSetEnabled(bool enabled) {
-    if (enabled == gEnabled) return;
-    gEnabled = enabled;
-    Preferences p;
-    p.begin("acab-glass", false);
-    p.putBool("on", enabled);
-    p.end();
-}
-bool glassesIsEnabled() { return gEnabled; }
+void glassesSetEnabled(bool enabled) { gEnabled.set(enabled); }
+bool glassesIsEnabled() { return gEnabled.on; }
 
 // Restore the persisted on/off (or `defaultEnabled` if never set). Call once in setup()
 // instead of hard-coding the default, so a board remembers an app-set toggle across
 // power cycles.
-void glassesRestoreEnabled(bool defaultEnabled) {
-    Preferences p;
-    p.begin("acab-glass", true);
-    gEnabled = p.getBool("on", defaultEnabled);
-    p.end();
-}
+void glassesRestoreEnabled(bool defaultEnabled) { gEnabled.restore(defaultEnabled); }
 
 // Pull out the manufacturer-specific data (AD type 0xFF) plus any 128-bit service UUIDs.
 // The service-UUID half was added 2026-07-31 for the HeyCyan SDK UUID; it mirrors the
@@ -126,7 +115,7 @@ static bool svcHasUuid(const uint8_t* hay, uint8_t hayLen, const uint8_t* needle
 
 bool glassesClassifyBLE(const uint8_t mac[6], const uint8_t* adv, size_t advLen,
                         int rssi, AcabDetection* out) {
-    if ((!gEnabled && !desertIsEnabled()) || !adv || !advLen) return false;
+    if ((!gEnabled.on && !desertIsEnabled()) || !adv || !advLen) return false;
 
     GlAdv f; parseAdv(adv, advLen, &f);
 

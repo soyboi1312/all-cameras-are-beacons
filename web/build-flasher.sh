@@ -43,75 +43,24 @@ done
 # just names: a chunk that is tracked but edited-and-uncommitted ships its OLD bytes, which an
 # existence test cannot see either.
 _VENDOR_DIR="web/vendor/esp-web-tools"
-_REPO="$(cd "$(dirname "$0")/.." && pwd)"
-if ! git -C "$_REPO" rev-parse --verify HEAD >/dev/null 2>&1; then
-  echo "!! no commits in $_REPO yet; cannot verify the vendor graph will ship."; exit 1
-fi
-# Test the directory SEPARATELY instead of leaning on an empty find result. `find` on a missing
-# path exits 1, `pipefail` promotes that to the whole `find | sort` pipeline, and `set -e` then
-# kills the script on the assignment line - so the "empty or missing" message below could never
-# reach the operator in the MISSING half. That half is reachable by a manual rm -rf or a sparse
-# checkout, not by the refresh steps in web/README.md, which re-pull into a directory they leave
-# in place. A bare exit 1 with no output is the one thing this guard exists not to do. With the -d test in front, a find that still fails is a real
-# problem (unreadable subdirectory), so let it abort loudly rather than swallowing its stderr.
-if [ -d "$_REPO/$_VENDOR_DIR" ]; then
-  _ON_DISK="$(cd "$_REPO" && find "$_VENDOR_DIR" -type f ! -name .DS_Store | LC_ALL=C sort)"
-else
-  _ON_DISK=""
-fi
-if [ -z "$_ON_DISK" ]; then
-  echo "!! $_VENDOR_DIR is empty or missing; the flasher would have no ESP Web Tools to load."
-  echo "!! Fix: re-run the vendor pull (see web/README.md), commit it, then re-run."
-  exit 1
-fi
-# Compare BOTH DIRECTIONS before comparing bytes. Iterating only over the files that still exist
-# on disk misses a tracked chunk deleted from the working tree: it is absent from the loop, the
-# guard passes, and `git add -u` commits a Pages deployment whose module graph 404s. Exact path-set
-# equality catches that deletion as well as a newly downloaded, not-yet-committed chunk.
-_IN_HEAD="$(git -C "$_REPO" ls-tree -r --name-only HEAD -- "$_VENDOR_DIR" | LC_ALL=C sort)"
-if [ "$_IN_HEAD" != "$_ON_DISK" ]; then
-  _MISSING_FROM_DISK="$(comm -23 \
-    <(printf '%s\n' "$_IN_HEAD") <(printf '%s\n' "$_ON_DISK"))"
-  _NOT_IN_HEAD="$(comm -13 \
-    <(printf '%s\n' "$_IN_HEAD") <(printf '%s\n' "$_ON_DISK"))"
-  echo "!! the vendored ESP Web Tools path set on disk is not exactly what HEAD would deploy."
-  if [ -n "$_MISSING_FROM_DISK" ]; then
-    echo "!! TRACKED IN HEAD BUT MISSING ON DISK (committing with git add -u would ship a 404):"
-    echo "$_MISSING_FROM_DISK" | sed '/^$/d; s/^/!!   /'
-  fi
-  if [ -n "$_NOT_IN_HEAD" ]; then
-    echo "!! ON DISK BUT NOT IN HEAD (Pages would omit these files):"
-    echo "$_NOT_IN_HEAD" | sed '/^$/d; s/^/!!   /'
-  fi
-  echo "!! Restore deleted chunks or add new chunks, commit the complete graph, then re-run."
-  exit 1
-fi
-
-_STALE=""
-while IFS= read -r f; do
-  [ -n "$f" ] || continue
-  _blob="$(git -C "$_REPO" rev-parse --verify --quiet "HEAD:$f" || true)"
-  if [ "$_blob" != "$(git -C "$_REPO" hash-object -- "$f")" ]; then
-    _STALE="${_STALE}$f
-"
-  fi
-done <<EOF
-$_ON_DISK
-EOF
-if [ -n "$_STALE" ]; then
-  echo "!! the vendored ESP Web Tools graph on disk is not what HEAD would deploy."
-  echo "!! EDITED BUT NOT COMMITTED (Pages would ship the old bytes):"
-  echo "$_STALE" | sed '/^$/d; s/^/!!   /'
-  if git -C "$_REPO" diff --cached --quiet -- "$_VENDOR_DIR"; then
-    echo "!! Fix: git add -f $_VENDOR_DIR, commit, then re-run."
-  else
-    echo "!! (part of it IS staged, but staging alone does not deploy: Pages builds from the"
-    echo "!!  pushed commit.) Fix: commit the staged $_VENDOR_DIR, then re-run."
-  fi
-  exit 1
-fi
-
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+_IN_HEAD="$(git -C "$ROOT" ls-tree -r --name-only HEAD -- "$_VENDOR_DIR" 2>/dev/null || true)"
+# One `git status` answers both directions and the bytes: empty output means HEAD, the index and
+# the disk agree. --ignored on purpose: a chunk that an ignore rule hides is still a chunk Pages
+# would omit; the exclude pathspec keeps Finder's .DS_Store out of that. Keep the call a plain
+# assignment (no pipe, no `|| true`) so a git failure aborts here under `set -e`. The -d test is
+# for a sparse checkout, where status reports nothing for the absent directory.
+# ponytail: status trusts the index, so an edited chunk with the assume-unchanged or
+# skip-worktree bit set passes; hash the disk bytes against HEAD if that ever matters.
+_DRIFT="$(git -C "$ROOT" status --porcelain --untracked-files=all --ignored -- "$_VENDOR_DIR" ':(exclude,glob)**/.DS_Store')"
+if [ ! -d "$ROOT/$_VENDOR_DIR" ] || [ -z "$_IN_HEAD" ] || [ -n "$_DRIFT" ]; then
+  echo "!! $_VENDOR_DIR on disk is not exactly what HEAD would deploy"
+  echo "!! ( D = missing on disk, ?? = not committed, M = edited, A/M in column 1 = staged only, !! = gitignored):"
+  echo "${_DRIFT:-(directory missing, or nothing committed under $_VENDOR_DIR)}" | sed 's/^/!!   /'
+  echo "!! Fix: restore deleted chunks or add new ones, commit the complete vendor graph (see web/README.md), then re-run."
+  exit 1
+fi
+
 FW="$ROOT/firmware"
 # Signed OTA is the default contract. Check the key before even building, and sign frozen build
 # outputs before arming the served-tree transaction below. A missing, encrypted/passphrase-only,
@@ -126,7 +75,6 @@ fi
 # python@3.x leaves the penv symlink dangling, and the heredocs below are stdlib-only anyway.
 PY="$HOME/.platformio/penv/bin/python"
 [ -x "$PY" ] || PY="$(command -v python3)"
-ESPTOOL="$HOME/.platformio/packages/tool-esptoolpy/esptool.py"
 BOOT_APP0="$(find "$HOME/.platformio/packages/framework-arduinoespressif32/tools/partitions" -name boot_app0.bin | head -1)"
 
 [ -x "$PY" ] || { echo "PlatformIO python not found at $PY"; exit 1; }

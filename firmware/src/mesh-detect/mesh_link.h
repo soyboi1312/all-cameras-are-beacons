@@ -37,8 +37,6 @@ struct MeshLinkConfig {
 MeshLinkConfig meshLinkDefaults();
 void meshLinkBegin(const MeshLinkConfig& cfg);
 
-// Choose the channel at runtime (PROTO transport only).
-void meshLinkSetChannel(uint8_t channelIndex);
 uint8_t meshLinkChannel();
 
 // Scanner sink helper: format + send a labelled detection.

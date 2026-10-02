@@ -34,7 +34,6 @@ MeshLinkConfig meshLinkDefaults() {
     return c;
 }
 
-void meshLinkSetChannel(uint8_t idx) { gCfg.channelIndex = idx; }
 uint8_t meshLinkChannel() { return gCfg.channelIndex; }
 
 // Store config and open the UART to the Heltec node.

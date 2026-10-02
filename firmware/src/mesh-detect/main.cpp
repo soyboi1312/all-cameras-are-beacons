@@ -54,14 +54,6 @@ void alertsSetLedEnabled(bool on) {
 #define ACAB_MESH_CHANNEL 0
 #endif
 
-// How often the diagnostic heartbeat fires. With -DACAB_DIAG, the unit pushes a
-// radio-health line to the mesh this often, so a drive test is readable without a
-// serial cable. ACAB_DIAG also turns on a chatty per-advert serial log (see
-// acab_scanner).
-#ifndef ACAB_HEARTBEAT_MS
-#define ACAB_HEARTBEAT_MS 120000
-#endif
-
 // Detection blink request: millis() of the newest first sighting, stamped by onDetection
 // (which runs on the scanner sink task) and consumed by loop()'s LED state machine. The sink
 // task must never sleep in a blink (a Desert-mode burst of 20 new devices/s would park it in
@@ -177,14 +169,12 @@ void setup() {
     acabBleStartAdvertising();
 
     AcabScannerConfig cfg = acabScannerDefaults();
-    cfg.initNimBLE = false;            // the GATT service already inited NimBLE
     cfg.bleDeviceName = "ACAB-mesh";
 
     // Axon body-cam detection on OUI 00:25:DF (field-validated 2026-06-17: real
     // Axon body cams advertise this public OUI). See axon_detect.cpp. Restore the
     // persisted app toggle (default ON) so the user's choice survives a reboot,
     // same as the beacon build.
-    axonUseRegistryCandidate();
     axonRestoreEnabled(true);
 
     // Item-tracker detection: restore the persisted app toggle (default OFF). AirTags
@@ -249,7 +239,6 @@ void loop() {
     acabScannerBufferAllTick();
 
     static uint32_t lastBeat = 0;
-    static uint32_t lastMeshBeat = 0;
     static bool bootPinged = false;
     uint32_t now = millis();
 
@@ -284,7 +273,6 @@ void loop() {
     if (!bootPinged && now > 10000) {
         bootPinged = true;
         meshLinkSendText("mesh-detect ACAB online");
-        lastMeshBeat = now;
     }
 
     if (now - lastBeat > 60000) {
@@ -296,27 +284,15 @@ void loop() {
                       (unsigned long)acabScannerTotalDetections());
     }
 
-#ifdef ACAB_DIAG
-    // Push radio-health counts to the mesh so a drive test is readable without a
-    // serial cable. Next to a known camera: rising ble/wifi with det=0 means a
-    // signature or range miss; flat ble/wifi means a dead radio or antenna.
-    if (bootPinged && now - lastMeshBeat > ACAB_HEARTBEAT_MS) {
-        lastMeshBeat = now;
-        char hb[96];
-        snprintf(hb, sizeof(hb), "ACAB diag | ble=%lu wifi=%lu det=%lu",
-                 (unsigned long)acabScannerBleSeen(),
-                 (unsigned long)acabScannerWifiSeen(),
-                 (unsigned long)acabScannerTotalDetections());
-        meshLinkSendText(hb);
-    }
-#endif
-
     // SECOND AT-REST SURFACE, and this build reaches it exactly like beacon-board does: same
     // {"clearlog"} handler, same det_log ring, same NimBLE host task parsing the phone's
     // {"lat","lon"} onto a stack an ELF dump would capture. Without this call {"clearlog"} would
-    // report success with the panic dump still in flash. Consumes the explicit NVS-backed erase
-    // generation even after power loss or while a shared ring sweep is already pending. A plain
-    // boot auto-wipe with no explicit token preserves the dump. The physical erase defers past
+    // report success with the panic dump still in flash. Consumes the NVS-backed erase generation
+    // even after power loss or while a shared ring sweep is already pending. The first
+    // authenticated phone link of every boot also arms that generation, so the dump setup() has
+    // just reported is erased on this boot's first pass when a phone had authenticated on the boot
+    // that crashed, and otherwise one pass after a phone authenticates. To decode a panic, use the
+    // serial boot report, or read the dump before a phone connects. The physical erase defers past
     // the ring sweep that acabBleDrainTick pumps below - see coredump_report.h.
     acabCoredumpWipeTick();
     acabBleDrainTick();   // stream buffered detections back on the app's sync request

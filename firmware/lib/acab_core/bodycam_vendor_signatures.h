@@ -11,6 +11,10 @@
  * 2026-07-23 ground truth recorded below) and emits below the apps' weak-match
  * threshold (<50) so it always renders as "verify this".
  *
+ * WatchGuard Video, the in-car and body-worn video maker that Motorola Solutions owns, has its
+ * own block in a second table (WATCHGUARD_VIDEO_OUI, below). It rides the same sub-toggle and
+ * the same confidence, but reports its own detail string, so a hit names the real registrant.
+ *
  * The sub-toggle exists because this match and the Axon BWCDEVICE tag used to share one
  * switch: a user turning "body cam" off to quiet THIS broad match also silenced the
  * conf-90 field-validated Axon signature, which is the best signature on the board.
@@ -65,16 +69,41 @@ static const uint8_t POLICE_OUI[][3] = {
 };
 static const size_t POLICE_OUI_COUNT = sizeof(POLICE_OUI) / sizeof(POLICE_OUI[0]);
 
-// FIELD-VALIDATION QUEUE, NOT COMPILED IN. Two in-car/body-video vendors whose own corporate
-// MA-L blocks are registry-confirmed (2026-08-07 pull of standards-oui.ieee.org/oui/oui.csv):
+// WatchGuard Video's own block (IEEE MA-L, registrant "WatchGuard Video", Plano TX; re-checked
+// 2026-10-01 against the maclookup.app registry mirror). Motorola Solutions owns WatchGuard, so
+// this rides the SAME sub-toggle ({"motorola":bool}, opt-in) and the same confidence 45 as the
+// Motorola blocks above. It is a SEPARATE table so police_detect.cpp can report the real
+// registrant: the detail string is "WatchGuard Video OUI", not "Motorola Solutions OUI". Both
+// apps resolve the maker from that string EXACTLY (BodyCamSignature), so it is a wire contract.
 //
-//   00:1D:96   WatchGuard Video
+// Promoted from the field-validation queue below in 2.1.0, by owner decision on 2026-10-01, on
+// own capture (table in docs/signatures.md, "WatchGuard Video 00:1D:96"):
+//   - 8 WiFi MACs, 00:1D:96:28:9B:AC to 00:1D:96:29:2D:40, every frame a probe request for the
+//     same two SSIDs (drives on 2026-09-07, 09-13, 09-19 and 09-27). One fleet with one
+//     configuration. No owner marker came near any of them.
+//   - 1 BLE MAC, 00:1D:96:E7:97:4F (2026-10-01), 10 s before an owner ground-truth marker for law
+//     enforcement on scene, in the same window as an agency-named Cradlepoint (VCSO 3425).
+// The bar the queue note sets ("a capture pins it to a device somebody actually saw") is met at
+// the SCENE level only: the owner saw law enforcement, not the device. And the queue's first
+// reason still holds: WatchGuard ships in-car video, body cams and docks on this one block, so
+// the TYPE claim "body camera" stays a "verify" (45), exactly like the Motorola rows.
+static const uint8_t WATCHGUARD_VIDEO_OUI[][3] = {
+    { 0x00, 0x1d, 0x96 },   // 00:1D:96  FIELD-OBSERVED 2026-09 (WiFi probes), 2026-10-01 (BLE)
+};
+static const size_t WATCHGUARD_VIDEO_OUI_COUNT =
+    sizeof(WATCHGUARD_VIDEO_OUI) / sizeof(WATCHGUARD_VIDEO_OUI[0]);
+
+// FIELD-VALIDATION QUEUE, NOT COMPILED IN. One in-car/body-video vendor whose own corporate
+// MA-L block is registry-confirmed (2026-08-07 pull of standards-oui.ieee.org/oui/oui.csv):
+//
 //   00:23:BD   Digital Ally, Inc.
 //
-// Both are narrow registrants, so they would pass the no-shared-silicon rule that keeps
-// Espressif and TP-Link out of these tables. They are still absent on purpose, for two reasons.
+// (WatchGuard Video, 00:1D:96, sat here too until 2.1.0; see WATCHGUARD_VIDEO_OUI above.)
 //
-// First, an OUI establishes the VENDOR, never the equipment type. Both companies ship in-car
+// It is a narrow registrant, so it would pass the no-shared-silicon rule that keeps Espressif
+// and TP-Link out of these tables. It is still absent on purpose, for two reasons.
+//
+// First, an OUI establishes the VENDOR, never the equipment type. Digital Ally ships in-car
 // video, interview-room recorders, evidence storage and fleet hardware alongside anything
 // body-worn, so a hit would not mean what the category name says it means. That is the exact
 // error the crowdsourced lists reviewed on 2026-08-07 make dozens of times over.
@@ -85,7 +114,7 @@ static const size_t POLICE_OUI_COUNT = sizeof(POLICE_OUI) / sizeof(POLICE_OUI[0]
 // vendor block earns a place here after a capture pins it to a device somebody actually saw,
 // not because the registration is real.
 //
-// To promote either one: capture near a confirmed unit with the capture build
+// To promote it: capture near a confirmed unit with the capture build
 // (pio run -e beacon-board-capture), which now logs every prober and its frame type, then record
 // the co-signals the way the netcam table records its own field validations. Bracket the visit
 // with {"mark":"digital-ally-near"}, then {"mark":"left"}, then {"mark":"end"} - three commands,

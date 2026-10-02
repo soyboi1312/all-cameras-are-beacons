@@ -19,61 +19,18 @@
 #include <cstring>
 #include <vector>
 
-// ---- stubs for the two symbols axon_detect.cpp calls into other translation units ----------
+// ---- stub for the one symbol axon_detect.cpp calls into another translation unit -----------
 // Desert mode lives in desert_detect.cpp, which the harness never compiles. It is a real branch
-// here (`if (!gEnabled && !desertIsEnabled()) return false;`), so unlike the glasses test this is
+// here (`if (!gEnabled.on && !desertIsEnabled()) return false;`), so unlike the glasses test this is
 // a settable flag, not a hard false: the "off but Desert forces it on" case is tested below.
+// (acabSanitizeAscii needs no stub: it is inline in acab_scanner.h, so this suite runs the
+// real clamp.)
 static bool gDesertOn = false;
 bool desertIsEnabled() { return gDesertOn; }
 
-// Copied byte-for-byte from acabSanitizeAscii in acab_scanner.cpp. It has to be a faithful copy,
-// not a memcpy: the parser runs advertised names through it BEFORE matching, so a lazy stub would
-// make the "control byte in the name breaks the Utility match" test pass for the wrong reason.
-// If the real one ever changes, this copy is the thing to resync.
-void acabSanitizeAscii(char* dst, const uint8_t* src, size_t n, size_t cap) {
-    if (!dst || cap == 0) return;
-    size_t m = n;
-    if (m > cap - 1) m = cap - 1;
-    size_t j = 0;
-    for (; j < m; j++) {
-        uint8_t c = src ? src[j] : 0;
-        dst[j] = (c >= 0x20 && c <= 0x7E) ? (char)c : '.';
-    }
-    dst[j] = 0;
-}
-
-static int failures = 0;
-static void chk_impl(const char* name, bool got, bool wantHit,
-                int gotConf = -1, int wantConf = -1, const char* gotDetail = "", const char* wantDetail = nullptr) {
-    bool ok = (got == wantHit);
-    if (ok && wantHit && wantConf >= 0) ok = (gotConf == wantConf);
-    if (ok && wantHit && wantDetail)    ok = (strcmp(gotDetail, wantDetail) == 0);
-    printf("  %-52s %s", name, ok ? "PASS" : "**FAIL**");
-    if (!ok) { printf("   got hit=%d conf=%d detail=\"%s\"", got, gotConf, gotDetail); failures++; }
-    printf("\n");
-}
-
-// ---- ARGUMENT-EVALUATION SEQUENCING (do not remove) ------------------------------------------
-// Every assertion below is written as
-//     chk("name", classify(..., &d), true, d.confidence, 90, d.detail, "...");
-// so the call that FILLS `d` and the reads of `d` are arguments to the SAME call. C++ leaves the
-// evaluation order of function arguments UNSPECIFIED. Clang evaluates left to right, so the
-// classifier runs before the reads and every assertion sees fresh values; GCC evaluates right to
-// left, so it reads `d` BEFORE the classifier fills it - yielding the PREVIOUS test's values, and
-// uninitialised stack on the first assertion (that is where the impossible `conf=153` came from).
-// The suite therefore passed on macOS and failed in CI, on identical source.
-//
-// These macros complete the classifier call in a statement of its own before any argument to the
-// reporting function is evaluated, so correctness no longer depends on the compiler. Keep the
-// assertions in their current one-line form; the macro is what makes that form safe.
-#define chk(name, hitexpr, ...) do { const bool acab_hit_ = (hitexpr); chk_impl((name), acab_hit_, ##__VA_ARGS__); } while (0)
-// Scalar assert, same output shape. Used for method / source / MAC-byte / table-size checks.
-static void chkInt(const char* name, long got, long want) {
-    bool ok = (got == want);
-    printf("  %-52s %s", name, ok ? "PASS" : "**FAIL**");
-    if (!ok) { printf("   got %ld want %ld", got, want); failures++; }
-    printf("\n");
-}
+// failures, chk_impl, the chk macro (and why it must stay a macro), and chkInt, which this suite
+// uses for method / source / MAC-byte / table-size checks.
+#include "host_check.h"
 
 // ---- advert builders (BLE AD structures: [len][type][data...]) -----------------------------
 static void addName(std::vector<uint8_t>& a, const char* s, uint8_t adType = 0x09) {
@@ -150,64 +107,20 @@ static bool runWiFi(std::vector<uint8_t>& f) {
     return axonClassifyWiFi(f.data(), f.size(), -63, &d);
 }
 
-// Custom signatures, to reach the match sources the shipped registry candidate leaves unused.
-static const AxonSignature SIG_MFG = {
-    /* useMfgId      */ true,  /* mfgId */ 0x1234,
-    /* useMfgPrefix  */ true,  /* mfgPrefix */ {0xAA,0xBB}, /* mfgPrefixLen */ 2,
-    /* useOui        */ false, /* oui */ {{0}}, /* ouiCount */ 0,
-    /* useName       */ false, /* namePatterns */ {nullptr,nullptr,nullptr,nullptr}, /* nameCount */ 0,
-    /* usePayload    */ false, /* payload */ nullptr,
-    /* baseConfidence*/ 55,
-};
-static const AxonSignature SIG_NAME = {
-    /* useMfgId      */ false, /* mfgId */ 0x0000,
-    /* useMfgPrefix  */ false, /* mfgPrefix */ {0}, /* mfgPrefixLen */ 0,
-    /* useOui        */ false, /* oui */ {{0}}, /* ouiCount */ 0,
-    /* useName       */ true,  /* namePatterns */ {"AB4",nullptr,nullptr,nullptr}, /* nameCount */ 1,
-    /* usePayload    */ false, /* payload */ nullptr,
-    /* baseConfidence*/ 60,
-};
-static const AxonSignature SIG_STRICT = {   // the "tightenable" mode the header advertises
-    /* useMfgId      */ false, /* mfgId */ 0x0000,
-    /* useMfgPrefix  */ false, /* mfgPrefix */ {0}, /* mfgPrefixLen */ 0,
-    /* useOui        */ true,  /* oui */ {{0x00,0x25,0xdf}}, /* ouiCount */ 1,
-    /* useName       */ false, /* namePatterns */ {nullptr,nullptr,nullptr,nullptr}, /* nameCount */ 0,
-    /* usePayload    */ true,  /* payload */ AXON_BWC_PAYLOAD,
-    /* baseConfidence*/ 75,
-};
-static const AxonSignature SIG_HICONF = {   // baseConfidence above the tag floor of 90
-    /* useMfgId      */ false, /* mfgId */ 0x0000,
-    /* useMfgPrefix  */ false, /* mfgPrefix */ {0}, /* mfgPrefixLen */ 0,
-    /* useOui        */ true,  /* oui */ {{0x00,0x25,0xdf}}, /* ouiCount */ 1,
-    /* useName       */ false, /* namePatterns */ {nullptr,nullptr,nullptr,nullptr}, /* nameCount */ 0,
-    /* usePayload    */ false, /* payload */ nullptr,
-    /* baseConfidence*/ 95,
-};
-
 int main() {
     printf("\n=== body-cam classifier regression (axon_detect) ===\n");
 
-    // -- defaults, BEFORE any signature is loaded ------------------------------------------
-    // The module ships ENABLED (field-validated 2026-06-17) but with the INERT placeholder
-    // signature. Both halves matter: firmware that calls axonSetEnabled(true) and forgets
-    // axonUseRegistryCandidate() detects nothing by OUI and looks fine on the bench.
-    printf("\n-- defaults (placeholder signature) --\n");
+    // -- defaults ----------------------------------------------------------------------------
+    // The module ships ENABLED (field-validated 2026-06-17).
+    printf("\n-- defaults --\n");
     chkInt("enabled by default", axonIsEnabled() ? 1 : 0, 1);
-    { std::vector<uint8_t> a;
-      chk("placeholder: Axon OUI alone -> NO hit", runBLE(MAC_AXON, a), false); }
-    { std::vector<uint8_t> a; addSvcStr(a, 0x21, "BWCDEVICE");
-      bool h = runBLE(MAC_PHONE, a);
-      chk("placeholder: BWCDEVICE tag still hits (standalone)", h, true, d.confidence, 90, d.detail, "BWC DEVICE"); }
-    { std::vector<uint8_t> a; addName(a, UTIL_BWC_NAME);
-      bool h = runBLE(MAC_PHONE, a);
-      chk("placeholder: Utility name still hits (own path)", h, true, d.confidence, 85, d.detail, "Utility BodyWorn"); }
     // Lock the signature tables themselves. A silent edit here changes what ships.
     chkInt("Utility OUI table still has 2 blocks", (long)UTIL_BWC_OUI_COUNT, 2);
     chkInt("UTIL_BWC_OUI[0] is 00:09:bc", (UTIL_BWC_OUI[0][0]<<16)|(UTIL_BWC_OUI[0][1]<<8)|UTIL_BWC_OUI[0][2], 0x0009bc);
     chkInt("UTIL_BWC_OUI[1] is 00:16:ed", (UTIL_BWC_OUI[1][0]<<16)|(UTIL_BWC_OUI[1][1]<<8)|UTIL_BWC_OUI[1][2], 0x0016ed);
     chkInt("tag constant is exactly \"BWCDEVICE\"", strcmp(AXON_BWC_PAYLOAD, "BWCDEVICE"), 0);
-    // Lock the two Axon OUI macros the same way. These are the values the shipped signature is
-    // built from, so an edit to either changes what the board matches in the field.
+    // Lock the two Axon OUI macros the same way. These are the values the shipped AXON_OUI table
+    // is built from, so an edit to either changes what the board matches in the field.
     { const uint8_t reg[3] = AXON_OUI_REGISTERED;
       chkInt("AXON_OUI_REGISTERED is 00:25:df", (reg[0]<<16)|(reg[1]<<8)|reg[2], 0x0025df); }
     { const uint8_t fld[3] = AXON_OUI_BWC_FIELD;
@@ -215,9 +128,8 @@ int main() {
       chkInt("  ^ and its locally-administered bit is CLEAR (a public block, not a random addr)",
              fld[0] & 0x02, 0); }
 
-    // -- BLE: the shipped registry candidate (OUI 00:25:DF) ---------------------------------
+    // -- BLE: the registry block (OUI 00:25:DF) ---------------------------------------------
     printf("\n-- BLE: Axon OUI 00:25:df --\n");
-    axonUseRegistryCandidate();
     { std::vector<uint8_t> a;
       bool h = runBLE(MAC_AXON, a);
       chk("OUI hit, empty advert (OUI needs no payload)", h, true, d.confidence, 75, d.detail, "Axon OUI");
@@ -387,52 +299,14 @@ int main() {
     axonSetEnabled(true);                                 // transition, so true is SAVED
     axonRestoreEnabled(false);
     chkInt("restoreEnabled(false) with true SAVED -> stays on", axonIsEnabled() ? 1 : 0, 1);
-    // Re-enable EXPLICITLY for the signature cases below. This used to be a bare
+    // Re-enable EXPLICITLY for the WiFi and adversarial cases below. This used to be a bare
     // axonRestoreEnabled(true), which only produced "enabled" because writes vanished; with real
     // storage it reads back whatever was last persisted and silently disables every case after
     // it, which is how 22 assertions failed at once the first time the stub was fixed.
     axonSetEnabled(true);
 
-    // -- swappable signatures (the other match sources) --------------------------------------
-    printf("\n-- swappable signature fields --\n");
-    axonLoadSignature(&SIG_MFG);
-    { std::vector<uint8_t> a; const uint8_t tail[] = {0xAA,0xBB,0xCC}; addMfg(a, 0x1234, tail, 3);
-      bool h = runBLE(MAC_PHONE, a);
-      // CONCERN (asserted as-is): a manufacturer-ID match still reports the detail string
-      // "Axon OUI" even though no OUI was involved. It is the wire-contract value the apps know,
-      // so it must not be "fixed" without changing both apps.
-      chk("mfg id + prefix -> 55, detail still \"Axon OUI\"", h, true, d.confidence, 55, d.detail, "Axon OUI");
-      chkInt("  ^ method is M_MFG_ID", d.method, M_MFG_ID);
-      chkInt("  ^ companyId not stamped by this detector", d.companyId, 0); }
-    { std::vector<uint8_t> a; const uint8_t tail[] = {0xAA,0xCC}; addMfg(a, 0x1234, tail, 2);
-      chk("right mfg id, wrong prefix -> NO hit", runBLE(MAC_PHONE, a), false); }
-    { std::vector<uint8_t> a; const uint8_t tail[] = {0xAA,0xBB}; addMfg(a, 0x1235, tail, 2);
-      chk("neighbouring company id 0x1235 -> NO hit", runBLE(MAC_PHONE, a), false); }
-    { std::vector<uint8_t> a; addMfg(a, 0x1234);
-      chk("right mfg id, prefix truncated away -> NO hit", runBLE(MAC_PHONE, a), false); }
-    axonLoadSignature(&SIG_NAME);
-    { std::vector<uint8_t> a; addName(a, "AXON ab4 cam");
-      bool h = runBLE(MAC_PHONE, a);
-      chk("name pattern \"AB4\" -> 60, detail \"Axon OUI\"", h, true, d.confidence, 60, d.detail, "Axon OUI");
-      chkInt("  ^ method is M_NAME", d.method, M_NAME); }
-    { std::vector<uint8_t> a; addName(a, "AXON AB3 cam");
-      chk("near-miss name \"AB3\" -> NO hit", runBLE(MAC_PHONE, a), false); }
-    axonLoadSignature(&SIG_STRICT);
-    { std::vector<uint8_t> a;
-      chk("usePayload: Axon OUI without the tag -> NO hit", runBLE(MAC_AXON, a), false); }
-    { std::vector<uint8_t> a; addSvcStr(a, 0x21, "BWCDEVICE");
-      chk("usePayload: Axon OUI WITH the tag -> hit", runBLE(MAC_AXON, a), true, d.confidence, 90, d.detail, "BWC DEVICE"); }
-    axonLoadSignature(&SIG_HICONF);
-    { std::vector<uint8_t> a; addSvcStr(a, 0x21, "BWCDEVICE");
-      // 90 is a FLOOR for the tag, not a fixed value: a signature already above it keeps its own.
-      chk("baseConfidence 95 + tag -> keeps 95, not 90", runBLE(MAC_AXON, a), true, d.confidence, 95, d.detail, "BWC DEVICE"); }
-    axonLoadSignature(nullptr);
-    { std::vector<uint8_t> a;
-      chk("loadSignature(nullptr) resets to placeholder", runBLE(MAC_AXON, a), false); }
-
     // -- WiFi entry point --------------------------------------------------------------------
     printf("\n-- WiFi (802.11 management frames) --\n");
-    axonUseRegistryCandidate();
     { std::vector<uint8_t> f = mgmtFrame(MAC_AXON, MAC_PHONE);
       bool h = runWiFi(f);
       // 65, NOT the BLE tier's 75: the OUI read is as reliable, but the type claim is weaker and
@@ -467,14 +341,6 @@ int main() {
     { std::vector<uint8_t> f;
       chk("zero-length frame -> no hit", runWiFi(f), false); }
     chkInt("null frame pointer -> no hit", axonClassifyWiFi(nullptr, 64, -50, &d) ? 1 : 0, 0);
-    // Asymmetry worth knowing: on WiFi the Axon table is gated on the loaded signature, but the
-    // Utility table is checked unconditionally. Placeholder loaded = Axon invisible, Utility not.
-    axonLoadSignature(nullptr);
-    { std::vector<uint8_t> f = mgmtFrame(MAC_AXON, MAC_PHONE);
-      chk("placeholder: Axon OUI on WiFi -> NO hit", runWiFi(f), false); }
-    { std::vector<uint8_t> f = mgmtFrame(MAC_UTIL_A, MAC_PHONE);
-      chk("placeholder: Utility OUI on WiFi -> still hits", runWiFi(f), true, d.confidence, 65, d.detail, "Utility BodyWorn"); }
-    axonUseRegistryCandidate();
 
     // -- adversarial adverts -------------------------------------------------------------------
     printf("\n-- adversarial adverts --\n");

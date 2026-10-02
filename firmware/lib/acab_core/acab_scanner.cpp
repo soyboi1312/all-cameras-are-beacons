@@ -75,8 +75,8 @@ static volatile bool      gWifiEnabled = true;  // app-toggleable WiFi scan
 // state while holding it before an eco wake re-enables RX.
 static SemaphoreHandle_t  gWifiModeMux = nullptr;
 
-static double gSelfLat = 0, gSelfLon = 0;
-static bool   gSelfGPSValid = false;
+static const uint32_t WIFI_HOP_INTERVAL_MS = 300;    // wifiHopTask dwell time per channel
+static const uint32_t DEDUP_WINDOW_MS      = 60000;  // re-emit a device as "new" after this gap
 
 // Dedup table -------------------------------------------------------------
 // One entry per device we've recently seen, so we don't re-report it every advert.
@@ -323,7 +323,7 @@ static DedupEntry* dedupFind(AcabDeviceType type, const uint8_t mac[6], uint32_t
     // tracker then gets re-admitted instead of refreshed - which zeroes count (so it re-alerts the
     // buzzer, defeating the tracker dwell gate) and zeroes loggedGen (so the offline flash ring
     // refills with duplicates of one device and wraps away the evidence). The unsigned subtraction
-    // below is wrap-correct, matching the `now - e->lastSeen > gCfg.dedupWindowMs` test in
+    // below is wrap-correct, matching the `now - e->lastSeen > DEDUP_WINDOW_MS` test in
     // handleDetection that already gets this right.
     int freeIdx = -1, oldestIdx = -1, oldestNearbyIdx = -1;
     uint32_t oldestAge = 0, oldestNearbyAge = 0;
@@ -536,7 +536,7 @@ static void handleDetection(AcabDetection& d, bool isReplay = false) {
 
     portENTER_CRITICAL(&gDedupMux);
     DedupEntry* e = dedupFind(d.type, key, bucket, now);
-    isNew = (e->count == 0) || (now - e->lastSeen > gCfg.dedupWindowMs);
+    isNew = (e->count == 0) || (now - e->lastSeen > DEDUP_WINDOW_MS);
     if (e->count == 0) e->firstSeen = now;
     e->lastSeen = now;
     if (e->count < 0xFFFF) e->count++;
@@ -650,16 +650,13 @@ static void handleDetection(AcabDetection& d, bool isReplay = false) {
     // Stamp EVERY non-drone hit with a GPS fix (drones broadcast their own) and record the fix's
     // age, so the app can say "location from a fix N old" instead of implying it is live.
     //
-    // Two sources go ON the detection:
-    //   1. gSelfGPSValid - an onboard or nRF-forwarded fix. NO CALLER TODAY: acabScannerSetSelfGPS
-    //      has never been wired up by any main, and the nRF forward frame carries no coordinates,
-    //      so on every shipped board this arm is false and the stamp comes from the phone.
-    //   2. the live phone fix, which exists only while a phone is connected. It is taken at "any
+    // One source goes ON the detection:
+    //   1. the live phone fix, which exists only while a phone is connected. It is taken at "any
     //      age" - see DET_LOG_GPS_MAX_AGE_MS, which is NOT a bound on this arm.
     //
     // And one source goes BESIDE it, never on it:
-    //   3. THE OFFLINE-BUFFER PATH. acabBleGetPhoneGps is cleared on disconnect, and det_log
-    //      accepts rows only while the phone is away, so 1 and 2 together stamped nothing at all
+    //   2. THE OFFLINE-BUFFER PATH. acabBleGetPhoneGps is cleared on disconnect, and det_log
+    //      accepts rows only while the phone is away, so the live fix stamped nothing at all
     //      onto a buffered record: a deploy-and-leave capture recorded what went by and lost
     //      where, which is half of what it was left there to record. The retained fix
     //      (acabBleGetLastPhoneGps) fills that in, but it may reach the encrypted ring and NOTHING
@@ -681,25 +678,20 @@ static void handleDetection(AcabDetection& d, bool isReplay = false) {
     //      sanctioned use for the retained fix, so it must not even read it.
     DetLogGpsStamp bufGps{};
     if (d.type != ACAB_DRONE && d.lat == 0 && d.lon == 0) {
-        if (gSelfGPSValid) {
-            d.lat = gSelfLat;
-            d.lon = gSelfLon;
-        } else {
-            double la, lo; uint32_t ageMs = 0;
-            if (acabBleGetPhoneGps(&la, &lo, 0xFFFFFFFFu, &ageMs)) {
-                d.lat = la;
-                d.lon = lo;
-                d.gpsAgeMs = ageMs;
-            } else if (shouldBuffer && !acabBleClientConnected() &&
-                       acabBleGetLastPhoneGps(&la, &lo, DET_LOG_GPS_MAX_AGE_MS, &ageMs)) {
-                // Converted to StoredDet's own units here so det_log stores exactly what was
-                // read, and so this struct cannot be mistaken for something a live path may use.
-                // The getter's maxAgeMs bound is what makes ageSec fit a uint16 without clamping.
-                bufGps.lat_e7 = (int32_t)(la * 1e7);
-                bufGps.lon_e7 = (int32_t)(lo * 1e7);
-                bufGps.ageSec = (uint16_t)(ageMs / 1000);
-                bufGps.valid  = true;
-            }
+        double la, lo; uint32_t ageMs = 0;
+        if (acabBleGetPhoneGps(&la, &lo, 0xFFFFFFFFu, &ageMs)) {
+            d.lat = la;
+            d.lon = lo;
+            d.gpsAgeMs = ageMs;
+        } else if (shouldBuffer && !acabBleClientConnected() &&
+                   acabBleGetLastPhoneGps(&la, &lo, DET_LOG_GPS_MAX_AGE_MS, &ageMs)) {
+            // Converted to StoredDet's own units here so det_log stores exactly what was
+            // read, and so this struct cannot be mistaken for something a live path may use.
+            // The getter's maxAgeMs bound is what makes ageSec fit a uint16 without clamping.
+            bufGps.lat_e7 = (int32_t)(la * 1e7);
+            bufGps.lon_e7 = (int32_t)(lo * 1e7);
+            bufGps.ageSec = (uint16_t)(ageMs / 1000);
+            bufGps.valid  = true;
         }
     }
 
@@ -766,20 +758,6 @@ static void handleDetection(AcabDetection& d, bool isReplay = false) {
 // ---------------------------------------------------------------------------
 // BLE
 // ---------------------------------------------------------------------------
-// Clamp an attacker-sourced byte string to printable ASCII on copy (see the header).
-// A crafted advert name / SSID / ODID id cannot smuggle control bytes into the JSON.
-void acabSanitizeAscii(char* dst, const uint8_t* src, size_t n, size_t cap) {
-    if (!dst || cap == 0) return;
-    size_t m = n;
-    if (m > cap - 1) m = cap - 1;
-    size_t j = 0;
-    for (; j < m; j++) {
-        uint8_t c = src ? src[j] : 0;
-        dst[j] = (c >= 0x20 && c <= 0x7E) ? (char)c : '.';
-    }
-    dst[j] = 0;
-}
-
 // Pull the advertised local name (AD type 0x08 short / 0x09 complete) out of a BLE
 // advert into name[outSz] for a synthesized watchlist hit. Empty if there is none.
 static void bleWatchName(const uint8_t* adv, size_t advLen, char* name, size_t outSz) {
@@ -880,8 +858,7 @@ static void logBodyCamNameCandidate(const uint8_t mac[6], const char* name, int 
 // decisions run over: the per-group tables, the counters, and the serial rendering.
 
 // Own constant rather than reusing the WiFi side's WATCH_LOG_EVERY_MS, which is declared further
-// down the file and lives inside the ACAB_DIAG_WIFI guard. Borrowing it would make this block fail
-// to compile in a capture build without WiFi diag, for no benefit.
+// down the file, after the BLE ingest code that needs this interval.
 static const uint32_t VENDOR_LOG_EVERY_MS = 5000;
 // SEPARATE TABLES PER VENDOR, because a shared one is not neutral. Motorola rides along in this
 // capture for free in CPU terms, but not in SLOTS: twelve Motorola radios at a station car park
@@ -1444,7 +1421,7 @@ static void bleScanTask(void*) {
 // ---------------------------------------------------------------------------
 // WiFi
 // ---------------------------------------------------------------------------
-#ifdef ACAB_DIAG_WIFI
+#ifdef ACAB_CAPTURE_BUILD
 // Bench diagnostic: log every beacon / probe-response (BSSID + SSID + RSSI), so a
 // field test next to a pole-mounted camera can spot its WiFi presence, if any.
 // Parsing + serial run off the promiscuous callback via a queue and task.
@@ -1477,7 +1454,6 @@ static void wifiDiagTask(void*) {
                           it.bssid[5], it.rssi, it.ssid);
 }
 
-#ifdef ACAB_CAPTURE_BUILD
 // Registered ALPR-vendor prefixes, capture builds only. This is deliberately separate from the
 // older diagnostic watchlist: these rows have exact IEEE widths and a named registrant, while the
 // WATCH row is one ambiguous shared-silicon lead. Neither produces a detection.
@@ -1592,7 +1568,6 @@ static bool alprWifiScanAddresses(const uint8_t* frame, size_t len, bool data, i
     }
     return any;
 }
-#endif
 
 // Flock Falcon Wi-Fi OUIs seen in the field (own captures, 2026-06),
 // all Liteon allocations. Liteon is shared silicon = FP-prone (bench only); a
@@ -1604,7 +1579,6 @@ static inline bool falconOui(const uint8_t* m) {
            (m[0]==0xF4 && m[1]==0x6A && m[2]==0xDD);     // F4:6A:DD
 }
 
-#ifdef ACAB_CAPTURE_BUILD
 // DIAGNOSTIC WATCHLIST - capture builds only, and deliberately NOT a classifier.
 //
 // OUIs that are interesting enough to want every frame of, but nowhere near good enough to
@@ -1725,19 +1699,18 @@ static FalconRec* falconRecFind(const uint8_t* mac) {
     return freeSlot;
 }
 #endif
-#endif
 
 // Compute + install the promiscuous frame filter. Production is MGMT-only (beacons + probe
 // req/resp): data frames are a firehose whose CPU + 2.4GHz-coexistence cost we refuse to pay
 // by default. We widen to DATA ONLY when the network-camera opt-in is on (its source-MAC OUI
-// match needs data frames) or in a bench diag build. When the opt-in is off the driver never
+// match needs data frames) or in a capture build. When the opt-in is off the driver never
 // delivers a data frame at all, so the OFF path is genuinely zero-cost. Callable at runtime:
 // netcamSetEnabled() invokes acabScannerRefreshWifiFilter() on every flip.
 static void applyWifiPromiscFilter() {
     wifi_promiscuous_filter_t pf;
     uint32_t mask = WIFI_PROMIS_FILTER_MASK_MGMT;
     if (netcamIsEnabled()) mask |= WIFI_PROMIS_FILTER_MASK_DATA;   // opt-in camera data-frame OUI match
-#ifdef ACAB_DIAG_WIFI
+#ifdef ACAB_CAPTURE_BUILD
     mask |= WIFI_PROMIS_FILTER_MASK_DATA;                          // bench: also capture data frames
 #endif
     pf.filter_mask = mask;
@@ -1752,7 +1725,7 @@ static void IRAM_ATTR wifiRxCallback(void* buf, wifi_promiscuous_pkt_type_t type
     int rssi = pkt->rx_ctrl.rssi;
     if (len < 24) return;
 
-#ifdef ACAB_DIAG_WIFI
+#ifdef ACAB_CAPTURE_BUILD
     // DATA frames: Falcon cams ride as WiFi clients (no "Flock-" beacon), so look for
     // a Falcon MAC OUI in any of the three address fields (addr1 @+4, addr2 @+10,
     // addr3 @+16) and log it. PROVISIONAL OUIs from own captures; Liteon is shared
@@ -1767,13 +1740,10 @@ static void IRAM_ATTR wifiRxCallback(void* buf, wifi_promiscuous_pkt_type_t type
         // single most valuable thing this capture path could ever record, and it was the one
         // case suppressed. loggedAnything exists ONLY to suppress the generic DATA-sample below.
         bool loggedAnything = false;
-#ifdef ACAB_CAPTURE_BUILD
         loggedAnything = alprWifiScanAddresses(payload, (size_t)len, /*data=*/true, rssi);
-#endif
         for (int k = 0; k < 3; k++) {
             const uint8_t* m = aa[k];
             if (!falconOui(m)) continue;
-#ifdef ACAB_CAPTURE_BUILD
             // ACCOUNTED + TIME-THROTTLED (see FalconRec). An associated camera streams data by
             // the hundred per second, and the unthrottled push this replaces would fill the diag
             // queue and discard the probe/beacon co-signals that give the sighting its meaning -
@@ -1818,24 +1788,9 @@ static void IRAM_ATTR wifiRxCallback(void* buf, wifi_promiscuous_pkt_type_t type
                          (int)f->best, (unsigned)f->addrMask);   // f is non-null: emit is only true above when it is
                 wifiDiagPush(it);
             }
-#else
-            WifiDiagItem it;
-            memcpy(it.bssid, m, 6);
-            it.rssi = (int8_t)rssi;
-            // "fwnote:" prefix, NOT a bare word. This label lands in the ssid= field of the
-            // [wifi] diagnostic line, and it only prints once falconOui() has already matched,
-            // so it says nothing the OUI table did not already say. The old spelling was
-            // "DATA-FALCON", which read back out of a capture as a broadcast SSID and became the
-            // sole evidence for a shipping conf-85 "*-FALCON" SSID rule (now ext=1; see
-            // FLOCK_SSID_FALCON_SUFFIX). Keep any label written here impossible to mistake for
-            // an SSID the air actually carried.
-            memcpy(it.ssid, "fwnote:falcon-oui-data", sizeof("fwnote:falcon-oui-data"));
-            wifiDiagPush(it);
-#endif
             loggedAnything = true;
             break;
         }
-#ifdef ACAB_CAPTURE_BUILD
         // Diagnostic watchlist on the DATA path too (see diagWatchOui). The mgmt-side copy of
         // this check only fires on management frames, so a watched device that is ASSOCIATED to
         // a network and sending nothing but data would have been invisible unless it happened to
@@ -1887,7 +1842,6 @@ static void IRAM_ATTR wifiRxCallback(void* buf, wifi_promiscuous_pkt_type_t type
             loggedAnything = true;
             break;
         }
-#endif
         if (!loggedAnything && (gDataN % 300) == 0) {   // sample: proves data frames are arriving
             WifiDiagItem it;
             memcpy(it.bssid, aa[1], 6);           // addr2 = source
@@ -1911,12 +1865,12 @@ static void IRAM_ATTR wifiRxCallback(void* buf, wifi_promiscuous_pkt_type_t type
     if (type != WIFI_PKT_MGMT) return;
     gWifiSeen++;
 
-#ifdef ACAB_DIAG_WIFI
+#ifdef ACAB_CAPTURE_BUILD
     // probe request (0x40): Falcon cams scan for networks as WiFi clients, so addr2 is the
-    // prober. A KNOWN Falcon OUI is called out by name; in a capture build EVERY prober is
-    // logged instead, with the SSID it is asking for.
+    // prober. EVERY prober is logged: a KNOWN Falcon OUI is called out by name, any other
+    // with the SSID it is asking for.
     //
-    // Why the unconditional arm exists: gating this on falconOui() made the capture build
+    // Why this is not gated on falconOui(): that gate made the capture build
     // circular. Its whole job is to discover a signature we do NOT have yet, but a client on an
     // unknown OUI could not reach the log at all - the mgmt path below only records beacons and
     // probe-responses (i.e. APs), and a client's data frames only surface through the 1-in-300
@@ -1927,18 +1881,16 @@ static void IRAM_ATTR wifiRxCallback(void* buf, wifi_promiscuous_pkt_type_t type
     // reason this stays out of shipping builds.
     if (gWifiDiagQ && payload[0] == 0x40) {
         const bool known = falconOui(payload + 10);
-#ifndef ACAB_CAPTURE_BUILD
-        if (known)
-#endif
         {
             WifiDiagItem it;
             memcpy(it.bssid, payload + 10, 6);
             it.rssi = (int8_t)rssi;
             if (known) {
-                // "fwnote:" prefix for the same reason as the data-frame label above: this is
-                // OUR note about OUR OUI match, not an SSID the frame carried. The old spelling
-                // "PROBE-FALCON" was read back out of a capture as a broadcast SSID and became
-                // the evidence for a conf-85 rule (now ext=1; see FLOCK_SSID_FALCON_SUFFIX).
+                // "fwnote:" prefix, NOT a bare word: this is OUR note about OUR OUI match, not
+                // an SSID the frame carried. The old spelling "PROBE-FALCON" was read back out
+                // of a capture as a broadcast SSID and became the evidence for a conf-85 rule
+                // (now ext=1; see FLOCK_SSID_FALCON_SUFFIX). Keep any label written here
+                // impossible to mistake for an SSID the air actually carried.
                 memcpy(it.ssid, "fwnote:falcon-oui-probe", sizeof("fwnote:falcon-oui-probe"));
             } else {
                 // "PROBE:<ssid>", or "PROBE:*" for the broadcast (wildcard) probe every client
@@ -1952,7 +1904,6 @@ static void IRAM_ATTR wifiRxCallback(void* buf, wifi_promiscuous_pkt_type_t type
             wifiDiagPush(it);
         }
     }
-#ifdef ACAB_CAPTURE_BUILD
     // Exact-width ALPR vendor-prefix annotations are an independent capture surface. They never
     // short-circuit the generic probe/beacon trace or any shipping classifier below.
     if (gWifiDiagQ) alprWifiScanAddresses(payload, (size_t)len, /*data=*/false, rssi);
@@ -2001,7 +1952,6 @@ static void IRAM_ATTR wifiRxCallback(void* buf, wifi_promiscuous_pkt_type_t type
         else    snprintf(it.ssid, sizeof(it.ssid), "FAL-MGMT t=0x%02X tablefull", payload[0]);
         wifiDiagPush(it);
     }
-#endif
     // beacon (0x80) or probe-response (0x50): grab BSSID + SSID for the bench log
     if (gWifiDiagQ && (payload[0] == 0x80 || payload[0] == 0x50) && len >= 38) {
         WifiDiagItem it;
@@ -2084,44 +2034,42 @@ static void restoreWifiEco() {
 static void wifiHopTask(void*) {
     int idx = 0;
     for (;;) {
-        if (gCfg.wifiChannelHop) {
-            esp_wifi_set_channel(WIFI_HOP_SEQ[idx], WIFI_SECOND_CHAN_NONE);
-            idx++;
-            if (idx >= WIFI_HOP_SEQ_LEN) {
-                idx = 0;
-                // A full channel sweep just finished. If eco is on, drop the WiFi RX for
-                // gWifiEcoSec before the next sweep - this is where the battery is saved (the
-                // promiscuous RX is the board's biggest single draw). BLE keeps running throughout.
-                // Skip while the WiFi toggle is off (its own promiscuous(false) owns the radio then),
-                // and re-check both flags every 100ms so a config change interrupts the sleep early.
+        esp_wifi_set_channel(WIFI_HOP_SEQ[idx], WIFI_SECOND_CHAN_NONE);
+        idx++;
+        if (idx >= WIFI_HOP_SEQ_LEN) {
+            idx = 0;
+            // A full channel sweep just finished. If eco is on, drop the WiFi RX for
+            // gWifiEcoSec before the next sweep - this is where the battery is saved (the
+            // promiscuous RX is the board's biggest single draw). BLE keeps running throughout.
+            // Skip while the WiFi toggle is off (its own promiscuous(false) owns the radio then),
+            // and re-check both flags every 100ms so a config change interrupts the sleep early.
 #ifdef ACAB_CAPTURE_BUILD
-                // Capture builds never sleep the receiver. The NVS eco level survives the
-                // reflash from a shipping image, and honoring it here would punch eco-sized
-                // holes in the exact firehose this build exists to record. The stored value
-                // is left alone (and still shows in the app) for the shipping image later.
-                const int eco = 0;
+            // Capture builds never sleep the receiver. The NVS eco level survives the
+            // reflash from a shipping image, and honoring it here would punch eco-sized
+            // holes in the exact firehose this build exists to record. The stored value
+            // is left alone (and still shows in the app) for the shipping image later.
+            const int eco = 0;
 #else
-                int eco = gWifiEcoSec;
+            int eco = gWifiEcoSec;
 #endif
-                if (eco > 0 && gWifiEnabled) {
-                    if (gWifiModeMux) xSemaphoreTake(gWifiModeMux, portMAX_DELAY);
-                    const bool shouldSleep = gWifiEnabled && gWifiEcoSec > 0;
-                    if (shouldSleep) esp_wifi_set_promiscuous(false);
-                    if (gWifiModeMux) xSemaphoreGive(gWifiModeMux);
-                    if (!shouldSleep) continue;
-                    uint32_t until = millis() + (uint32_t)eco * 1000;
-                    while ((int32_t)(millis() - until) < 0 && gWifiEcoSec > 0 && gWifiEnabled)
-                        vTaskDelay(pdMS_TO_TICKS(100));
-                    // The app toggle may have run after the loop condition was last read. Holding
-                    // the same mutex for the final check plus driver call makes the desired flag
-                    // and actual radio state one transition: eco can never re-arm over WiFi-off.
-                    if (gWifiModeMux) xSemaphoreTake(gWifiModeMux, portMAX_DELAY);
-                    if (gWifiEnabled) esp_wifi_set_promiscuous(true);
-                    if (gWifiModeMux) xSemaphoreGive(gWifiModeMux);
-                }
+            if (eco > 0 && gWifiEnabled) {
+                if (gWifiModeMux) xSemaphoreTake(gWifiModeMux, portMAX_DELAY);
+                const bool shouldSleep = gWifiEnabled && gWifiEcoSec > 0;
+                if (shouldSleep) esp_wifi_set_promiscuous(false);
+                if (gWifiModeMux) xSemaphoreGive(gWifiModeMux);
+                if (!shouldSleep) continue;
+                uint32_t until = millis() + (uint32_t)eco * 1000;
+                while ((int32_t)(millis() - until) < 0 && gWifiEcoSec > 0 && gWifiEnabled)
+                    vTaskDelay(pdMS_TO_TICKS(100));
+                // The app toggle may have run after the loop condition was last read. Holding
+                // the same mutex for the final check plus driver call makes the desired flag
+                // and actual radio state one transition: eco can never re-arm over WiFi-off.
+                if (gWifiModeMux) xSemaphoreTake(gWifiModeMux, portMAX_DELAY);
+                if (gWifiEnabled) esp_wifi_set_promiscuous(true);
+                if (gWifiModeMux) xSemaphoreGive(gWifiModeMux);
             }
         }
-        vTaskDelay(pdMS_TO_TICKS(gCfg.wifiHopIntervalMs));
+        vTaskDelay(pdMS_TO_TICKS(WIFI_HOP_INTERVAL_MS));
     }
 }
 
@@ -2132,17 +2080,8 @@ AcabScannerConfig acabScannerDefaults() {
     AcabScannerConfig c;
     c.enableBLE        = true;
     c.enableWiFi       = true;
-    c.initNimBLE       = true;
     c.bleDeviceName    = "ACAB";
-    c.wifiChannelHop   = true;
-    c.wifiFixedChannel = 6;
-    c.wifiHopIntervalMs= 300;
-    c.dedupWindowMs    = 60000;
     return c;
-}
-
-void acabScannerSetSelfGPS(double lat, double lon, bool valid) {
-    gSelfLat = lat; gSelfLon = lon; gSelfGPSValid = valid;
 }
 
 bool acabScannerBlockCaptureForOwnerSession() {
@@ -2574,17 +2513,16 @@ void acabScannerBegin(const AcabScannerConfig& cfg, AcabDetectionSink sink) {
         WiFi.disconnect();
         esp_wifi_set_promiscuous(true);
         // Install the frame filter: MGMT-only in production, widened to DATA only when the
-        // network-camera opt-in is on (or a diag build). netcamRestoreEnabled() already ran
+        // network-camera opt-in is on (or a capture build). netcamRestoreEnabled() already ran
         // in main() before this, so a persisted opt-in is honored from the first frame.
         applyWifiPromiscFilter();
         esp_wifi_set_promiscuous_rx_cb(&wifiRxCallback);
-        esp_wifi_set_channel(cfg.wifiChannelHop ? 6 : cfg.wifiFixedChannel,
-                             WIFI_SECOND_CHAN_NONE);
+        esp_wifi_set_channel(6, WIFI_SECOND_CHAN_NONE);
         if (xTaskCreatePinnedToCore(wifiHopTask, "acabWifiHop", 4096, nullptr, 1, nullptr, 0) != pdPASS) {
             Serial.println("[fatal] wifi hop task create failed - restarting");
             delay(250); ESP.restart();
         }
-#ifdef ACAB_DIAG_WIFI
+#ifdef ACAB_CAPTURE_BUILD
         gWifiDiagQ = xQueueCreate(64, sizeof(WifiDiagItem));
         if (!gWifiDiagQ ||
             xTaskCreatePinnedToCore(wifiDiagTask, "acabWifiDiag", 4096, nullptr, 1, nullptr, 0) != pdPASS) {
@@ -2595,9 +2533,6 @@ void acabScannerBegin(const AcabScannerConfig& cfg, AcabDetectionSink sink) {
     }
 
     if (cfg.enableBLE) {
-        if (cfg.initNimBLE && !NimBLEDevice::getInitialized()) {
-            NimBLEDevice::init(cfg.bleDeviceName ? cfg.bleDeviceName : "ACAB");
-        }
         // hush the lib's warnings about zero-length adverts we ignore anyway
         esp_log_level_set("NimBLEAdvertisedDevice", ESP_LOG_NONE);
 

@@ -27,30 +27,7 @@
 #include <freertos/FreeRTOS.h>
 #include <freertos/semphr.h>
 #include <string.h>
-#include <Preferences.h>   // per-unit IRK persistence (see the privacy block in acabBleBegin)
-#include <esp_random.h>
 #include <esp_timer.h>
-
-// ---- privacy build-configuration guard -------------------------------------------------------
-// PROVEN ON HARDWARE 2026-08-01, and the reason this guard exists rather than a comment.
-//
-// NimBLEDevice::setOwnAddrType(BLE_OWN_ADDR_RPA_*) looks like it enables address privacy. On
-// ESP32-S3 with the stock Arduino sdkconfig it does NOT: the ble_hs_pvcy_rpa_config() call inside
-// it sits behind #if MYNEWT_VAL(BLE_HOST_BASED_PRIVACY), which resolves to
-// CONFIG_BT_NIMBLE_HOST_BASED_PRIVACY, which is not defined. The call compiles away, the function
-// sets a member variable, and the board advertises its fixed factory address forever while every
-// line of source reads as though privacy is on.
-//
-// That is exactly what shipped in the first attempt at this: two consecutive boots printed the
-// identical address e8:3d:c1:... (an Espressif OUI, i.e. the factory public address). Nothing in
-// the build warned. A comment would not have caught it, because the code was already commented.
-//
-// So: asking for privacy without the stack support is now a BUILD FAILURE, not a silent no-op.
-#if ACAB_BLE_PRIVACY && !(defined(CONFIG_BT_NIMBLE_HOST_BASED_PRIVACY) && CONFIG_BT_NIMBLE_HOST_BASED_PRIVACY)
-#error "ACAB_BLE_PRIVACY=1 needs -DCONFIG_BT_NIMBLE_HOST_BASED_PRIVACY=1 in build_flags. \
-Without it NimBLE compiles the RPA call away and the board advertises a FIXED address while \
-appearing to be private. Add the flag to this env in platformio.ini, or set ACAB_BLE_PRIVACY=0."
-#endif
 
 // acab_core-internal loop pumps and hooks driven from acabBleDrainTick below (every build's
 // loop() already calls it each pass): the det_log deferred-wipe chunker + drain-resume cursor
@@ -316,10 +293,6 @@ static bool nrfDfuMayArmNow() {
     return acabLegacyDfuMayArm(gConnected, acabBlePairWindowOpen());
 }
 
-// NimBLE host-privacy re-arm. Private header (ble_hs_pvcy_priv.h), no NimBLE-Arduino wrapper.
-extern "C" int ble_hs_pvcy_rpa_config(uint8_t enable);
-#define ACAB_NIMBLE_ENABLE_RPA 1
-
 // RAW GAP TAP. Observer only, returns 0, the normal handlers still run.
 //
 // WHY THIS EXISTS: NimBLE-Arduino's C++ callbacks DROP the fields that carry the reason.
@@ -361,15 +334,13 @@ static int acabGapTap(ble_gap_event* ev, void*) {
     return 0;
 }
 
-// Re-arm advertising after the stack preempts it. LOAD-BEARING, and the failure it prevents is
-// worse than the leak address privacy was added to fix.
+// Re-arm advertising after the stack preempts it.
 //
-// ble_hs_pvcy_rpa_config arms an RPA rotation timer (CONFIG_BT_NIMBLE_RPA_TIMEOUT, 900 s by
-// default). Each rotation calls ble_gap_preempt(), which STOPS advertising, and ble_gap_preempt_done
-// then delivers ADV_COMPLETE with reason BLE_HS_EPREEMPTED and restarts NOTHING. With no completion
-// callback that event is dropped on the floor and the board goes silent 15 minutes after boot and
-// stays silent until it is power-cycled - which is exactly the product's normal case, a board left
-// running in a car with the phone connecting later.
+// ble_gap_preempt() STOPS advertising, and ble_gap_preempt_done then delivers ADV_COMPLETE with
+// reason BLE_HS_EPREEMPTED and restarts NOTHING. With no completion callback that event is dropped
+// on the floor, and it is left to the supervisor in acabBleDrainTick to bring advertising back.
+// In the pinned NimBLE 1.4.3, as this project builds it, the callers of ble_gap_preempt are
+// ble_hs_pvcy_add_entry (a bonded peer goes onto the controller resolving list) and ble_hs_stop.
 //
 // Restarting from inside the callback is legal: preempt_done clears the preempted flag inside the
 // lock BEFORE dispatching, so start() here does not return BLE_HS_EPREEMPTED.
@@ -992,7 +963,6 @@ class CfgCb : public NimBLECharacteristicCallbacks {
         if (doc["bodycam"].is<bool>() || doc["axon"].is<bool>()) {
             bool on = doc["bodycam"].is<bool>() ? doc["bodycam"].as<bool>()
                                                 : doc["axon"].as<bool>();
-            if (on) axonUseRegistryCandidate();   // load the Axon OUI table so it actually fires
             axonSetEnabled(on);
             // NOTE: deliberately does NOT touch policeSetEnabled. The broad Motorola
             // match is a SUB-toggle ({"motorola"}) underneath this category, so the
@@ -1002,67 +972,35 @@ class CfgCb : public NimBLECharacteristicCallbacks {
             Serial.printf("[ACAB] Body-cam detector %s\n", on ? "ENABLED" : "disabled");
             statusDirty = true;
         }
-        // Broad Motorola Solutions OUI match: sub-toggle of the body-cam category.
-        // Lets a user quiet the noisy corporate-OUI proxy while keeping the conf-90
-        // Axon BWCDEVICE tag and Utility BodyWorn running.
-        if (doc["motorola"].is<bool>()) {
-            bool on = doc["motorola"].as<bool>();
-            policeSetEnabled(on);
-            Serial.printf("[ACAB] Motorola broad-OUI match %s\n", on ? "on" : "off");
-            statusDirty = true;
-        }
-        if (doc["tracker"].is<bool>()) {
-            bool on = doc["tracker"].as<bool>();
-            trackerSetEnabled(on);
-            Serial.printf("[ACAB] Tracker detector %s\n", on ? "on" : "off");
-            statusDirty = true;
-        }
-        if (doc["glasses"].is<bool>()) {      // recording-glasses detector (BLE mfg company ID)
-            bool on = doc["glasses"].as<bool>();
-            glassesSetEnabled(on);
-            Serial.printf("[ACAB] Glasses detector %s\n", on ? "on" : "off");
-            statusDirty = true;
-        }
-        if (doc["flock"].is<bool>()) {        // Flock/ALPR detector (BLE + WiFi)
-            bool on = doc["flock"].as<bool>();
-            flockSetEnabled(on);
-            Serial.printf("[ACAB] Flock/ALPR detector %s\n", on ? "on" : "off");
-            statusDirty = true;
-        }
-        if (doc["drone"].is<bool>()) {        // drone Remote ID detector (BLE + WiFi)
-            bool on = doc["drone"].as<bool>();
-            droneSetEnabled(on);
-            Serial.printf("[ACAB] Drone detector %s\n", on ? "on" : "off");
-            statusDirty = true;
-        }
-        if (doc["droneoui"].is<bool>()) {     // drone vendor-OUI fallback opt-in (default OFF; may false-positive on stationary drone-vendor gear)
-            bool on = doc["droneoui"].as<bool>();
-            droneOuiSetEnabled(on);
-            Serial.printf("[ACAB] Drone OUI fallback %s\n", on ? "on" : "off");
-            statusDirty = true;
-        }
-        if (doc["netcam"].is<bool>()) {       // network-camera opt-in (default OFF; widens WiFi to data frames, see netcam_detect.cpp)
-            bool on = doc["netcam"].as<bool>();
-            netcamSetEnabled(on);
-            Serial.printf("[ACAB] Network-camera detector %s\n", on ? "on" : "off");
-            statusDirty = true;
-        }
-        if (doc["desert"].is<bool>()) {       // Desert mode: report EVERY device in range
-            bool on = doc["desert"].as<bool>();
-            desertSetEnabled(on);
-            Serial.printf("[ACAB] Desert mode %s\n", on ? "ENABLED" : "disabled");
-            statusDirty = true;
-        }
-        if (doc["buzzer"].is<bool>()) {
-            bool on = doc["buzzer"].as<bool>();
-            alertsSetBuzzerEnabled(on);
-            Serial.printf("[ACAB] Buzzer %s\n", on ? "on" : "off");
-            statusDirty = true;
-        }
-        if (doc["led"].is<bool>()) {
-            bool on = doc["led"].as<bool>();
-            alertsSetLedEnabled(on);
-            Serial.printf("[ACAB] LED %s\n", on ? "on" : "off (lights out)");
+        // The plain on/off keys, one row each: same is<bool>() gate, setter, log line and echo.
+        // {"bufall"} is NOT a row on purpose: detLogSetBufferAll(true) is refused while capture
+        // is off, and the same write can turn capture on in the {"buffer"} block further down,
+        // so bufall keeps its own block after that one.
+        static const struct { const char* key; void (*set)(bool); const char* what; } kToggles[] = {
+            // Broad Motorola Solutions OUI match (WatchGuard Video's block included): sub-toggle
+            // of the body-cam category.
+            // Lets a user quiet the noisy corporate-OUI proxy while keeping the conf-90
+            // Axon BWCDEVICE tag and Utility BodyWorn running.
+            {"motorola", policeSetEnabled,       "Motorola broad-OUI match"},
+            {"tracker",  trackerSetEnabled,      "Tracker detector"},
+            {"glasses",  glassesSetEnabled,      "Glasses detector"},      // recording-glasses detector (BLE mfg company ID)
+            {"flock",    flockSetEnabled,        "Flock/ALPR detector"},   // Flock/ALPR detector (BLE + WiFi)
+            {"drone",    droneSetEnabled,        "Drone detector"},        // drone Remote ID detector (BLE + WiFi)
+            // drone vendor-OUI fallback opt-in (default OFF; may false-positive on stationary drone-vendor gear)
+            {"droneoui", droneOuiSetEnabled,     "Drone OUI fallback"},
+            // network-camera opt-in (default OFF; widens WiFi to data frames, see netcam_detect.cpp)
+            {"netcam",   netcamSetEnabled,       "Network-camera detector"},
+            {"desert",   desertSetEnabled,       "Desert mode"},           // Desert mode: report EVERY device in range
+            {"buzzer",   alertsSetBuzzerEnabled, "Buzzer"},
+            {"led",      alertsSetLedEnabled,    "LED"},                   // off = lights out
+            {"ble",      acabScannerSetBLE,      "BLE scan"},
+            {"wifi",     acabScannerSetWiFi,     "WiFi scan"},
+        };
+        for (const auto& t : kToggles) {
+            if (!doc[t.key].is<bool>()) continue;
+            const bool on = doc[t.key].as<bool>();
+            t.set(on);
+            Serial.printf("[ACAB] %s %s\n", t.what, on ? "on" : "off");
             statusDirty = true;
         }
         if (doc["volume"].is<int>()) {
@@ -1071,18 +1009,6 @@ class CfgCb : public NimBLECharacteristicCallbacks {
             if (v > 100) v = 100;
             alertsSetVolume((uint8_t)v);
             Serial.printf("[ACAB] Volume %d\n", v);
-            statusDirty = true;
-        }
-        if (doc["ble"].is<bool>()) {
-            bool on = doc["ble"].as<bool>();
-            acabScannerSetBLE(on);
-            Serial.printf("[ACAB] BLE scan %s\n", on ? "on" : "off");
-            statusDirty = true;
-        }
-        if (doc["wifi"].is<bool>()) {
-            bool on = doc["wifi"].as<bool>();
-            acabScannerSetWiFi(on);
-            Serial.printf("[ACAB] WiFi scan %s\n", on ? "on" : "off");
             statusDirty = true;
         }
         if (doc["wifiEco"].is<int>()) {   // 0/3/7/15 s of WiFi RX sleep between sweeps (battery SKU)
@@ -1311,33 +1237,6 @@ void acabBleBegin(const char* deviceName, const char* fwLabel, bool startAdverti
     NimBLEDevice::init(deviceName ? deviceName : "ACAB");
     NimBLEDevice::setCustomGapHandler(acabGapTap);   // raw reason codes, see acabGapTap
 
-// PER-UNIT IRK: DESIGNED, IMPLEMENTED, AND REVERTED. Read this before trying it again.
-//
-// NimBLE installs a HARDCODED DEFAULT IRK (ble_hs_pvcy_default_irk, a public constant sitting in
-// this repo's own libdeps) unless told otherwise, so every board ships the same identity key. That
-// is a real weakness and it is UNFIXED: a listener holding that published constant can resolve any
-// unit's rotating address, and two boards bonded to one phone can resolve to each other.
-//
-// The obvious fix, 16 random bytes in NVS installed with ble_hs_pvcy_set_our_irk, was built and
-// then removed because it BREAKS PAIRING ON EVERY BOOT. Traced through the pinned NimBLE 1.4.3:
-//   ble_hs_pvcy_irk[16] is file-static BSS, so it reads as zero on every boot and the "is this a
-//   new IRK" memcmp in ble_hs_pvcy_set_our_irk ALWAYS differs. That runs
-//   ble_hs_resolv_list_clear_all(), which zeroes the resolving list (discarding the bonded peers
-//   ble_hs_misc_restore_irks just restored during sync) and calls ble_rpa_peer_dev_rec_clear_all(),
-//   which calls ble_store_persist_peer_records() - so the peer records are deleted FROM NVS.
-//   A bonded phone then connects from an RPA nothing can resolve, the LTK lookup misses, encryption
-//   fails, and every characteristic here is READ_ENC/WRITE_ENC, so the app gets nothing. Re-pairing
-//   works only until the next power cycle, forever.
-//
-// Doing it properly means rebuilding peer_dev_rec from the bond store and re-running
-// ble_hs_misc_restore_irks after the install, both private host APIs, and it must be proven on a
-// BONDED board across a power cycle before it ships. Restoring the resolving list alone is not
-// enough: the connect path reads peer_dev_rec, and ble_hs_resolv_list_add only updates records that
-// already exist, it never creates them.
-//
-// Until then the shared default IRK stands, and the privacy claim must be stated honestly: the
-// address rotates, which defeats casual correlation, but it is NOT unlinkable to anyone who knows
-// the NimBLE constant.
     NimBLEDevice::setMTU(512);   // roomy ATT payload: the status + rich drone JSON outgrew 247 (see NOTIFY_MAX)
     // Encrypted, bonded link for the whole service, so a stranger can't silence the
     // scanner (config write) or watch what you're detecting (detection/status stream).
@@ -1348,62 +1247,17 @@ void acabBleBegin(const char* deviceName, const char* fwLabel, bool startAdverti
     // RF environment (not in public) - a no-I/O device can't do better without OOB pairing.
     NimBLEDevice::setSecurityAuth(true, false, true);            // bonding, no MITM, LE Secure Connections
     NimBLEDevice::setSecurityIOCap(BLE_HS_IO_NO_INPUT_OUTPUT);
-    // DISTRIBUTE THE IRK EXPLICITLY (BLE_SM_PAIR_KEY_DIST_ID), do not inherit a default.
+    // DISTRIBUTE THE ID KEYS EXPLICITLY (BLE_SM_PAIR_KEY_DIST_ID), do not inherit a default.
     //
-    // This is what makes address privacy WORK rather than break pairing. Under ACAB_BLE_PRIVACY
-    // below, the board advertises a Resolvable Private Address that rotates. A bonded phone can
-    // only follow that rotation if it holds our Identity Resolving Key, and it only holds the IRK
-    // if we handed it over during bonding. Rely on whatever NimBLE's default key distribution
-    // happens to be and the outcome is version-dependent: on a build that omits ID, every rotation
-    // looks like a brand-new stranger and the paired phone stops reconnecting.
-    //
-    // Stated as its own call so it is impossible to change the privacy setting without seeing this.
+    // A phone connects from a Resolvable Private Address that rotates. The board can match a
+    // bonded phone across that rotation only if it holds the phone's Identity Resolving Key, and
+    // it holds that key only if the pairing distributed it. ServerCb::onConnect's known-peer check
+    // reads the resolved peer_id_addr. Rely on whatever NimBLE's default key distribution happens
+    // to be and the outcome is version-dependent: on a build that omits ID, a bonded phone on a
+    // new address looks like a brand-new stranger.
     NimBLEDevice::setSecurityInitKey(BLE_SM_PAIR_KEY_DIST_ENC | BLE_SM_PAIR_KEY_DIST_ID);
     NimBLEDevice::setSecurityRespKey(BLE_SM_PAIR_KEY_DIST_ENC | BLE_SM_PAIR_KEY_DIST_ID);
 
-#if ACAB_BLE_PRIVACY
-    // ADDRESS PRIVACY. Advertise a Resolvable Private Address that rotates, instead of a fixed
-    // one that persists across reboots.
-    //
-    // WHY A COUNTER-SURVEILLANCE DEVICE OF ALL THINGS NEEDS THIS: the detection path is genuinely
-    // passive and always was, but the phone link had to exist, and it was broadcasting a stable
-    // address forever. That makes a unit a persistent, trackable identity - the same beacon at a
-    // protest on Tuesday and a courthouse on Friday is provably the same device to anyone with a
-    // cheap dongle. It is precisely the harm this product's own tracker detection exists to warn
-    // people about, pointed back at its owner. Our own drive tests recorded boards detecting each
-    // other, which is that enumeration working by accident.
-    //
-    // A bonded phone follows the rotation using the IRK distributed above; strangers cannot.
-    //
-    // *** BENCH BEFORE PUBLISHING. NOT A DESK CHANGE. ***
-    // Existing bonds were made BEFORE the explicit IRK distribution above, so a phone paired to an
-    // older build may not hold our IRK and may need to forget-and-re-pair ONCE after this update.
-    // That is recoverable, not a brick, but it must be a known cost rather than a surprise.
-    // Required sequence on real hardware before this reaches anyone:
-    //   1. flash one board, confirm an ALREADY-BONDED phone still reconnects (or note that it does
-    //      not, and that re-pairing is therefore required for existing users)
-    //   2. confirm a FRESH pair works end to end on both iOS and Android
-    //   3. confirm the board still appears in the app's picker across an address rotation
-    // BLE_OWN_ADDR_RANDOM (0x01), NOT BLE_OWN_ADDR_RPA_PUBLIC_DEFAULT (0x02). This distinction is
-    // the whole feature and it is invisible from the board.
-    //
-    // 0x02 asks the CONTROLLER to generate an RPA from its resolving list. Under HOST-based
-    // privacy NimBLE keeps that list in a host-side array and never sends HCI LE Add Device To
-    // Resolving List, so the controller's list is empty, and per Core Spec Vol 4 Pt E 7.8.5 an
-    // empty list under 0x02 means the controller falls back to THE PUBLIC ADDRESS. The board then
-    // advertises its fixed factory MAC exactly as before, while ble_hs_pvcy_rpa_config has
-    // genuinely installed a rotating RPA as the controller's RANDOM address, which nothing reads.
-    //
-    // 0x01 advertises that random address, which IS the RPA the host installed and keeps
-    // re-rolling. NimBLE-Arduino routes both cases through the same ble_hs_pvcy_rpa_config, so
-    // nothing else changes. ble_hs_pvcy.h states this outright: "2. Set own_addr_type to
-    // BLE_OWN_ADDR_RANDOM."
-    //
-    // The first attempt used 0x02 and the serial diagnostic below printed a rotating address, so
-    // it read as working. It was not: the diagnostic proves an RPA was GENERATED, never that it
-    // was ADVERTISED. Do not treat that line as on-air proof.
-    NimBLEDevice::setOwnAddrType(BLE_OWN_ADDR_RANDOM);
-#endif
 #ifdef ESP_PWR_LVL_P9
     NimBLEDevice::setPower(ESP_PWR_LVL_P9);
 #endif
@@ -1462,19 +1316,6 @@ void acabBleBegin(const char* deviceName, const char* fwLabel, bool startAdverti
     NimBLEAdvertisementData scanResp;
     scanResp.setName(deviceName ? deviceName : "ACAB");
 
-#if ACAB_ADVERTISE_VERSION
-    // LEGACY, DEFAULT OFF. The exact firmware version used to ride the scan response so the app
-    // could show it in the picker before connecting. That published the unit's CAPABILITY to
-    // every passive listener - which signature set it carries, therefore what it can and cannot
-    // see - to save its owner one tap. The version is already in the Status characteristic, which
-    // is post-connect and post-bond, so nothing is lost but the pre-connect convenience.
-    std::string verData;
-    verData.push_back((char)0xAB);          // company id 0xACAB (LE) - our own marker
-    verData.push_back((char)0xAC);
-    verData += ACAB_FW_VERSION;             // e.g. "0.2.3"
-    scanResp.setManufacturerData(verData);
-#endif
-
     adv->setScanResponseData(scanResp);
     // DEFERRABLE. beacon-board passes false and starts advertising itself AFTER the soft-power gate
     // and after the pairing gate is configured. Previously the radio went live here, ~160 lines
@@ -1489,46 +1330,9 @@ void acabBleBegin(const char* deviceName, const char* fwLabel, bool startAdverti
     acabBleUpdateStatus();
     Serial.printf("[ACAB] BLE service up%s\n",
                   startAdvertising ? ", advertising" : " (advertising deferred)");
-    // Report the advertised address and whether privacy is on. This is the ONLY way to verify the
-    // RPA change from a laptop: macOS and iOS never hand a peer's MAC to an application, they
-    // substitute a per-host UUID, so a scan from a development machine cannot tell a rotating
-    // address from a fixed one. The board has to say it itself. Two boots printing two different
-    // addresses is the evidence that privacy is actually engaged rather than silently ignored.
-    // getAddress() is hardcoded to BLE_ADDR_PUBLIC in NimBLE-Arduino, so it reports the IDENTITY
-    // address and CANNOT tell you whether an RPA is being advertised. The load-bearing fact is
-    // whether the host privacy code was compiled in at all: ble_hs_pvcy_rpa_config() sits behind
-    // #if MYNEWT_VAL(BLE_HOST_BASED_PRIVACY), which on ESP32-S3 resolves to
-    // CONFIG_BT_NIMBLE_HOST_BASED_PRIVACY. Without it, setOwnAddrType() silently does nothing but
-    // set a member variable, and a build that LOOKS correct advertises a fixed address forever.
-    // Tested on hardware 2026-08-01: two boots printed the identical factory address.
-    // Guarded with defined() because the symbol is genuinely absent, not zero, in a stock build,
-    // so a bare MYNEWT_VAL() here is a compile error rather than a false reading.
-#if defined(CONFIG_BT_NIMBLE_HOST_BASED_PRIVACY) && CONFIG_BT_NIMBLE_HOST_BASED_PRIVACY
-    const char* kPrivCompiled = "YES";
-#else
-    const char* kPrivCompiled = "NO - RPA IS A NO-OP IN THIS BUILD";
-#endif
-    // Ask the host for BOTH identity kinds. getAddress() only ever reports the PUBLIC one, so on
-    // its own it cannot distinguish a private build from a fixed one. When host privacy is live
-    // NimBLE configures a random address as well, and its presence plus its top two bits are the
-    // closest thing available WITHOUT A SNIFFER, and it is not on-air proof: 01 = resolvable private (the
-    // rotating kind privacy is supposed to produce), 11 = static random, 00 = non-resolvable.
-    ble_addr_t rnd; bool haveRnd = (ble_hs_id_copy_addr(BLE_ADDR_RANDOM, rnd.val, NULL) == 0);
-    char rndStr[24] = "none";
-    const char* rndKind = "-";
-    if (haveRnd) {
-        snprintf(rndStr, sizeof(rndStr), "%02x:%02x:%02x:%02x:%02x:%02x",
-                 rnd.val[5], rnd.val[4], rnd.val[3], rnd.val[2], rnd.val[1], rnd.val[0]);
-        switch (rnd.val[5] >> 6) {
-            case 0b01: rndKind = "RESOLVABLE-PRIVATE (rotates)"; break;
-            case 0b11: rndKind = "static-random";                break;
-            case 0b00: rndKind = "non-resolvable-private";       break;
-            default:   rndKind = "?";                            break;
-        }
-    }
-    Serial.printf("[ACAB] BLE public=%s | random=%s (%s) | privacy requested=%s compiled=%s\n",
-                  NimBLEDevice::getAddress().toString().c_str(), rndStr, rndKind,
-                  ACAB_BLE_PRIVACY ? "yes" : "no", kPrivCompiled);
+    // The public address is the one the board advertises from. firmware/BENCH-BOARDS.md tells the
+    // bench to confirm a board against this line, because a USB port does not identify a board.
+    Serial.printf("[ACAB] BLE public=%s\n", NimBLEDevice::getAddress().toString().c_str());
 }
 
 // ---- REPLAY TRIM LADDER (small-MTU peers) ----------------------------------------------------
@@ -1716,8 +1520,8 @@ void acabBleDrainTick() {
 
     // ADVERTISING SUPERVISOR, belt and braces to advCompleteCb above. A board that has silently
     // stopped advertising is indistinguishable from a dead board to the user, and this class of
-    // stop is not unique to RPA rotation: any future preemption, a controller reset, or a start()
-    // that fails transiently would strand it the same way. Cheap enough to run unconditionally
+    // stop is not unique to a GAP preemption: a controller reset, or a start() that fails
+    // transiently, would strand it the same way. Cheap enough to run unconditionally
     // (one bool read on a tick loop() already calls), and it covers the window where a preemption
     // lands while the callback pointer is momentarily unset. Rate-limited so a genuinely failing
     // start() cannot spin, and it logs, because a board recovering itself in silence teaches
@@ -1746,19 +1550,6 @@ void acabBleDrainTick() {
         const uint32_t now = millis();
         if (adv && !adv->isAdvertising() && (uint32_t)(now - lastKick) >= 2000) {
             lastKick = now;
-#if ACAB_BLE_PRIVACY
-            // A HOST RESET (HCI timeout, controller fault) zeroes the random address, and the
-            // re-sync only guarantees a PUBLIC one. Under BLE_OWN_ADDR_RANDOM every start() then
-            // fails with BLE_HS_ENOADDR, and nothing re-establishes the RPA except the 900 s
-            // rotation callout, so without this the board is invisible for up to 15 minutes while
-            // this supervisor logs a restart every 2 s that cannot succeed. Reinstall privacy
-            // first, and only then try to advertise.
-            ble_addr_t rnd;
-            if (ble_hs_id_copy_addr(BLE_ADDR_RANDOM, rnd.val, NULL) != 0) {
-                Serial.println("[ACAB] random address gone (host reset?), reinstalling privacy");
-                ble_hs_pvcy_rpa_config(ACAB_NIMBLE_ENABLE_RPA);
-            }
-#endif
             Serial.println("[ACAB] advertising had stopped, restarting (see advCompleteCb)");
             adv->start(0, advCompleteCb);
         }
@@ -2132,6 +1923,13 @@ void acabBleSendDiag() {
     // export is a separate, explicitly-consented flow). cdElf is the app ELF SHA, which is the
     // dump's only identity: it does NOT imply the running firmware version, because a dump
     // survives an OTA.
+    // RARELY REACHABLE. {"diag":true} is parsed only behind gConfigPrivacyReady, and the
+    // detLogPrepareConfigSession() call that sets it arms det_log's coredump erase token, so
+    // acabCoredumpWipeTick() erases the dump on the next loop pass (a pending ring sweep can defer
+    // that, bounded by kRingSweepWaitMs in coredump_report.cpp). These fields reach a phone only
+    // when no phone authenticated on the boot that crashed (else this boot's first pass already
+    // erased it) AND this diag write is handled before that next pass. The serial boot report is
+    // the dependable copy; see coredump_report.h.
     {
         const AcabCoredumpInfo& cd = acabCoredumpInfo();
         if (cd.present) {
@@ -2293,7 +2091,7 @@ void acabBleUpdateStatus() {
     // width provable from THIS file alone, whatever a future board's acabNrfVersion returns.
     { int nrfv = acabNrfVersion(); if (nrfv > 9999) nrfv = 9999; if (nrfv >= 0) doc["nrfv"] = nrfv; }
     // Carrier revision so the app (and support) can see which board is in the case without opening
-    // it: "A" = the first 250 (slide switch), "B" = button power + VBUS sense. Auto-detected.
+    // it: "A" = the first 250 (slide switch), "B" = button power + VBUS sense. Fixed at build time.
     doc["rev"] = acabBoardIsRevB() ? "B" : "A";   // was `if (acabBoardIsRevB)`: a function-ADDRESS
                                                   // truthiness test, never false, so the guard did
                                                   // nothing. The emit is unconditional by design.

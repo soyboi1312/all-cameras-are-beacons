@@ -10,35 +10,28 @@
 #include "netcam_signatures.h"
 #include "acab_scanner.h"   // acabScannerRefreshWifiFilter: widen/narrow the promiscuous filter on toggle
 #include <Arduino.h>
-#include <Preferences.h>    // persist the opt-in across reboots (NVS)
+#include "acab_nvs_toggle.h" // persist the opt-in across reboots (NVS)
 #include <string.h>
 #include <stdio.h>
 #include <ctype.h>          // tolower, for the case-insensitive SSID prefix test
 
 // Opt-in flag (default OFF). NVS-backed in namespace "acab-netcam" key "on" so an app-set
 // toggle survives a reboot. Mirrors the drone-OUI opt-in (gEnabledOui) exactly.
-static bool gEnabled = false;
+static AcabNvsToggle gEnabled{"acab-netcam", "on", false};
 
 void netcamSetEnabled(bool enabled) {
-    if (enabled == gEnabled) return;
-    gEnabled = enabled;
-    Preferences p; p.begin("acab-netcam", false); p.putBool("on", enabled); p.end();
     // Widen the WiFi promiscuous filter to DATA frames when turning ON, narrow back to
     // MGMT-only when turning OFF, so the OFF path truly delivers no data frames (zero cost).
     // Safe to call before the scanner starts (it no-ops until WiFi is up).
-    acabScannerRefreshWifiFilter();
+    if (gEnabled.set(enabled)) acabScannerRefreshWifiFilter();
 }
-bool netcamIsEnabled() { return gEnabled; }
+bool netcamIsEnabled() { return gEnabled.on; }
 
 // Reload the persisted opt-in on boot; if none saved yet, use defaultEnabled (callers pass
 // false so it stays off by default). Does NOT touch the promiscuous filter - it runs before
 // the scanner starts, and acabScannerBegin reads netcamIsEnabled() when it installs the
 // filter, so the restored state is applied there.
-void netcamRestoreEnabled(bool defaultEnabled) {
-    Preferences p; p.begin("acab-netcam", true);
-    gEnabled = p.getBool("on", defaultEnabled);
-    p.end();
-}
+void netcamRestoreEnabled(bool defaultEnabled) { gEnabled.restore(defaultEnabled); }
 
 // Branded IP-camera OUI match. Skip randomized / locally-administered MACs (the OUI is
 // meaningless there), like the flock/drone OUI matchers. This is the ONLY per-data-frame work
@@ -91,7 +84,7 @@ const char* netcamVendorOui(const uint8_t mac[6]) {
 
 bool netcamClassifyWiFi(const uint8_t* frame, size_t len, bool isDataFrame,
                         int rssi, AcabDetection* out) {
-    if (!gEnabled) return false;             // opt-in: zero work when off
+    if (!gEnabled.on) return false;          // opt-in: zero work when off
     if (!frame || len < 16) return false;
 
     // Where the SOURCE MAC lives.

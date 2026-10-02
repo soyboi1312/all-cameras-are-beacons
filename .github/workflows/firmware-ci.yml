@@ -17,11 +17,13 @@ name: Firmware CI
 # this script "FAILS the build"; the app-tree paths in both lists are what makes that sentence true.
 #
 # THE LIST IS CHECKED, NOT TRUSTED. The script's last check, check_ci_trigger_paths, records every
-# file the run read and fails when one is missing from the push list or the pull_request list, so a
-# pin added on a new file fails its own commit until that path is in BOTH lists below.
+# file the run read and fails when one is missing from the push list or the pull_request list. The
+# two app source trees are listed whole, so a pin on a new file inside them needs no edit here. A
+# pin on a file that no pattern below covers (an app test, a Gradle script, a second web page)
+# fails its own commit until that path is in BOTH lists below.
 #
-# THE COST, STATED: an edit to any of them spends a cached PlatformIO build, and several are large
-# screens and managers that change often, so this is not free. A guard that does not run on the
+# THE COST, STATED: an edit to any file in the two app source trees spends a cached PlatformIO
+# build, and those trees change often, so this is not free. A guard that does not run on the
 # commit it exists to catch is worth less than the runner minutes, and cancel-in-progress below
 # stops a superseded push from spending them twice.
 on:
@@ -32,49 +34,8 @@ on:
       - 'docs/**'
       - 'README.md'
       - '.github/workflows/firmware-ci.yml'
-      - 'ios/Beacons/Resources/faq-content.json'
-      - 'android/app/src/main/assets/faq-content.json'
-      - 'ios/Beacons/Models/DeviceType.swift'
-      - 'android/app/src/main/java/tech/acab/app/model/Models.kt'
-      - 'ios/Beacons/BLE/ContributionCsv.swift'
-      - 'ios/Beacons/BLE/BLEManager.swift'
-      - 'android/app/src/main/java/tech/acab/app/ble/AcabBleManager.kt'
-      - 'ios/Beacons/BLE/BLEManager*.swift'
-      - 'android/app/src/main/java/tech/acab/app/ble/NrfDfuCoordinator.kt'
-      - 'ios/Beacons/Views/SettingsView.swift'
-      - 'android/app/src/main/java/tech/acab/app/ui/Components.kt'
-      - 'android/app/src/main/java/tech/acab/app/ui/theme/Theme.kt'
-      - 'android/app/src/main/java/tech/acab/app/ui/DeviceScreen.kt'
-      - 'ios/Beacons/Views/RootView.swift'
-      - 'ios/Beacons/Views/ConnectView.swift'
-      - 'android/app/src/main/java/tech/acab/app/ui/AcabApp.kt'
-      - 'ios/Beacons/Views/DashboardView.swift'
-      - 'ios/Beacons/Models/DashboardPresentation.swift'
-      - 'ios/Beacons/Models/BeaconPresentation.swift'
-      - 'ios/Beacons/Views/Components.swift'
-      - 'ios/Beacons/Views/Theme.swift'
-      - 'android/app/src/main/java/tech/acab/app/ui/StatusScreen.kt'
-      - 'ios/Beacons/Views/DetectionsView.swift'
-      - 'android/app/src/main/java/tech/acab/app/ui/LogScreen.kt'
-      - 'android/app/src/main/java/tech/acab/app/ui/MainScreen.kt'
-      - 'ios/Beacons/Views/MapTabView.swift'
-      - 'android/app/src/main/java/tech/acab/app/ui/MapScreen.kt'
-      - 'android/app/src/main/java/tech/acab/app/ui/MapProjection.kt'
-      - 'ios/Beacons/Views/DetectionDetailView.swift'
-      - 'android/app/src/main/java/tech/acab/app/ui/DetailScreen.kt'
-      - 'ios/Beacons/Views/DetectionRow.swift'
-      - 'ios/Beacons/Views/FirstRunTourView.swift'
-      - 'android/app/src/main/java/tech/acab/app/ui/FirstRunTour.kt'
-      - 'ios/Beacons/Views/HelpView.swift'
-      - 'ios/Beacons/Views/ChecklistView.swift'
-      - 'ios/Beacons/Models/Detection.swift'
-      - 'ios/Beacons/Models/BoardKind.swift'
-      - 'android/app/src/main/java/tech/acab/app/ble/BoardKind.kt'
-      - 'ios/Beacons/BLE/RememberedBoard.swift'
-      - 'ios/Beacons/Models/ALPRDataset.swift'
-      - 'android/app/src/main/java/tech/acab/app/ui/MapAlpr.kt'
-      - 'ios/Beacons/Models/OUIVendors.swift'
-      - 'android/app/src/main/java/tech/acab/app/model/OuiVendors.kt'
+      - 'ios/Beacons/**'
+      - 'android/app/src/main/**'
       - 'web/privacy.html'
   pull_request:
     paths:
@@ -82,49 +43,8 @@ on:
       - 'docs/**'
       - 'README.md'
       - '.github/workflows/firmware-ci.yml'
-      - 'ios/Beacons/Resources/faq-content.json'
-      - 'android/app/src/main/assets/faq-content.json'
-      - 'ios/Beacons/Models/DeviceType.swift'
-      - 'android/app/src/main/java/tech/acab/app/model/Models.kt'
-      - 'ios/Beacons/BLE/ContributionCsv.swift'
-      - 'ios/Beacons/BLE/BLEManager.swift'
-      - 'android/app/src/main/java/tech/acab/app/ble/AcabBleManager.kt'
-      - 'ios/Beacons/BLE/BLEManager*.swift'
-      - 'android/app/src/main/java/tech/acab/app/ble/NrfDfuCoordinator.kt'
-      - 'ios/Beacons/Views/SettingsView.swift'
-      - 'android/app/src/main/java/tech/acab/app/ui/Components.kt'
-      - 'android/app/src/main/java/tech/acab/app/ui/theme/Theme.kt'
-      - 'android/app/src/main/java/tech/acab/app/ui/DeviceScreen.kt'
-      - 'ios/Beacons/Views/RootView.swift'
-      - 'ios/Beacons/Views/ConnectView.swift'
-      - 'android/app/src/main/java/tech/acab/app/ui/AcabApp.kt'
-      - 'ios/Beacons/Views/DashboardView.swift'
-      - 'ios/Beacons/Models/DashboardPresentation.swift'
-      - 'ios/Beacons/Models/BeaconPresentation.swift'
-      - 'ios/Beacons/Views/Components.swift'
-      - 'ios/Beacons/Views/Theme.swift'
-      - 'android/app/src/main/java/tech/acab/app/ui/StatusScreen.kt'
-      - 'ios/Beacons/Views/DetectionsView.swift'
-      - 'android/app/src/main/java/tech/acab/app/ui/LogScreen.kt'
-      - 'android/app/src/main/java/tech/acab/app/ui/MainScreen.kt'
-      - 'ios/Beacons/Views/MapTabView.swift'
-      - 'android/app/src/main/java/tech/acab/app/ui/MapScreen.kt'
-      - 'android/app/src/main/java/tech/acab/app/ui/MapProjection.kt'
-      - 'ios/Beacons/Views/DetectionDetailView.swift'
-      - 'android/app/src/main/java/tech/acab/app/ui/DetailScreen.kt'
-      - 'ios/Beacons/Views/DetectionRow.swift'
-      - 'ios/Beacons/Views/FirstRunTourView.swift'
-      - 'android/app/src/main/java/tech/acab/app/ui/FirstRunTour.kt'
-      - 'ios/Beacons/Views/HelpView.swift'
-      - 'ios/Beacons/Views/ChecklistView.swift'
-      - 'ios/Beacons/Models/Detection.swift'
-      - 'ios/Beacons/Models/BoardKind.swift'
-      - 'android/app/src/main/java/tech/acab/app/ble/BoardKind.kt'
-      - 'ios/Beacons/BLE/RememberedBoard.swift'
-      - 'ios/Beacons/Models/ALPRDataset.swift'
-      - 'android/app/src/main/java/tech/acab/app/ui/MapAlpr.kt'
-      - 'ios/Beacons/Models/OUIVendors.swift'
-      - 'android/app/src/main/java/tech/acab/app/model/OuiVendors.kt'
+      - 'ios/Beacons/**'
+      - 'android/app/src/main/**'
       - 'web/privacy.html'
   workflow_dispatch:
 

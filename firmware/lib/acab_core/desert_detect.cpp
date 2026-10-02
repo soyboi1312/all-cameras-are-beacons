@@ -3,11 +3,12 @@
  */
 #include "desert_detect.h"
 #include "acab_scanner.h"   // acabSanitizeAscii: clamp attacker-sourced strings on ingest
-#include <Preferences.h>    // persist the Desert toggle across reboots (NVS)
+#include "acab_nvs_toggle.h" // persist the Desert toggle across reboots (NVS)
 #include <string.h>
 #include <stdio.h>
 
-static bool gEnabled = false;   // OFF by default; a special, opt-in mode
+// OFF by default; a special, opt-in mode.
+static AcabNvsToggle gEnabled{"acab-desert", "on", false};
 
 // PERSISTED as of 2026-08-08. Desert was the ONLY detector toggle without NVS, so every reboot
 // silently turned it off with nothing in the log to say so. That already voided one drive test,
@@ -15,18 +16,10 @@ static bool gEnabled = false;   // OFF by default; a special, opt-in mode
 // cache for a week stops recording the moment a brownout resets it, and the owner comes back
 // unable to tell "nothing came by" from "the mode switched itself off on day two". Mirrors
 // flock/axon/tracker/glasses/netcam exactly.
-void desertSetEnabled(bool enabled) {
-    if (enabled == gEnabled) return;
-    gEnabled = enabled;
-    Preferences p; p.begin("acab-desert", false); p.putBool("on", enabled); p.end();
-}
-bool desertIsEnabled(void) { return gEnabled; }
+void desertSetEnabled(bool enabled) { gEnabled.set(enabled); }
+bool desertIsEnabled(void) { return gEnabled.on; }
 
-void desertRestoreEnabled(bool defaultEnabled) {
-    Preferences p; p.begin("acab-desert", true);
-    gEnabled = p.getBool("on", defaultEnabled);
-    p.end();
-}
+void desertRestoreEnabled(bool defaultEnabled) { gEnabled.restore(defaultEnabled); }
 
 // A locally-administered MAC (bit 1 of the first octet) is a randomized/private
 // address - phones rotate these ~every 15 min. A globally-unique OUI means real
@@ -75,7 +68,7 @@ static void bleName(const uint8_t* adv, size_t advLen, char* name, size_t outSz)
 
 bool desertClassifyBLE(const uint8_t mac[6], const uint8_t* adv, size_t advLen,
                        int rssi, AcabDetection* out, AcabBleAddrType addrType) {
-    if (!gEnabled) return false;
+    if (!gEnabled.on) return false;
     acabInit(out, ACAB_NEARBY_DEVICE, SRC_BLE, mac, (int16_t)rssi);
     out->method = M_NONE;
     if (adv && advLen) bleName(adv, advLen, out->name, sizeof(out->name));
@@ -88,7 +81,7 @@ bool desertClassifyBLE(const uint8_t mac[6], const uint8_t* adv, size_t advLen,
 }
 
 bool desertClassifyWiFi(const uint8_t* frame, size_t len, int rssi, AcabDetection* out) {
-    if (!gEnabled || !frame || len < 24) return false;
+    if (!gEnabled.on || !frame || len < 24) return false;
     uint8_t fc = frame[0];   // frame-control octet (type/subtype)
     // Only the "presence" mgmt frames: beacon (0x80), probe-response (0x50),
     // probe-request (0x40). Skip the rest (acks etc.) to keep it to real devices.

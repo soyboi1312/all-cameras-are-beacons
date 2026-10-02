@@ -50,22 +50,8 @@ extern "C" {
 static bool gDesert = false;
 bool desertIsEnabled(void) { return gDesert; }
 
-// Mirrors acab_scanner.cpp's acabSanitizeAscii byte for byte. It is NOT a shortcut: every string
-// the drone detector emits (UAS ID, operator ID) goes through it, so a divergent copy here would
-// make the string assertions below lie. Anything outside printable ASCII becomes '.', and note it
-// always copies n bytes - including the NUL padding of a short ID, which is why a 6-character
-// serial comes out dot-padded to 20. That behaviour is asserted, not assumed.
-void acabSanitizeAscii(char* dst, const uint8_t* src, size_t n, size_t cap) {
-    if (!dst || cap == 0) return;
-    size_t m = n;
-    if (m > cap - 1) m = cap - 1;
-    size_t j = 0;
-    for (; j < m; j++) {
-        uint8_t c = src ? src[j] : 0;
-        dst[j] = (c >= 0x20 && c <= 0x7E) ? (char)c : '.';
-    }
-    dst[j] = 0;
-}
+// acabSanitizeAscii is NOT defined here: it is inline in acab_scanner.h, so every string the drone
+// detector emits (UAS ID, operator ID) goes through the real clamp.
 
 extern "C" {
 // Faithful host copy of the vendored wifi.c body (that file cannot be compiled here). It does the
@@ -106,33 +92,10 @@ int odid_wifi_receive_message_pack_nan_action_frame(ODID_UAS_Data* uas, char* ma
 } // extern "C"
 
 // ---------------------------------------------------------------------------
-// Assertion helpers (same shape and output format as test_glasses.cpp)
+// Assertion helpers. failures, chk_impl and the chk macro (and why it must stay a macro) come from
+// host_check.h; ok() below prints in the same format.
 // ---------------------------------------------------------------------------
-static int failures = 0;
-static void chk_impl(const char* name, bool got, bool wantHit,
-                int gotConf = -1, int wantConf = -1, const char* gotDetail = "", const char* wantDetail = nullptr) {
-    bool ok = (got == wantHit);
-    if (ok && wantHit && wantConf >= 0) ok = (gotConf == wantConf);
-    if (ok && wantHit && wantDetail)    ok = (strcmp(gotDetail, wantDetail) == 0);
-    printf("  %-52s %s", name, ok ? "PASS" : "**FAIL**");
-    if (!ok) { printf("   got hit=%d conf=%d detail=\"%s\"", got, gotConf, gotDetail); failures++; }
-    printf("\n");
-}
-
-// ---- ARGUMENT-EVALUATION SEQUENCING (do not remove) ------------------------------------------
-// Every assertion below is written as
-//     chk("name", classify(..., &d), true, d.confidence, 90, d.detail, "...");
-// so the call that FILLS `d` and the reads of `d` are arguments to the SAME call. C++ leaves the
-// evaluation order of function arguments UNSPECIFIED. Clang evaluates left to right, so the
-// classifier runs before the reads and every assertion sees fresh values; GCC evaluates right to
-// left, so it reads `d` BEFORE the classifier fills it - yielding the PREVIOUS test's values, and
-// uninitialised stack on the first assertion (that is where the impossible `conf=153` came from).
-// The suite therefore passed on macOS and failed in CI, on identical source.
-//
-// These macros complete the classifier call in a statement of its own before any argument to the
-// reporting function is evaluated, so correctness no longer depends on the compiler. Keep the
-// assertions in their current one-line form; the macro is what makes that form safe.
-#define chk(name, hitexpr, ...) do { const bool acab_hit_ = (hitexpr); chk_impl((name), acab_hit_, ##__VA_ARGS__); } while (0)
+#include "host_check.h"
 // For the fields chk() does not carry (id, coordinates, method, source, telemetry).
 static void ok(const char* name, bool cond) {
     printf("  %-52s %s\n", name, cond ? "PASS" : "**FAIL**");

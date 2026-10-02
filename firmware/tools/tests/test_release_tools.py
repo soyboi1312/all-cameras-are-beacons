@@ -148,6 +148,7 @@ class OtaSigningKeyIdentityTests(unittest.TestCase):
 
     def setUp(self) -> None:
         self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
         root = Path(self.temp.name)
         self.retiring_key = root / "retiring.pem"
         self.new_key = root / "new.pem"
@@ -160,9 +161,6 @@ class OtaSigningKeyIdentityTests(unittest.TestCase):
             "trust_root_sha256": hashlib.sha256(self.new_der).hexdigest(),
             "signer_sha256": hashlib.sha256(self.retiring_der).hexdigest(),
         }
-
-    def tearDown(self) -> None:
-        self.temp.cleanup()
 
     def rotation_declared(self, value):
         return mock.patch.object(release_tools, "OTA_ROTATION", value)
@@ -258,11 +256,13 @@ class OtaSigningKeyIdentityTests(unittest.TestCase):
 
 
 class VerifierOtaKeyIdentityTests(unittest.TestCase):
-    """check_ota_key_identity: the recorded root, the pub file, and the DER inside every image."""
+    """check_ota_key_identity: the recorded root, the pub file, and the DER inside every image.
+    check_signature: one row per signature, verified against that same pub file."""
 
     def setUp(self) -> None:
         self.verifier = load_verifier()
         self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
         root = Path(self.temp.name)
         self.repo = root / "all-cameras-are-beacons"
         self.firmware = self.repo / "firmware"
@@ -291,9 +291,6 @@ class VerifierOtaKeyIdentityTests(unittest.TestCase):
             patcher = mock.patch.object(self.verifier, name, value)
             patcher.start()
             self.addCleanup(patcher.stop)
-
-    def tearDown(self) -> None:
-        self.temp.cleanup()
 
     def install_pub(self, key: Path) -> None:
         subprocess.run(
@@ -347,6 +344,25 @@ class VerifierOtaKeyIdentityTests(unittest.TestCase):
         failures, out = self.run_check("2.0.8", "2.0.8", [self.fresh], None)
         self.assertEqual(failures, [], out)
 
+    def test_check_signature_passes_only_the_pub_file_keys_strict_hex_signature(self) -> None:
+        self.install_pub(self.new_key)
+
+        def sign(key: Path) -> str:
+            return subprocess.run(
+                ["openssl", "dgst", "-sha256", "-sign", key, self.fresh],
+                check=True, stdout=subprocess.PIPE).stdout.hex()
+
+        good = sign(self.new_key)
+        # The newline case is what `xxd -p` emits when a stager loses its `tr -d '\n'`.
+        for sig, passes in ((good, True), (sign(self.retiring_key), False),
+                            (good[:60] + "\n" + good[60:], False), ("MEUCIQ==", False)):
+            self.verifier.OK.clear()
+            self.verifier.FAIL.clear()
+            with contextlib.redirect_stdout(io.StringIO()):
+                self.verifier.check_signature("beacon board", "OTA", sig, os.fspath(self.fresh))
+            self.assertEqual((len(self.verifier.OK), len(self.verifier.FAIL)),
+                             (1, 0) if passes else (0, 1), sig)
+
     def test_a_stale_declaration_is_a_failure_not_a_skip(self) -> None:
         self.install_pub(self.new_key)
         failures, out = self.run_check("2.0.8", "2.0.8", [self.fresh], self.rotation)
@@ -364,6 +380,7 @@ class VerifierOtaKeyIdentityTests(unittest.TestCase):
 class DirtyTreeDigestTests(unittest.TestCase):
     def setUp(self) -> None:
         self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
         self.repo = Path(self.temp.name)
         git(self.repo, "init", "-q")
         git(self.repo, "config", "user.name", "release test")
@@ -371,9 +388,6 @@ class DirtyTreeDigestTests(unittest.TestCase):
         (self.repo / "tracked.txt").write_text("base\n", encoding="utf-8")
         git(self.repo, "add", "tracked.txt")
         git(self.repo, "commit", "-qm", "base")
-
-    def tearDown(self) -> None:
-        self.temp.cleanup()
 
     def test_clean_tree_has_no_digest(self) -> None:
         self.assertIsNone(dirty_tree_digest(self.repo))
@@ -495,28 +509,16 @@ class OtaVersionBoundTests(unittest.TestCase):
 
     def setUp(self) -> None:
         self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
         self.firmware = Path(self.temp.name) / "firmware"
-        (self.firmware / "lib/acab_core").mkdir(parents=True)
-
-    def tearDown(self) -> None:
-        self.temp.cleanup()
-
-    def declare(self, header: str, beacon: str) -> None:
-        (self.firmware / "lib/acab_core/acab_version.h").write_text(
-            f'#define ACAB_FW_VERSION "{header}"\n', encoding="utf-8"
-        )
-        (self.firmware / "platformio.ini").write_text(
-            f'[env:beacon-board]\nbuild_flags = -DACAB_FW_VERSION=\\"{beacon}\\"\n',
-            encoding="utf-8",
-        )
 
     def test_the_widest_installable_field_is_still_accepted(self) -> None:
         self.assertEqual(OTA_VERSION_FIELD_MAX, 1023)
-        self.declare("2.0.1023", "2.0.1023")
+        declare_versions(self.firmware, "2.0.1023", "2.0.1023")
         self.assertEqual(declared_versions(self.firmware), ("2.0.1023", "2.0.1023"))
 
     def test_a_suffix_is_ignored_exactly_as_the_packer_ignores_it(self) -> None:
-        self.declare("2.0.6-rc1", "2.0.6")
+        declare_versions(self.firmware, "2.0.6-rc1", "2.0.6")
         self.assertEqual(declared_versions(self.firmware)[0], "2.0.6-rc1")
 
     def test_one_to_three_numeric_fields_are_accepted(self) -> None:
@@ -534,31 +536,31 @@ class OtaVersionBoundTests(unittest.TestCase):
                 require_ota_packable_version(version, "test")
 
     def test_header_parser_does_not_accept_a_valid_prefix_of_an_invalid_label(self) -> None:
-        self.declare("2.0.6_bad", "2.0.6")
+        declare_versions(self.firmware, "2.0.6_bad", "2.0.6")
         with self.assertRaises(ReleaseToolError):
             declared_versions(self.firmware)
 
     def test_beacon_parser_does_not_accept_a_valid_prefix_of_an_invalid_label(self) -> None:
-        self.declare("2.0.6", "2.0.6+meta")
+        declare_versions(self.firmware, "2.0.6", "2.0.6+meta")
         with self.assertRaises(ReleaseToolError):
             declared_versions(self.firmware)
 
     def test_beacon_parser_rejects_unbalanced_or_trailing_escape_content(self) -> None:
         for raw in (r"2.0.6\\garbage", r'\\"2.0.6\\garbage\\"', r'\\"2.0.6'):
             with self.subTest(raw=raw):
-                self.declare("2.0.6", raw)
+                declare_versions(self.firmware, "2.0.6", raw)
                 with self.assertRaises(ReleaseToolError):
                     declared_versions(self.firmware)
 
     def test_header_field_past_the_bound_is_refused(self) -> None:
-        self.declare("2.0.1024", "2.0.6")
+        declare_versions(self.firmware, "2.0.1024", "2.0.6")
         with self.assertRaises(ReleaseToolError):
             declared_versions(self.firmware)
 
     def test_beacon_override_past_the_bound_is_refused(self) -> None:
         # The override is the version SHIPPING hardware compares, so it needs its own case: the
         # header can be perfectly in bounds while platformio.ini is not.
-        self.declare("2.0.6", "2.0.1024")
+        declare_versions(self.firmware, "2.0.6", "2.0.1024")
         with self.assertRaises(ReleaseToolError):
             declared_versions(self.firmware)
 
@@ -698,6 +700,7 @@ class UsbManifestGateTests(unittest.TestCase):
     def setUp(self) -> None:
         self.verifier = load_verifier()
         self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
         self.dir = Path(self.temp.name)
         self.src_mtime = 1_000_000.0
         for name in self.verifier.REV_A_FILES.values():
@@ -705,9 +708,6 @@ class UsbManifestGateTests(unittest.TestCase):
             path.write_bytes(b"staged")
             os.utime(path, (self.src_mtime + 10, self.src_mtime + 10))
         self.parts = self.verifier.beacon_usb_parts(self.verifier.REV_A_FILES)
-
-    def tearDown(self) -> None:
-        self.temp.cleanup()
 
     def failures(self, parts, version: str = "2.0.6"):
         """The gate's FAIL messages for a manifest naming `parts`, output swallowed."""
@@ -1018,6 +1018,7 @@ class WebStagerFailureTests(unittest.TestCase):
 
     def setUp(self) -> None:
         self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
         root = Path(self.temp.name)
         self.repo = root / "all-cameras-are-beacons"
         self.site_firmware = root / "soyboi.tech/firmware"
@@ -1119,9 +1120,6 @@ class WebStagerFailureTests(unittest.TestCase):
             + [self.site_firmware / name for name in labels.values()]
             + [self.site_firmware / "firmware-latest.json"]
         )
-
-    def tearDown(self) -> None:
-        self.temp.cleanup()
 
     def snapshot(self):
         return {os.fspath(path): path.read_bytes() for path in self.served_paths}
@@ -1244,7 +1242,7 @@ class WebStagerFailureTests(unittest.TestCase):
         before = self.snapshot()
         proc = self.run_stager()
         self.assertNotEqual(proc.returncode, 0, proc.stdout)
-        self.assertIn("TRACKED IN HEAD BUT MISSING ON DISK", proc.stdout)
+        self.assertIn(" D web/vendor/esp-web-tools/chunk.js", proc.stdout)
         self.assertFalse(self.pio_marker.exists(), proc.stdout)
         self.assertEqual(self.snapshot(), before, proc.stdout)
 
@@ -1252,6 +1250,7 @@ class WebStagerFailureTests(unittest.TestCase):
 class RevBStagingTests(unittest.TestCase):
     def setUp(self) -> None:
         self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
         root = Path(self.temp.name)
         self.firmware = root / "firmware"
         self.site = root / "site"
@@ -1286,9 +1285,6 @@ class RevBStagingTests(unittest.TestCase):
             }),
             encoding="utf-8",
         )
-
-    def tearDown(self) -> None:
-        self.temp.cleanup()
 
     def test_stages_distinct_files_and_revision_key(self) -> None:
         stage_rev_b(self.firmware, self.site, self.boot_app0, None, True)

@@ -1,4 +1,5 @@
-// Host regression test for the Motorola Solutions vendor proxy (police_detect.cpp).
+// Host regression test for the Motorola Solutions vendor proxy (police_detect.cpp), including the
+// WatchGuard Video block it carries since 2.1.0 (section 4b).
 //
 // WHY THIS FILE EXISTS: this is the broadest, least-earned match on the board. It flags a whole
 // corporate OUI block, and the 2026-07-23 airport ground truth found ALL 27 of its WiFi hits were
@@ -35,31 +36,7 @@ void axonSetEnabled(bool e)   { gAxonOn = e; }
 bool desertIsEnabled(void)    { return gDesertOn; }
 void desertSetEnabled(bool e) { gDesertOn = e; }
 
-static int failures = 0;
-static void chk_impl(const char* name, bool got, bool wantHit,
-                int gotConf = -1, int wantConf = -1, const char* gotDetail = "", const char* wantDetail = nullptr) {
-    bool ok = (got == wantHit);
-    if (ok && wantHit && wantConf >= 0) ok = (gotConf == wantConf);
-    if (ok && wantHit && wantDetail)    ok = (strcmp(gotDetail, wantDetail) == 0);
-    printf("  %-52s %s", name, ok ? "PASS" : "**FAIL**");
-    if (!ok) { printf("   got hit=%d conf=%d detail=\"%s\"", got, gotConf, gotDetail); failures++; }
-    printf("\n");
-}
-
-// ---- ARGUMENT-EVALUATION SEQUENCING (do not remove) ------------------------------------------
-// Every assertion below is written as
-//     chk("name", classify(..., &d), true, d.confidence, 90, d.detail, "...");
-// so the call that FILLS `d` and the reads of `d` are arguments to the SAME call. C++ leaves the
-// evaluation order of function arguments UNSPECIFIED. Clang evaluates left to right, so the
-// classifier runs before the reads and every assertion sees fresh values; GCC evaluates right to
-// left, so it reads `d` BEFORE the classifier fills it - yielding the PREVIOUS test's values, and
-// uninitialised stack on the first assertion (that is where the impossible `conf=153` came from).
-// The suite therefore passed on macOS and failed in CI, on identical source.
-//
-// These macros complete the classifier call in a statement of its own before any argument to the
-// reporting function is evaluated, so correctness no longer depends on the compiler. Keep the
-// assertions in their current one-line form; the macro is what makes that form safe.
-#define chk(name, hitexpr, ...) do { const bool acab_hit_ = (hitexpr); chk_impl((name), acab_hit_, ##__VA_ARGS__); } while (0)
+#include "host_check.h"   // failures, chk_impl, the chk macro (and why it must stay a macro)
 // Same reporting shape for the scalar fields of the emitted record (type / method / source /
 // rssi / toggle state), which downstream code reads just as hard as the confidence does.
 static void chkVal(const char* name, long got, long want) {
@@ -77,6 +54,8 @@ static const uint8_t MAC_MOTO_ALT[6] = { 0x4c, 0xcc, 0x34, 0xaa, 0xbb, 0xcc };  
 static const uint8_t MAC_MALAY[6]    = { 0x10, 0x74, 0x6f, 0x01, 0x02, 0x03 };   // Malaysia entity
 static const uint8_t MAC_OTHER[6]    = { 0x3c, 0x5a, 0xb4, 0x01, 0x02, 0x03 };   // unrelated vendor
 static const uint8_t MAC_AXON[6]     = { 0x00, 0x25, 0xdf, 0x01, 0x02, 0x03 };   // Axon's own OUI
+// WatchGuard Video's block. The tail is the BLE device seen beside an owner marker on 2026-10-01.
+static const uint8_t MAC_WG[6]       = { 0x00, 0x1d, 0x96, 0xe7, 0x97, 0x4f };
 
 static AcabDetection d;
 static bool runBle(const uint8_t mac[6], const uint8_t* adv = nullptr, size_t advLen = 0, int rssi = -70) {
@@ -230,6 +209,82 @@ int main() {
       setGates(true, false, false);
       chk("WiFi path respects the category being off", runWifi(f.data(), f.size()), false);
       setGates(true, true, false); }
+
+    // ---------------------------------------------------------------------------------------
+    // 4b. WATCHGUARD VIDEO (2.1.0). Its own table, its own detail string, but the same gates and
+    // the same 45. The detail string is a WIRE CONTRACT: both apps resolve the maker from it
+    // EXACTLY (BodyCamSignature), so a typo here silently degrades every WatchGuard row to the
+    // generic body-cam fallback. And it must never fall back to the Motorola string, which would
+    // tell the user the block is Motorola's own.
+    // ---------------------------------------------------------------------------------------
+    chkVal("WatchGuard table holds one block", (long)WATCHGUARD_VIDEO_OUI_COUNT, 1);
+    chkVal("WatchGuard row is 00:1D:96",
+           (WATCHGUARD_VIDEO_OUI[0][0] == 0x00 && WATCHGUARD_VIDEO_OUI[0][1] == 0x1d &&
+            WATCHGUARD_VIDEO_OUI[0][2] == 0x96) ? 1 : 0, 1);
+    setGates(true, true, false);
+    { bool got = runBle(MAC_WG, nullptr, 0, -82);
+      chk("WatchGuard BLE -> own detail, conf 45", got, true, d.confidence, 45, d.detail,
+          "WatchGuard Video OUI"); }
+    chkVal("WatchGuard type is ACAB_AXON_BODYCAM", (long)d.type, (long)ACAB_AXON_BODYCAM);
+    chkVal("WatchGuard method is M_OUI", (long)d.method, (long)M_OUI);
+    chkVal("WatchGuard source is SRC_BLE", (long)d.src, (long)SRC_BLE);
+    chkVal("WatchGuard rssi is passed through", (long)d.rssi, -82);
+    chkVal("WatchGuard mac is copied", memcmp(d.mac, MAC_WG, 6), 0);
+    chkVal("WatchGuard detail carries no p-word", strstr(d.detail, "olice") == nullptr ? 1 : 0, 1);
+    // No body-cam row may grow: the Motorola string already ships at this length, so a WatchGuard
+    // row can never be the one that pushes a live notify over its budget.
+    chkVal("WatchGuard detail no longer than Motorola's",
+           strlen("WatchGuard Video OUI") <= strlen("Motorola Solutions OUI") ? 1 : 0, 1);
+    { uint8_t m[6] = { 0x00, 0x1d, 0x96, 0x28, 0x9b, 0xac };   // one of the 2026-09 WiFi probers
+      bool got = runBle(m);
+      chk("WatchGuard, other tail -> still matches", got, true, d.confidence, 45, d.detail,
+          "WatchGuard Video OUI"); }
+    // The same two switches gate it. Desert forces it, like every other detector.
+    setGates(false, true, false);
+    chk("WatchGuard: sub-toggle OFF -> no hit", runBle(MAC_WG), false);
+    setGates(true, false, false);
+    chk("WatchGuard: category OFF -> no hit", runBle(MAC_WG), false);
+    setGates(false, false, true);
+    { bool got = runBle(MAC_WG);
+      chk("WatchGuard: both OFF + Desert ON -> forced hit", got, true, d.confidence, 45, d.detail,
+          "WatchGuard Video OUI"); }
+    setGates(true, true, false);
+    // WiFi: the 2026-09 sightings were all probe requests (mgmt subtype 4, fc0 0x40).
+    { std::vector<uint8_t> f = mgmtFrame(MAC_WG, MAC_OTHER, 0x40);
+      bool got = runWifi(f.data(), f.size());
+      chk("WatchGuard probe request on WiFi -> hit", got, true, d.confidence, 45, d.detail,
+          "WatchGuard Video OUI");
+      chkVal("WatchGuard WiFi source is SRC_WIFI", (long)d.src, (long)SRC_WIFI); }
+    { std::vector<uint8_t> f = mgmtFrame(MAC_OTHER, MAC_WG);
+      bool got = runWifi(f.data(), f.size());
+      chk("WatchGuard BSSID only -> hit on addr3", got, true, d.confidence, 45, d.detail,
+          "WatchGuard Video OUI");
+      chkVal("addr3 fallback reports the WatchGuard mac", memcmp(d.mac, MAC_WG, 6), 0); }
+    // addr2 wins over addr3 across the two tables too, and each keeps its own label.
+    { std::vector<uint8_t> f = mgmtFrame(MAC_MOTO, MAC_WG);
+      bool got = runWifi(f.data(), f.size());
+      chk("Motorola addr2 + WatchGuard addr3 -> Motorola", got, true, d.confidence, 45, d.detail,
+          "Motorola Solutions OUI"); }
+    { std::vector<uint8_t> f = mgmtFrame(MAC_WG, MAC_MOTO);
+      bool got = runWifi(f.data(), f.size());
+      chk("WatchGuard addr2 + Motorola addr3 -> WatchGuard", got, true, d.confidence, 45, d.detail,
+          "WatchGuard Video OUI"); }
+    // Near misses, the locally-administered twin, and the WatchGuard TECHNOLOGIES decoys (a
+    // firewall company, not WatchGuard Video; docs/signatures.md keeps them off the table).
+    { uint8_t m[6] = { 0x00, 0x1d, 0x95, 0, 0, 1 };
+      chk("neighbouring OUI 00:1D:95 -> no hit", runBle(m), false); }
+    { uint8_t m[6] = { 0x00, 0x1d, 0x97, 0, 0, 1 };
+      chk("neighbouring OUI 00:1D:97 -> no hit", runBle(m), false); }
+    { uint8_t m[6] = { 0x02, 0x1d, 0x96, 0xe7, 0x97, 0x4f };
+      chk("locally-administered 02:1D:96 -> no hit", runBle(m), false); }
+    { uint8_t m[6] = { 0x00, 0x01, 0x21, 0, 0, 1 };
+      chk("WatchGuard Technologies 00:01:21 -> no hit", runBle(m), false); }
+    { uint8_t m[6] = { 0x00, 0x90, 0x7f, 0, 0, 1 };
+      chk("WatchGuard Technologies 00:90:7F -> no hit", runBle(m), false); }
+    // The Motorola table did not absorb the new block: it still names Motorola, seven rows.
+    { bool got = runBle(MAC_MOTO);
+      chk("Motorola still reports its own detail", got, true, d.confidence, 45, d.detail,
+          "Motorola Solutions OUI"); }
 
     // ---------------------------------------------------------------------------------------
     // 5. ADVERSARIAL INPUT. Nothing here may read out of bounds or crash, and nothing here may

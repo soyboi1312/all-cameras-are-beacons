@@ -22,8 +22,10 @@
 #include <cstring>
 #include <vector>
 
-// ---- stubs for the two symbols flock_detect.cpp pulls from other translation units ----
-// The harness compiles exactly one _detect.cpp, so anything else flock calls has to live here.
+// ---- stub for the one symbol flock_detect.cpp pulls from another translation unit ----
+// The harness compiles exactly one _detect.cpp, so anything flock calls in another .cpp has to
+// live here. (acabSanitizeAscii is not one of those: it is inline in acab_scanner.h, so parseAdv
+// runs every advertised name through the real clamp.)
 //
 // Desert mode is a runtime override inside both classifiers ("classify even when toggled off"),
 // so unlike test_glasses.cpp this stub is settable - that override is a behaviour worth locking,
@@ -31,54 +33,10 @@
 static bool gDesert = false;
 bool desertIsEnabled() { return gDesert; }
 
-// Byte-for-byte copy of acab_scanner.cpp's implementation. It has to match, not merely exist:
-// parseAdv runs every advertised name through it, so a divergence here would let a name pattern
-// pass in the test that the firmware would never see (or the reverse).
-void acabSanitizeAscii(char* dst, const uint8_t* src, size_t n, size_t cap) {
-    if (!dst || cap == 0) return;
-    size_t m = n;
-    if (m > cap - 1) m = cap - 1;
-    size_t j = 0;
-    for (; j < m; j++) {
-        uint8_t c = src ? src[j] : 0;
-        dst[j] = (c >= 0x20 && c <= 0x7E) ? (char)c : '.';
-    }
-    dst[j] = 0;
-}
-
-static int failures = 0;
-static void chk_impl(const char* name, bool got, bool wantHit,
-                int gotConf = -1, int wantConf = -1, const char* gotDetail = "", const char* wantDetail = nullptr) {
-    bool ok = (got == wantHit);
-    if (ok && wantHit && wantConf >= 0) ok = (gotConf == wantConf);
-    if (ok && wantHit && wantDetail)    ok = (strcmp(gotDetail, wantDetail) == 0);
-    printf("  %-52s %s", name, ok ? "PASS" : "**FAIL**");
-    if (!ok) { printf("   got hit=%d conf=%d detail=\"%s\"", got, gotConf, gotDetail); failures++; }
-    printf("\n");
-}
-
-// ---- ARGUMENT-EVALUATION SEQUENCING (do not remove) ------------------------------------------
-// Every assertion below is written as
-//     chk("name", classify(..., &d), true, d.confidence, 90, d.detail, "...");
-// so the call that FILLS `d` and the reads of `d` are arguments to the SAME call. C++ leaves the
-// evaluation order of function arguments UNSPECIFIED. Clang evaluates left to right, so the
-// classifier runs before the reads and every assertion sees fresh values; GCC evaluates right to
-// left, so it reads `d` BEFORE the classifier fills it - yielding the PREVIOUS test's values, and
-// uninitialised stack on the first assertion (that is where the impossible `conf=153` came from).
-// The suite therefore passed on macOS and failed in CI, on identical source.
-//
-// These macros complete the classifier call in a statement of its own before any argument to the
-// reporting function is evaluated, so correctness no longer depends on the compiler. Keep the
-// assertions in their current one-line form; the macro is what makes that form safe.
-#define chk(name, hitexpr, ...) do { const bool acab_hit_ = (hitexpr); chk_impl((name), acab_hit_, ##__VA_ARGS__); } while (0)
+#include "host_check.h"   // failures, chk_impl, the chk macro (and why it must stay a macro), chkInt
 // method / type / mac are consumed downstream too (acabApplyDurability keys on M_OUI, the apps
-// route on type), so they get their own assertions on one representative case per branch.
-static void chkInt(const char* name, long got, long want) {
-    bool ok = (got == want);
-    printf("  %-52s %s", name, ok ? "PASS" : "**FAIL**");
-    if (!ok) { printf("   got %ld want %ld", got, want); failures++; }
-    printf("\n");
-}
+// route on type), so they get their own assertions on one representative case per branch:
+// chkInt (host_check.h) for the scalars, chkStr for the name and mac strings.
 static void chkStr(const char* name, const char* got, const char* want) {
     bool ok = (strcmp(got, want) == 0);
     printf("  %-52s %s", name, ok ? "PASS" : "**FAIL**");

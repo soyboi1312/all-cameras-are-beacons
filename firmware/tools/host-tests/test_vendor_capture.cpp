@@ -11,10 +11,10 @@
 // anything else meant Motorola. That held only while the list carried exactly two vendors whose
 // names began with different letters. The first row added outside that pair - PCAM-CID, whose tag
 // begins with 'P' - would have landed in the MOTOROLA table and incremented moto_ble, the one
-// counter whose ZERO is currently a result worth quoting. `theOldTagLetterRuleWouldHaveMisrouted`
-// below is the anchor for that: it scans the PCAM field-shape advert through the live entry points
-// (acabVendorScanAdv, then acabVendorGroupMask / acabVendorSlotGroup) and fails if the live routing
-// ever lands where the retired rule sent that row.
+// counter whose ZERO is currently a result worth quoting. `scanRealAdverts` below is the anchor
+// for that: it scans the PCAM field-shape advert through the live entry points (acabVendorScanAdv,
+// then acabVendorGroupMask / acabVendorSlotGroup) and fails if the live routing lands in VG_MOTO.
+// `groupRouting` then routes every row, hit alone, and checks it against the row's own group.
 //
 // Read vendor_capture.h first. Every assertion here maps to a stated decision there.
 #include "../../lib/acab_core/vendor_capture.h"
@@ -67,8 +67,7 @@ static int rowIndex(uint8_t kind, uint16_t val) {
 //   0C 09 "PCAM_XXXXXX"             complete local name restating the address
 // NOTE the manufacturer structure is length 0x09, which is type + 2 company-ID bytes + the
 // 0x0A 0x01 lead-in + FOUR varying bytes. vendor_capture.h's FIELD SHAPE block records the same
-// four; the 0x09 length byte is what settles it. One fixture, shared by the retired-rule section
-// and the scan section, so both route the same bytes.
+// four; the 0x09 length byte is what settles it.
 static const char* const PCAM_ADV_HEX = "02010609FF7F080A01AABBCCDD0C095043414D5F414141414141";
 static const size_t      PCAM_ADV_LEN = 26;
 
@@ -98,7 +97,7 @@ static void tableShape() {
 
     // Every row pinned by (kind, value) to its declared group. The three company IDs are what the
     // routing is about; the five UUID rows are pinned the same way because nothing else holds
-    // their groups - the retired-rule check below is about history and deliberately does not.
+    // their groups.
     struct { uint8_t kind; uint16_t val; VendorGroup group; const char* what; } pin[] = {
         { 0, 0x034D, VG_AXON, "0x034D (TASER company ID) is exactly one row, in VG_AXON" },
         { 0, 0x04EC, VG_MOTO, "0x04EC (Motorola company ID) is exactly one row, in VG_MOTO" },
@@ -113,63 +112,6 @@ static void tableShape() {
         int r = rowIndex(p.kind, p.val);
         check(r >= 0 && VENDOR_BLE_ID[r].group == p.group, p.what);
     }
-}
-
-// ---------------------------------------------------------------------------------------------
-// THE RETIRED RULE
-// ---------------------------------------------------------------------------------------------
-static void theOldTagLetterRuleWouldHaveMisrouted() {
-    printf("\n== the routing rewrite this cut is for ==\n");
-
-    // Reconstruct the retired inference exactly: tag[0] == 'A' meant Axon, everything else
-    // Motorola. It is applied to the tags the rows carried WHEN THE RULE WAS RETIRED, held here
-    // as fixture strings, not to today's tags: this section records what the old rule did, and
-    // renaming a row today (0x034D to "TASER-CID", say) does not change that history. The live
-    // side is never read from the table's `group` field: it is the real routing, acabVendorScanAdv
-    // over the PCAM field-shape advert and then acabVendorGroupMask / acabVendorSlotGroup over
-    // the mask that produced, so a routing that went back to reading the tag letter fails here
-    // instead of a literal being compared with itself.
-    auto retiredRule = [](const char* tagThen) -> uint8_t {
-        return tagThen[0] == 'A' ? (uint8_t)VG_AXON : (uint8_t)VG_MOTO;
-    };
-
-    int pcam = rowIndex(0, 0x087F);
-    check(pcam >= 0, "the PCAM row is present to route");
-    if (pcam < 0) return;
-
-    uint8_t buf[64], mask = 0, sol = 0;
-    size_t n = fromHex(PCAM_ADV_HEX, buf, sizeof buf);
-    acabVendorScanAdv(buf, n, &mask, &sol);
-    check(n == PCAM_ADV_LEN && mask == (uint8_t)(1u << pcam),
-          "the PCAM field-shape advert confirms exactly the 0x087F row");
-    const uint8_t live = acabVendorSlotGroup(acabVendorGroupMask(mask));
-    const uint8_t then = retiredRule("PCAM-CID");   // VG_MOTO: 'P' is not 'A'
-    check(live == VG_PCAM,
-          "the live routing slots that advert into VG_PCAM");
-    check(live != then,
-          "...not into VG_MOTO, where the retired rule sent it - the regression is pinned");
-
-    // And the reason the old rule survived as long as it did: on the seven rows that existed
-    // when it was retired it agreed with where the live routing sends each row now, so nothing
-    // tripped until a row outside the Axon/Motorola pair arrived. Scoped to those seven by
-    // (kind, value): a row that is no longer in the table has nothing to say here (tableShape
-    // pins presence), and a row in any future group is not part of this history and cannot turn
-    // it red.
-    struct { uint8_t kind; uint16_t val; const char* tagThen; } legacy[] = {
-        { 0, 0x034D, "AXON-CID" }, { 1, 0xFC81, "AXON-SVC" }, { 1, 0xFE6B, "AXON-SVC" },
-        { 1, 0xFE6C, "AXON-SVC" }, { 0, 0x04EC, "MOTO-CID" }, { 1, 0xFD8E, "MOTO-SVC" },
-        { 1, 0xFE04, "MOTO-SVC" },
-    };
-    bool agreesOnLegacyRows = true;
-    for (const auto& l : legacy) {
-        int r = rowIndex(l.kind, l.val);
-        if (r < 0) continue;
-        const uint8_t hit = (uint8_t)(1u << r);
-        if (retiredRule(l.tagThen) != acabVendorSlotGroup(acabVendorGroupMask(hit)))
-            agreesOnLegacyRows = false;
-    }
-    check(agreesOnLegacyRows,
-          "the retired rule agreed with live routing on every row that existed then (why it hid)");
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -196,6 +138,12 @@ static void groupRouting() {
           "a PCAM-only device slots into the PCAM table");
     check(acabVendorSlotGroup(acabVendorGroupMask(motoHit)) == VG_MOTO,
           "a Motorola-only device slots into the Motorola table");
+
+    // Every row, hit alone, slots into the group its row states (tableShape pins those by value).
+    // The check label is the row's tag.
+    for (size_t k = 0; k < VENDOR_BLE_ID_N; k++)
+        check(acabVendorSlotGroup(acabVendorGroupMask((uint8_t)(1u << k))) == VENDOR_BLE_ID[k].group,
+              VENDOR_BLE_ID[k].tag);
 
     // CO-OCCURRENCE WITHIN ONE ADVERT. Every group the packet names is counted, and the packet is
     // slotted ONCE, lowest group first, so one advert cannot take a slot in more than one table.
@@ -227,7 +175,7 @@ static void scanRealAdverts() {
     uint8_t buf[64], mask = 0, sol = 0;
     size_t n;
 
-    // The PCAM field shape (PCAM_ADV_HEX above, shared with the retired-rule section).
+    // The PCAM field shape (PCAM_ADV_HEX above).
     n = fromHex(PCAM_ADV_HEX, buf, sizeof buf);
     check(n == PCAM_ADV_LEN, "PCAM fixture decodes to the expected length");
     acabVendorScanAdv(buf, n, &mask, &sol);
@@ -498,7 +446,6 @@ static void emitDecision() {
 int main() {
     printf("vendor capture table (vendor_capture.h)\n");
     tableShape();
-    theOldTagLetterRuleWouldHaveMisrouted();
     groupRouting();
     scanRealAdverts();
     reservation();

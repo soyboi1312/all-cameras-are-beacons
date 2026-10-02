@@ -23,6 +23,7 @@ before publishing. That is this file.
 Exit status is 1 on any failure, so it can gate a release step or a CI job.
 """
 import argparse
+import binascii
 import glob
 import hashlib
 import json
@@ -31,6 +32,7 @@ from pathlib import Path
 import re
 import subprocess
 import sys
+import tempfile
 
 from release_tools import (
     ReleaseToolError,
@@ -59,52 +61,14 @@ from stage_beacon_revb import REV_B_FILES, REV_B_LABEL, REV_B_MANIFEST, check_si
 #
 # A row of None means "this release introduces no honest new shared literal", which is a real state
 # and is reported as a SKIP, never as a pass. A version with no row at all is still a hard failure.
+# Never use the version literal itself as a canary: the VERSION section already proves it on the
+# same artifact (raw esp_app_desc), so that row could not fail. Declare None instead.
 CANARIES = {
-    "2.0.3": ["Google Find Hub (separated)", "Ezviz"],
-    # "Arlo base station" is the ideal canary for this round: it is the detail string of the NEW
-    # SSID match path, so it exists in no earlier image. "Arlo" alone would also match the OUI
-    # table, which cannot prove the SSID rule shipped.
-    "2.0.4": ["Arlo base station", "Arlo"],
-    # "cid" is the one string literal 2.0.5 introduces into EVERY app image (serializeDetection
-    # emits the company-ID key for the first time; no earlier image contains the wire key).
-    # Weakness, stated: it is a 3-char substring test, so any stray "...cid..." run in a stale
-    # 2.0.4 image would false-pass this row - accepted because the staleness + descriptor-version
-    # gates above run on the same artifacts and would still catch a stale image.
-    "2.0.5": ["cid"],
-    # 2.0.6's new i-PRO/Getac literals deliberately compile only into ACAB_CAPTURE_BUILD, which is
-    # a bench image and is not one of the staged production artifacts this verifier examines. The
-    # shipping images therefore have no honest new shared content literal: "i-PRO" already existed
-    # in the netcam OUI table and would false-pass a 2.0.5 image.
-    #
-    # None is that state, DECLARED. This row used to read ["2.0.6"], and the version literal lives
-    # at esp_app_desc offset 48 (release_tools.ESP_APP_VERSION_OFFSET), so the VERSION section
-    # below had already proved it on the same artifact: eight green "contains '2.0.6'" rows that
-    # could only fail when the version row failed. The rule further down says a check that cannot
-    # fail is worse than no check because it reads as a pass, and that is exactly what those rows
-    # did - they turned "this release has no content proof" into eight satisfied lines. A skip
-    # says the true thing.
-    #
-    # The independent source-mtime and raw esp_app_desc checks stay what actually proves each
-    # staged image was rebuilt from current source in a round shaped like this one.
-    "2.0.6": None,
-    # 2.0.7 adds vendor rows to the shared netcam tables, so every production image gains detail-
-    # string labels that exist in no earlier image. "Juan OEM" and "Night Owl" are two of the five
-    # new labels; neither is a substring of any string a 2.0.6 image carries ("Blink" was avoided
-    # as a canary because it is short enough to false-pass on an unrelated run of bytes). The
-    # Flock change in this cut alters confidence arithmetic only and introduces no literal.
-    "2.0.7": ["Juan OEM", "Night Owl"],
-    # 2.0.8's capture instrumentation is capture-only; the app/UI work introduces no new
-    # literal shared by production firmware images. Keep descriptor and provenance checks
-    # authoritative rather than using the version string itself as a circular content proof.
-    "2.0.8": None,
-    # 2.0.9 has two production changes. The MAC OUI D8:1F:65 added to the Axon signature table is
-    # three binary bytes in a const array, so bin_strings cannot see it, and the detail string it
-    # renders under ("Axon OUI") already ships in 2.0.7 and 2.0.8, so it would false-pass. The
-    # offline-buffer flood limit is the honest canary: its diag format string is new in 2.0.9 and
-    # is compiled into every production image (the .rodata pool puts it next to the version
-    # literal). Confirmed at the 2.0.9 release pass against all five staged binaries, and absent
-    # from all five published 2.0.8 images.
-    "2.0.9": ["offline buffer refused"],
+    # 2.1.0 adds WatchGuard Video's block to the Motorola vendor proxy with its own detail string.
+    # The OUI bytes are not text a canary can name, but "WatchGuard Video OUI" is a new literal in
+    # police_detect.cpp, linked into every production image, and absent from every earlier one.
+    # Confirmed in all five local 2.1.0 builds (one occurrence each) on 2026-10-01.
+    "2.1.0": ["WatchGuard Video OUI"],
 }
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -270,9 +234,51 @@ def web_manifest_inventory(repo):
     return expected, actual
 
 
+def ota_pub_path():
+    """beacon_ota_pub.pem, else beacon_ota_pub.der, else None."""
+    for name in ("beacon_ota_pub.pem", "beacon_ota_pub.der"):
+        path = os.path.join(REPO, "firmware/tools/ota_signing", name)
+        if os.path.exists(path):
+            return path
+    return None
+
+
+def check_signature(label, kind, sig, signed_path):
+    """One row: `sig` verifies over signed_path against the ota_pub_path() key.
+
+    HEX, not Base64, and the key is beacon_ota_pub.pem (or .der). Both were wrong in the first
+    version of this gate: it looked for a beacon_ota_key.pub that has never existed and b64decoded
+    a hex DER signature. Either mistake fails EVERY legitimate release, which is the worst possible
+    failure for a release gate - it trains you to ignore it. build-beacon-flasher.sh emits
+    `openssl dgst -sha256 -sign ... | xxd -p`, i.e. hex of a DER ECDSA signature, which is why a
+    real one starts with 3044/3045."""
+    pub = ota_pub_path()
+    if pub is None:
+        check(False, f"{label}: no OTA public key found to verify the {kind} signature against")
+        return
+    try:
+        # unhexlify, not bytes.fromhex: fromhex skips whitespace, and the board (app image) and
+        # the apps (nRF package) refuse a signature with a newline in it.
+        raw = binascii.unhexlify(sig)
+    except ValueError as exc:
+        check(False, f"{label}: {kind} signature is not hex ({exc}); "
+                     f"expected hex DER from build-beacon-flasher.sh")
+        return
+    with tempfile.NamedTemporaryFile() as sf:
+        sf.write(raw)
+        sf.flush()
+        r = subprocess.run(
+            ["openssl", "dgst", "-sha256", "-verify", pub,
+             "-keyform", "PEM" if pub.endswith(".pem") else "DER",
+             "-signature", sf.name, signed_path],
+            capture_output=True)
+    check(r.returncode == 0,
+          f"{label}: {kind} signature VERIFIES against {os.path.basename(pub)}")
+
+
 def check_ota_key_identity(shared_ver, beacon_ver, images):
     """Pin the OTA trust root: header DER == recorded fingerprint == the DER inside every staged
-    image, and the pub file the signatures below are verified against is that same key. The one
+    image, and the pub file check_signature verifies against is that same key. The one
     exception is the declared rotation cut (release_tools.OTA_ROTATION): there the pub file must
     be the RETIRING signer, because the images bake the new root and a fielded board accepts them
     only while they are signed by the root it already runs."""
@@ -316,16 +322,14 @@ def check_ota_key_identity(shared_ver, beacon_ver, images):
               f"{rotation['trust_root_sha256'][:12]} and are signed by the retiring key "
               f"{rotation['signer_sha256'][:12]}; fielded boards accept this cut only because "
               f"they still trust the retiring key")
-    pub = os.path.join(REPO, "firmware/tools/ota_signing/beacon_ota_pub.pem")
+    pub = ota_pub_path()
     file_der = None
-    if os.path.exists(pub):
+    if pub and pub.endswith(".pem"):
         r = subprocess.run(["openssl", "pkey", "-pubin", "-in", pub, "-outform", "DER"],
                            capture_output=True)
         file_der = r.stdout if r.returncode == 0 else None
-    else:
-        pub = os.path.join(REPO, "firmware/tools/ota_signing/beacon_ota_pub.der")
-        if os.path.exists(pub):
-            file_der = open(pub, "rb").read()
+    elif pub:
+        file_der = open(pub, "rb").read()
     if file_der is None:
         check(False, "ota_signing pub key file exists and is readable")
     elif rotation is not None:
@@ -423,24 +427,6 @@ def check_usb_manifest(label, manifest_path, expected_version, expected_parts, s
               f"{label} part staged after the last source edit: {path}")
 
 
-def bin_strings(path):
-    try:
-        # -n 3: the default 4-char minimum silently drops 3-char literals, and the 2.0.5 canary
-        # ("cid") IS one - with the default this row failed on images that genuinely contain it.
-        result = subprocess.run(["strings", "-n", "3", path], capture_output=True, text=True,
-                                timeout=120)
-        # CHECK THE EXIT STATUS. A nonzero strings(1) hands back empty stdout, and an empty blob
-        # makes the VERSION loop below print "carries no readable banner, version not checked
-        # here" - a read that FAILED, reported as a deliberate skip. Fall through to the scan.
-        if result.returncode == 0 and result.stdout:
-            return result.stdout
-    except Exception:
-        pass
-    # strings(1) missing or failed: fall back to a crude printable-run scan so the gate still works.
-    data = open(path, "rb").read()
-    return "".join(chr(b) if 32 <= b < 127 else "\n" for b in data)
-
-
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--strings", nargs="*", default=[],
@@ -522,9 +508,13 @@ def main():
         # "=== All Cameras Are Beacons 2.0.3 ===", the Colonel Panic images print
         # "=== ACAB OUI-Spy 2.0.3 ===" / "=== ACAB Mesh-Detect 2.0.3 ===". A version check that
         # cannot fail is worse than no version check, because it reads as a pass.
-        blob = bin_strings(p)
-        found = (re.findall(r"All Cameras Are Beacons ([0-9.]+)", blob)
-                 + re.findall(r"=== ACAB [\w-]+ ([0-9.]+) ===", blob))
+        # Search the raw image bytes. There is no strings(1) step, so no minimum run length can
+        # drop a short literal (the 2.0.5 canary was "cid", three characters) and no failed
+        # subprocess can turn an unread image into a "no readable banner" skip.
+        blob = Path(p).read_bytes()
+        found = [v.decode() for v in
+                 re.findall(rb"All Cameras Are Beacons ([0-9.]+)", blob)
+                 + re.findall(rb"=== ACAB [\w-]+ ([0-9.]+) ===", blob)]
         if not found:
             # oui-spy / mesh-detect images carry a different banner; only gate what we can read.
             print(f"  --    {rel} carries no readable banner, version not checked here")
@@ -548,9 +538,9 @@ def main():
         if not canaries:
             check(False, f"{rel} has content canaries defined for version {version}")
             continue
-        blob = bin_strings(p)
+        blob = Path(p).read_bytes()
         for string in canaries:
-            check(string in blob, f"{rel} contains {string!r}")
+            check(string.encode() in blob, f"{rel} contains {string!r}")
     if skipped_canary and args.production:
         print("  --    NOTE: --production does not fail on a DECLARED absent canary. The"
               " per-release row stays mandatory - an undeclared version fails above - and None is"
@@ -636,37 +626,7 @@ def main():
                 sig = (app.get("sig") or "").strip()
                 check(bool(sig), f"{name}: OTA signature present and non-empty")
                 if sig:
-                    # HEX, not Base64, and the key is beacon_ota_pub.pem (or .der). Both were wrong
-                    # in the first version of this gate: it looked for a beacon_ota_key.pub that has
-                    # never existed and b64decoded a hex DER signature. Either mistake fails EVERY
-                    # legitimate release, which is the worst possible failure for a release gate -
-                    # it trains you to ignore it. build-beacon-flasher.sh emits
-                    # `openssl dgst -sha256 -sign ... | xxd -p`, i.e. hex of a DER ECDSA signature,
-                    # which is why a real one starts with 3044/3045.
-                    pub = os.path.join(REPO, "firmware/tools/ota_signing/beacon_ota_pub.pem")
-                    if not os.path.exists(pub):
-                        pub = os.path.join(REPO, "firmware/tools/ota_signing/beacon_ota_pub.der")
-                    if not os.path.exists(pub):
-                        check(False, f"{name}: no OTA public key found to verify against")
-                    else:
-                        import binascii, subprocess, tempfile
-                        try:
-                            raw = binascii.unhexlify(sig.strip())
-                        except Exception as e:
-                            raw = None
-                            check(False, f"{name}: signature is not hex ({e}); "
-                                         f"expected hex DER from build-beacon-flasher.sh")
-                        if raw:
-                            with tempfile.NamedTemporaryFile(delete=False) as sf:
-                                sf.write(raw); sigf = sf.name
-                            keyform = "PEM" if pub.endswith(".pem") else "DER"
-                            r = subprocess.run(
-                                ["openssl", "dgst", "-sha256", "-verify", pub,
-                                 "-keyform", keyform, "-signature", sigf, p],
-                                capture_output=True)
-                            check(r.returncode == 0,
-                                  f"{name}: OTA signature VERIFIES against {os.path.basename(pub)}")
-                            os.unlink(sigf)
+                    check_signature(name, "OTA", sig, p)
 
         # nRF DFU package. Bind the manifest entry to the exact signed ZIP and the application
         # version inside its init packet, not just an unsigned outer version number.
@@ -713,33 +673,8 @@ def main():
                       f"{label}: nRF OTA offer flag is true for the signed package")
                 sig = (nrf.get("sig") or "").strip()
                 check(bool(sig), f"{label}: nRF OTA signature present and non-empty")
-                if not sig:
-                    continue
-                import binascii, tempfile
-                try:
-                    raw = binascii.unhexlify(sig)
-                except Exception as exc:
-                    raw = None
-                    check(False, f"{label}: nRF signature is not hex ({exc})")
-                if not raw:
-                    continue
-                pub = os.path.join(REPO, "firmware/tools/ota_signing/beacon_ota_pub.pem")
-                if not os.path.exists(pub):
-                    pub = os.path.join(REPO, "firmware/tools/ota_signing/beacon_ota_pub.der")
-                if not os.path.exists(pub):
-                    check(False, f"{label}: no OTA public key for nRF signature")
-                    continue
-                with tempfile.NamedTemporaryFile(delete=False) as sf:
-                    sf.write(raw); sigf = sf.name
-                keyform = "PEM" if pub.endswith(".pem") else "DER"
-                result = subprocess.run(
-                    ["openssl", "dgst", "-sha256", "-verify", pub,
-                     "-keyform", keyform, "-signature", sigf, z],
-                    capture_output=True,
-                )
-                check(result.returncode == 0,
-                      f"{label}: nRF signature verifies against OTA public key")
-                os.unlink(sigf)
+                if sig:
+                    check_signature(label, "nRF", sig, z)
             if len(descriptors) == 2:
                 check(descriptors[0][1] == descriptors[1][1],
                       "rev-A and rev-B carry the exact same co-processor package descriptor")
@@ -828,7 +763,6 @@ def main():
     # dirty digest is part of the record, not a footnote.
     if args.production:
         print("\nPROVENANCE")
-        import subprocess
         for label, path in (("acab", REPO), ("soyboi.tech", SITE)):
             try:
                 # CHECK THE EXIT STATUS. A failed rev-parse hands back an EMPTY stdout, which used

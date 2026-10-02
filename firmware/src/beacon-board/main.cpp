@@ -28,7 +28,7 @@
 #include "ota_update.h"   // S3 self-update over BLE + boot-attempt rollback
 #include "acab_banner.h"
 #ifdef ACAB_DUAL_RADIO
-#include <Preferences.h>   // board-revision latch (NVS)
+#include <Preferences.h>   // NVS: committed power state (pwrCommittedOn)
 #include "esp_sleep.h"    // soft power: the slide switch parks us in deep sleep instead of cutting the cell
 #include "driver/rtc_io.h"
 // The companion nRF updates itself over BLE DFU (its Adafruit bootloader speaks native Nordic
@@ -53,7 +53,7 @@ static const uint32_t kBatteryStartupSettleMs = 100;
 // gates them too - there is no separate police type.)
 //
 // EVERY DESERT-FORCED CLASSIFIER NEEDS AN ARM HERE. flock, drone, glasses, tracker and axon all
-// self-gate with `if (!gEnabled && !desertIsEnabled()) return false;`, so with Desert on they
+// self-gate with `if (!gEnabled.on && !desertIsEnabled()) return false;`, so with Desert on they
 // emit with their category toggle OFF and this gate is the toggle's only remaining job. Until
 // 2026-08-25 the switch covered 3 of the 7 toggle-bearing types, so ACAB_FLOCK_CAMERA /
 // ACAB_FLOCK_RAVEN / ACAB_DRONE / ACAB_GLASSES fell through to `default: return true` and a board
@@ -302,132 +302,23 @@ static void nrfEnterDfu() {
 // going LOW again. A JST unplug stays the hard disconnect.
 static const gpio_num_t kSwSensePin = GPIO_NUM_9;   // XIAO D10 (RTC-capable, non-strapping)
 
-// ---- BOARD REVISION AUTO-DETECT (2026-07-28) -------------------------------------------------
-// One firmware image serves BOTH carrier revisions, so the web flasher stays a single button and a
-// user can never pick wrong (they do not know which board they own; esp-web-tools only knows the
-// chip family, which is ESP32-S3 on both).
+// ---- BOARD REVISION (build constant) ---------------------------------------------------------
+// Each carrier revision has its own image, so the revision is fixed at build time:
+// -DACAB_FORCE_REV_B=1 selects rev-B ([env:beacon-board-revb] in platformio.ini), no flag is rev-A.
 //   rev-A (the first 250): SS12D00G4 slide switch, D0/GPIO1 UNCONNECTED.
 //   rev-B: EVQ-P7 momentary button, and R3/R4 (100k/100k off the S3's 5V/USB-VBUS castellation)
-//          drive D0. That divider is the ONLY electrical difference we can see from firmware, so
-//          it is the revision tell.
-// PROBE: enable the internal pulldown on D0 and read the ADC. With USB present rev-B's divider
-// fights the ~45k pulldown to a steady ~1.2V; an unconnected rev-A pin collapses to ~0 (and if the
-// ADC init drops the pulldown, a floating pin reads NOISY, which the stability test below rejects).
-// We demand BOTH an in-band mean AND a tight spread, because "floating pin happened to sit in
-// range" is the only way this can go wrong.
-// LATCH POLICY , deliberately asymmetric: only a POSITIVE rev-B detect is written to NVS, and it is
-// permanent. A negative result is NOT latched, because it is ambiguous: a rev-B board booting on
-// battery with no USB looks exactly like a rev-A board (the 5V pad floats, R4 pulls the node down).
-// So false-negative = transient, self-corrects the first time the unit sees USB (flashing, bring-up
-// or any charge); false-positive = permanent, and therefore the case we make hard to reach.
-// CONSEQUENCE TO KNOW: a rev-B unit that has NEVER been plugged into USB runs slide semantics, so
-// its momentary button reads as "off" and it parks. Every board is USB-flashed at build time, so the
-// latch happens in the factory - but if a rev-B board ever acts dead on battery, plug it in once.
-// OVERRIDE: -DACAB_FORCE_REV_B=1 (or =0) at build time. THAT IS THE ONLY OVERRIDE.
-// This line used to also offer "revb 1" / "revb 0" on USB serial, and there was never a parser for
-// it: nrfConsolePoll() has a 16-byte buffer and recognises exactly one token, "nrfdfu". The
-// setter it named had no declaration in any header and no caller anywhere in the repo. Documenting
-// a recovery that silently does nothing is worse than documenting none, because this block is what
-// someone reads when a board "looks bricked" - so the clause and the unreachable setter both went
-// (2026-08-25). Nothing needs them today: ACAB_REV_DETECT is defined by no env, so boardProbeRevB
-// never runs and the #else branch below already heals a stale latch on every boot. If the probe is
-// ever enabled for real rev-B boards, add a serial escape back AT THE SAME TIME, with a parser.
+//          drive D0, which readBatteryPct reads as the USB-plugged signal.
 static const int kVbusSensePin = 1;      // D0 / GPIO1 / ADC1_CH0 , rev-B VBUS divider node
-static int8_t gBoardRevB = -1;           // -1 unknown, 0 rev-A, 1 rev-B
-
-static bool boardProbeOnce(int* meanOut, int* spreadOut) {
-    // ACTIVE probe. The first cut just enabled the internal pulldown and read the ADC, and a real
-    // rev-A board measured mean=689mV spread=2678mV (2026-07-28 bench): the ADC init drops the pull
-    // resistor, so the floating pin wandered the full range and its MEAN landed above a 600mV
-    // threshold. Only the stability test caught it - one heuristic away from permanently latching a
-    // rev-A board as rev-B. So: discharge the pin first, then let the divider (if any) re-establish.
-    pinMode(kVbusSensePin, OUTPUT);      // drive LOW: dump whatever charge is sitting on a floating pin
-    digitalWrite(kVbusSensePin, LOW);
-    delay(3);
-    pinMode(kVbusSensePin, INPUT);       // release, no internal pull (the ADC would drop it anyway)
-    delay(20);                           // rev-B's 100k/100k snaps back in ~us; a float has nothing to pull it
-    int lo = 4096, hi = 0; long sum = 0;
-    for (int i = 0; i < 16; i++) {
-        int mv = (int)analogReadMilliVolts(kVbusSensePin);
-        sum += mv; if (mv < lo) lo = mv; if (mv > hi) hi = mv;
-        delay(2);
-    }
-    int mean = (int)(sum / 16), spread = hi - lo;
-    if (meanOut) *meanOut = mean;
-    if (spreadOut) *spreadOut = spread;
-    // rev-B with USB present parks at ~2500mV (5V halved) and holds it dead steady. A discharged
-    // floating pin sits near 0 and, if it drifts, drifts noisily. 1500mV is deliberately far above
-    // anything a float produced on the bench, and 120mV of spread is generous for ADC noise but
-    // impossible for a high-impedance pin.
-    return (mean > 1500 && spread < 120);
-}
-
-// Three independent rounds must ALL agree before we latch anything permanent. A single wandering
-// sample set cannot reach the threshold three times in a row after three separate discharges.
-static bool boardProbeRevB() {
-    int mean = 0, spread = 0, agree = 0;
-    for (int r = 0; r < 3; r++) {
-        int m = 0, sp = 0;
-        if (boardProbeOnce(&m, &sp)) agree++;
-        mean = m; spread = sp;
-    }
-    Serial.printf("[board] D0 probe: mean=%dmV spread=%dmV rounds=%d/3 -> %s\n",
-                  mean, spread, agree,
-                  (agree == 3) ? "rev-B divider present" : "no divider (rev-A, or rev-B on battery)");
-    return agree == 3;
-}
-
-// Resolve the revision once at boot.
-// PRECEDENCE: -DACAB_FORCE_REV_B (explicit) > -DACAB_REV_DETECT (probe+latch) > rev-A (default).
-//
-// DETECTION IS OPT-IN AS OF 2026-07-28, and that is deliberate. No rev-B board exists yet, so on
-// every board that physically exists today a rev-B verdict is WRONG BY DEFINITION - there is no
-// upside to guessing and a very real downside. It bit for real: a board whose SW1 pads were bridged
-// GND<->D10 (the documented slim always-on mod) held D10 LOW forever, the probe had latched rev-B,
-// and the rev-B off-hold read that permanent LOW as "button held" and parked the unit ~1.5s after
-// every boot. The unit looked bricked and the correct hardware mod was what exposed it.
-// When rev-B boards arrive, build them with -DACAB_REV_DETECT and the probe/latch below runs again.
-static void boardRevDetect() {
+// A bench board that ran an old probe build can still hold NVS key "revb" = 1 in namespace
+// "acab-board". No firmware reads it; a future revision latch must use a NEW key.
 #if defined(ACAB_FORCE_REV_B)
-    gBoardRevB = (ACAB_FORCE_REV_B) ? 1 : 0;
-    Serial.printf("[board] revision FORCED by build flag: rev-%s\n", gBoardRevB ? "B" : "A");
-    // Forcing rev-A must ALSO heal a stale latch, exactly like the detection-off path below.
-    // Without this, -DACAB_FORCE_REV_B=0 (the documented way to declare a board rev-A) left a
-    // poisoned revb=1 in NVS, and a later -DACAB_REV_DETECT build would hit the stored==1 early
-    // return and resurrect the mis-latch WITHOUT ever running the probe.
-    if (!gBoardRevB) {
-        Preferences p; p.begin("acab-board", false);
-        if ((int8_t)p.getChar("revb", -1) == 1) { p.remove("revb"); Serial.println("[board] cleared a stale rev-B latch from NVS"); }
-        p.end();
-    }
-#elif defined(ACAB_REV_DETECT)
-    Preferences p;
-    p.begin("acab-board", true);
-    int8_t stored = (int8_t)p.getChar("revb", -1);
-    p.end();
-    if (stored == 1) { gBoardRevB = 1; Serial.println("[board] revision: rev-B (latched in NVS)"); return; }
-    if (boardProbeRevB()) {
-        gBoardRevB = 1;
-        Preferences w; w.begin("acab-board", false); w.putChar("revb", 1); w.end();
-        Serial.println("[board] revision: rev-B DETECTED and latched (button power + VBUS sense)");
-    } else {
-        gBoardRevB = 0;   // not latched on purpose , see LATCH POLICY above
-        Serial.println("[board] revision: rev-A (slide switch); will re-probe next boot");
-    }
+static const bool kBoardRevB = (ACAB_FORCE_REV_B) != 0;
 #else
-    gBoardRevB = 0;
-    // HEAL a poisoned latch written by an earlier build that probed by default. Without this, simply
-    // rebuilding with detection off would leave the bad NVS key sitting there to bite again the next
-    // time detection is enabled.
-    { Preferences p; p.begin("acab-board", false);
-      if ((int8_t)p.getChar("revb", -1) == 1) { p.remove("revb"); Serial.println("[board] cleared a stale rev-B latch from NVS"); }
-      p.end(); }
-    Serial.println("[board] revision: rev-A (detection off; build -DACAB_REV_DETECT once rev-B boards exist)");
+static const bool kBoardRevB = false;
 #endif
-}
 
 // Public: true when this carrier is rev-B (momentary button + real VBUS sense).
-bool acabBoardIsRevB() { return gBoardRevB == 1; }
+bool acabBoardIsRevB() { return kBoardRevB; }
 
 static void nrfResetPulse();   // defined below; powerOffDeepSleep uses it for DFU-bootloader rescue
 
@@ -822,9 +713,9 @@ void setup() {
     // so the board deep-sleeps 3s after every boot and never comes up for bring-up. This flag
     // skips the soft-power park so the S3 always runs on the bench. It is a BENCH-ONLY flag,
     // never set on a shipped build (the real carrier drives D10 through SW1). DEFAULT OFF.
-    // Resolve the carrier revision FIRST: the power-gate below and swSensePollOff() both branch on
-    // it, so it has to be known before we look at D10.
-    boardRevDetect();
+    // The carrier revision is a build constant (kBoardRevB), so the power-gate below and
+    // swSensePollOff() can branch on it with nothing to resolve first.
+    Serial.printf("[board] revision: rev-%s\n", kBoardRevB ? "B" : "A");
 #ifndef ACAB_BENCH_NO_SLEEP
     pinMode(kSwSensePin, INPUT_PULLUP);
     delay(10);
@@ -965,16 +856,14 @@ void setup() {
     // inert (no capture) until the app enables it and pushes an at-rest key.
     detLogBegin();
 
-    // Scanner reuses the NimBLE stack we just inited (initNimBLE=false) and adds
+    // Scanner reuses the NimBLE stack we just inited and adds
     // WiFi promiscuous on top.
     AcabScannerConfig cfg = acabScannerDefaults();
-    cfg.initNimBLE = false;
     cfg.bleDeviceName = kBleName;
 
     // Axon body-cam detection on OUI 00:25:DF. Field-validated 2026-06-17: real
     // Axon body cams advertise this public OUI (payload reads "...BWC DEVICE").
     // See axon_detect.cpp.
-    axonUseRegistryCandidate();
     // Restore the persisted body-cam CATEGORY toggle (default ON). Covers Axon (OUI +
     // the conf-90 BWCDEVICE tag) and Utility BodyWorn.
     axonRestoreEnabled(true);
@@ -1439,7 +1328,7 @@ void loop() {
                       (int)acabScannerCoProcScanning(), (unsigned long)acabScannerCoProcBbCount(), gBatMv,
                       acabBleBondCount(),
                       (unsigned long)(acabBlePairWindowRemainingMs() / 1000));
-#ifdef ACAB_DIAG_WIFI
+#ifdef ACAB_CAPTURE_BUILD
         // Capture builds only. diag_drop>0 means the promiscuous callback outran the serial
         // task and records were thrown away, so the capture is INCOMPLETE: an absent signal in
         // that log proves nothing. Printed on its own line so a grep for it is unambiguous.
@@ -1455,18 +1344,15 @@ void loop() {
         // which no shipping rule can currently see. falcon_full>0 means FALCON_MAX overflowed and
         // falcon_macs is a floor, not a count.
         Serial.printf("[diag] wifi_diag sent=%lu dropped=%lu app=%d bufen=%d buf=%lu"
-#ifdef ACAB_CAPTURE_BUILD
                       " watch_data=%lu falcon_data=%lu falcon_mgmt=%lu falcon_macs=%lu falcon_full=%lu"
                       " axon_ble=%lu moto_ble=%lu pcam_ble=%lu vendor_macs=%lu vendor_full=%lu"
                       " alpr_ble=%lu alpr_wifi=%lu alpr_macs=%lu alpr_full=%lu"
-#endif
                       "\n",
                       (unsigned long)acabScannerWifiDiagSent(),
                       (unsigned long)acabScannerWifiDiagDropped(),
                       acabBleClientConnected() ? 1 : 0,
                       detLogEnabled() ? 1 : 0,
                       (unsigned long)detLogCount()
-#ifdef ACAB_CAPTURE_BUILD
                       , (unsigned long)acabScannerWatchDataSeen()
                       , (unsigned long)acabScannerFalconData()
                       , (unsigned long)acabScannerFalconMgmt()
@@ -1481,7 +1367,6 @@ void loop() {
                       , (unsigned long)acabScannerAlprCandidateWifiSeen()
                       , (unsigned long)acabScannerAlprCandidateMacs()
                       , (unsigned long)acabScannerAlprCandidateTableFull()
-#endif
                       );
 #endif
     }
@@ -1506,13 +1391,16 @@ void loop() {
     // coredump_report.h.
     //
     // Ride the SAME explicit user intent, so "erase what this board stored" means both regions.
-    // clearlog, a key change, and buffer:false persist a separate erase-generation token; this
-    // tick consumes it even when the ring sweep was already pending or the token was restored
-    // after power loss. A boot auto-wipe with NO explicit token still preserves the dump setup()
-    // has just printed decode instructions for. The rule lives in acabCoredumpWipeTick() rather
-    // than here because mesh-detect needs the identical behaviour, and the 64 KB cache-off erase
-    // must run on this loop task. It defers past the ring sweep that acabBleDrainTick pumps below
-    // so a normal pass never takes two block erases back to back. Free on a clean boot.
+    // clearlog, a key change, buffer:false, and the first authenticated phone link of every boot
+    // (detLogPrepareConfigSession) persist a separate erase-generation token; this tick consumes
+    // it even when the ring sweep was already pending or the token was restored after power loss.
+    // So the dump setup() has just reported is erased on this boot's first pass when a phone had
+    // authenticated on the boot that crashed, and otherwise one pass after a phone authenticates.
+    // A boot auto-wipe alone does not arm the token. To decode a panic, use the serial boot
+    // report, or read the dump before a phone connects. The rule lives in acabCoredumpWipeTick()
+    // rather than here because mesh-detect needs the identical behaviour, and the 64 KB cache-off
+    // erase must run on this loop task. It defers past the ring sweep that acabBleDrainTick pumps
+    // below so a normal pass never takes two block erases back to back. Free on a clean boot.
     acabCoredumpWipeTick();
     acabBleDrainTick();   // stream buffered detections back on the app's sync request
     acabBleOtaWatchdog(); // abort + un-quiesce a stalled OTA session (missed link drop)

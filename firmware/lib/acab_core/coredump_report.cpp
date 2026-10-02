@@ -7,6 +7,7 @@
 // still links: the whole feature degrades to "no dump reported", never to a build break.
 #if __has_include(<esp_core_dump.h>)
   #include <esp_core_dump.h>
+  #include <esp_partition.h>
   #define ACAB_HAVE_COREDUMP 1
 #endif
 #include <esp_system.h>
@@ -17,15 +18,51 @@ static bool gProbed = false;
 
 const AcabCoredumpInfo& acabCoredumpInfo() { return gInfo; }
 
+#ifdef ACAB_HAVE_COREDUMP
+// EMPTINESS IS PROVEN BY READING THE PARTITION, never by an IDF return code. The pinned IDF
+// (v4.4.7, esp_core_dump_partition_and_size_get) answers ESP_ERR_INVALID_SIZE for a blank
+// partition, the same code it gives a garbage size word, and ESP_ERR_NOT_FOUND only when the
+// partition table has no coredump partition; esp_core_dump.h documents NOT_FOUND for "no core
+// dump stored", which this IDF does not do. True only when no stack byte can be retained:
+//   - there is no coredump partition, or
+//   - every byte is 0xFF, apart from bytes 4..15, which may be the 0x00 pad of the 16-byte
+//     {0xFFFFFFFF, 0, 0, 0} marker esp_core_dump_image_erase() writes after its erase.
+// A blank size word alone is NOT proof: a panic write erases only the sectors the new dump
+// needs, so a write interrupted before its header lands leaves a blank head in front of an
+// older, larger dump's stack bytes. A read error proves nothing either.
+// Clean-boot cost: one pass over the 64 KB partition in sizeof(buf) pieces, from setup() before
+// the radios start. IDF takes the flash guard (cache off, other core parked) once per
+// esp_partition_read call, not for the whole pass. Measured 13-14 ms on a rev-A board
+// (2026-10-02, three boots, serial gap around the probe; the pre-fix probe measured ~0 ms).
+static bool coredumpPartitionBlank() {
+    const esp_partition_t* part = esp_partition_find_first(
+        ESP_PARTITION_TYPE_DATA, ESP_PARTITION_SUBTYPE_DATA_COREDUMP, nullptr);
+    if (!part) return true;
+    uint8_t buf[1024];   // loop task stack is 8 KB and nearly empty this early in setup()
+    for (size_t off = 0; off < part->size; off += sizeof(buf)) {
+        const size_t left = part->size - off;
+        const size_t n = left < sizeof(buf) ? left : sizeof(buf);
+        if (esp_partition_read(part, off, buf, n) != ESP_OK) return false;
+        for (size_t i = 0; i < n; i++) {
+            const size_t at = off + i;
+            const bool markerPad = at >= 4 && at < 16 && buf[i] == 0x00;
+            if (buf[i] != 0xFF && !markerPad) return false;
+        }
+    }
+    return true;
+}
+#endif
+
 void acabCoredumpProbe() {
     memset(&gInfo, 0, sizeof(gInfo));
 #ifdef ACAB_HAVE_COREDUMP
-    // image_check() validates the stored dump end to end. ESP_ERR_NOT_FOUND is the ordinary
-    // "clean boot, nothing retained" case and is the ONLY result that proves emptiness. A check
-    // or metadata-access failure is not permission to acknowledge a destructive request: the
+    // image_check() validates a stored dump end to end. When it finds no valid image, the
+    // ordinary "clean boot, nothing retained" case is a partition coredumpPartitionBlank() can
+    // prove blank, and that proof is the ONLY thing that means empty. Any other check or
+    // metadata-access failure is not permission to acknowledge a destructive request: the
     // partition can still contain sensitive stack bytes even when IDF cannot describe them.
     const esp_err_t chk = esp_core_dump_image_check();
-    if (chk == ESP_ERR_NOT_FOUND) {
+    if (chk != ESP_OK && coredumpPartitionBlank()) {
         gProbed = true;
         return;
     }

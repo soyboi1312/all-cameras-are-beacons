@@ -73,8 +73,9 @@
 // WHAT THIS ENTRY ACTUALLY BUYS, stated plainly so nobody overrates it: ONE device across every
 // capture to date, 04:a2:57. The other eight already fire at conf 90 on the tag, which is
 // MAC-independent and needs no OUI at all. A device on rotating random addresses stops presenting
-// the OUI (and the WiFi path, axonOuiHit, skips locally-administered MACs outright), so this buys
-// nothing once Axon finishes moving to rotating addresses. AXON_BWC_PAYLOAD is what survives that; this is the fallback beneath it.
+// the OUI (and axonOuiHit, on both the BLE and WiFi paths, skips locally-administered MACs
+// outright), so this buys nothing once Axon finishes moving to rotating addresses.
+// AXON_BWC_PAYLOAD is what survives that; this is the fallback beneath it.
 //   src: own field capture, 2026-08-09 and 2026-09-19 (owner-confirmed).
 #define AXON_OUI_BWC_FIELD   { 0xd8, 0x1f, 0x65 }
 

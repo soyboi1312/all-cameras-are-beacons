@@ -27,7 +27,7 @@
 #include "desert_detect.h"   // Desert mode forces classification even when toggled off
 #include "acab_scanner.h"    // acabSanitizeAscii: clamp attacker-sourced strings on ingest
 #include <Arduino.h>
-#include <Preferences.h>     // persist the drone toggle across reboots (NVS)
+#include "acab_nvs_toggle.h" // persist the drone toggle across reboots (NVS)
 #include <string.h>
 #include <stdio.h>
 
@@ -38,20 +38,12 @@ extern "C" {
 
 // Master on/off (default ON). NVS-backed so an app-set drone toggle survives a
 // reboot (mirrors axon/tracker/glasses).
-static bool gEnabled = true;
-void droneSetEnabled(bool enabled) {
-    if (enabled == gEnabled) return;
-    gEnabled = enabled;
-    Preferences p; p.begin("acab-drone", false); p.putBool("on", enabled); p.end();
-}
-bool droneIsEnabled() { return gEnabled; }
+static AcabNvsToggle gEnabled{"acab-drone", "on", true};
+void droneSetEnabled(bool enabled) { gEnabled.set(enabled); }
+bool droneIsEnabled() { return gEnabled.on; }
 
 // Reload the persisted toggle on boot; if none saved yet, use defaultEnabled.
-void droneRestoreEnabled(bool defaultEnabled) {
-    Preferences p; p.begin("acab-drone", true);
-    gEnabled = p.getBool("on", defaultEnabled);
-    p.end();
-}
+void droneRestoreEnabled(bool defaultEnabled) { gEnabled.restore(defaultEnabled); }
 
 // Vendor-OUI fallback opt-in (default OFF). The OUI fallback below cannot tell a
 // flying drone from a stationary gadget that happens to share a drone vendor's
@@ -59,21 +51,13 @@ void droneRestoreEnabled(bool defaultEnabled) {
 // mislabels such a device a drone. Keep it off unless the user explicitly opts in.
 // NVS-backed in the same "acab-drone" namespace (key "oui") so the choice survives
 // a reboot - mirrors the master toggle and axon's persistence.
-static bool gEnabledOui = false;
-void droneOuiSetEnabled(bool enabled) {
-    if (enabled == gEnabledOui) return;
-    gEnabledOui = enabled;
-    Preferences p; p.begin("acab-drone", false); p.putBool("oui", enabled); p.end();
-}
-bool droneOuiIsEnabled() { return gEnabledOui; }
+static AcabNvsToggle gEnabledOui{"acab-drone", "oui", false};
+void droneOuiSetEnabled(bool enabled) { gEnabledOui.set(enabled); }
+bool droneOuiIsEnabled() { return gEnabledOui.on; }
 
 // Reload the persisted OUI-fallback opt-in on boot; if none saved yet, use
 // defaultEnabled (callers pass false so the fallback stays off by default).
-void droneOuiRestoreEnabled(bool defaultEnabled) {
-    Preferences p; p.begin("acab-drone", true);
-    gEnabledOui = p.getBool("oui", defaultEnabled);
-    p.end();
-}
+void droneOuiRestoreEnabled(bool defaultEnabled) { gEnabledOui.restore(defaultEnabled); }
 
 // ---------------------------------------------------------------------------
 // Gathering a drone's messages into one identity.
@@ -286,7 +270,7 @@ static bool droneRidBLE(const uint8_t mac[6], const uint8_t* payload, size_t len
 // Public BLE classifier: Remote ID first, the vendor-OUI fallback only under it.
 bool droneClassifyBLE(const uint8_t mac[6], const uint8_t* payload, size_t len,
                       int rssi, AcabDetection* out) {
-    if (!gEnabled && !desertIsEnabled()) return false;
+    if (!gEnabled.on && !desertIsEnabled()) return false;
     if (droneRidBLE(mac, payload, len, rssi, out)) return true;
     // OUI fallback is opt-in (default OFF): it cannot distinguish a flying drone from
     // a stationary drone-vendor gadget, so it false-positives. Only run it when the
@@ -344,7 +328,7 @@ static bool droneRidWiFi(const uint8_t* frame, size_t len, int rssi,
 // transmitter address (addr2, frame bytes 10-15) when no RID was decoded.
 bool droneClassifyWiFi(const uint8_t* frame, size_t len, int rssi,
                        AcabDetection* out) {
-    if (!gEnabled && !desertIsEnabled()) return false;
+    if (!gEnabled.on && !desertIsEnabled()) return false;
     if (droneRidWiFi(frame, len, rssi, out)) return true;
     // OUI fallback is opt-in (default OFF) - see droneClassifyBLE for the why. Desert
     // mode still forces it on, matching how the master guard above treats desert.

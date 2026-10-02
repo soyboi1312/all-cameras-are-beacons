@@ -2550,7 +2550,7 @@ static DetLogAppendResult appendLocked(const AcabDetection& d, const DetLogGpsSt
     memcpy(s.mac, d.mac, 6);
     s.rssi   = d.rssi;
     // ---- the record's position, decided in ONE place ----
-    // First the detection's own: a drone's broadcast coordinates, or an onboard/nRF-forwarded fix.
+    // First the detection's own: a drone's broadcast coordinates, or the live phone stamp.
     int32_t  latE7 = (int32_t)(d.lat * 1e7);
     int32_t  lonE7 = (int32_t)(d.lon * 1e7);
     uint32_t ageMs = d.gpsAgeMs;

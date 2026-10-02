@@ -26,6 +26,24 @@
 // field above 1023 is therefore un-shippable over the air: the apps compare unclamped, would keep offering
 // the update, and the board would refuse it forever. Bump the MINOR when the patch field runs out.
 //
+// 2.1.0: adds WatchGuard Video's block, 00:1D:96, to the opt-in Motorola sub-toggle
+//        ({"motorola":bool}, default OFF on every board). A match reports body cam at conf 45,
+//        like the Motorola rows, but with its OWN detail string "WatchGuard Video OUI", so the
+//        apps name the registrant instead of the parent company. Table and provenance:
+//        bodycam_vendor_signatures.h (WATCHGUARD_VIDEO_OUI); evidence: docs/signatures.md.
+//        THIS IS A PRODUCTION CHANGE: a board with the sub-toggle on (or Desert on) now reports
+//        that block on BLE and WiFi. An app that predates the string still shows the row, as a
+//        body cam with the generic fallback vendor and explainer, until it learns the label.
+//        The number jumps from 2.0.9 to 2.1.0 so firmware and both apps (2.1.0) share a version
+//        again; OTA compares 2.1.0 above 2.0.9 on the board and in both apps.
+//        SECOND PRODUCTION CHANGE: a blank core dump partition no longer reads as "erase
+//        required". The pinned IDF answers ESP_ERR_INVALID_SIZE for a blank partition, and the
+//        probe since 2.0.6 took only ESP_ERR_NOT_FOUND as empty, so every boot printed the
+//        UNREADABLE/INVALID line and a board that linked to a phone erased the 64 KB partition
+//        once per boot. acabCoredumpProbe now proves emptiness by reading the whole partition
+//        (coredumpPartitionBlank in coredump_report.cpp, 13-14 ms per boot on a rev-A board).
+//        beacon-board: RAM 78460 bytes (unchanged from 2.0.9), flash 1036481 bytes (-2444; the
+//        same release removes dead code, which is more than the new table and probe add).
 // 2.0.9: adds a SECOND Axon OUI, D8:1F:65, beside the registry block 00:25:DF. UNLIKE 2.0.8 THIS
 //        CUT IS NOT A PRODUCTION NO-OP: axon_detect.cpp's signature goes ouiCount 1 -> 2, so a
 //        shipping build now matches that prefix on both paths: at the signature's confidence 75 on
@@ -175,7 +193,7 @@
 //        diagnostics (enc_change status, disconnect reason, peer identity), which are what
 //        named every fault in this round instead of guessing. Address privacy (rotating RPA) is
 //        implemented and OFF: proven on air and on Android, and iOS cannot connect through it.
-//        Read ACAB_BLE_PRIVACY in acab_ble_service.h before touching that flag.
+//        That build option was removed later; docs/ble-protocol.md holds the bench note.
 // 2.0.2: everything in 2.0.1 plus its review round. Network cameras got their own buzzer
 //        pattern and now honour their own opt-in; the glasses classifier scores all three
 //        match surfaces instead of returning on the first; the WiFi Axon detail strings match
@@ -187,7 +205,7 @@
 // 2.0.0: the Colonel Panic builds pick up the full v2 detection set the beacon board ships
 // with (offline buffer, watchlist/custom category, ignore list, refreshed OUIs, glasses).
 #ifndef ACAB_FW_VERSION
-#define ACAB_FW_VERSION "2.0.9"
+#define ACAB_FW_VERSION "2.1.0"
 #endif
 
 #endif // ACAB_VERSION_H

@@ -35,13 +35,24 @@
  * the material the rest of the design goes to lengths to protect.
  *
  * EXPLICIT INTENT IS DURABLE AND INDEPENDENT. `clearlog`, an at-rest key change, and every
- * `buffer:false` write advance an NVS-backed erase-generation token in det_log. That token is
- * independent of the ring's shared `wipe` level, survives power loss, and is cleared only after
+ * `buffer:false` write advance an NVS-backed erase-generation token in det_log. So does the first
+ * authenticated phone link of every boot, with the buffer on or off: detLogPrepareConfigSession()
+ * pre-arms one generation before any config write is admitted, and det_log's
+ * gSensitiveStackExposedThisBoot then refuses its completion for the rest of that boot. The token
+ * is independent of the ring's shared `wipe` level, survives power loss, and is cleared only after
  * this partition is erased (or positively found empty). A new request supersedes an in-flight
  * generation without being acknowledged by the older completion. This closes both historical
  * gaps: an explicit clear while a ring sweep was already pending, and a crash/power loss between
- * the ring and dump erases. The boot-count auto-wipe intentionally does NOT create this explicit
- * token: it preserves the post-mortem the boot report has just told the operator how to decode.
+ * the ring and dump erases. The boot-count auto-wipe does NOT create this token.
+ *
+ * SO A RETAINED DUMP IS SHORT-LIVED ON ANY BOARD A PHONE USES. acabCoredumpWipeTick() erases it on
+ * the first loop pass that finds the token pending (a pending ring sweep can defer it, bounded; see
+ * acabCoredumpWipeTick below). On the boot after a panic, that is the first pass when a phone had
+ * authenticated on the boot that crashed, and otherwise the first pass after a phone
+ * authenticates. acabCoredumpPrint() runs from setup() before either, so the serial boot report
+ * always prints once. To decode a panic, read that serial boot report, or read the dump out of
+ * flash before a phone connects; when a phone was linked at the crash, the boot report is the
+ * only copy.
  *
  * COVERAGE IS PER-MAIN, WHICH IS THE PART THAT GOES WRONG. acabCoredumpWipeTick() carries the
  * whole trigger rule, so each product main spends exactly one line on it: beacon-board / oui-spy
@@ -75,10 +86,13 @@ struct AcabCoredumpInfo {
     uint32_t dumpVersion;    ///< core-dump format version
 };
 
-/// Read + cache the retained dump's summary. Only ESP_ERR_NOT_FOUND is treated as positively
-/// empty. Every other incomplete/error state is fail-closed as corrupt so an explicit wipe cannot
-/// be acknowledged over possibly retained stack bytes. Call once, early in setup(), after Serial
-/// is up so the one-line report is visible.
+/// Read + cache the retained dump's summary. Only a partition that reads back blank (every byte
+/// 0xFF apart from the marker esp_core_dump_image_erase() leaves; see coredumpPartitionBlank in
+/// coredump_report.cpp) or a table with no coredump partition is treated as positively empty; no
+/// IDF error code is. Every other incomplete/error state is fail-closed as corrupt so an explicit
+/// wipe cannot be acknowledged over possibly retained stack bytes. On a clean boot the proof reads
+/// the whole 64 KB partition. Call once, early in setup(), after Serial is up so the one-line
+/// report is visible.
 void acabCoredumpProbe();
 
 /// The cached result. Zeroed until acabCoredumpProbe() runs.
@@ -96,9 +110,10 @@ void acabCoredumpPrint();
 /// the flash cache off. Call it from the LOOP TASK, like detLogEraseTick, never from the NimBLE
 /// host task - a cache-off stall there freezes GATT for both cores.
 ///
-/// This is NOT part of the boot report. acabCoredumpPrint() tells the reader to decode the dump
-/// against the ELF with the printed SHA, and that needs the binary still in flash; erasing at boot
-/// would make the printed instruction impossible to follow.
+/// This is NOT part of the boot report: setup() prints the report before any erase can run. The
+/// printed instruction (decode against the ELF with the printed SHA) needs the dump still in
+/// flash, but acabCoredumpWipeTick() calls this as soon as det_log's erase token is pending, and
+/// any authenticated phone link makes it pending. See SO A RETAINED DUMP IS SHORT-LIVED above.
 bool acabCoredumpErase();
 
 /// Pump the erase from loop(), once per pass, on the LOOP TASK. Consumes det_log's NVS-backed

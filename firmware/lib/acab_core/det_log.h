@@ -329,7 +329,7 @@ bool     detLogDeliverIfCaptureEpochCurrent(uint32_t epoch,
 //
 // `gps`, when non-null and valid, supplies the position for THIS record only - see DetLogGpsStamp
 // for why the retained phone fix arrives beside the detection rather than on it. A detection that
-// already carries its own coordinate (a drone's broadcast position, an onboard fix) keeps it. ---
+// already carries its own coordinate (a drone's broadcast position, a live phone fix) keeps it. ---
 enum DetLogAppendResult : uint8_t {
     DET_LOG_APPEND_STORED,          // row is durably present in the raw ring
     DET_LOG_APPEND_RETRY,           // transient refusal; caller should release its capture claim

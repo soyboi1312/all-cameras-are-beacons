@@ -29,7 +29,6 @@
 inline uint32_t acabHostMillisCounter = 0;
 
 inline uint32_t millis() { return acabHostMillisCounter; }
-inline uint32_t micros() { return acabHostMillisCounter * 1000u; }
 
 // Test-side controls. Use these, never a sleep.
 inline void acabHostSetMillis(uint32_t ms)     { acabHostMillisCounter = ms; }
@@ -61,20 +60,17 @@ inline AcabHostSerialSink Serial;
 
 inline uint32_t acabHostNonzeroPwmWrites = 0;
 inline uint32_t acabHostLedLowWrites = 0;
-inline uint32_t acabHostLedHighWrites = 0;
 inline uint32_t acabHostLastPwmDuty = 0;
 
 inline void acabHostResetOutputs() {
     acabHostNonzeroPwmWrites = 0;
     acabHostLedLowWrites = 0;
-    acabHostLedHighWrites = 0;
     acabHostLastPwmDuty = 0;
 }
 
 inline void pinMode(uint8_t, uint8_t) {}
 inline void digitalWrite(uint8_t, uint8_t value) {
     if (value == LOW) acabHostLedLowWrites++;
-    else acabHostLedHighWrites++;
 }
 inline double ledcSetup(uint8_t, double frequency, uint8_t) { return frequency; }
 inline void ledcAttachPin(uint8_t, uint8_t) {}
@@ -96,8 +92,6 @@ typedef struct { uint32_t owner; uint32_t count; } portMUX_TYPE;
 
 inline void portENTER_CRITICAL(portMUX_TYPE*)      {}
 inline void portEXIT_CRITICAL(portMUX_TYPE*)       {}
-inline void portENTER_CRITICAL_ISR(portMUX_TYPE*)  {}
-inline void portEXIT_CRITICAL_ISR(portMUX_TYPE*)   {}
 
 // ---------------------------------------------------------------------------
 // DELIBERATELY ABSENT

@@ -68,22 +68,6 @@ static void chkStr(const char* name, const char* got, const char* want) {
     printf("\n");
 }
 
-// Copied byte-for-byte from acabSanitizeAscii in acab_scanner.cpp (same stub test_axon,
-// test_flock and test_drone carry). The SSID path runs the matched name through it, so a
-// lazy memcpy stub would let a control-byte SSID pass for the wrong reason. Resync if the
-// real one ever changes.
-void acabSanitizeAscii(char* dst, const uint8_t* src, size_t n, size_t cap) {
-    if (!dst || cap == 0) return;
-    size_t m = n;
-    if (m > cap - 1) m = cap - 1;
-    size_t j = 0;
-    for (; j < m; j++) {
-        uint8_t c = src ? src[j] : 0;
-        dst[j] = (c >= 0x20 && c <= 0x7E) ? (char)c : '.';
-    }
-    dst[j] = 0;
-}
-
 // ---- 802.11 frame builders -------------------------------------------------------------------
 // The classifier reads exactly two things: frame[1] (the ToDS/FromDS bits) and the 6 bytes at the
 // source-address offset those bits select. Everything else is padding, so the padding is 0x11:

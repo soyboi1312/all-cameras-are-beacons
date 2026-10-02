@@ -41,15 +41,11 @@
 struct AcabScannerConfig {
     bool        enableBLE;          // scan BLE advertisements
     bool        enableWiFi;         // 802.11 promiscuous capture
-    bool        initNimBLE;         // false if the firmware already inited NimBLE
-    const char* bleDeviceName;      // only used when initNimBLE == true
-    bool        wifiChannelHop;     // hop 1..13, or sit on a fixed channel
-    uint8_t     wifiFixedChannel;   // used when wifiChannelHop == false
-    uint32_t    wifiHopIntervalMs;  // dwell time per channel
-    uint32_t    dedupWindowMs;      // re-emit a device as "new" after this gap
+    const char* bleDeviceName;      // this build's own advertised name; isSiblingBoard reads it
 };
 
-// Sensible defaults: both radios on, NimBLE self-init, channel hopping, 60 s dedup.
+// Sensible defaults: both radios on, bleDeviceName "ACAB". The caller inits NimBLE
+// (acabBleBegin) before acabScannerBegin.
 AcabScannerConfig acabScannerDefaults();
 
 // Start scanning. `sink` fires from scanner task context for each detection.
@@ -60,12 +56,21 @@ void acabScannerBegin(const AcabScannerConfig& cfg, AcabDetectionSink sink);
 // min(n, cap-1) bytes then null-terminates. Keeps a crafted advert name / WiFi SSID /
 // drone ODID id from injecting control bytes that would make the detection JSON
 // invalid (iOS silently drops invalid JSON, suppressing the live alert). Shared so
-// every ingest path sanitizes identically.
-void acabSanitizeAscii(char* dst, const uint8_t* src, size_t n, size_t cap);
-
-// Feed in our own GPS fix; fixed-device detections (Flock/Axon) get stamped
-// with it. Drones carry their own broadcast coordinates, so they don't.
-void acabScannerSetSelfGPS(double lat, double lon, bool valid);
+// every ingest path sanitizes identically. Defined inline HERE, not in acab_scanner.cpp,
+// so each host test compiles this definition with its classifier (tools/host-tests/run.sh
+// never compiles acab_scanner.cpp). Never give a test its own copy: a non-inline copy
+// links without an error and can replace this one in that suite.
+inline void acabSanitizeAscii(char* dst, const uint8_t* src, size_t n, size_t cap) {
+    if (!dst || cap == 0) return;
+    size_t m = n;
+    if (m > cap - 1) m = cap - 1;
+    size_t j = 0;
+    for (; j < m; j++) {
+        uint8_t c = src ? src[j] : 0;
+        dst[j] = (c >= 0x20 && c <= 0x7E) ? (char)c : '.';
+    }
+    dst[j] = 0;
+}
 
 // Run the full BLE classifier chain on a single advert and funnel any match
 // into the detection pipeline. The NimBLE scan callback calls this for the
@@ -178,7 +183,7 @@ bool acabScannerHealthy();
 // WiFi eco mode (battery SKU): seconds of promiscuous-RX sleep inserted AFTER each full channel
 // sweep. 0 = continuous (off). The app offers 0/3/7/15; the setter snaps to that ladder. Persisted
 // to NVS. Trades battery for WiFi-only coverage (Flock APs, network cameras) during the gaps; BLE
-// is never throttled. No effect while the WiFi radio toggle is off, or in fixed-channel mode.
+// is never throttled. No effect while the WiFi radio toggle is off.
 void acabScannerSetWifiEco(int sec);
 int  acabScannerWifiEco();
 
@@ -198,13 +203,12 @@ typedef void (*AcabCmdSink)(const char* line);
 void acabScannerSetCmdSink(AcabCmdSink sink);
 
 
-#ifdef ACAB_DIAG_WIFI
+#ifdef ACAB_CAPTURE_BUILD
 // Diagnostic-queue accounting (capture builds). dropped>0 means the promiscuous callback
 // produced diag records faster than the serial task drained them, so the log is INCOMPLETE and
 // an absent signal proves nothing. Reported on the [diag] line.
 uint32_t acabScannerWifiDiagSent();
 uint32_t acabScannerWifiDiagDropped();
-#ifdef ACAB_CAPTURE_BUILD
 // Every watched DATA frame seen, counted even when the rate limiter printed no line for it.
 uint32_t acabScannerWatchDataSeen();
 // Falcon-OUI mode accounting. Measures whether a data-frame rule for falconWifiOui() could ever
@@ -288,7 +292,6 @@ uint32_t acabScannerAlprCandidateTableFull();
 //
 // Capture builds only; produces no detection and never reaches the apps.
 void acabScannerMark(const char* label);
-#endif
 #endif
 
 #endif // ACAB_SCANNER_H

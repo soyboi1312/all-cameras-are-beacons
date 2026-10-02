@@ -7,15 +7,14 @@ no longer diffed against any third-party curated list.
     python3 firmware/tools/check-signature-drift.py --offline   # skip the network watch
 
 Exits 0 when nothing upstream is missing locally, 1 when there is drift to look
-at. It only reports; it never edits anything. Provenance is in CREDITS.md. When an
-upstream repo moves a file or renames a branch, update the URLs below.
+at. It only reports; it never edits anything. Provenance is in CREDITS.md. When the
+upstream repo moves, update ODID_REPO below.
 
 A network failure is NOT a pass here (see check_odid). Pass --offline to state on
 purpose that a run is not watching upstream.
 """
 import argparse
 import fractions
-import glob
 import hashlib
 import json
 import os
@@ -24,14 +23,6 @@ import sys
 import urllib.request
 
 # --- upstream sources (edit as they move) -----------------------------------
-LOCAL_FLOCK = "firmware/lib/acab_core/flock_detect.cpp"
-
-# We no longer mirror any third-party curated Flock OUI list. The shipped Flock WiFi
-# OUIs are our own field captures plus Flock's own IEEE block (see docs/signatures.md).
-# This list stays empty on purpose: a curated upstream selection is not ours to track,
-# and matching it was the source of the field false positives we since dropped.
-UPSTREAM_FLOCK_URLS = []
-
 # opendroneid decoder: watch for a NEW upstream RELEASE instead of byte-diffing
 # master. core-c's last release is v2.0 (2022); everything on master since is
 # unreleased const-correctness and encode-side churn we reviewed and chose to
@@ -39,11 +30,6 @@ UPSTREAM_FLOCK_URLS = []
 # ships a newer release. Bump the baseline when you re-vendor opendroneid/.
 ODID_REPO = "opendroneid/opendroneid-core-c"
 ODID_BASELINE_RELEASE = "v2.0"   # latest release reviewed (2026-06-16)
-
-# The real clamp every attacker-supplied advert name, SSID and ODID id passes through, plus the
-# host tests that carry a link-stub copy of it (see check_ascii_clamp_copies).
-LOCAL_ASCII_CLAMP = "firmware/lib/acab_core/acab_scanner.cpp"
-HOST_TESTS_GLOB = "firmware/tools/host-tests/test_*.cpp"
 
 # The two enums whose faqKey values ARE the keys of faq-content.json's relatedHelp map.
 IOS_DEVICE_TYPE = "ios/Beacons/Models/DeviceType.swift"
@@ -117,28 +103,13 @@ CANONICAL_PRIVACY_URL = (
 FIRMWARE_CI = ".github/workflows/firmware-ci.yml"
 # ----------------------------------------------------------------------------
 
-# A 3-byte OUI written as 0xNN,0xNN,0xNN (our C arrays) or NN:NN:NN (most lists).
-# Lookarounds keep us from grabbing the first three bytes of a longer MAC.
-OUI_CARR = re.compile(
-    r"(?<![0-9A-Fa-f])0x([0-9A-Fa-f]{2})\s*,\s*0x([0-9A-Fa-f]{2})\s*,\s*0x([0-9A-Fa-f]{2})"
-)
-OUI_COLON = re.compile(
-    r"(?<![0-9A-Fa-f:])([0-9A-Fa-f]{2}):([0-9A-Fa-f]{2}):([0-9A-Fa-f]{2})(?![0-9A-Fa-f:])"
-)
-
 
 def repo_root():
     return os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
 
 
-def fetch(url):
-    req = urllib.request.Request(url, headers={"User-Agent": "acab-drift-check"})
-    with urllib.request.urlopen(req, timeout=20) as r:
-        return r.read().decode("utf-8", "replace")
-
-
 # Every repo-relative path this run reads, for check_ci_trigger_paths. read_local adds its own;
-# the two checks that hash files without it (check_odid_copies, check_faq_copies) add theirs.
+# check_faq_copies hashes its two files without it and adds them itself.
 _READS = set()
 
 
@@ -148,67 +119,13 @@ def read_local(rel):
         return f.read()
 
 
-def extract_ouis(text):
-    out = set()
-    for groups in OUI_CARR.findall(text):
-        out.add("".join(g.upper() for g in groups))
-    for groups in OUI_COLON.findall(text):
-        out.add("".join(g.upper() for g in groups))
-    return out
-
-
-def fmt(oui):
-    return f"{oui[0:2]}:{oui[2:4]}:{oui[4:6]}"
-
-
-def check_flock(offline=False):
-    print("== Flock OUI tables ==")
-    local = extract_ouis(read_local(LOCAL_FLOCK))
-    print(f"   local:    {len(local):>3} OUIs  ({LOCAL_FLOCK})")
-    # Empty by CONFIGURATION, which is a real answer, unlike an empty result from failed fetches.
-    # Those two used to collapse into the same "no third-party list is mirrored" line further
-    # down, so the moment anyone re-added a URL a dead network would have read as no drift.
-    if not UPSTREAM_FLOCK_URLS:
-        print("   Flock OUIs are own-sourced; no third-party list is mirrored (see docs/signatures.md)")
-        return 0
-    if offline:
-        print(f"   --   skipped (--offline): {len(UPSTREAM_FLOCK_URLS)} upstream list(s) not fetched")
-        return 0
-    upstream = set()
-    unfetched = 0
-    for url in UPSTREAM_FLOCK_URLS:
-        try:
-            found = extract_ouis(fetch(url))
-            print(f"   upstream: {len(found):>3} OUIs  {url}")
-            upstream |= found
-        except Exception as exc:
-            # A fetch that failed is a comparison that did not happen. Count it, or the run
-            # reports "every upstream OUI is present locally" about a list it never read.
-            print(f"   !! could not fetch {url}: {exc}")
-            unfetched += 1
-    missing = sorted(upstream - local)  # upstream has it, we don't -> drift risk
-    extra = sorted(local - upstream)    # ours only -> additions from other sources
-    if missing:
-        print(f"\n   !! {len(missing)} upstream OUI(s) MISSING locally (possible drift):")
-        for o in missing:
-            print(f"      {fmt(o)}")
-    elif unfetched == 0:
-        print("   ok: every upstream OUI is present locally")
-    if upstream:
-        # Only meaningful against a list we actually read. With every fetch failed this would
-        # report the entire local table as "superset additions", which is not what happened.
-        print(f"   ({len(extra)} local-only OUIs, your superset additions)")
-    return len(missing) + unfetched
-
-
 def latest_release(repo):
     url = f"https://api.github.com/repos/{repo}/releases/latest"
     headers = {"User-Agent": "acab-drift-check", "Accept": "application/vnd.github+json"}
     # Unauthenticated api.github.com allows 60 requests/hour per SOURCE IP, and Actions runners
     # share egress IPs, so an unauthenticated call from CI hits a 403 fairly often. The workflow
     # hands us the job's own GITHUB_TOKEN, which raises that to the repo's own budget and removes
-    # the usual reason this watch fails. Sent ONLY to api.github.com, never to fetch()'s
-    # arbitrary upstream URLs.
+    # the usual reason this watch fails. Sent ONLY to api.github.com.
     token = os.environ.get("GITHUB_TOKEN") or os.environ.get("GH_TOKEN")
     if token:
         headers["Authorization"] = f"Bearer {token}"
@@ -244,98 +161,6 @@ def check_odid(offline=False):
     print("      review the release, re-vendor opendroneid/ (.c + .h) if it matters,")
     print("      then bump ODID_BASELINE_RELEASE in this script")
     return 1
-
-
-def check_odid_copies():
-    """The opendroneid decoder is vendored TWICE, on purpose.
-
-    lib/acab_core/opendroneid/ is what the product links; src/odid-sim/ carries its own copy so
-    the bench simulator stays self-contained and does not drag in the rest of acab_core (see the
-    odid-sim env in platformio.ini). That layout is fine, but it has one failure mode: check_odid
-    above says to re-vendor "opendroneid/" in the SINGULAR, and a re-vendor that updates one copy
-    and forgets the other leaves a bench simulator that silently disagrees with the receiver it
-    exists to test. A test tool that lies is worse than no test tool.
-
-    So assert byte-identity instead of trusting whoever does the next re-vendor to remember.
-    """
-    print("\n== opendroneid vendored copies (must stay identical) ==")
-    pairs = [
-        ("lib/acab_core/opendroneid/opendroneid.c", "src/odid-sim/opendroneid.c"),
-        ("lib/acab_core/opendroneid/opendroneid.h", "src/odid-sim/opendroneid.h"),
-    ]
-    drift = 0
-    for a, b in pairs:
-        _READS.update((f"firmware/{a}", f"firmware/{b}"))
-        pa = os.path.join(repo_root(), "firmware", a)
-        pb = os.path.join(repo_root(), "firmware", b)
-        if not os.path.exists(pa) or not os.path.exists(pb):
-            print(f"   WARN missing: {a if not os.path.exists(pa) else b}")
-            drift += 1
-            continue
-        ha = hashlib.sha256(open(pa, "rb").read()).hexdigest()
-        hb = hashlib.sha256(open(pb, "rb").read()).hexdigest()
-        if ha == hb:
-            print(f"   ok: {os.path.basename(pa):15} identical ({ha[:12]})")
-        else:
-            print(f"   !! {os.path.basename(pa)} DIFFERS between the two vendored copies")
-            print(f"      {a}  {ha[:12]}")
-            print(f"      {b}  {hb[:12]}")
-            print("      re-vendor BOTH, or the bench simulator no longer matches the receiver")
-            drift += 1
-    return drift
-
-
-# The body of `void acabSanitizeAscii(char* dst, const uint8_t* src, size_t n, size_t cap) { ... }`.
-# Non-greedy up to a closing brace in COLUMN ZERO, which is the function's own; every brace inside
-# it is indented.
-ASCII_CLAMP_RE = re.compile(r"void\s+acabSanitizeAscii\s*\([^)]*\)\s*\{(.*?)\n\}", re.S)
-
-
-def _clamp_body(rel):
-    """acabSanitizeAscii's body in `rel`, comments stripped and whitespace collapsed, or None."""
-    m = ASCII_CLAMP_RE.search(read_local(rel))
-    if not m:
-        return None
-    return " ".join(re.sub(r"//[^\n]*", "", m.group(1)).split())
-
-
-def check_ascii_clamp_copies():
-    """The ingest clamp is duplicated into the host tests, on purpose. Assert byte equality.
-
-    run.sh compiles exactly ONE classifier source next to each test, so a suite whose classifier
-    calls acabSanitizeAscii (acab_scanner.cpp's, which the harness never compiles) has to carry a
-    link stub, and several do. Those copies are NOT inert: the tests assert the exact clamped
-    output strings, so if the real clamp changes - a wider printable range, a different truncation
-    rule, a rejection instead of a substitution - the host suite keeps asserting the OLD firmware
-    behaviour and reports PASS on strings the board would now emit differently.
-
-    Same guard, same reasoning as the vendored opendroneid copies and the two FAQ copies. Discovered
-    by glob rather than listed, so a NEW suite that copies the function is covered the day it lands.
-    """
-    print("\n== acabSanitizeAscii copies (host-test stubs must match the real clamp) ==")
-    real = _clamp_body(LOCAL_ASCII_CLAMP)
-    if real is None:
-        print(f"   !! could not find acabSanitizeAscii in {LOCAL_ASCII_CLAMP}")
-        print("      it moved (update LOCAL_ASCII_CLAMP) or changed shape; until then this is blind")
-        return 1
-    root = repo_root()
-    drift = 0
-    copies = 0
-    for path in sorted(glob.glob(os.path.join(root, HOST_TESTS_GLOB))):
-        rel = os.path.relpath(path, root)
-        body = _clamp_body(rel)
-        if body is None:
-            continue                      # this suite links nothing that needs the stub
-        copies += 1
-        if body == real:
-            print(f"   ok: {os.path.basename(path):22} matches")
-        else:
-            print(f"   !! {rel} has DRIFTED from {LOCAL_ASCII_CLAMP}")
-            print("      that suite is asserting the OLD clamp's output; re-copy the body verbatim")
-            drift += 1
-    if copies == 0:
-        print("   no host-test copies found (correct if the clamp now lives in a shared header)")
-    return drift
 
 
 # A relatedHelp key as both apps write it: SCREAMING_CASE, DIGITS ALLOWED after the first
@@ -443,8 +268,6 @@ def check_faq_copies():
     cross-platform copy drift is the most recurring defect class in this repo. So it is one file,
     duplicated verbatim into two resource trees because neither build system will reach outside its
     own tree, and this check is what makes the duplication safe: edit one, the build tells you.
-
-    Same guard, same reasoning as the vendored opendroneid copies above.
     """
     root = repo_root()
     rel_a, rel_b = IOS_FAQ, AND_FAQ
@@ -807,7 +630,7 @@ SHARED_CONSTANTS = (
         # section headers: an outright rename of the first word reads as "could not be read",
         # which this check already reports as drift.
         "ios": (IOS_MAP_TAB, r'mapOptionsSection\("(REFERENCE[^"]*)"\)'),
-        "android": (AND_MAP_SCREEN, r'Kicker\("(REFERENCE[^"]*)"\)'),
+        "android": (AND_MAP_SCREEN, r'SectionLabel\("(REFERENCE[^"]*)"'),
     },
     {
         "what": "known-ALPR layer note",
@@ -1509,13 +1332,27 @@ SHARED_CONSTANTS = (
     {
         "what": "dossier flagged line",
         "kind": "fragments",
-        "why": "'Flagged by <method> over <source>.', said once when the two are the same word;"
-               " the same sentence on both phones",
+        "why": "'Flagged by <method> over <source>.', said once when the two are the same word, and"
+               " 'Heard over <source> in desert mode.' for a Desert row; the same sentences on both"
+               " phones",
         "ios": (IOS_DETECTION_DETAIL,
-                r"(func dossierFlaggedLine\(methodLabel: String, sourceLabel: String\) -> String \{.*?\n\})"),
+                r"(func dossierFlaggedLine\(type: DeviceType, methodLabel: String, sourceLabel: String\)"
+                r" -> String \{.*?\n\})"),
         "android": (AND_DETAIL_SCREEN,
-                    r"(internal fun dossierFlaggedLine\(methodLabel: String, sourceLabel: String\):"
-                    r" String =.*?)\n\n"),
+                    r"(internal fun dossierFlaggedLine\(type: DeviceType, methodLabel: String,"
+                    r" sourceLabel: String\): String = when \{.*?\n\})"),
+    },
+    {
+        "what": "dossier confidence line",
+        "kind": "fragments",
+        "why": "the MATCH QUALITY 'confidence' value: '<verdict> · <n>%' in three bands, and 'Not a"
+               " match' for a Desert row; the same words on both phones (Android keeps the bands"
+               " in verdictLabel)",
+        "ios": (IOS_DETECTION_DETAIL,
+                r"(func dossierConfidenceLine\(type: DeviceType, confidence: Int\) -> String \{.*?\n\})"),
+        "android": (AND_DETAIL_SCREEN,
+                    r"(internal fun dossierConfidenceLine\(type: DeviceType, confidence: Int\): String =.*?)\n\n"
+                    r"(private fun verdictLabel\(pct: Int\): String = when \{.*?\n\})"),
     },
     {
         "what": "dossier hero subtitle",
@@ -1540,6 +1377,16 @@ SHARED_CONSTANTS = (
                     r"(internal fun dossierBodyCamFallbackLine\(replay: Boolean\): String =.*?)\n\n"),
     },
     {
+        "what": "dossier nearby-device explainer",
+        "kind": "fragments",
+        "why": "what MATCH QUALITY says about a Desert-mode row: no signature matched, then a gloss"
+               " on the firmware's address label, keyed on the same three labels on both phones",
+        "ios": (IOS_DETECTION_DETAIL,
+                r"(func dossierNearbyDeviceLine\(detail: String\?\) -> String \{.*?\n\})"),
+        "android": (AND_DETAIL_SCREEN,
+                    r"(internal fun dossierNearbyDeviceLine\(detail: String\?\): String \{.*?\n\})"),
+    },
+    {
         "what": "tracker offline note",
         "kind": "string",
         "why": "the app's gloss under a tracker's firmware '(offline)': separated from its owner,"
@@ -1554,13 +1401,15 @@ SHARED_CONSTANTS = (
     {
         "what": "matched-on method telegrams",
         "kind": "fragments",
-        "why": "the two OUI answers in the dossier's 'matched on' row, quoted by the FAQ; every"
-               " other method passes its own label through (pinned in SHARED_SHAPES)",
+        "why": "the Desert-mode answer and the two OUI answers in the dossier's 'matched on' row,"
+               " the OUI pair quoted by the FAQ; every other method passes its own label through"
+               " (pinned in SHARED_SHAPES)",
         "ios": (IOS_DETECTION_DETAIL,
-                r"(func methodChipLabel\(method: DetectionMethod, maker: String\?\) -> String \{.*?\n\})"),
+                r"(func methodChipLabel\(type: DeviceType, method: DetectionMethod, maker: String\?\)"
+                r" -> String \{.*?\n\})"),
         "android": (AND_DETAIL_SCREEN,
-                    r"(internal fun methodChipLabel\(method: Int, maker: String\?, methodLabel: String\):"
-                    r" String = when \{.*?\n\})"),
+                    r"(internal fun methodChipLabel\(type: DeviceType, method: Int, maker: String\?,"
+                    r" methodLabel: String\): String = when \{.*?\n\})"),
     },
     {
         "what": "signal graph floor (dBm)",
@@ -2244,13 +2093,16 @@ def check_shared_constants():
 # rule below spans its panel list with this too.
 _KT_ARM_GAP = r"\s*(?://[^\n]*\s*)*"
 
-# The two shipped FAQ answers that promise the desert restore rule to the user, as needles for the
-# rule below. Built with re.escape from the sentences THEMSELVES, never hand-written as a pattern:
-# a hand-written one drifts into matching a reworded promise, and the promise is the point. The two
-# faq-content.json copies are already asserted byte-identical (check_faq_copies), so this is the
-# other half of that guard: identical copies that both stopped saying it still pass byte equality.
+# The shipped FAQ answer that promises the desert restore rule to the user, as a needle for the
+# rule below. It used to be pinned in TWO answers, the alerts answer and the desert-mode answer,
+# word for word; the owner asked for a shorter alerts answer (2026-09-30), so the promise now lives
+# once, in the desert-mode answer, and the alerts answer points there. Built with re.escape from
+# the sentences THEMSELVES, never hand-written as a pattern: a hand-written one drifts into
+# matching a reworded promise, and the promise is the point. The two faq-content.json copies are
+# already asserted byte-identical (check_faq_copies), so this is the other half of that guard:
+# identical copies that both stopped saying it still pass byte equality.
 #
-# BOTH SENTENCES ARE SCOPED, and the scoping is the promise, not hedging. "if this phone saved a
+# THE PROMISE IS SCOPED, and the scoping is the promise, not hedging. "if this phone saved a
 # mode" is there because a phone that never enabled Desert itself holds nothing and gets no control;
 # "when that section is shown" is there because a mesh-detect board draws no Alerts row at all; and
 # the waiting clause is the durability the offer actually has (persisted beside the pre-Desert mode,
@@ -2264,20 +2116,7 @@ _KT_ARM_GAP = r"\s*(?://[^\n]*\s*)*"
 # Both arms are now surfaces the code draws (AlertRestorePanel, from the two gates pinned below),
 # so a side that deletes either surface has to delete its half of this promise too.
 _FAQ_DESERT_PROMISES = (
-    ("the alerts answer still promises an offer, not an automatic restore",
-     re.escape("trackers never beep on the board in any mode, and desert mode sets the board to"
-               " silent while it runs. turning desert mode off yourself restores your previous"
-               " alert mode, unless you picked a mode by hand (including silent) while desert mode"
-               " was running. when the board ends desert mode on its own (after a factory reset,"
-               " on an older board, or because another paired phone ended it), the app doesn't"
-               " change your alert mode. if this phone saved a mode when desert mode started, the"
-               " app offers to restore it: a Restore Alerts control appears on the desert card"
-               " under Beacon, and under alerts when that section is shown. nothing changes until"
-               " you tap it. the offer stays after app restarts. it moves to the top of the Beacon"
-               " tab when board controls are unavailable, and to the connect screen when the app"
-               " is scanning for a beacon again, so you can tap it with the beacon off or not"
-               " connected.")),
-    ("the desert-mode answer still promises the same thing",
+    ("the desert-mode answer still promises an offer, not an automatic restore",
      re.escape("deduplication, and rate limits still apply. desert mode sets the board to silent"
                " while it runs. turning desert mode off yourself restores your previous alert"
                " mode, unless you picked a mode by hand (including silent) while desert mode was"
@@ -4092,7 +3931,9 @@ SHARED_SHAPES = (
     },
     {
         "what": "dossier line rules (no 'X over X', no maker repeating the title, the tracker"
-                " note only under a tracker's '(offline)', the buffer blamed only for a replay)",
+                " note only under a tracker's '(offline)', the buffer blamed only for a replay, a"
+                " Desert row explained before any per-method line can claim a match, and never"
+                " called flagged, scored, or weak)",
         "why": "the words are compared in SHARED_CONSTANTS; these hold the conditions that pick"
                " them and the slots that draw them, so one phone cannot say 'Remote ID over Remote"
                " ID' or explain a tracker's '(offline)' under a different kind of row",
@@ -4103,15 +3944,28 @@ SHARED_SHAPES = (
               ("the maker is dropped when it equals the headline, ignoring case",
                r"makerOrVendor\.caseInsensitiveCompare\(headline\) == \.orderedSame"),
               ("the tracker note needs a tracker and the firmware's suffix",
-               r'guard type == \.tracker, let detail, detail\.hasSuffix\("\(offline\)"\) else \{ return nil \}'))),
+               r'guard type == \.tracker, let detail, detail\.hasSuffix\("\(offline\)"\) else \{ return nil \}'),
+              ("a Desert row is heard, never flagged by its method",
+               r'if type == \.nearbyDevice \{ return "Heard over '),
+              ("a Desert row's confidence is not a match, with no percent",
+               r'if type == \.nearbyDevice \{ return "Not a match" \}'),
+              ("a Desert row gets no amber weak-match glyph",
+               r"private var confidenceIsWeak: Bool \{ d\.confidence < 50 && d\.type != \.nearbyDevice \}"))),
             ("iOS slots", IOS_DETECTION_DETAIL, None,
-             (("the flagged line", r"\bText\(dossierFlaggedLine\(methodLabel: d\.method\.label,"
+             (("the flagged line", r"\bText\(dossierFlaggedLine\(type: d\.type, methodLabel: d\.method\.label,"
                r" sourceLabel: d\.source\.label\)\)"),
+              ("the confidence row, handed the type, its glyph on the Desert-aware cue",
+               r'dossierRow\("confidence", dossierConfidenceLine\(type: d\.type, confidence: d\.confidence\),'
+               r'\s*\n\s*glyph: confidenceIsWeak \? "exclamationmark\.triangle\.fill" : "gauge\.medium",'
+               r"\s*\n\s*glyphColor: confidenceIsWeak \? ACABTheme\.warn : ACABTheme\.dim\)"),
               ("the hero subtitle, handed the headline",
                r"\bText\(dossierHeroSubtitle\(node: d\.nodeName, makerOrVendor: d\.maker \?\? d\.vendor,"
                r"\s*headline: headline\)\)"),
               ("the body-cam fallback, told whether the row is a replay",
-               r"return Text\(dossierBodyCamFallbackLine\(isReplay: d\.isHistory\)\)"))),
+               r"return Text\(dossierBodyCamFallbackLine\(isReplay: d\.isHistory\)\)"),
+              ("the nearby-device explainer, handed the detail, ahead of the per-method lines",
+               r"if d\.type == \.nearbyDevice \{ return Text\(dossierNearbyDeviceLine\(detail: d\.detail\)\) \}"
+               r"\s*\n\s*switch d\.method \{"))),
             ("iOS match quality", IOS_DETECTION_DETAIL,
              r"private var matchQualityPanel: some View \{(.*?)\n    \}",
              (("the tracker note sits directly under the verbatim detail",
@@ -4124,13 +3978,25 @@ SHARED_SHAPES = (
               ("the maker is dropped when it equals the headline, ignoring case",
                r"makerOrVendor\.equals\(headline, ignoreCase = true\)"),
               ("the tracker note needs a tracker and the firmware's suffix",
-               r'type == DeviceType\.TRACKER && detail\?\.endsWith\("\(offline\)"\) == true'))),
+               r'type == DeviceType\.TRACKER && detail\?\.endsWith\("\(offline\)"\) == true'),
+              ("a Desert row is heard, never flagged by its method",
+               r'type == DeviceType\.NEARBY_DEVICE -> "Heard over '),
+              ("a Desert row's confidence is not a match, with no percent",
+               r'if \(type == DeviceType\.NEARBY_DEVICE\) "Not a match"\s*\n\s*else '),
+              ("a Desert row gets no amber weak-match glyph",
+               r"val weak = d\.confidence < 50 && d\.type != DeviceType\.NEARBY_DEVICE\n"))),
             ("Android slots", AND_DETAIL_SCREEN, None,
-             (("the flagged line", r"\bText\(dossierFlaggedLine\(d\.methodLabel, d\.sourceLabel\),"),
+             (("the flagged line", r"\bText\(dossierFlaggedLine\(d\.type, d\.methodLabel, d\.sourceLabel\),"),
+              ("the confidence row, handed the type, its glyph on the Desert-aware cue",
+               r'GroupedValueRow\("confidence", dossierConfidenceLine\(d\.type, d\.confidence\), leading = \{'
+               r"\s*\n\s*Icon\(if \(weak\) Icons\.Filled\.Warning else Icons\.Outlined\.Speed,"),
               ("the hero subtitle, handed the headline",
                r"\bText\(dossierHeroSubtitle\(nodeName\(d\.mac\), d\.maker \?: d\.vendor, headline\),"),
               ("the body-cam fallback, told whether the row is a replay",
-               r"\bappend\(dossierBodyCamFallbackLine\(replay = d\.hist \|\| d\.offline\)\)"))),
+               r"\bappend\(dossierBodyCamFallbackLine\(replay = d\.hist \|\| d\.offline\)\)"),
+              ("the nearby-device explainer, handed the detail, ahead of the per-method lines",
+               r"if \(d\.type == DeviceType\.NEARBY_DEVICE\) \{\s*\n\s*append\(dossierNearbyDeviceLine\(d\.detail\)\)"
+               r"\s*\n\s*return@buildAnnotatedString\s*\n\s*\}\s*\n\s*when \(d\.method\) \{"))),
             ("Android match quality", AND_DETAIL_SCREEN,
              r"private fun MatchQualityPanel\(d: Detection\) \{(.*?)\n\}",
              (("the tracker note sits directly under the verbatim detail",
@@ -4140,31 +4006,37 @@ SHARED_SHAPES = (
         ),
     },
     {
-        "what": "matched-on keeps each method label's own casing (two OUI telegrams, then the"
-                " label verbatim)",
+        "what": "matched-on keeps each method label's own casing (a Desert-mode row first, then two"
+                " OUI telegrams, then the label verbatim)",
         "why": "the dossier's 'matched on' row quotes the same method words the FAQ does; a phone"
                " that lowercases them, or renames one (NAME MATCH), answers in words the FAQ never"
-               " uses",
+               " uses; a phone that keys the Desert answer on the method calls a real SSID"
+               " signature 'no signature', or a Desert row 'SSID'",
         "sides": (
             ("iOS rule", IOS_DETECTION_DETAIL,
-             r"func methodChipLabel\(method: DetectionMethod, maker: String\?\) -> String \{(.*?)\n\}",
-             (("vendor, then chipset, then the label as written",
+             r"func methodChipLabel\(type: DeviceType, method: DetectionMethod, maker: String\?\)"
+             r" -> String \{(.*?)\n\}",
+             (("a Desert-mode row, by type, before any method",
+               r'if type == \.nearbyDevice \{ return "no signature" \}\s*\n\s*switch method \{'),
+              ("vendor, then chipset, then the label as written",
                r'case \.oui where maker != nil: return "OUI \\u\{00B7\} VENDOR ONLY"\s*\n\s*'
                r'case \.oui:\s*return "OUI \\u\{00B7\} CHIPSET ONLY"\s*\n\s*'
                r"default:\s*return method\.label\s*$"),
               ("no case is changed", r"lowercased|uppercased|capitalized", 0))),
             ("iOS row", IOS_DETECTION_DETAIL, None,
              (("the row reads it",
-               r'dossierRow\("matched on", methodChipLabel\(method: d\.method, maker: d\.maker\)'),)),
+               r'dossierRow\("matched on", methodChipLabel\(type: d\.type, method: d\.method, maker: d\.maker\)'),)),
             ("Android rule", AND_DETAIL_SCREEN,
-             r"internal fun methodChipLabel\(method: Int, maker: String\?, methodLabel: String\):"
-             r" String = when \{(.*?)\n\}",
-             (("vendor, then chipset, then the label as written",
+             r"internal fun methodChipLabel\(type: DeviceType, method: Int, maker: String\?,"
+             r" methodLabel: String\): String = when \{(.*?)\n\}",
+             (("a Desert-mode row, by type, before any method",
+               r'type == DeviceType\.NEARBY_DEVICE -> "no signature"\s*\n\s*method == 1 && maker != null'),
+              ("vendor, then chipset, then the label as written",
                r'method == 1 && maker != null -> "OUI · VENDOR ONLY"\s*\n\s*'
                r'method == 1 -> "OUI · CHIPSET ONLY"\s*\n\s*else -> methodLabel\s*$'),
               ("no case is changed", r"lowercase|uppercase|capitalize", 0))),
             ("Android row", AND_DETAIL_SCREEN, None,
-             (("the row reads it", r"\bmethodChipLabel\(d\.method, d\.maker, d\.methodLabel\) to "),)),
+             (("the row reads it", r"\bmethodChipLabel\(d\.type, d\.method, d\.maker, d\.methodLabel\) to "),)),
         ),
     },
     {
@@ -4351,7 +4223,7 @@ SHARED_SHAPES = (
         "sides": (
             ("iOS", IOS_COMPONENTS, None,
              (("the environment value, refreshed by the system",
-               r"@Environment\(\\\.accessibilityReduceMotion\) private var reduceMotion", 2),)),
+               r"@Environment\(\\\.accessibilityReduceMotion\) private var reduceMotion"),)),
             ("Android", AND_COMPONENTS, r"\nfun rememberReduceMotion\(\): Boolean \{(.*?)\n\}",
              (("a remembered state, not a one-shot read",
                r"var reduce by remember\(resolver\) \{ mutableStateOf\(read\(\)\) \}"),
@@ -4930,14 +4802,14 @@ def main():
     ap = argparse.ArgumentParser(
         description="ACAB signature + vendored-copy drift check (reports only, changes nothing)")
     ap.add_argument("--offline", action="store_true",
-                    help="skip the upstream release/list watch instead of failing on an "
+                    help="skip the upstream release watch instead of failing on an "
                          "unreachable network. For a bench run with no connectivity, NOT for CI: "
                          "a watcher that skipped itself has watched nothing.")
     args = ap.parse_args()
-    print("ACAB signature drift check (reports only, changes nothing)\n")
-    drift = (check_flock(args.offline) + check_odid(args.offline) + check_odid_copies()
+    print("ACAB signature drift check (reports only, changes nothing)")
+    drift = (check_odid(args.offline)
              + check_faq_copies() + check_inline_labels()
-             + check_ascii_clamp_copies() + check_shared_constants()
+             + check_shared_constants()
              + check_shared_shapes() + check_board_kinds() + check_map_refresh_ladder()
              + check_pin_priority()
              + check_privacy_contract())

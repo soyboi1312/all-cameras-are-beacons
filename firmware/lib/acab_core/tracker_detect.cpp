@@ -20,7 +20,7 @@
 #include "desert_detect.h"   // Desert mode forces classification even when toggled off
 #include <string.h>
 #include <stdio.h>
-#include <Preferences.h>   // persist the on/off toggle across reboots (NVS)
+#include "acab_nvs_toggle.h"   // persist the on/off toggle across reboots (NVS)
 
 #define TILE_SVC           0xFEED
 #define SAMSUNG_SMARTTAG   0xFD5A
@@ -62,29 +62,17 @@
 // Tile/Samsung finding UUID - rejects a bare/empty entry a spoofer could trivially set.
 #define TRK_MIN_SD         4
 
-static bool gEnabled = false;
+static AcabNvsToggle gEnabled{"acab-trk", "on", false};
 
 // NVS-backed so an app-set toggle survives a reboot. Only writes on a real change
 // (toggles are rare), so flash wear is negligible.
-void trackerSetEnabled(bool enabled) {
-    if (enabled == gEnabled) return;
-    gEnabled = enabled;
-    Preferences p;
-    p.begin("acab-trk", false);
-    p.putBool("on", enabled);
-    p.end();
-}
-bool trackerIsEnabled() { return gEnabled; }
+void trackerSetEnabled(bool enabled) { gEnabled.set(enabled); }
+bool trackerIsEnabled() { return gEnabled.on; }
 
 // Restore the persisted on/off (or `defaultEnabled` if never set). Call once in
 // setup() instead of hard-coding the default, so a board remembers a tracker scan
 // you turned on in the app across power cycles.
-void trackerRestoreEnabled(bool defaultEnabled) {
-    Preferences p;
-    p.begin("acab-trk", true);
-    gEnabled = p.getBool("on", defaultEnabled);
-    p.end();
-}
+void trackerRestoreEnabled(bool defaultEnabled) { gEnabled.restore(defaultEnabled); }
 
 // Pull out what we need: manufacturer data, and any 16-bit SERVICE DATA (AD 0x16)
 // element with its payload length. We do NOT harvest bare 0x02/0x03 UUID-list entries
@@ -130,7 +118,7 @@ static bool emit(AcabDetection* out, const uint8_t mac[6], int rssi,
 
 bool trackerClassifyBLE(const uint8_t mac[6], const uint8_t* adv, size_t advLen,
                         int rssi, AcabDetection* out) {
-    if ((!gEnabled && !desertIsEnabled()) || !adv || !advLen) return false;
+    if ((!gEnabled.on && !desertIsEnabled()) || !adv || !advLen) return false;
     TrkAdv f; parseAdv(adv, advLen, &f);
 
     // Apple Find My - only the offline/separated form (tag away from its owner).

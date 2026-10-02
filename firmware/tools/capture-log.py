@@ -17,7 +17,7 @@ While it runs, type a note and hit return. It lands in the log as:
 
 Then grep the log by marker afterwards, or split on them.
 
-Requires a firmware build with -DACAB_DIAG (BLE) and/or -DACAB_DIAG_WIFI (WiFi), otherwise there
+Requires a firmware build with -DACAB_DIAG (BLE) and/or -DACAB_CAPTURE_BUILD (WiFi), otherwise there
 is nothing to capture but the ordinary [diag] counters. Desert-mode reminder: the toggle IS
 persisted to NVS now (desertSetEnabled / desertRestoreEnabled in desert_detect.cpp, since
 2026-08-08), so an ordinary app reflash keeps it; only a full flash erase, or a board that never

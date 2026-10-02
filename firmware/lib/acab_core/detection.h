@@ -96,7 +96,7 @@ struct AcabDetection {
     char           detail[48];     // free-form: raven fw, ssid, drone op-id, etc.
 
     // Location. For drones, the broadcast UAS coordinates; for fixed devices,
-    // our own GPS fix (0 if we don't have one).
+    // the connected phone's GPS fix (0 if there is none).
     double         lat, lon;
     double         pilotLat, pilotLon;   // drone operator location (0 if n/a)
     int32_t        altitude;             // metres MSL (drones)
@@ -229,9 +229,8 @@ static inline void acabInit(AcabDetection* d, AcabDeviceType type, AcabSource sr
 //
 // DEFENCE IN DEPTH. Every M_OUI emitter already refuses a locally-administered MAC before it
 // stamps a record - flock_detect ouiMatch/falconWifiOui, police_detect ouiMatch, netcam_detect
-// netcamEntry, drone_detect through acabOuiPrefixMatches, axon_detect utilOui and axonOuiHit -
-// and the one arm with no source-level guard, axonClassifyBLE's signature-table loop, can only
-// match 00:25:DF, whose 0x02 bit is clear. So from the BYTES alone the condition never holds.
+// netcamEntry, drone_detect through acabOuiPrefixMatches, axon_detect through axonOuiHit on
+// both its BLE and WiFi paths. So from the BYTES alone the condition never holds.
 //
 // It IS reachable from the radio's address type. A resolvable private address such as 44:xx:xx
 // has the 0x02 bit CLEAR, so it walks straight through every per-matcher guard; when the native

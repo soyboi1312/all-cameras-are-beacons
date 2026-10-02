@@ -62,7 +62,8 @@ static const FalconWifiOui FALCON_WIFI_OUI[] = {
     // rows shipping unconditionally since the table was written, so there was nothing to promote,
     // and those two strings are this firmware's OWN diagnostic labels, printed into the ssid= field
     // of the [wifi] line only AFTER falconOui() had already matched, so they attest to nothing but
-    // this table. They are spelled "fwnote:falcon-oui-*" in acab_scanner.cpp now, precisely so the
+    // this table. The probe label is spelled "fwnote:falcon-oui-probe" in acab_scanner.cpp now, and
+    // the data-frame line is a "FAL-DATA n=..." counter record, precisely so the
     // round trip cannot be made again. Behaviour of these rows is unchanged, and always was; only
     // the story above them was wrong. Do not re-split the four on the strength of that story - the
     // evidence behind them is one batch, so grade them together or not at all.

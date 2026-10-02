@@ -74,7 +74,6 @@ static void mdReset() {
 
 void otaSetNotifier(void (*fn)(const char*)) { gNotify = fn; }
 static void notify(const char* j) { if (gNotify) gNotify(j); }
-void otaEmitNotify(const char* json) { notify(json); }
 
 // The real finish: size + CRC + signature + version-floor + Update.end. Reachable two ways -
 // the `end` control when the image is already complete, or a trailing otaWrite that completes a
@@ -384,7 +383,6 @@ void otaAbort() {
 }
 
 bool     otaInProgress() { return gActive; }
-uint32_t otaReceived()   { return gRecv; }
 bool     otaOnTrial()    { return gOnTrial; }
 
 void otaBootCheck() {

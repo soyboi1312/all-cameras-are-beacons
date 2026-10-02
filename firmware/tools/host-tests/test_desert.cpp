@@ -21,25 +21,11 @@
 #include <cstring>
 #include <vector>
 
-// LINK STUB: desert_detect.cpp calls acabSanitizeAscii() from acab_scanner.cpp, and the harness
-// compiles exactly one source file next to the test. Mirrored byte-for-byte from
-// acab_scanner.cpp so the name/SSID clamping tests below assert the real behaviour: printable
-// ASCII (0x20..0x7E) passes, anything else becomes '.', truncate at cap-1, always NUL-terminate.
-// If the real one ever changes, this copy has to change with it.
-void acabSanitizeAscii(char* dst, const uint8_t* src, size_t n, size_t cap) {
-    if (!dst || cap == 0) return;
-    size_t m = n;
-    if (m > cap - 1) m = cap - 1;
-    size_t j = 0;
-    for (; j < m; j++) {
-        uint8_t c = src ? src[j] : 0;
-        dst[j] = (c >= 0x20 && c <= 0x7E) ? (char)c : '.';
-    }
-    dst[j] = 0;
-}
+// No link stubs here. desert_detect.cpp calls acabSanitizeAscii, which is inline in
+// acab_scanner.h, so the name/SSID clamping tests below run the real clamp.
 
 static int failures = 0;
-// Same shape as test_glasses.cpp's helper, but desert always hits when enabled, so the
+// Same shape as chk_impl in host_check.h, but desert always hits when enabled, so the
 // interesting assertions are the strings it reports rather than the hit/no-hit verdict.
 static void chk_impl(const char* label, bool got, bool wantHit,
                 const char* gotDetail = "", const char* wantDetail = nullptr,
