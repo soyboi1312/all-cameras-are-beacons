@@ -1226,18 +1226,6 @@ struct MapTabView: View {
         }
     }
 
-    /// Element-wise render comparison, short-circuiting on the first difference and on a length
-    /// change. Used instead of `==` on the snapshot's pin arrays: what the gate needs to know is
-    /// whether the map DRAWS the same thing, which is a narrower question than value equality
-    /// (see `InfraPin.rendersSame(as:)`).
-    private static func rendersSame<T>(_ a: [T], _ b: [T], by same: (T, T) -> Bool) -> Bool {
-        guard a.count == b.count else { return false }
-        for i in a.indices {
-            if !same(a[i], b[i]) { return false }
-        }
-        return true
-    }
-
     /// Everything one body eval needs from the store, computed in a SINGLE pass. located /
     /// totalLocated / count(cat) / the per-layer splits used to be independent computed
     /// properties, each an O(store) filter resolving mapCoord per row, and body read them
@@ -1392,9 +1380,11 @@ struct MapTabView: View {
                 && spokenScope == other.spokenScope
                 && spokenLocationDenied == other.spokenLocationDenied
                 && trackerTrails == other.trackerTrails
-                && MapTabView.rendersSame(infra, other.infra) { $0.rendersSame(as: $1) }
-                && MapTabView.rendersSame(clusters, other.clusters) { $0.rendersSame(as: $1) }
-                && MapTabView.rendersSame(drones, other.drones) { $0.rendersSame(as: $1) }
+                // Keep the closures: `MapProjectedCluster` is Equatable, so without one the
+                // compare falls back to `==` and the signal reading is back in the render key.
+                && infra.elementsEqual(other.infra) { $0.rendersSame(as: $1) }
+                && clusters.elementsEqual(other.clusters) { $0.rendersSame(as: $1) }
+                && drones.elementsEqual(other.drones) { $0.rendersSame(as: $1) }
         }
     }
 
@@ -1698,44 +1688,16 @@ struct MapTabView: View {
             activeIsSampleData: sampleData)
     }
 
-    /// Keep only the highest-priority infrastructure markers without sorting every candidate.
-    /// The heap root is the worst retained pin, so each extra candidate costs O(log limit); the
-    /// final stable sort touches at most the adaptive 80...300 marker budget.
+    /// The `limit` highest-priority infrastructure markers, best first: drone-bearing spots, then
+    /// the newest lead, then `id` as the tie-break. Only called over the cap.
+    // ponytail: sorts every candidate (the snapshot pass already walks them all, and the store
+    // caps the count at `liveFeedCap`); a bounded heap if a profile ever shows this sort.
     private func bestInfrastructurePins(_ candidates: [InfraPin], limit: Int) -> [InfraPin] {
-        guard limit > 0, candidates.count > limit else { return candidates }
-        func ranksBefore(_ a: InfraPin, _ b: InfraPin) -> Bool {
+        Array(candidates.sorted { a, b in
             if a.holdsDrone != b.holdsDrone { return a.holdsDrone }
             let at = a.leadSeen ?? .distantPast, bt = b.leadSeen ?? .distantPast
             return at == bt ? a.id < b.id : at > bt
-        }
-        func isWorse(_ a: InfraPin, than b: InfraPin) -> Bool { ranksBefore(b, a) }
-        var heap: [InfraPin] = []
-        heap.reserveCapacity(limit)
-        for candidate in candidates {
-            if heap.count < limit {
-                heap.append(candidate)
-                var child = heap.count - 1
-                while child > 0 {
-                    let parent = (child - 1) / 2
-                    guard isWorse(heap[child], than: heap[parent]) else { break }
-                    heap.swapAt(child, parent); child = parent
-                }
-                continue
-            }
-            guard ranksBefore(candidate, heap[0]) else { continue }
-            heap[0] = candidate
-            var parent = 0
-            while true {
-                let left = parent * 2 + 1
-                guard left < heap.count else { break }
-                let right = left + 1
-                var worse = left
-                if right < heap.count, isWorse(heap[right], than: heap[left]) { worse = right }
-                guard isWorse(heap[worse], than: heap[parent]) else { break }
-                heap.swapAt(parent, worse); parent = worse
-            }
-        }
-        return heap.sorted(by: ranksBefore)
+        }.prefix(limit))
     }
 
     private func installFreshSnapshot(region requestedRegion: MKCoordinateRegion? = nil) {
@@ -2600,7 +2562,7 @@ struct MapTabView: View {
         HStack(spacing: Self.mapChipSpacing) {
             chip(nil, "ALL", snap.totalLocated)
             ForEach(shownCategories(snap)) { c in
-                chip(c.key, c.chipLabel, snap.counts[c.key] ?? 0)
+                chip(c, c.chipLabel, snap.counts[c.key] ?? 0)
             }
         }
     }
@@ -2729,7 +2691,7 @@ struct MapTabView: View {
                         .font(ACABTheme.font(.body))
                 }
 
-                // BYTE-IDENTICAL to Android MapScreen.kt's `Kicker("REFERENCE OVERLAYS ·
+                // BYTE-IDENTICAL to Android MapScreen.kt's `SectionLabel("REFERENCE OVERLAYS ·
                 // NOT FILTERS")`, header and the ALPR note below alike: the toggles here
                 // draw reference data over the map and never hide a detection, and the
                 // two sheets must say so in the same words. The source credit
@@ -2904,10 +2866,10 @@ struct MapTabView: View {
     /// MapGlassTintTests pins `dim` at the 4.5:1 text floor on the tinted glass over the lightest
     /// tile). Selected: the category hue, opaque, with `onAccent` ink, exactly as before; the
     /// filled chip is the selection cue and glass never sits under it (`MapChipSurface`).
-    private func chip(_ cat: String?, _ label: String, _ n: Int) -> some View {
-        let active = filter == cat
-        let tint = catTint(cat)
-        return Button { filter = cat } label: {
+    private func chip(_ c: DetectionCategory?, _ label: String, _ n: Int) -> some View {
+        let active = filter == c?.key
+        let tint = c?.type.tint ?? ACABTheme.tint   // nil is the ALL chip
+        return Button { filter = c?.key } label: {
             HStack(spacing: 5) {
                 Text(label).font(ACABTheme.font(.subheadline, weight: .semibold))
                 Text("\(n)").font(ACABTheme.font(.subheadline, tabular: true))
@@ -2923,35 +2885,8 @@ struct MapTabView: View {
             .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
-        .accessibilityLabel("\(spokenCategory(label)), \(n) located")
+        .accessibilityLabel("\(c?.spoken ?? "all categories"), \(n) located")
         .accessibilityAddTraits(active ? .isSelected : [])
-    }
-
-    private func catTint(_ cat: String?) -> Color {
-        switch cat {
-        case "ALPR":     return ACABTheme.flockTone
-        case "DRONE":    return ACABTheme.droneTone
-        case "BODY CAM": return ACABTheme.axonTone
-        case "TRACKER":  return ACABTheme.trackerTone
-        case "GLASSES":  return ACABTheme.glassesTone
-        case "CAMERA":   return ACABTheme.netcamTone
-        case "WATCHED":  return DeviceType.watched.tint
-        default:         return ACABTheme.tint
-        }
-    }
-
-    private func spokenCategory(_ label: String) -> String {
-        switch label {
-        case "ALPR": return "automatic license plate readers"
-        case "DRONE": return "drones"
-        case "BODY CAM": return "body cameras"
-        case "CAMERA", "NETCAM", "NETWORK CAM": return "network cameras"
-        case "TRKR", "TRACKER": return "item trackers"
-        case "GLAS", "GLASSES": return "recording glasses"
-        case "WATCH", "WATCHED": return "watched devices"
-        case "ALL": return "all categories"
-        default: return label.lowercased()
-        }
     }
 
     // MARK: Bottom notices
@@ -3164,7 +3099,7 @@ struct MapTabView: View {
     ///
     /// Closed by the info button, the close control, a map tap, the escape gesture and any
     /// presentation; pans and zooms leave it open (Apple Maps). Not modal: the map stays
-    /// interactive under it. TWIN: android MapScreen.kt `MapLegendCardContent`.
+    /// interactive under it. TWIN: android MapScreen.kt `MapLegendCard`.
     private func legendCard(_ snap: MapSnapshot) -> some View {
         HeightCap(cap: legendCardCap) {
             VStack(alignment: .leading, spacing: 0) {
@@ -4233,10 +4168,6 @@ struct Cluster: Identifiable {
     var id: String
     let coord: CLLocationCoordinate2D
     let members: [Detection]
-
-    init(id: String = UUID().uuidString, coord: CLLocationCoordinate2D, members: [Detection]) {
-        self.id = id; self.coord = coord; self.members = members
-    }
 }
 
 /// A count bubble for a multi-member cluster, sized up a touch for bigger clumps: a neutral

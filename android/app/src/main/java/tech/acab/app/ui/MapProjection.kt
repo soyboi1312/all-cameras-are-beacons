@@ -37,13 +37,11 @@ internal fun mapHistoryIncludes(
     lastSeenAt: Long?,
     scope: MapHistoryScope,
     now: Long,
-    recentWindowMs: Long = MAP_RECENT_WINDOW_MS,
-    activeWindowMs: Long = ACTIVE_NEARBY_WINDOW_MS,
     demo: Boolean = false,
 ): Boolean = when (scope) {
     MapHistoryScope.All -> true
-    MapHistoryScope.Recent -> demo || (lastSeenAt != null && now - lastSeenAt in 0..recentWindowMs)
-    MapHistoryScope.Active -> demo || (lastSeenAt != null && now - lastSeenAt in 0..activeWindowMs)
+    MapHistoryScope.Recent -> demo || (lastSeenAt != null && now - lastSeenAt in 0..MAP_RECENT_WINDOW_MS)
+    MapHistoryScope.Active -> demo || (lastSeenAt != null && now - lastSeenAt in 0..ACTIVE_NEARBY_WINDOW_MS)
 }
 
 /** Stable ordered membership for the history lens. [latestLastSeen] is an authoritative slow

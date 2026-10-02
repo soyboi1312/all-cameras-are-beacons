@@ -63,15 +63,6 @@ final class ExportTests: XCTestCase {
 
     // MARK: - an isolated manager
 
-    /// Suites handed out by makeManager, removed after each test.
-    private var isolatedSuites: [(name: String, defaults: UserDefaults)] = []
-
-    override func tearDown() {
-        for suite in isolatedSuites { suite.defaults.removePersistentDomain(forName: suite.name) }
-        isolatedSuites = []
-        super.tearDown()
-    }
-
     /// Every manager in this file comes from here, never from `BLEManager()`. That initializer
     /// uses the standard store, which in this hosted unit test is the host app's own container on
     /// whichever simulator runs the suite: a seen watermark the real app left in one simulator's
@@ -84,11 +75,8 @@ final class ExportTests: XCTestCase {
     /// ignore/watch files and starts an async load of its persisted detections. Tests here keep
     /// those out of their assertions by seeding rows synchronously, without spinning the run loop
     /// first, or by handing the export an explicit snapshot.
-    private func makeManager(seenWatermark: Date? = nil) throws -> BLEManager {
-        let name = "tech.beacons.tests.export.\(UUID().uuidString)"
-        let defaults = try XCTUnwrap(UserDefaults(suiteName: name))
-        defaults.removePersistentDomain(forName: name)
-        isolatedSuites.append((name, defaults))
+    private func makeManager(seenWatermark: Date? = nil) -> BLEManager {
+        let defaults = isolatedDefaults()
         if let seenWatermark {
             defaults.set(seenWatermark.timeIntervalSince1970, forKey: "acab.seenWatermark")
         }
@@ -154,7 +142,7 @@ final class ExportTests: XCTestCase {
         // The UI projection is deliberately never published. Stop must still see the manager's
         // capture-local live ledger, and the observer coordinate must be the one paired with this
         // exact sighting rather than a session-wide first/closest position.
-        let manager = try makeManager()
+        let manager = makeManager()
         let d = try decode(Self.nearbyJSON.replacingOccurrences(
             of: "c2:40:d8:1c:2b:96", with: "02:aa:bb:cc:dd:01"))
         let start: Int64 = 1_780_000_000_000
@@ -193,7 +181,7 @@ final class ExportTests: XCTestCase {
         // A replay can land in the authoritative session store during a reconnect and carry times
         // that overlap the user's window. It is not a live in-window observation, so it must never
         // receive the contribution's `.exact` timestamp.
-        let manager = try makeManager()
+        let manager = makeManager()
         let historyJSON = Self.nearbyJSON
             .replacingOccurrences(of: "c2:40:d8:1c:2b:96", with: "02:aa:bb:cc:dd:02")
             .replacingOccurrences(of: "\"n\":1}", with: "\"n\":1,\"hist\":true,\"seq\":7}")
@@ -215,7 +203,7 @@ final class ExportTests: XCTestCase {
         // For a non-drone, wire lat/lon may be detector GPS and remains useful in a standard Log
         // export. A bounded contribution timestamp describes one exact live sighting, though, so
         // that fallback is too old/ambiguous when the capture ledger has no matching phone fix.
-        let manager = try makeManager()
+        let manager = makeManager()
         let d = try decode(Self.nearbyJSON.replacingOccurrences(
             of: "c2:40:d8:1c:2b:96", with: "02:aa:bb:cc:dd:03"))
         let start: Int64 = 1_780_000_200_000
@@ -262,7 +250,7 @@ final class ExportTests: XCTestCase {
         // unseen assertions below fails whatever that store holds: no watermark or an earlier one
         // fails the watermarkAfterRows assertion, a later one fails the watermarkBeforeRows one.
         func seeded(watermark: Date) throws -> BLEManager {
-            let manager = try makeManager(seenWatermark: watermark)
+            let manager = makeManager(seenWatermark: watermark)
             manager.testSeedContributionDetection(live, firstSeen: now, lastSeen: now)
             manager.testSeedContributionDetection(offline, firstSeen: now, lastSeen: now)
             return manager
@@ -274,18 +262,21 @@ final class ExportTests: XCTestCase {
 
         let frozen = watermarkBeforeRows.detectionExportSnapshot()
         XCTAssertEqual(frozen.ids, [live.id, offline.id])
-        XCTAssertEqual(frozen.filtered(category: nil, unseenOnly: false, offlineOnly: true).ids,
-                       [offline.id])
-        XCTAssertEqual(frozen.filtered(category: "DRONE", unseenOnly: false, offlineOnly: false).ids,
-                       [offline.id])
-        XCTAssertEqual(frozen.filtered(category: nil, unseenOnly: true, offlineOnly: false).ids,
-                       [live.id, offline.id],
+        // The replayed drone row is a wire row: "hist" and no "off" key. The export lens must
+        // still find it as an offline row and as a DRONE row.
+        func lens(category: String? = nil, offlineOnly: Bool = false) -> Set<String> {
+            frozen.reviewed(category: category, unseenOnly: false, offlineOnly: offlineOnly,
+                            query: DetectionLogQuery(""), sort: .newest,
+                            isWatched: { _ in false }).ids
+        }
+        XCTAssertEqual(lens(offlineOnly: true), [offline.id])
+        XCTAssertEqual(lens(category: "DRONE"), [offline.id])
+        XCTAssertEqual(frozen.unseenIDs, [live.id, offline.id],
                        "rows first heard after the seen watermark are New")
 
         let marked = watermarkAfterRows.detectionExportSnapshot()
         XCTAssertEqual(marked.ids, [live.id, offline.id], "same rows; only the watermark differs")
-        XCTAssertEqual(marked.filtered(category: nil, unseenOnly: true, offlineOnly: false).ids,
-                       Set<String>(),
+        XCTAssertEqual(marked.unseenIDs, Set<String>(),
                        "rows first heard before the seen watermark are not New")
     }
 
@@ -313,7 +304,7 @@ final class ExportTests: XCTestCase {
     /// (`.exact`) must report both. Fails if the producer passes the first-seen basis as
     /// lastSeenBasis, which would file a row heard today under "older" in the paused Log.
     func testExportSnapshotCarriesTheLastSeenBasis() throws {
-        let manager = try makeManager()
+        let manager = makeManager()
         let d = try decode(Self.nearbyJSON)
         let now = Date(timeIntervalSince1970: 1_780_001_000)
         manager.testSeedContributionDetection(d, firstSeen: Date(timeIntervalSince1970: 0),
@@ -417,15 +408,15 @@ final class ExportTests: XCTestCase {
         // Two share sheets can overlap in time. The second export must not mutate the URL already
         // handed to the first, while the leaf filename should remain useful to the recipient.
         //
-        // The snapshot is handed in EXPLICITLY rather than letting the convenience overload build
-        // one from the manager's store. That store is whatever the simulator container already
+        // The snapshot is handed in EXPLICITLY rather than building one from the manager's
+        // store. That store is whatever the simulator container already
         // holds, so the old form's output rode a race: loadPersistedDetections() hands off to
         // persistQueue and landed AFTER both snapshots, which is the only reason the two files
         // were header-only and the byte-equality assertion below passed by construction. Win that
         // race on a developer machine and the same test writes real captured MACs and GPS out to
         // temporaryDirectory. A fixture row removes both halves: no stored row reaches the export,
         // and there is real content on both sides of the comparison.
-        let manager = try makeManager()
+        let manager = makeManager()
         let snapshot = BLEManager.DetectionExportSnapshot(rows: [try row(Self.nearbyJSON)],
                                                           unseenIDs: [])
         let done = expectation(description: "two exports finish")
@@ -526,7 +517,7 @@ final class ExportTests: XCTestCase {
     /// fails the first export assertion; restoring the old drop, in which a pin retired the pair,
     /// fails the surviving-pair and kept-field assertions at the end.
     func testShippedPeaklessPairIsKeptForTheStandardExportAndNeverBecomesAPin() throws {
-        let manager = try makeManager()
+        let manager = makeManager()
         let d = try staleLiveRow(mac: "02:aa:bb:cc:ff:01")
         let shipped = CLLocationCoordinate2D(latitude: 41.5, longitude: -71.25)
         func standardApprox() throws -> [String] {
@@ -580,7 +571,7 @@ final class ExportTests: XCTestCase {
     /// assertions; a restore that clears the kept table when its own row carries no pair fails the
     /// raced assertion; ranking the pair as a pin fails the export assertion.
     func testRestoreThatPinsTheRowStillPreservesTheShippedPair() throws {
-        let manager = try makeManager()
+        let manager = makeManager()
         let shipped = CLLocationCoordinate2D(latitude: 41.5, longitude: -71.25)
 
         let ranked = try decode(Self.nearbyJSON.replacingOccurrences(
@@ -596,7 +587,7 @@ final class ExportTests: XCTestCase {
         XCTAssertEqual(rankedState.stored.keptLon, shipped.longitude)
 
         // The next launch, from exactly what the checkpoint stored.
-        let relaunched = try makeManager()
+        let relaunched = makeManager()
         relaunched.testRestoreCheckpointRow(ranked, lat: rankedState.stored.lat,
                                             lon: rankedState.stored.lon,
                                             peak: rankedState.stored.peak,

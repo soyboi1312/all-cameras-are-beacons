@@ -39,27 +39,6 @@ val DRONE_LOCATION_COLS = setOf("drone_lat", "drone_lon")
  *  the disclosure said was removed. Only the AIRCRAFT's altitude/speed/heading are telemetry. */
 val OPERATOR_LOCATION_COLS = setOf("operator_lat", "operator_lon", "operator_alt_m")
 
-/**
- * True when a device's presence overlaps a capture window. A bounded "Start -> observe -> Stop"
- * contribution exports ONLY the devices audible during [startMs, stopMs], not the whole history.
- *
- * Membership is OVERLAP, not containment: a device first heard before Start but still present
- * during the window WAS observed during it, so `firstSeen <= stop && lastSeen >= start`. Both times
- * are the phone's wall clock (firstSeenAt/lastSeenAt). A device with no phone-side timestamp
- * (e.g. a buffered replay never heard live) cannot be placed in a live window and is excluded,
- * which is the conservative call for "what came by while I was capturing".
- */
-fun inCaptureWindow(firstSeenMs: Long?, lastSeenMs: Long?, startMs: Long, stopMs: Long): Boolean {
-    if (firstSeenMs == null || lastSeenMs == null) return false
-    return firstSeenMs <= stopMs && lastSeenMs >= startMs
-}
-
-/** Timestamp written by a bounded capture. Full history uses first-ever sighting; a bounded row
- *  must name when the device was heard inside this window. The caller freezes [lastSeenMs] at Stop;
- *  clamping is a final invariant guard and keeps every emitted instant in [startMs, stopMs]. */
-fun captureTimestamp(lastSeenMs: Long?, startMs: Long, stopMs: Long): Long? =
-    lastSeenMs?.coerceIn(startMs, stopMs)
-
 /** Which columns to blank, from the three independent policy switches. */
 fun contributionBlankColumns(
     includeObserverLocation: Boolean,
@@ -229,11 +208,6 @@ internal fun parseCsvDocument(csv: String): ParsedCsvDocument? {
 
     return ParsedCsvDocument(records, recordSeparator ?: "\n", endsWithRecordSeparator)
 }
-
-/** Compatibility helper for tests and callers parsing exactly one record. Malformed input returns
- * an empty list rather than exposing partially parsed fields. */
-internal fun parseCsvLine(line: String): List<String> =
-    parseCsvDocument(line)?.records?.singleOrNull() ?: emptyList()
 
 private fun serialiseCsv(records: List<List<String>>, separator: String, trailingSeparator: Boolean): String {
     if (records.isEmpty()) return ""

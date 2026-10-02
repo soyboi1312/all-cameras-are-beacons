@@ -46,7 +46,6 @@ jobs:
       - name: Lint (full, gates the release)
         working-directory: android
         run: |
-          chmod +x ./gradlew
           ./gradlew :app:lintRelease --no-daemon
 
       # UNIT TESTS, as their own gate, BEFORE anything is signed or published. Without this step a
@@ -83,7 +82,6 @@ jobs:
           ACAB_KEY_ALIAS: acab
           ACAB_KEY_PASSWORD: ${{ secrets.ACAB_KEY_PASSWORD }}
         run: |
-          chmod +x ./gradlew
           ./gradlew :app:assembleRelease :app:bundleRelease --no-daemon
 
       - name: Verify the APK is signed

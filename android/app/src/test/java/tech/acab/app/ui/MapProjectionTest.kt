@@ -6,6 +6,7 @@ import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.withTimeout
+import org.json.JSONObject
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotEquals
@@ -20,35 +21,9 @@ import tech.acab.app.model.Detection
 import tech.acab.app.model.DeviceType
 
 class MapProjectionTest {
-    private fun detection(index: Int, rssi: Int = -70) = Detection(
-        type = DeviceType.TRACKER,
-        source = 0,
-        method = 0,
-        confidence = 80,
-        mac = "projection-$index",
-        rssi = rssi,
-        name = null,
-        rid = null,
-        detail = null,
-        lat = null,
-        lon = null,
-        pilotLat = null,
-        pilotLon = null,
-        altitude = null,
-        speedH = null,
-        speedV = null,
-        heading = null,
-        heightAGL = null,
-        pilotAlt = null,
-        ridStatus = null,
-        count = 1,
-        isNew = false,
-        gpsAgeSec = null,
-        hist = false,
-        seq = 0L,
-        at = 0L,
-        approx = false,
-    )
+    private fun detection(index: Int, rssi: Int = -70) = Detection.fromJson(
+        JSONObject().put("t", DeviceType.TRACKER.raw).put("c", 80)
+            .put("mac", "projection-$index").put("rssi", rssi))
 
     private fun denseRows(size: Int): List<MapDetectionEvidence> = List(size) { index ->
         MapDetectionEvidence(

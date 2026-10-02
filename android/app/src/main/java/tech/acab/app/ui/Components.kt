@@ -25,7 +25,6 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.materialIcon
 import androidx.compose.material.icons.materialPath
 import androidx.compose.material.icons.automirrored.filled.HelpOutline
-import androidx.compose.material.icons.automirrored.filled.KeyboardArrowRight
 import androidx.compose.material.icons.filled.CameraOutdoor
 import androidx.compose.material.icons.filled.Check
 import androidx.compose.material.icons.filled.Flight
@@ -69,7 +68,6 @@ import androidx.compose.ui.platform.LocalView
 import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.semantics.heading
 import androidx.compose.ui.semantics.semantics
-import androidx.compose.ui.semantics.stateDescription
 import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.font.FontWeight
@@ -190,8 +188,7 @@ fun SectionFooter(text: String, modifier: Modifier = Modifier) =
 // GroupedCard) ----
 
 /** One M3 list row. Heights come from the ListItem minimums; a fixed height is never set.
- *  [supporting] is the value line (`supporting = { Kicker(value) }`), [overline] a provenance
- *  mark (OFFLINE / MUTED / RECON), [badge] sits after the headline text, [leading] takes a
+ *  [supporting] is the value line (`supporting = { Kicker(value) }`), [leading] takes a
  *  CatGlyph or an Icon. For a title with one trailing runtime string use [GroupedValueRow].
  *  The headline is always Roboto, never the uppercase-label rule: callers pass runtime device
  *  names here (the Map cluster sheet's titleName), and an all-caps name is a name, not a label. */
@@ -200,27 +197,16 @@ fun GroupedRow(
     headline: String,
     modifier: Modifier = Modifier,
     supporting: (@Composable () -> Unit)? = null,
-    overline: (@Composable () -> Unit)? = null,
     leading: (@Composable () -> Unit)? = null,
     trailing: (@Composable () -> Unit)? = null,
-    badge: (@Composable () -> Unit)? = null,
     onClick: (() -> Unit)? = null,
     onClickLabel: String? = null,
 ) {
     ListItem(
-        headlineContent = {
-            Row(verticalAlignment = Alignment.CenterVertically) {
-                Text(headline, Modifier.weight(1f, fill = false), style = MaterialTheme.typography.bodyLarge)
-                if (badge != null) {
-                    Spacer(Modifier.width(8.dp))
-                    badge()
-                }
-            }
-        },
+        headlineContent = { Text(headline, style = MaterialTheme.typography.bodyLarge) },
         modifier = if (onClick != null) {
             modifier.clickable(onClickLabel = onClickLabel, role = Role.Button, onClick = onClick)
         } else modifier,
-        overlineContent = overline,
         supportingContent = supporting,
         leadingContent = leading,
         trailingContent = trailing,
@@ -231,8 +217,7 @@ fun GroupedRow(
 /** Title + TRAILING value (the dossier's rows in DetailScreen, such as "matched on" and
  *  "confidence"; the Beacon rows moved to DeviceScreen's BeaconLinkRow, the state under the title). Falls back to title-over-value STACKING when both do not fit on one line
  *  ([valueRowStacks]); never clamps the line count or hugs a width, so a runtime value of any
- *  length stays whole. [onClick] = null draws no chevron and has no click role (a disabled
- *  row's value string names its state). Intrinsics are measured in layout, not composition.
+ *  length stays whole. The row has no click role. Intrinsics are measured in layout, not composition.
  *  The value is data (a method, a confidence, a MAC, an age), so it is always the instrument face
  *  (Kicker telemetryLine = true); an uppercase-identifier title (SIGHTINGS) is too ([rowTitleStyle]).
  *  The value is drawn through [dossierValueForDisplay], so a wrapped value never starts a line
@@ -244,9 +229,7 @@ fun GroupedRow(
  *  DetectionDetailView dossierRowNote (SF footnote). */
 @Composable
 fun GroupedValueRow(title: String, value: String?, modifier: Modifier = Modifier,
-                    leading: (@Composable () -> Unit)? = null, onClick: (() -> Unit)? = null,
-                    onClickLabel: String? = null, chevron: Boolean = onClick != null,
-                    note: String? = null) {
+                    leading: (@Composable () -> Unit)? = null, note: String? = null) {
     val scheme = MaterialTheme.colorScheme
     val titleContent: @Composable () -> Unit = {
         Text(title, style = rowTitleStyle(title), color = scheme.onSurface)
@@ -267,9 +250,6 @@ fun GroupedValueRow(title: String, value: String?, modifier: Modifier = Modifier
     Row(
         modifier
             .fillMaxWidth()
-            .then(if (onClick != null) {
-                Modifier.clickable(onClickLabel = onClickLabel, role = Role.Button, onClick = onClick)
-            } else Modifier)
             .heightIn(min = 56.dp)
             .padding(horizontal = 16.dp, vertical = 8.dp)
             .semantics(mergeDescendants = true) {},
@@ -317,11 +297,6 @@ fun GroupedValueRow(title: String, value: String?, modifier: Modifier = Modifier
                 }
             }
         }
-        if (chevron) {
-            Spacer(Modifier.width(8.dp))
-            Icon(Icons.AutoMirrored.Filled.KeyboardArrowRight, contentDescription = null,
-                tint = scheme.onSurfaceVariant)
-        }
     }
 }
 
@@ -350,38 +325,25 @@ private val RowTitleLabelStyle = AcabTypography.bodyLarge.telemetry(weight = Fon
 internal fun valueRowStacks(availablePx: Int, titlePx: Int, valuePx: Int, gapPx: Int): Boolean =
     titlePx + gapPx + valuePx > availablePx
 
-/** A toggle row: the whole row toggles (Role.Switch), the Switch is display-only. Same contract
- *  as DeviceScreen's ToggleRow: disabled while [pending], with "Applying" as the spoken state and
- *  a small spinner beside the switch. No switch colours are set: the M3 defaults come from the
- *  scheme (track primary, thumb onPrimary, the check mark in onPrimaryContainer). [exp] draws the
- *  EXP tag after the title. The row never decides a toggle's polarity; callers pass it. */
+/** A toggle row: the whole row toggles (Role.Switch), the Switch is display-only. No switch
+ *  colours are set: the M3 defaults come from the scheme (track primary, thumb onPrimary, the
+ *  check mark in onPrimaryContainer). The row never decides a toggle's polarity; callers pass it.
+ *  The row has no pending state; DeviceScreen's ToggleRow is the row that disables while pending. */
 @Composable
 fun GroupedSwitchRow(title: String, checked: Boolean, onCheckedChange: (Boolean) -> Unit,
-                     modifier: Modifier = Modifier, supporting: String? = null,
-                     enabled: Boolean = true, pending: Boolean = false, exp: Boolean = false) {
+                     modifier: Modifier = Modifier, supporting: String? = null) {
     GroupedRow(
         headline = title,
-        modifier = modifier
-            .toggleable(value = checked, enabled = enabled && !pending, role = Role.Switch,
-                onValueChange = onCheckedChange)
-            .semantics(mergeDescendants = true) { if (pending) stateDescription = "Applying" },
+        modifier = modifier.toggleable(value = checked, role = Role.Switch, onValueChange = onCheckedChange),
         supporting = if (supporting != null) { { Kicker(supporting) } } else null,
-        badge = if (exp) { { ExpTag() } } else null,
         trailing = {
-            Row(verticalAlignment = Alignment.CenterVertically) {
-                if (pending) {
-                    CircularProgressIndicator(Modifier.size(20.dp), strokeWidth = 2.dp)
-                    Spacer(Modifier.width(8.dp))
-                }
-                Switch(
-                    checked = checked,
-                    onCheckedChange = null,
-                    enabled = enabled && !pending,
-                    thumbContent = if (checked) {
-                        { Icon(Icons.Filled.Check, contentDescription = null, modifier = Modifier.size(SwitchDefaults.IconSize)) }
-                    } else null,
-                )
-            }
+            Switch(
+                checked = checked,
+                onCheckedChange = null,
+                thumbContent = if (checked) {
+                    { Icon(Icons.Filled.Check, contentDescription = null, modifier = Modifier.size(SwitchDefaults.IconSize)) }
+                } else null,
+            )
         },
     )
 }
@@ -398,12 +360,11 @@ fun GroupedCard(modifier: Modifier = Modifier, content: @Composable ColumnScope.
     Column(modifier.fillMaxWidth().clip(MaterialTheme.shapes.medium)
         .background(MaterialTheme.colorScheme.surfaceContainer), content = content)
 
-/** Card look for the screens that still use it: a surfaceContainer fill ([strong] = the raised
- *  surfaceContainerHigh) with rounded corners and no border. Interior padding is the card token
- *  [Acab.padCard]. New code uses [GroupedCard] or a flat list. */
-fun Modifier.panel(strong: Boolean = false): Modifier = this
-    .background(if (strong) Acab.palette.surfaceContainerHigh else Acab.palette.surfaceContainer,
-        RoundedCornerShape(Acab.radius))
+/** Card look for the screens that still use it: a surfaceContainer fill with rounded corners
+ *  and no border. Interior padding is the card token [Acab.padCard]. New code uses
+ *  [GroupedCard] or a flat list. */
+fun Modifier.panel(): Modifier = this
+    .background(Acab.palette.surfaceContainer, RoundedCornerShape(Acab.radius))
     .padding(Acab.padCard)
 
 /** The app's banner frame: a surfaceContainerHigh card (M3 medium shape) holding an optional

@@ -146,6 +146,22 @@ final class DetectionLogLensTests: XCTestCase {
         XCTAssertFalse(matches("unverified", motorola))
     }
 
+    /// The fifth body-cam signature (firmware 2.1.0). WatchGuard Video belongs to Motorola
+    /// Solutions, but the firmware reports the registry's name, so the row names WatchGuard as the
+    /// maker and a "motorola" search does not claim it. Android's LogExportLensTest pins the same
+    /// answers. Dropping the enum case fails every assertion here: the row falls back to the
+    /// category's "Axon / Utility / Motorola", which matches "motorola".
+    func testWatchGuardRowNamesItsOwnMaker() throws {
+        let wg = try detection("00:1d:96:e7:97:4f", type: .axonBodyCam,
+                               detail: "WatchGuard Video OUI")
+        XCTAssertEqual(wg.bodyCamSignature, .watchguard)
+        XCTAssertEqual(wg.vendor, "WatchGuard Video")
+        XCTAssertEqual(wg.maker, "WatchGuard Video")
+        XCTAssertEqual(wg.ouiVendor, "WatchGuard Video")
+        XCTAssertTrue(matches("watchguard", wg))
+        XCTAssertFalse(matches("motorola", wg))
+    }
+
     func testStrongestSortUsesRawRSSIAndKeepsNewestTieOrder() throws {
         let newerWeak = try detection(rssi: -85)
         let newerStrong = try detection("aa:bb:cc:dd:ee:02", rssi: -40)

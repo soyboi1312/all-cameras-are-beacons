@@ -42,7 +42,6 @@ enum CombinedUpdatePhase: Equatable {
 final class CombinedUpdateContext {
     let entry: FirmwareManifest.Build
     let fwLabel: String
-    let latest: String
     let startedAt = Date()
 
     // What we planned to run at the start. Decides how the 0...1 bar is split so a single
@@ -64,11 +63,10 @@ final class CombinedUpdateContext {
     var verifyStartedAt: Date?             // confirm creep timing (indeterminate)
     var nrfFinished = false                // durable across dismissNrfUpdate before the S3 leg
 
-    init(entry: FirmwareManifest.Build, fwLabel: String, latest: String,
+    init(entry: FirmwareManifest.Build, fwLabel: String,
          s3Planned: Bool, nrfPlanned: Bool) {
         self.entry = entry
         self.fwLabel = fwLabel
-        self.latest = latest
         self.s3Planned = s3Planned
         self.nrfPlanned = nrfPlanned
         if s3Planned && nrfPlanned {
@@ -147,7 +145,7 @@ extension BLEManager {
         dismissFirmwareUpdate()
         dismissNrfUpdate()
 
-        let ctx = CombinedUpdateContext(entry: entry, fwLabel: fwLabel, latest: latest,
+        let ctx = CombinedUpdateContext(entry: entry, fwLabel: fwLabel,
                                         s3Planned: s3, nrfPlanned: nrf)
         combinedCtx = ctx
         combinedNotice = nil
@@ -289,19 +287,12 @@ extension BLEManager {
     }
 
     private func combinedDriveS3(_ ctx: CombinedUpdateContext) {
+        // No `.done` arm: combinedHandleSubengineTerminal consumes S3 success in the turn that
+        // publishes it, so this tick never sees it.
         switch otaState {
         case .failed(let reason):
             // S3 failed: abort the whole flow, never touch the nRF.
             combinedFail(reason)
-        case .done:
-            // Engine handled reboot + reconnect + confirm internally.
-            ctx.s3Finished = true
-            ctx.s3DidUpdate = true
-            ctx.s3DoneAt = Date()
-            ctx.reconnectStartedAt = ctx.reconnectStartedAt ?? Date()
-            otaRereadStatus()
-            combinedState = .reconnecting
-            combinedSetProgress(ctx.s3Base + ctx.s3Span * 0.95)
         case .rebooting, .confirming:
             // The engine is rebooting/reconnecting the board. Enter our reconnect band.
             ctx.reconnectStartedAt = ctx.reconnectStartedAt ?? Date()
@@ -336,18 +327,9 @@ extension BLEManager {
         combinedSetProgress(base + (top - base) * t * 0.9)
 
         if !ctx.s3Finished {
-            // The S3 engine is still finishing its own reboot/confirm. Watch for its terminal.
-            switch otaState {
-            case .done:
-                ctx.s3Finished = true
-                ctx.s3DidUpdate = true
-                ctx.s3DoneAt = Date()
-                otaRereadStatus()
-            case .failed(let r):
-                combinedFail(r)
-            default:
-                break
-            }
+            // The S3 engine is still finishing its own reboot/confirm. Only a failure is polled
+            // here; success arrives through combinedHandleSubengineTerminal.
+            if case .failed(let r) = otaState { combinedFail(r) }
             return
         }
 
@@ -374,23 +356,18 @@ extension BLEManager {
     private func combinedDecideNrfLeg(_ ctx: CombinedUpdateContext) {
         // Re-evaluate on the freshest Status we have.
         if status?.nrfVersion == nil {
-            if ctx.nrfPlanned {
-                // We meant to update the co-processor but can't read its version right now. Do
-                // NOT claim it updated; finish S3-only with a soft notice. The single button
-                // self-heals: staleness re-evaluates per Status frame, so it re-offers the
-                // nRF-only run once nrfv returns.
-                combinedNotice = "Couldn't reach the co-processor to check its version - reconnect and try Update again if its update is available."
-                combinedFinish(ctx.s3DidUpdate ? .done : .partial)
-            } else {
-                // Single-radio board (or no co-processor package): S3-only, cleanly done.
-                combinedFinish(.done)
-            }
+            // We meant to update the co-processor but can't read its version right now. Do NOT
+            // claim it updated; finish S3-only with a soft notice. The single button self-heals:
+            // staleness re-evaluates per Status frame, so it re-offers the nRF-only run once nrfv
+            // returns.
+            combinedNotice = "Couldn't reach the co-processor to check its version - reconnect and try Update again if its update is available."
+            combinedFinish(ctx.s3DidUpdate ? .done : .partial)
             return
         }
         if nrfUpdateAvailable(ctx.entry) {
             combinedBeginNrfLeg(ctx)
         } else {
-            // Co-processor already current (or nothing was planned for it).
+            // Co-processor already current.
             combinedFinish(.done)
         }
     }

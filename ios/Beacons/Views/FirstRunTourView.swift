@@ -114,7 +114,7 @@ struct FirstRunTourView: View {
                         .font(.system(size: 34, weight: .regular))
                         .foregroundStyle(ACABTheme.tint)
                     Text(c.title)
-                        .font(ACABTheme.display(23, weight: .semibold))
+                        .font(ACABTheme.font(.title2, weight: .semibold))
                         .foregroundStyle(ACABTheme.text)
                         .fixedSize(horizontal: false, vertical: true)
                     // R8: the body and the note read on the Dynamic Type scale (.body, then

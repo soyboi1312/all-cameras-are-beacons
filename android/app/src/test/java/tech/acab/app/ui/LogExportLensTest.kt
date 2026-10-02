@@ -1,5 +1,6 @@
 package tech.acab.app.ui
 
+import org.json.JSONObject
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNull
@@ -12,10 +13,15 @@ import tech.acab.app.ble.LOG_ACTIVE_SECTION_HEADER
 import tech.acab.app.ble.activeBoundary
 import tech.acab.app.ble.frozenNewIdSet
 import tech.acab.app.ble.newestFirstEnvelope
+import tech.acab.app.model.BodyCamSignature
 import tech.acab.app.model.Detection
 import tech.acab.app.model.DeviceNames
 import tech.acab.app.model.DeviceType
 import tech.acab.app.model.TimeBasis
+import tech.acab.app.model.bodyCamSignature
+import tech.acab.app.model.maker
+import tech.acab.app.model.ouiVendor
+import tech.acab.app.model.vendor
 import java.time.ZoneId
 import java.time.ZonedDateTime
 
@@ -28,36 +34,10 @@ class LogExportLensTest {
         name: String? = null,
         rid: String? = null,
         detail: String? = null,
-    ) = Detection(
-        type = type,
-        source = 0,
-        method = 0,
-        confidence = 1,
-        mac = mac,
-        rssi = rssi,
-        name = name,
-        rid = rid,
-        detail = detail,
-        lat = null,
-        lon = null,
-        pilotLat = null,
-        pilotLon = null,
-        altitude = null,
-        speedH = null,
-        speedV = null,
-        heading = null,
-        heightAGL = null,
-        pilotAlt = null,
-        ridStatus = null,
-        count = 1,
-        isNew = true,
-        gpsAgeSec = null,
-        hist = offline,
-        seq = 0L,
-        at = 0L,
-        approx = false,
-        offline = offline,
-    )
+    ) = Detection.fromJson(
+        JSONObject().put("t", type.raw).put("c", 1).put("mac", mac).put("rssi", rssi)
+            .putOpt("name", name).putOpt("id", rid).putOpt("det", detail)
+            .put("new", true).put("hist", offline).put("offline", offline))
 
     /** Offline is a filter that composes with any scope, not a scope of its own: offline only
      *  under All keeps the replayed tracker, and under New it still needs the row to be unseen.
@@ -205,6 +185,22 @@ class LogExportLensTest {
         assertEquals(listOf(axon), filterLogRows(rows, null, LogScope.All, emptySet(), query = "axon"))
         assertEquals(listOf(motorola), filterLogRows(rows, null, LogScope.All, emptySet(), query = "motorola"))
         assertEquals(emptyList<Detection>(), filterLogRows(rows, null, LogScope.All, emptySet(), query = "unverified"))
+    }
+
+    /** The fifth body-cam signature (firmware 2.1.0). WatchGuard Video belongs to Motorola
+     *  Solutions, but the firmware reports the registry's name, so the row names WatchGuard as the
+     *  maker and a "motorola" search does not claim it. iOS DetectionLogLensTests pins the same
+     *  answers. Dropping the enum entry fails every assertion here: the row falls back to the
+     *  category's "Axon / Utility / Motorola", which matches "motorola". */
+    @Test
+    fun watchGuardRowNamesItsOwnMaker() {
+        val wg = row("00:1D:96:E7:97:4F", DeviceType.BODY_CAM, detail = "WatchGuard Video OUI")
+        assertEquals(BodyCamSignature.WATCHGUARD, wg.bodyCamSignature)
+        assertEquals("WatchGuard Video", wg.vendor)
+        assertEquals("WatchGuard Video", wg.maker)
+        assertEquals("WatchGuard Video", wg.ouiVendor)
+        assertEquals(listOf(wg), filterLogRows(listOf(wg), null, LogScope.All, emptySet(), query = "watchguard"))
+        assertEquals(emptyList<Detection>(), filterLogRows(listOf(wg), null, LogScope.All, emptySet(), query = "motorola"))
     }
 
     /** The lens-summary line, the list's footer, counts the lens the list shows, which is the

@@ -2,21 +2,7 @@ import XCTest
 @testable import Beacons
 
 final class OnboardingPolicyTests: XCTestCase {
-    private var suiteName = ""
-    private var defaults: UserDefaults!
-
-    override func setUp() {
-        super.setUp()
-        suiteName = "tech.beacons.tests.onboarding.\(UUID().uuidString)"
-        defaults = UserDefaults(suiteName: suiteName)
-        defaults.removePersistentDomain(forName: suiteName)
-    }
-
-    override func tearDown() {
-        defaults.removePersistentDomain(forName: suiteName)
-        defaults = nil
-        super.tearDown()
-    }
+    private lazy var defaults = isolatedDefaults()
 
     func testChecklistWaitsForEncryptedSessionReadiness() {
         XCTAssertEqual(onboardingPresentation(
@@ -197,9 +183,6 @@ final class OnboardingPolicyTests: XCTestCase {
 
     func testSecureReadinessWatchdogSpansTransportThroughReady() {
         XCTAssertEqual(secureReadinessTimeoutInterval, 45)
-        XCTAssertEqual(secureReadinessWatchdogAction(for: .transportConnected), .arm)
-        XCTAssertEqual(secureReadinessWatchdogAction(for: .sessionReady), .cancel)
-        XCTAssertEqual(secureReadinessWatchdogAction(for: .teardown), .cancel)
 
         let expected = UUID()
         XCTAssertTrue(secureReadinessTimeoutApplies(

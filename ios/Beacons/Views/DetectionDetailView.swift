@@ -103,7 +103,12 @@ func dossierValueForDisplay(_ value: String) -> String {
 /// band owner: the row's weak-match glyph switches at the same 50 edge, and
 /// DetectionRow.confidenceWord follows these edges. Low certainty is loud amber (the glyph),
 /// never crimson: crimson is for categories only, never for confidence.
-func dossierConfidenceLine(confidence: Int) -> String {
+///
+/// A Desert-mode row (nearbyDevice) is confidence 0 because nothing matched, not because a match
+/// is weak, so it reads "Not a match" with no percent (the Log hides that 0 for the same reason).
+/// TWIN: android DetailScreen.kt `dossierConfidenceLine`.
+func dossierConfidenceLine(type: DeviceType, confidence: Int) -> String {
+    if type == .nearbyDevice { return "Not a match" }
     let verdict: String
     switch confidence {
     case ..<50: verdict = "Weak match, verify"
@@ -157,10 +162,12 @@ func dossierSignalWord(isDemoMode: Bool, stale: Bool) -> String {
 }
 
 /// The "why flagged" line under the hero. When the method and the source carry the same label
-/// (a drone: Remote ID over Remote ID) the source is dropped instead of repeated.
-/// TWIN: android DetailScreen.kt `dossierFlaggedLine`.
-func dossierFlaggedLine(methodLabel: String, sourceLabel: String) -> String {
-    methodLabel.caseInsensitiveCompare(sourceLabel) == .orderedSame
+/// (a drone: Remote ID over Remote ID) the source is dropped instead of repeated. A Desert-mode
+/// row (nearbyDevice) was flagged by nothing: its method is SSID on WiFi and none on BLE, so it
+/// names only the radio and desert mode. TWIN: android DetailScreen.kt `dossierFlaggedLine`.
+func dossierFlaggedLine(type: DeviceType, methodLabel: String, sourceLabel: String) -> String {
+    if type == .nearbyDevice { return "Heard over \(sourceLabel) in desert mode." }
+    return methodLabel.caseInsensitiveCompare(sourceLabel) == .orderedSame
         ? "Flagged by \(methodLabel)."
         : "Flagged by \(methodLabel) over \(sourceLabel)."
 }
@@ -185,8 +192,14 @@ func dossierHeroSubtitle(node: String, makerOrVendor: String, headline: String) 
 /// "chipset only" would understate what we know. What's uncertain is which of the vendor's
 /// products this is, which is why it keeps the amber weak-match treatment. Keyed on `maker`
 /// rather than bodyCamSignature so network cameras stop sitting on the wrong side of this exact
-/// distinction. TWIN: android DetailScreen.kt `methodChipLabel`.
-func methodChipLabel(method: DetectionMethod, maker: String?) -> String {
+/// distinction.
+///
+/// A Desert-mode row (nearbyDevice) matched nothing, yet desert_detect.cpp stamps its WiFi rows
+/// with method SSID and its BLE rows with none, so the method label would read "SSID" or
+/// "unknown" on a row no signature claimed. It reads "no signature" instead, keyed on the type.
+/// TWIN: android DetailScreen.kt `methodChipLabel`.
+func methodChipLabel(type: DeviceType, method: DetectionMethod, maker: String?) -> String {
+    if type == .nearbyDevice { return "no signature" }
     switch method {
     case .oui where maker != nil: return "OUI \u{00B7} VENDOR ONLY"
     case .oui:                    return "OUI \u{00B7} CHIPSET ONLY"
@@ -202,6 +215,26 @@ func dossierBodyCamFallbackLine(isReplay: Bool) -> String {
     isReplay
         ? "Matched a body-worn camera signature. This record came from the offline buffer, which doesn't keep which signature fired."
         : "Matched a body-worn camera signature. The board didn't report which one."
+}
+
+/// The MATCH QUALITY explainer for a Desert-mode row (nearbyDevice, wire t=7). desert_detect.cpp
+/// emits one for every device it hears, at confidence 0, with method SSID (WiFi) or none (BLE),
+/// so the per-method lines would claim a signature matched. `detail` is that file's address
+/// label (bleAddrLabel, desertClassifyWiFi), which the footer draws verbatim under this line; an
+/// unknown label or none (a buffered record keeps no detail) gets the first sentence alone.
+/// TWIN: android DetailScreen.kt `dossierNearbyDeviceLine`.
+func dossierNearbyDeviceLine(detail: String?) -> String {
+    let base = "Desert mode lists every nearby device it hears, and no signature matched this one."
+    switch detail {
+    case "randomized MAC":
+        return "\(base) \"randomized MAC\" means the address isn't from a maker's registered block. Phones, watches, and earbuds use addresses like this and change them often, so the same device can come back under a new one."
+    case "hardware OUI":
+        return "\(base) \"hardware OUI\" means the address starts with a block registered to a maker, so it usually stays the same between sightings."
+    case "OUI unknown":
+        return "\(base) \"OUI unknown\" means the board couldn't tell whether the address comes from a maker's registered block or is randomized."
+    default:
+        return base
+    }
 }
 
 /// The app's note under a tracker's verbatim firmware detail when that detail ends "(offline)":
@@ -452,7 +485,7 @@ struct DetectionDetailView: View {
         .alert("Watchlist full", isPresented: $ble.watchlistFull) {
             Button("OK", role: .cancel) {}
         } message: {
-            Text("You can watch up to 256 devices at once. Un-watch one before adding another.")
+            Text("You can watch up to 256 devices at once. Stop watching one before adding another.")
         }
     }
 
@@ -687,6 +720,11 @@ struct DetectionDetailView: View {
         }
     }
 
+    /// The confidence row's amber weak-match cue. A Desert-mode row is confidence 0 because nothing
+    /// matched, so it reads "Not a match" (dossierConfidenceLine) beside the plain gauge, with no
+    /// weak match to verify. TWIN: android DetailScreen.kt MatchQualityPanel's `weak`.
+    private var confidenceIsWeak: Bool { d.confidence < 50 && d.type != .nearbyDevice }
+
     private var matchQualityPanel: some View {
         Section {
             // The weak-match cue rides the leading glyphs, never the values: ONE rule on both
@@ -696,11 +734,11 @@ struct DetectionDetailView: View {
             // the RSSI graph means" control and the Technical details disclosure, so an (i) here
             // read as a help button that did nothing (C12-09). TWIN: android DetailScreen.kt MatchQualityPanel's confidence icon
             // (Icons.Outlined.Speed, the same gauge idea; Warning below 50).
-            dossierRow("matched on", methodChipLabel(method: d.method, maker: d.maker),
+            dossierRow("matched on", methodChipLabel(type: d.type, method: d.method, maker: d.maker),
                        glyph: "touchid", glyphColor: d.method == .oui ? ACABTheme.warn : ACABTheme.dim)
-            dossierRow("confidence", dossierConfidenceLine(confidence: d.confidence),
-                       glyph: d.confidence < 50 ? "exclamationmark.triangle.fill" : "gauge.medium",
-                       glyphColor: d.confidence < 50 ? ACABTheme.warn : ACABTheme.dim)
+            dossierRow("confidence", dossierConfidenceLine(type: d.type, confidence: d.confidence),
+                       glyph: confidenceIsWeak ? "exclamationmark.triangle.fill" : "gauge.medium",
+                       glyphColor: confidenceIsWeak ? ACABTheme.warn : ACABTheme.dim)
         } header: {
             Kicker("MATCH QUALITY")
         } footer: {
@@ -733,7 +771,7 @@ struct DetectionDetailView: View {
     /// The MATCH QUALITY footer: what actually matched, in words.
     /// Returns Text so the OUI vendor name can render semibold inside the dim line.
     private var matchExplainer: Text {
-        // Body cam covers four signatures of very different weight under one label, so the
+        // Body cam covers five signatures of very different weight under one label, so the
         // generic per-method line is too vague here (and its "shared chipset" wording is
         // wrong for a vendor's own OUI block). Name the signature that fired instead.
         if let sig = d.bodyCamSignature { return signatureExplainer(sig) }
@@ -754,6 +792,10 @@ struct DetectionDetailView: View {
         if d.type == .axonBodyCam {
             return Text(dossierBodyCamFallbackLine(isReplay: d.isHistory))
         }
+        // Desert mode's ambient rows match no signature but still carry a method (SSID on WiFi),
+        // so the per-method lines below would claim a match. TWIN: android DetailScreen.kt
+        // plainMatchLine, the same branch in the same place.
+        if d.type == .nearbyDevice { return Text(dossierNearbyDeviceLine(detail: d.detail)) }
         switch d.method {
         case .oui:
             // An OUI block is one of two very different things and the copy has to say which.
@@ -781,12 +823,12 @@ struct DetectionDetailView: View {
         case .remoteID:    return Text("The aircraft identified itself over Remote ID.")
         case .serviceData: return Text("A service-data tag tied to this hardware matched.")
         case .mfgSubtype:  return Text("A decoded manufacturer-data subtype matched a known signature.")
-        case .watchlist:   return Text("You starred this exact device, so every sighting matches.")
+        case .watchlist:   return Text("This exact device was on your watchlist, so every sighting matched.")
         case .none:        return Text("No match method was reported for this hit.")
         }
     }
 
-    /// Which body-cam signature fired, and how much weight it carries. The four sources
+    /// Which body-cam signature fired, and how much weight it carries. The five sources
     /// under this one category range from Axon's own broadcast identifier to a vendor-block
     /// proxy, and without this they all read as "Body camera". Says nothing about the
     /// numbers: the confidence row above already carries the strength.
@@ -804,6 +846,8 @@ struct DetectionDetailView: View {
             return Text("Matched \(name) by address block only. The block is Utility Inc's, but the broadcast name didn't match and Utility ships other gear on it, so treat this as a maybe.")
         case .motorola:
             return Text("Matched \(name), a vendor proxy rather than a body cam signature. The block is Motorola Solutions' own, so the maker is right, but they also sell two-way radios, docks, and site infrastructure on it. Read this as their equipment nearby, not a confirmed camera.")
+        case .watchguard:
+            return Text("Matched \(name), a vendor proxy rather than a body cam signature. The block is WatchGuard Video's own, so the maker is right, but they also put in-car video systems and docks on it. WatchGuard belongs to Motorola Solutions, so the Motorola Solutions switch controls this match. Read this as their equipment nearby, not a confirmed body cam.")
         }
     }
 
@@ -863,7 +907,7 @@ struct DetectionDetailView: View {
             : AnyLayout(HStackLayout(alignment: .center, spacing: 12))
         return layout {
             Label {
-                Text("Star it to get pinged every time this exact device shows up.")
+                Text("Watch it to get pinged every time this exact device shows up.")
                     .font(ACABTheme.font(.body)).foregroundStyle(ACABTheme.text)
                     .fixedSize(horizontal: false, vertical: true)
             } icon: {
@@ -1111,7 +1155,7 @@ struct DetectionDetailView: View {
 
     private var whyFlagged: some View {
         Label {
-            Text(dossierFlaggedLine(methodLabel: d.method.label, sourceLabel: d.source.label))
+            Text(dossierFlaggedLine(type: d.type, methodLabel: d.method.label, sourceLabel: d.source.label))
                 .font(ACABTheme.font(.subheadline)).foregroundStyle(ACABTheme.dim)
                 .fixedSize(horizontal: false, vertical: true)
         } icon: {
@@ -1500,14 +1544,14 @@ struct DetectionDetailView: View {
             // tracking detectors can accumulate evidence), rolling around 4am. So the star DOES
             // work, just not past the rollover. Do not repeat the "every few minutes" line here,
             // that is the near-owner interval and it is wrong for the tags that matter.
-            return "This tag's address holds for about a day, then changes around 4am. The star stops matching when it does. The tracker detector finds it either way."
+            return "This tag's address holds for about a day, then changes around 4am. The watchlist entry stops matching when it does. The tracker detector finds it either way."
         case .nearbyDevice:
-            return "Most phones change their address every few minutes, so this star will likely stop matching within the hour."
+            return "Most phones change their address every few minutes, so the watchlist entry will likely stop matching within the hour."
         default:
             // No "trackers" here: .tracker is handled above, and a separated tag rotates about
             // once a day, not every few minutes. Repeating the near-owner interval in the fallback
             // would put the debunked claim straight back in front of the user.
-            return "This address looks randomized, so the star may stop matching this device."
+            return "This address looks randomized, so the watchlist entry may stop matching this device."
         }
     }
 

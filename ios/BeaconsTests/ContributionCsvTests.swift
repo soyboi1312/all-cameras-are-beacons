@@ -223,28 +223,6 @@ final class ContributionCsvTests: XCTestCase {
         XCTAssertEqual(ContributionCsv.redact(csv, blankColumns: ["approx_lat", "approx_lon"]), renamed)
     }
 
-    func testCaptureWindowOverlapSemantics() {
-        let start: Int64 = 1000, stop: Int64 = 2000
-        XCTAssertFalse(ContributionCsv.inCaptureWindow(200, 800, start, stop))   // before
-        XCTAssertFalse(ContributionCsv.inCaptureWindow(2200, 2500, start, stop)) // after
-        XCTAssertTrue(ContributionCsv.inCaptureWindow(1200, 1800, start, stop))  // inside
-        XCTAssertTrue(ContributionCsv.inCaptureWindow(500, 1500, start, stop))   // present before Start, still audible
-        XCTAssertTrue(ContributionCsv.inCaptureWindow(1500, 3000, start, stop))  // starts inside, runs past Stop
-        XCTAssertTrue(ContributionCsv.inCaptureWindow(0, 5000, start, stop))     // spans the window
-        XCTAssertTrue(ContributionCsv.inCaptureWindow(2000, 2000, start, stop))  // boundary, inclusive
-        XCTAssertTrue(ContributionCsv.inCaptureWindow(1000, 1000, start, stop))
-        XCTAssertFalse(ContributionCsv.inCaptureWindow(nil, 1500, start, stop))  // no timestamp -> out
-        XCTAssertFalse(ContributionCsv.inCaptureWindow(1500, nil, start, stop))
-    }
-
-    func testCaptureTimestampUsesLastSightingClampedInsideWindow() {
-        let start: Int64 = 1000, stop: Int64 = 2000
-        XCTAssertEqual(ContributionCsv.captureTimestamp(800, start, stop), start)
-        XCTAssertEqual(ContributionCsv.captureTimestamp(1500, start, stop), 1500)
-        XCTAssertEqual(ContributionCsv.captureTimestamp(2200, start, stop), stop)
-        XCTAssertNil(ContributionCsv.captureTimestamp(nil, start, stop))
-    }
-
     func testPolicySetMapsToTheRightColumns() {
         // Exhaustive single-flag mapping: each include flag owns exactly its column set.
         XCTAssertEqual(ContributionCsv.blankColumns(includeObserverLocation: false, includeDroneLocation: true,

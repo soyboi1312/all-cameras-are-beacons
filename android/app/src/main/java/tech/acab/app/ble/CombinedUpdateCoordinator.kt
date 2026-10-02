@@ -452,22 +452,17 @@ class CombinedUpdateCoordinator(
             return
         }
         if (status.value?.nrfVersion == null) {
-            if (nrfPlanned) {
-                // We meant to update the co-processor but can't read its version right now. Don't
-                // claim it updated, and never call a planned two-radio run DONE without the target
-                // version. PARTIAL is the honest terminal; a fresh Status later can re-offer it.
-                notice = "Couldn't reach the co-processor to check its version - reconnect and try Update again if its update is available."
-                finish(CombinedUpdatePhase.PARTIAL)
-            } else {
-                // Single-radio board (or no co-processor package): S3-only, cleanly done.
-                finish(CombinedUpdatePhase.DONE)
-            }
+            // We meant to update the co-processor but can't read its version right now. Don't claim
+            // it updated, and never call a planned two-radio run DONE without the target version.
+            // PARTIAL is the honest terminal; a fresh Status later can re-offer it.
+            notice = "Couldn't reach the co-processor to check its version - reconnect and try Update again if its update is available."
+            finish(CombinedUpdatePhase.PARTIAL)
             return
         }
         if (nrfUpdateAvailable(b)) {
             beginNrfLeg()
         } else {
-            // Co-processor already current (or nothing was planned for it).
+            // Co-processor already current.
             finish(CombinedUpdatePhase.DONE)
         }
     }

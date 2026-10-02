@@ -10,8 +10,9 @@ import Security
 /// A board we spotted while scanning.
 ///
 /// Keyed on `peripheral.identifier`, which is CoreBluetooth's PER-HOST UUID and not the board's
-/// BLE address. That does NOT make the row immune to the firmware's rotating Resolvable Private
-/// Address; see the staleness prune in didDiscover for the evidence and the window.
+/// BLE address. That does NOT make the row immune to a board that rotates its address (a
+/// Resolvable Private Address; no released firmware does, a bench build did); see
+/// pruneStaleDiscovered for the evidence and the window.
 struct DiscoveredDevice: Identifiable {
     let id: UUID
     let peripheral: CBPeripheral
@@ -557,20 +558,7 @@ func demoEntryNeedsScanCancellation(isScanning: Bool, scanDeferred: Bool) -> Boo
     isScanning || scanDeferred
 }
 
-enum SecureReadinessWatchdogEvent: Equatable {
-    case transportConnected
-    case sessionReady
-    case teardown
-}
-
-enum SecureReadinessWatchdogAction: Equatable { case arm, cancel }
-
 let secureReadinessTimeoutInterval: TimeInterval = 45
-
-func secureReadinessWatchdogAction(for event: SecureReadinessWatchdogEvent)
-    -> SecureReadinessWatchdogAction {
-    event == .transportConnected ? .arm : .cancel
-}
 
 func secureReadinessTimeoutApplies(expectedID: UUID, currentID: UUID?,
                                    sessionReady: Bool, isDemoMode: Bool) -> Bool {
@@ -1207,6 +1195,76 @@ enum AlertModeOrigin {
     case app    // Desert's forced mute, or a restore the app is carrying out
 }
 
+/// What the connect path writes to the board's buzzer: the stored mode's buzzer state, or NOTHING
+/// when this phone holds no stored mode (a fresh install, a reinstall, cleared data, a second phone).
+///
+/// WHY NOTHING AND NOT "SOUND ON" (security review 2026-09-29). The in-memory mode defaults to
+/// .buzzer when nothing is stored, and the connect path used to push that default. A board the
+/// user had muted from another install or phone was un-muted and saved the change to its own flash,
+/// Desert included, with nobody tapping anything. Only the user changes whether the detector makes
+/// sound (see desertAlertModeTransition), so a phone with no stored mode mirrors the board instead
+/// (mirroredAlertMode) and writes nothing at connect until the user picks a mode.
+/// Android twin: connectBuzzerWrite in AcabBleManager.kt.
+func connectBuzzerWrite(hasStoredMode: Bool, mode: AlertMode) -> Bool? {
+    hasStoredMode ? mode == .buzzer : nil
+}
+
+/// The alert mode a status frame puts on screen, or nil when this phone is holding a mode of its
+/// own and the frame is only something to reconcile against.
+///
+/// A phone MIRRORS the board when it holds no stored mode and the app has not set one on this link
+/// (Desert's mute or restore, see setAlertMode). Sound on reads as .buzzer; a muted board reads as
+/// .silent, never .vibrate: the board cannot say which quiet mode was picked elsewhere, and .silent
+/// adds no feedback on THIS phone that nobody asked for. A Mesh-Detect board has no buzzer and
+/// always reports false, so it mirrors as .silent too, which is true: it cannot make a sound. That
+/// matters for Desert, which captures the mode on screen: an unmirrored .buzzer default captured
+/// on a mesh board used to come back as a real un-mute on the next beacon. In memory only; a
+/// mirror is never stored. Android twin: mirroredAlertMode in AcabBleManager.kt.
+func mirroredAlertMode(hasStoredMode: Bool, heldThisLink: Bool, boardBuzzer: Bool) -> AlertMode? {
+    guard !hasStoredMode, !heldThisLink else { return nil }
+    return boardBuzzer ? .buzzer : .silent
+}
+
+/// The one Config write that turns Desert on. When Desert's transition mutes, the mute rides in the
+/// SAME object: the board applies every key of one Config write together, so a link lost between
+/// two writes can no longer leave the board in Desert and audible. That mattered once a phone with
+/// no stored mode stopped re-asserting Desert's Silent at the next connect (security review
+/// 2026-09-29, second re-review). Android twin: desertEnableConfig in AcabBleManager.kt.
+func desertEnableConfig(mutes: Bool) -> [String: Bool] {
+    mutes ? ["desert": true, "buzzer": false] : ["desert": true]
+}
+
+/// The one Config write that turns Desert off: Desert and the restored buzzer state together, for
+/// the same reason as desertEnableConfig. Split in two, a link lost between them dropped the
+/// restore on a phone with no stored mode (its restore holds for the link only), and a failed
+/// desert:false followed by a landed buzzer:true left the board in Desert AND audible.
+/// Android twin: desertDisableConfig in AcabBleManager.kt.
+func desertDisableConfig(restoreTo: AlertMode?) -> [String: Bool] {
+    guard let mode = restoreTo else { return ["desert": false] }
+    return ["desert": false, "buzzer": mode == .buzzer]
+}
+
+/// One-time upgrade rule for a mode stored by 2.1.0 and earlier, which stored EVERY mode it set,
+/// Desert's app-origin mute and restore included. Only BUZZER can be a mode nobody picked: the
+/// in-memory default was .buzzer, and nothing but a picker tap ever produced .vibrate.
+///  - A stored Buzzer may be Desert's restore rather than a pick, and kept, it would un-mute a
+///    board muted from another phone at every connect. It is dropped, and the phone mirrors the
+///    board until the user picks, the quiet direction.
+///  - A stored mode beside a saved pre-Desert Buzzer (`desertSaved == .buzzer`) is dropped too.
+///    That stored mode is Silent, Desert's forced mute (from 2.0.8 a hand pick empties the saved
+///    mode; before it a hand-picked Silent could stay beside one, which is the same Silent). Kept,
+///    it made the phone one that stores a mode, and Desert-off then stored the saved Buzzer for
+///    good, possibly a default nobody picked. The saved mode stays, so Desert-off still restores
+///    the board, for that link only.
+///  - Otherwise the stored mode stays: a legacy Silent or Vibrate only ever mutes, and beside a
+///    saved Vibrate (always a hand pick) the forced Silent stays so Desert-off stores that pick.
+/// Applied once, gated by a stored flag. Android twin: alertModeKeptFromLegacyStore in
+/// AcabBleManager.kt.
+func alertModeKeptFromLegacyStore(_ stored: AlertMode?, desertSaved: AlertMode?) -> AlertMode? {
+    if desertSaved == .buzzer || stored == .buzzer { return nil }
+    return stored
+}
+
 /// The alert-mode state a Desert run owns, as ONE value.
 ///
 /// `saved` is the mode captured on the way into Desert (BLEManager.alertModeBeforeDesert).
@@ -1325,6 +1383,76 @@ func desertAlertModeTransition(state: DesertAlertModeState, event: DesertAlertMo
         return DesertAlertModeOutcome(state: DesertAlertModeState(saved: nil, offered: prior),
                                       effect: .keepMode, restoreTo: nil)
     }
+}
+
+// MARK: - Detection store cap
+
+/// How long a flag row counts as one of the newest arrivals when the detection store is over its
+/// cap, and how many such rows at once mark a flood. Android twins: STORE_FLOOD_WINDOW_MS and
+/// STORE_FLOOD_COHORT_ROWS in AcabBleManager.kt. The numbers must stay identical; both suites pin
+/// them.
+let storeFloodWindow: TimeInterval = 600
+let storeFloodCohortRows = 500
+
+/// Which rows leave the detection store when it is `overflow` rows over its cap. `rows` is the
+/// whole store in the order the call site ages it, oldest first: by lastSeen here (publishDetections
+/// sorts on it), by last filing on Android, where a replay re-files its row at replay time.
+///
+/// THE ATTACK THIS SHAPES (security review 2026-09-29). Rows are keyed type:mac, so a transmitter
+/// that fakes default-on signatures (Flock names, Axon OUIs, Remote ID serials) from fresh
+/// addresses adds one row per fake. Under the old rule a full store dropped its OLDEST flag rows,
+/// so earlier sessions, replayed history and watched devices went first, and the next checkpoint
+/// sealed the loss to disk. While a phone is connected the board does not buffer, so this log is
+/// the only record.
+///
+/// THE RULE, pass by pass:
+///  1. Ambient rows (Desert's confidence-0 nearby devices), oldest first.
+///  2. During a flood, flag rows first seen within `storeFloodWindow`, oldest first.
+///     A flood is MORE than `storeFloodCohortRows` such rows in the store at once, far past what a
+///     real drive adds in ten minutes, so a flood evicts its own rows and older evidence stays.
+///  3. Any flag row, oldest first: the ordinary rolling log.
+///  4. Watched rows, only when nothing else is left.
+/// A row with no first-seen clock reading counts as old: the call site passes nil for a replay row
+/// whose time is bracketed or unknown, and an anchored replay row carries its real capture time,
+/// which the board's own flood limit caps at a few hundred rows in ten minutes.
+///
+/// WHAT IT DOES NOT DO. A flood slower than the threshold still ages old rows out, as ordinary
+/// traffic would; it only takes far longer. A real device first seen DURING a flood competes with
+/// the fakes, which outnumber it.
+/// Android twin: storeEvictionVictims in AcabBleManager.kt, same passes in the same order.
+func storeEvictionVictims<Row>(rows: [Row], overflow: Int, now: Date,
+                               id: (Row) -> String,
+                               isAmbient: (Row) -> Bool,
+                               isWatched: (Row) -> Bool,
+                               firstSeen: (Row) -> Date?) -> [String] {
+    guard overflow > 0 else { return [] }
+    var out: [String] = []
+    var taken = Set<String>()
+    func take(_ keep: (Row) -> Bool) {
+        for row in rows {
+            if out.count >= overflow { return }
+            guard keep(row) else { continue }
+            let key = id(row)
+            if taken.insert(key).inserted { out.append(key) }
+        }
+    }
+    let cutoff = now.addingTimeInterval(-storeFloodWindow)
+    func inFloodWindow(_ row: Row) -> Bool {
+        guard !isAmbient(row), let first = firstSeen(row), first >= cutoff else { return false }
+        return !isWatched(row)
+    }
+    func unwatchedAmbient(_ row: Row) -> Bool { isAmbient(row) && !isWatched(row) }
+    func unwatchedFlag(_ row: Row) -> Bool { !isAmbient(row) && !isWatched(row) }
+
+    take(unwatchedAmbient)                                           // 1
+    if out.count < overflow {
+        var recent = 0
+        for row in rows where inFloodWindow(row) { recent += 1 }
+        if recent > storeFloodCohortRows { take(inFloodWindow) }     // 2
+    }
+    take(unwatchedFlag)                                              // 3
+    take(isWatched)                                                  // 4
+    return out
 }
 
 /// Connection lifecycle the UI watches. Doesn't track data-readiness separately.
@@ -1679,7 +1807,7 @@ final class BLEManager: NSObject, ObservableObject {
 
     private func setSessionReady(_ ready: Bool) {
         if ready {
-            updateSecureReadinessWatchdog(.sessionReady)
+            cancelSecureReadinessWatchdog()
         }
         sessionWasReady = ready
         sessionReady = ready
@@ -1703,7 +1831,7 @@ final class BLEManager: NSObject, ObservableObject {
     /// has no OS timeout and didFailToConnect never fires for a board that simply is not there
     /// (powered off since discovery, or claimed by another phone), so without this a tapped stale
     /// row pins connectionState at .connecting forever. One-shot, armed only by
-    /// connect(peripheral:), which both connect(_:) and connect(pickerEntryID:) route through; the
+    /// connect(peripheral:), which connect(pickerEntryID:) routes through for both row kinds; the
     /// unexpected-drop auto-reconnect stays deliberately indefinite and never runs it.
     private var connectTimeoutTimer: Timer?
     private let connectTimeoutInterval: TimeInterval = 15
@@ -1909,6 +2037,34 @@ final class BLEManager: NSObject, ObservableObject {
     private var approxSeenSeq: UInt32 = 0
     private let approxSeenSeqKey = "acab.approxSeenSeq"
     private let alertModeKey = "acab.alertMode"
+    /// Set once the stored mode has been through alertModeKeptFromLegacyStore. From then on only a
+    /// user pick, or a mode on a phone that already stores one, is ever stored (setAlertMode).
+    /// Android twin: KEY_ALERT_MODE_ORIGIN_AWARE in AcabBleManager.kt.
+    private let alertModeOriginAwareKey = "acab.alertModeOriginAware"
+    /// True once THIS phone stores an alert mode: the user picked one here, or one was already
+    /// stored at launch. setAlertMode is the only writer of alertModeKey, and it stores an
+    /// app-origin mode (Desert's mute or restore) only on a phone that already stores one. False on
+    /// a fresh install, a reinstall, cleared data and a second phone until the user picks; such a
+    /// phone mirrors the board and writes nothing at connect (connectBuzzerWrite, mirroredAlertMode).
+    /// Android twin: hasStoredAlertMode in AcabBleManager.
+    private var hasStoredAlertMode = false
+    /// An app-origin mode (Desert's mute or restore) set on a phone with NO stored mode. It holds for
+    /// THIS link only, so reconcileBuzzer keeps the board at that mode (and keeps re-sending a mute
+    /// the board has not taken), but it is never stored. It is cleared where every link STARTS
+    /// (didConnect), and that clear is the guarantee: the first status frame of a link is
+    /// reconciled before READY, and some teardowns reach neither didDisconnect nor clearConnection
+    /// (disconnect() during setup nils the peripheral, so its didDisconnect is ignored as a stray;
+    /// the OTA reboot-wait branch of disconnect()). It is also cleared on disconnect, in
+    /// clearConnection and at READY. Stored instead, it made the phone assert a mode nobody picked on every later
+    /// connect: a Desert on-and-off from a second phone un-muted a board muted elsewhere
+    /// (security review 2026-09-29, re-review). Android twin: appHeldAlertModeThisLink.
+    private var appHeldAlertModeThisLink = false
+
+    /// What the connect path writes to the buzzer: see connectBuzzerWrite. A property, not an
+    /// expression at the call site, so BeaconsTests can pin exactly what the manager hands it.
+    var connectTimeBuzzerWrite: Bool? {
+        connectBuzzerWrite(hasStoredMode: hasStoredAlertMode, mode: alertMode)
+    }
     private let lastSeqKey = "acab.lastSeq"   // persisted across disconnects; survives relaunch
     private let replayCursorKey = "acab.replayCursorV2" // one atomic "generation:sequence" tuple
     private let redactKey = "acab.redactLockScreen"
@@ -2050,7 +2206,7 @@ final class BLEManager: NSObject, ObservableObject {
     // Live-feed performance. A Desert-mode firehose can fire detection notifies far
     // faster than SwiftUI can diff a list, so we (1) cap the published array at the
     // most-recent `liveFeedCap` rows and (2) coalesce republishes to a few Hz.
-    private let liveFeedCap = 5000                 // most-recent rows kept (map + list + backing store). High enough to just keep logging through any real session (~5MB); still bounded so a marathon Desert firehose can't exhaust memory. The board's black box is the uncapped record.
+    private let liveFeedCap = 5000                 // most-recent rows kept (map + list + backing store). High enough to just keep logging through any real session (~5MB); still bounded so a marathon Desert firehose can't exhaust memory. Past the cap, rows leave by storeEvictionVictims.
     private var publishTimer: Timer?               // pending coalesced republish
     private var muteExpiryTimer: Timer?
     /// O(1) lookup used by every incoming detection and every rendered log row. Rebuilt only when
@@ -2222,7 +2378,15 @@ final class BLEManager: NSObject, ObservableObject {
         // Do not adopt here. At initialization there is no ready encrypted session yet and the
         // Location state has not been acted on; reconcileDriveMode owns adoption after both gates.
         notifier.refreshAuthorization()   // trust the system's answer, not our own last request
-        alertMode = AlertMode(rawValue: defaults.string(forKey: alertModeKey) ?? "") ?? .buzzer
+        var storedAlertMode = AlertMode(rawValue: defaults.string(forKey: alertModeKey) ?? "")
+        if !defaults.bool(forKey: alertModeOriginAwareKey) {
+            // Once per install: see alertModeKeptFromLegacyStore for why a legacy Buzzer is dropped.
+            storedAlertMode = alertModeKeptFromLegacyStore(storedAlertMode, desertSaved: alertModeBeforeDesert)
+            if storedAlertMode == nil { defaults.removeObject(forKey: alertModeKey) }
+            defaults.set(true, forKey: alertModeOriginAwareKey)
+        }
+        alertMode = storedAlertMode ?? .buzzer   // shown until a status frame says otherwise
+        hasStoredAlertMode = storedAlertMode != nil
         // Republish a restore offer left over from a previous run, so a Desert run the board ended
         // behind our back does not become a silence with nothing on screen saying why. Assigning
         // the mirror directly, NOT through desertAlertModeState: this is a read of what is already
@@ -2389,10 +2553,6 @@ final class BLEManager: NSObject, ObservableObject {
         if connectionState == .scanning { connectionState = .idle }
     }
 
-    func connect(_ device: DiscoveredDevice) {
-        connect(peripheral: device.peripheral)
-    }
-
     /// The one fresh-connect path, shared by a scanned row and the remembered row. central.connect
     /// is a pending connect that completes whenever the board is in range, advertising or not; the
     /// 15 s connectTimeoutTimer below bounds it exactly as it bounds a scanned row, so a remembered
@@ -2410,7 +2570,7 @@ final class BLEManager: NSObject, ObservableObject {
             carriedKind: discovered.first { $0.id == target.identifier }?.kindHint)
         central.stopScan()
         scanTimeoutTimer?.invalidate(); scanTimeoutTimer = nil   // the window closes with the scan
-        updateSecureReadinessWatchdog(.teardown)
+        cancelSecureReadinessWatchdog()
         setSessionReady(false)   // a fresh session hasn't reached ready until its CCCD subscribe lands
         retireSessionCharacteristics()
         connectionState = .connecting
@@ -2495,7 +2655,7 @@ final class BLEManager: NSObject, ObservableObject {
     /// advertising, otherwise the retrieved one) and takes the same bounded connect path.
     func connect(pickerEntryID id: UUID) {
         if let scanned = discovered.first(where: { $0.id == id }) {
-            connect(scanned)
+            connect(peripheral: scanned.peripheral)
         } else if let remembered = rememberedPeripheral, remembered.identifier == id {
             connect(peripheral: remembered)
         }
@@ -2578,7 +2738,7 @@ final class BLEManager: NSObject, ObservableObject {
         connectTimeoutTimer = nil
         guard connectionState == .connecting, reconnectTarget == nil,
               otaAwaitingReboot == nil, let pending = peripheral else { return }
-        updateSecureReadinessWatchdog(.teardown)
+        cancelSecureReadinessWatchdog()
         cancelUpdatesForLinkTeardown(reason: "The board connection timed out during the update.")
         resetConfigWriteQueue()
         retireSessionCharacteristics()
@@ -2588,22 +2748,19 @@ final class BLEManager: NSObject, ObservableObject {
         connectHint = .failure(.timeout, kind: targetKind)
     }
 
-    private func updateSecureReadinessWatchdog(_ event: SecureReadinessWatchdogEvent,
-                                               peripheral: CBPeripheral? = nil) {
-        switch secureReadinessWatchdogAction(for: event) {
-        case .cancel:
-            secureReadinessTimeoutTimer?.invalidate()
-            secureReadinessTimeoutTimer = nil
-        case .arm:
-            guard let peripheral else { return }
-            let expectedID = peripheral.identifier
-            secureReadinessTimeoutTimer?.invalidate()
-            secureReadinessTimeoutTimer = Timer.scheduledTimer(
-                withTimeInterval: secureReadinessTimeoutInterval,
-                repeats: false) { [weak self] _ in
-                    self?.secureReadinessTimedOut(expectedID: expectedID)
-                }
-        }
+    private func cancelSecureReadinessWatchdog() {
+        secureReadinessTimeoutTimer?.invalidate()
+        secureReadinessTimeoutTimer = nil
+    }
+
+    private func armSecureReadinessWatchdog(_ peripheral: CBPeripheral) {
+        let expectedID = peripheral.identifier
+        secureReadinessTimeoutTimer?.invalidate()
+        secureReadinessTimeoutTimer = Timer.scheduledTimer(
+            withTimeInterval: secureReadinessTimeoutInterval,
+            repeats: false) { [weak self] _ in
+                self?.secureReadinessTimedOut(expectedID: expectedID)
+            }
     }
 
     private func secureReadinessTimedOut(expectedID: UUID) {
@@ -2624,7 +2781,7 @@ final class BLEManager: NSObject, ObservableObject {
 
     func disconnect() {
         let pendingOtaReconnect = otaAwaitingReboot != nil ? peripheral : nil
-        updateSecureReadinessWatchdog(.teardown)
+        cancelSecureReadinessWatchdog()
         cancelUpdatesForLinkTeardown(
             reason: "Update cancelled because you disconnected from the board.")
         resetConfigWriteQueue()
@@ -4130,28 +4287,29 @@ final class BLEManager: NSObject, ObservableObject {
             .sorted { $0.t > $1.t }
             .map(\.d)
         // Rolling cap on the backing store too, so a long Desert-mode session can't grow
-        // memory without bound (parity with Android's STORE_CAP). Priority-aware eviction:
-        // an airport-density flood of confidence-0 "nearby device" rows must never push a
-        // real flag (tracker, body cam, drone, glasses, or a starred/watched device) out of
-        // the store. Drop the oldest ambient rows first; only if the store is somehow all
-        // flags past the cap do we fall back to dropping the oldest flags too.
+        // memory without bound (parity with Android's STORE_CAP). Which rows go is
+        // storeEvictionVictims: ambient rows first, a flood's own rows next, then the oldest
+        // flags, and watched rows last, so neither an airport-density Desert firehose nor a
+        // flood of faked signatures can push older evidence out of the store.
         var logRows = sorted
         if sorted.count > liveFeedCap {
-            let overflow = sorted.count - liveFeedCap
-            let oldestFirst = Array(sorted.reversed())
-            var evict: [Detection] = []
-            for d in oldestFirst where d.type == .nearbyDevice {
-                if evict.count == overflow { break }
-                evict.append(d)
-            }
-            if evict.count < overflow {                     // last resort: too many flags to fit
-                for d in oldestFirst where d.type != .nearbyDevice {
-                    if evict.count == overflow { break }
-                    evict.append(d)
-                }
-            }
-            for d in evict { evictKey(d.id) }   // the one full-teardown list, shared with the ignore paths
-            let evictIds = Set(evict.map { $0.id })
+            let watchedMacs = watchedMacSet
+            let evict = storeEvictionVictims(
+                rows: Array(sorted.reversed()), overflow: sorted.count - liveFeedCap, now: lastPublish,
+                id: { $0.id }, isAmbient: { $0.type == .nearbyDevice },
+                isWatched: { watchedMacs.contains($0.loweredMac) },
+                // Only a first-seen stamp that is a clock reading counts toward a flood. A bracketed
+                // or unknown replay row is re-keyed near the sync time by resolveBracketedHistory,
+                // so counting it would let a large offline replay evict itself. Android keeps those
+                // rows at their near-2001 pseudo stamp, which never falls inside the window.
+                firstSeen: { d in
+                    switch self.timeBasis(for: d.id) {
+                    case .exact, .reconstructed: return self.firstSeenAt[d.id]
+                    case .bracketed, .unknown: return nil
+                    }
+                })
+            for id in evict { evictKey(id) }   // the one full-teardown list, shared with the ignore paths
+            let evictIds = Set(evict)
             logRows = sorted.filter { !evictIds.contains($0.id) }
         }
         // Both @Published projections come from the same capped/sorted array. Log keeps the
@@ -4370,16 +4528,6 @@ final class BLEManager: NSObject, ObservableObject {
         func lastSeenBasis(for id: String) -> TimeBasis? {
             rowByID[id]?.lastSeenBasis
         }
-
-        func filtered(category: String?, unseenOnly: Bool, offlineOnly: Bool) -> DetectionExportSnapshot {
-            let kept = rows.filter { row in
-                (category == nil || row.d.type.category == category)
-                    && (!unseenOnly || unseenIDs.contains(row.d.id))
-                    && (!offlineOnly || row.d.offline)
-            }
-            let keptIDs = Set(kept.map { $0.d.id })
-            return DetectionExportSnapshot(rows: kept, unseenIDs: unseenIDs.intersection(keptIDs))
-        }
     }
 
     /// Snapshot the authoritative Log plus every side-table field used by CSV/GPX. All BLE
@@ -4583,7 +4731,7 @@ final class BLEManager: NSObject, ObservableObject {
             // overload that produced the CSV bug. Without the gate a drone's own position would be
             // labelled "Position is where the PHONE was", the exact inversion of the honesty rule
             // this writer exists to enforce. Its real position gets its own waypoint below.
-            // Matches Android detectionsGpx; Android has no legacy pair to export.
+            // Matches Android renderDetectionsGpx; Android has no legacy pair to export.
             if let c = r.approxCoordinate {
                 wpt(lat: c.latitude, lon: c.longitude,
                     name: "Heard: \(label)",
@@ -4631,11 +4779,6 @@ final class BLEManager: NSObject, ObservableObject {
         case failure(String)
     }
 
-    /// `category` is a DeviceType.category key (ALPR / DRONE / BODY CAM / TRACKER), or nil for
-    /// everything. Callers pass the filter the user is already looking at in the log, so export
-    /// means "give me what is on screen" rather than silently handing over the whole history.
-    /// The chosen category also lands in the FILENAME, so a partial export can never be mistaken
-    /// for a complete one after it leaves the app.
     // MARK: - Bounded contribution capture window
 
     private static func ms(_ d: Date?) -> Int64? { d.map { Int64($0.timeIntervalSince1970 * 1000) } }
@@ -4788,15 +4931,6 @@ final class BLEManager: NSObject, ObservableObject {
         }
     }
 
-    /// Convenience for a whole-log export. It still snapshots the authoritative store rather than
-    /// the delayed SwiftUI projection.
-    func writeDetections(_ format: ExportFormat, category: String? = nil,
-                         completion: @escaping (DetectionExportResult) -> Void) {
-        let snapshot = detectionExportSnapshot().filtered(category: category,
-                                                          unseenOnly: false, offlineOnly: false)
-        writeDetections(format, snapshot: snapshot, filenameQualifier: category, completion: completion)
-    }
-
     /// Use the same document-aware field serializer the redactor tests. Delegating here is
     /// load-bearing: a lone carriage return is a CSV record separator too, so the old local
     /// comma/quote/LF-only rule could emit an unquoted UAS ID that shifted later location columns
@@ -4894,15 +5028,16 @@ final class BLEManager: NSObject, ObservableObject {
             }
             return
         }
-        writeConfig(["desert": on])
         if on {
             // Capture the mode we are about to mute, and close any offer left over from the last
             // run: the user picked a new mute over a mode they were being offered back, so one tap
             // must not undo the mute they just asked for. desertAlertModeTransition owns both
             // decisions, including "already Silent means nothing to give back". Mirrors Android.
-            if applyDesertAlertModeEvent(.userEnabledDesert).effect == .muteToSilent {
-                setAlertMode(.silent, origin: .app)
-            }
+            let mutes = applyDesertAlertModeEvent(.userEnabledDesert).effect == .muteToSilent
+            // Desert and its mute in ONE write (see desertEnableConfig). setAlertMode below sends
+            // the mute again, which is idempotent.
+            writeConfig(desertEnableConfig(mutes: mutes))
+            if mutes { setAlertMode(.silent, origin: .app) }
             desertSeenOn = false   // wait for the board to confirm before arming the reconciler
         } else {
             // THE USER ended Desert, right here, so the mode is restored rather than offered: the
@@ -4911,9 +5046,11 @@ final class BLEManager: NSObject, ObservableObject {
             // which is why it offers instead. origin .app, because nobody picked this mode now -
             // they picked it before Desert started. Mirrors Android.
             let outcome = applyDesertAlertModeEvent(.userEndedDesert)
-            if outcome.effect == .restore, let prior = outcome.restoreTo {
-                setAlertMode(prior, origin: .app)
-            }
+            let restoreTo = outcome.effect == .restore ? outcome.restoreTo : nil
+            // Desert-off and its restore in ONE write (see desertDisableConfig). setAlertMode below
+            // sends the buzzer state again, which is idempotent.
+            writeConfig(desertDisableConfig(restoreTo: restoreTo))
+            if let prior = restoreTo { setAlertMode(prior, origin: .app) }
         }
     }
 
@@ -4981,6 +5118,10 @@ final class BLEManager: NSObject, ObservableObject {
     ///  3. The correction was persisted, so one transient link fault could rewrite a stored
     ///     preference. The correction is now in-memory for the session; the stored preference is
     ///     re-asserted from scratch on the next launch.
+    ///
+    /// A LATER FIX (security review 2026-09-29): a phone with NO stored mode used to assert the
+    /// in-memory default, .buzzer, and un-mute a board muted from another install or phone. Such a
+    /// phone now only mirrors the board (the hasStoredAlertMode guard below).
     /// Latched view of the board's Desert state, so a `desert:false` frame can be told apart from
     /// "our enable write has not landed yet". Only flips true once the BOARD confirms Desert on.
     private var desertSeenOn = false
@@ -5067,7 +5208,22 @@ final class BLEManager: NSObject, ObservableObject {
         applyDesertAlertModeEvent(.boardEndedDesert)
     }
 
-    private func reconcileBuzzer(_ s: DeviceStatus) {
+    /// Reconcile the alert mode against the board's reported buzzer; the history and the three
+    /// earlier mistakes are in the comment block above desertSeenOn. NOT private, so BeaconsTests
+    /// can drive it with a decoded status frame, as it does reconcileDesert.
+    func reconcileBuzzer(_ s: DeviceStatus) {
+        // A phone holding no mode shows what the board does and writes nothing. The board's state
+        // is the last choice anyone made for it, and only a pick on THIS phone may change it (see
+        // connectBuzzerWrite). BEFORE the mesh bail, so a mesh board mirrors as .silent instead of
+        // leaving the .buzzer placeholder for Desert to capture (see mirroredAlertMode). Guarded:
+        // @Published republishes an equal value, and this runs on every status frame.
+        if let mirrored = mirroredAlertMode(hasStoredMode: hasStoredAlertMode,
+                                            heldThisLink: appHeldAlertModeThisLink, boardBuzzer: s.buzzer) {
+            if alertMode != mirrored { alertMode = mirrored }
+            buzzerReassertAttempts = 0
+            lastBuzzerMuteWrite = .distantPast
+            return
+        }
         guard !s.isMeshDetect else { buzzerReassertAttempts = 0; return }   // no buzzer to reconcile
 
         let wantBuzzer = (alertMode == .buzzer)
@@ -5121,7 +5277,16 @@ final class BLEManager: NSObject, ObservableObject {
             _ = setDemoStatusValue(m == .buzzer, for: "buzzer")
             return
         }
-        defaults.set(m.rawValue, forKey: alertModeKey)
+        // Stored only when a user picked it, or when this phone already stores a mode. An app-origin
+        // mode on a phone with no stored mode holds for this link only (appHeldAlertModeThisLink):
+        // Desert still mutes and restores the board, but the phone goes back to mirroring on the
+        // next connect instead of asserting a mode nobody picked here.
+        if origin == .user || hasStoredAlertMode {
+            defaults.set(m.rawValue, forKey: alertModeKey)
+            hasStoredAlertMode = true
+        } else {
+            appHeldAlertModeThisLink = true
+        }
         // A user pick drops everything the app was holding on their behalf: the mode captured on
         // the way into Desert AND an offer still on screen. SILENT IS INCLUDED, which is the whole
         // point - choosing silence by hand is a choice, not a mute to undo later. An app-set mode
@@ -5439,7 +5604,7 @@ final class BLEManager: NSObject, ObservableObject {
     /// well as failing the update. Leaving the retained peripheral and stale characteristics in
     /// place would keep the app looking connected and let a later callback revive dead state.
     func otaRebootReconnectTimedOut(ownerID: UUID, reason: String) {
-        updateSecureReadinessWatchdog(.teardown)
+        cancelSecureReadinessWatchdog()
         guard let target = peripheral, target.identifier == ownerID else {
             cancelUpdatesForLinkTeardown(reason: reason)
             return
@@ -5885,8 +6050,9 @@ final class BLEManager: NSObject, ObservableObject {
             clearPending: persistedDetectionClearTombstone.isPending
         ) else { return }
         let loadToken = persistedDetectionLoadGate.beginLoad()
-        // Decode + sort OFF the main thread, then populate the store back ON it. The file caps at
-        // liveFeedCap (5000) rows / ~5MB, so doing this inline in init() on the main thread is a
+        // Decode + sort OFF the main thread, then populate the store back ON it. The file holds about
+        // liveFeedCap (5000) rows / ~5MB (a checkpoint can overshoot until the next publish; see
+        // NO CAP HERE below), so doing this inline in init() on the main thread is a
         // launch-watchdog (0x8badf00d) risk on a full log - Android already runs it off-main. CB is
         // created queue: nil (every callback lands on main), so applying the rows back on main keeps
         // store access main-confined and needs no locks. Routed through persistQueue so a load can't
@@ -5903,17 +6069,12 @@ final class BLEManager: NSObject, ObservableObject {
                 print("[ACAB-store] skipped \(skipped) unreadable row(s) of \(decoded.count); kept \(rows.count)")
             }
             #endif
-            // CAP THE RELOAD to liveFeedCap, MIRRORING publishDetections' eviction: keep real flags,
-            // drop ambient Desert rows first (a plain newest-first cut would discard an old body-cam
-            // hit to make room for a fresh confidence-0 phone). Defensive today - the file is written
-            // from the already-capped store - but must not be the one place that prefers noise over
-            // evidence if that stops being true (e.g. a file from a build with a larger cap).
-            let byRecency = rows.sorted { ($0.lastSeen ?? .distantPast) > ($1.lastSeen ?? .distantPast) }
-            let flags   = byRecency.filter { $0.detection.type != .nearbyDevice }
-            let ambient = byRecency.filter { $0.detection.type == .nearbyDevice }
-            let newest  = flags.count >= self.liveFeedCap
-                ? Array(flags.prefix(self.liveFeedCap))
-                : flags + ambient.prefix(self.liveFeedCap - flags.count)
+            // NO CAP HERE. A checkpoint can hold a few rows past liveFeedCap (it snapshots the store
+            // between an ingest and the coalesced publish), and applyLoadedRows ends in
+            // publishDetections, whose storeEvictionVictims is the one owner of which rows go. This
+            // used to cut the file with a second copy of the old rule, which drifted from it: it
+            // dropped watched rows before older unwatched ones.
+            let newest = rows.sorted { ($0.lastSeen ?? .distantPast) > ($1.lastSeen ?? .distantPast) }
             DispatchQueue.main.async {
                 guard self.persistedDetectionLoadGate.accepts(loadToken),
                       persistedDetectionLoadAllowed(
@@ -5935,7 +6096,8 @@ final class BLEManager: NSObject, ObservableObject {
         return t.isFinite && (0...4_294_967_295).contains(t) ? d : nil
     }
 
-    /// Populate the store from a decoded, capped, recency-sorted batch. MAIN THREAD only (the store
+    /// Populate the store from a decoded, recency-sorted batch; the closing publishDetections
+    /// applies the cap. MAIN THREAD only (the store
     /// is main-confined; CB runs queue: nil). Split out of loadPersistedDetections so the heavy
     /// decode + sort can run off-main without moving store access off it.
     private func applyLoadedRows(_ newest: [StoredRow]) {
@@ -6747,7 +6909,7 @@ final class BLEManager: NSObject, ObservableObject {
             scanWhenCentralIsReady = false
             stopScan()
         }
-        updateSecureReadinessWatchdog(.teardown)
+        cancelSecureReadinessWatchdog()
         cancelUpdatesForLinkTeardown(reason: "Update cancelled before entering the demo.")
         resetConfigWriteQueue()
         retireSessionCharacteristics()
@@ -7002,10 +7164,11 @@ extension BLEManager: CBCentralManagerDelegate {
     /// reconnect bookkeeping, since there is nothing to reconnect to until the radio is back.
     private func clearConnection() {
         resetConfigWriteQueue()
+        appHeldAlertModeThisLink = false   // radio-off/reset can end a link with no didDisconnect
         checkpointLive()   // the session's only copy is in RAM; get it to disk before the link state goes
         stopStatusPolling()
         connectTimeoutTimer?.invalidate(); connectTimeoutTimer = nil
-        updateSecureReadinessWatchdog(.teardown)
+        cancelSecureReadinessWatchdog()
         // CoreBluetooth may provide no disconnect callback when its radio becomes unavailable.
         // Retaining any update state here would let a later board inherit this board's transfer or
         // confirmation. Settle every asynchronous owner before dropping the handle.
@@ -7080,13 +7243,15 @@ extension BLEManager: CBCentralManagerDelegate {
     ///
     /// WHY THIS EXISTS ON IOS AT ALL, since the list is keyed on peripheral.identifier and that is
     /// a CoreBluetooth per-host UUID rather than the board's BLE address. The question is whether
-    /// CoreBluetooth collapses a peripheral whose advertised address rotates (the firmware
-    /// advertises a Resolvable Private Address, re-rolled every CONFIG_BT_NIMBLE_RPA_TIMEOUT =
-    /// 900 s) onto ONE identifier. It does not, and cannot, before the board is bonded:
+    /// CoreBluetooth collapses a peripheral whose advertised address rotates (a bench firmware
+    /// build advertised a Resolvable Private Address, re-rolled every CONFIG_BT_NIMBLE_RPA_TIMEOUT
+    /// = 900 s; that build option is removed and released firmware keeps a fixed address, see
+    /// docs/ble-protocol.md) onto ONE identifier. It does not, and cannot, before the board is
+    /// bonded:
     ///
     ///   - An RPA is only resolvable with the advertiser's Identity Resolving Key, and a central
     ///     receives that key during bonding (Bluetooth Core Spec; the firmware distributes it
-    ///     explicitly via BLE_SM_PAIR_KEY_DIST_ID in acab_ble_service.cpp for exactly this reason).
+    ///     explicitly via BLE_SM_PAIR_KEY_DIST_ID in acab_ble_service.cpp).
     ///     CoreBluetooth exposes no API to hand it an IRK, so before the first pair iOS has nothing
     ///     to resolve WITH: each new address is a device it has never met.
     ///   - Apple documents the identifier only as "The unique, persistent identifier associated
@@ -7150,6 +7315,7 @@ extension BLEManager: CBCentralManagerDelegate {
         // callback. No in-flight tag or queued payload from the retired link may block/inherit the
         // new link's KEY write.
         resetConfigWriteQueue()
+        appHeldAlertModeThisLink = false   // a new link never inherits an app-set mode (see its doc)
         // A CBPeripheral object and its cached services can be reused across reconnects. Retire
         // every old channel now; fresh discovery installs the only identities callbacks may use.
         retireSessionCharacteristics()
@@ -7161,7 +7327,7 @@ extension BLEManager: CBCentralManagerDelegate {
         self.peripheral = peripheral
         peripheral.delegate = self
         connectTimeoutTimer?.invalidate(); connectTimeoutTimer = nil   // transport resolved
-        updateSecureReadinessWatchdog(.transportConnected, peripheral: peripheral)
+        armSecureReadinessWatchdog(peripheral)
         if reconnectTarget === peripheral { reconnectTarget = nil }
         sessionDiscoveryPhase = .awaitingServices
         peripheral.discoverServices([ACABProfile.service])
@@ -7177,7 +7343,7 @@ extension BLEManager: CBCentralManagerDelegate {
         }
         guard self.peripheral === peripheral else { return }
         connectTimeoutTimer?.invalidate(); connectTimeoutTimer = nil
-        updateSecureReadinessWatchdog(.teardown)
+        cancelSecureReadinessWatchdog()
         if otaAwaitingReboot != nil {
             // The reboot wait owns this exact handle and has its own overall timeout. A transient
             // failed reconnect should retry rather than clear the handle and strand confirmation.
@@ -7225,11 +7391,12 @@ extension BLEManager: CBCentralManagerDelegate {
         // teardown below clears `status`, and the not-ready branch may forget the record. The
         // reconnect panel and banner, and a failure hint, name the board by it.
         let droppedKind = boardKind(for: peripheral.identifier)
+        appHeldAlertModeThisLink = false   // an app-set mode holds for its link only (see its doc)
         // Includes the OTA-reboot early-return below. CoreBluetooth need not answer an in-flight
         // Config write after link loss, so carrying that tag would wedge the reconnect handshake.
         resetConfigWriteQueue()
         retireSessionCharacteristics()
-        updateSecureReadinessWatchdog(.teardown)
+        cancelSecureReadinessWatchdog()
         if otaQuarantinedPeripheralID == peripheral.identifier {
             otaQuarantinedPeripheralID = nil
         }
@@ -7391,7 +7558,7 @@ extension BLEManager: CBPeripheralDelegate {
                 .compactMap { $0 }.joined(separator: " + ")
             connectHint = .failure(.missingChannel(missing),
                                    kind: boardKind(for: peripheral.identifier))
-            updateSecureReadinessWatchdog(.teardown)
+            cancelSecureReadinessWatchdog()
             intentionalDisconnectID = peripheral.identifier
             central?.cancelPeripheralConnection(peripheral)
             // Keep this unresolved attempt non-idle until its own disconnect callback consumes the
@@ -7525,7 +7692,11 @@ extension BLEManager: CBPeripheralDelegate {
         lastBuzzerMuteWrite = .distantPast       // and the slow mute retry starts over with it
         listPushAttempts.removeAll()             // and a fresh board gets a fresh convergence budget
         lastPushedEnabled = nil                  // force the next status frame to re-push the columns
-        setBuzzerEnabled(alertMode == .buzzer)   // a fresh beacon boots up buzzing; match the phone's mode
+        // Only a phone that stores a mode writes the buzzer here. One that does not (fresh install,
+        // reinstall, second phone) mirrors the board from its first status frame instead, so a
+        // board muted elsewhere stays muted. See connectBuzzerWrite.
+        appHeldAlertModeThisLink = false   // already cleared in didConnect; repeated at the session edge
+        if let on = connectTimeBuzzerWrite { setBuzzerEnabled(on) }
         lastGpsSent = .distantPast; sendPhoneLocation()   // push an existing fix to the freshly-connected beacon
         // Background: keep the "latest"/OTA gate current. Hop to the main actor explicitly
         // (the store is @MainActor); CB callbacks already run on main, so this is immediate.

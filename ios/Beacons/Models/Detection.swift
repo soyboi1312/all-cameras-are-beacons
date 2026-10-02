@@ -324,8 +324,8 @@ struct Detection: Identifiable, Equatable {
     let altitude: Int?           // metres MSL (drones)
     let gpsAgeSec: Int?          // age (s) of the fix behind lat/lon (json "gage"). Present on any
                                  // non-drone row whose stamping fix was >= 1s old, LIVE rows included;
-                                 // nil = fresh sub-second fix, no coordinate, the board's own onboard
-                                 // fix, a drone's broadcast position, or a trimmed hist row
+                                 // nil = fresh sub-second fix, no coordinate, a drone's broadcast
+                                 // position, or a trimmed hist row
 
     // Drone Remote ID flight telemetry (drones only; nil when not broadcast).
     let speedH: Int?             // horizontal speed m/s   (json "spd")

@@ -1,5 +1,6 @@
 package tech.acab.app.ui
 
+import org.json.JSONObject
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertSame
@@ -30,35 +31,9 @@ class MapPinTest {
 
     private var seq = 0
 
-    private fun row(type: DeviceType, mac: String = "m${seq++}") = Detection(
-        type = type,
-        source = 0,
-        method = 0,
-        confidence = 1,
-        mac = mac,
-        rssi = -50,
-        name = null,
-        rid = null,
-        detail = null,
-        lat = null,
-        lon = null,
-        pilotLat = null,
-        pilotLon = null,
-        altitude = null,
-        speedH = null,
-        speedV = null,
-        heading = null,
-        heightAGL = null,
-        pilotAlt = null,
-        ridStatus = null,
-        count = 1,
-        isNew = true,
-        gpsAgeSec = null,
-        hist = false,
-        seq = 0L,
-        at = 0L,
-        approx = false,
-    )
+    private fun row(type: DeviceType, mac: String = "m${seq++}") = Detection.fromJson(
+        JSONObject().put("t", type.raw).put("c", 1).put("mac", mac).put("rssi", -50)
+            .put("new", true))
 
     /** What buildMapRenderPlan hands the draw loop for [items] at street zoom over the whole
      *  world: one MapSymbolGroup per spot, coordinates and stamps supplied by id. Zoom 16 sits
@@ -442,39 +417,6 @@ class MapPinTest {
         val now = 1_700_000_000_000L
         assertEquals(PinAge.FRESH, pinAge(now + 60_000L, now))
         assertEquals(PinAge.FRESH, pinAge(now + PIN_RECENT_MAX_MS * 2, now))
-    }
-
-    // ---- what a marker's own text says --------------------------------------------------
-
-    /** A lone pin carries the bare category it has always carried. */
-    @Test
-    fun aLonePinKeepsItsBareCategory() {
-        assertEquals("ALPR", pinTitle("ALPR", 1))
-    }
-
-    /** A grouped title names the count and the category it is drawing. */
-    @Test
-    fun aGroupedPinSaysHowManyRowsItStandsFor() {
-        val title = pinTitle("BODY CAM", 4)
-        assertTrue(title, title.contains("4"))
-        assertTrue(title, title.contains("BODY CAM"))
-    }
-
-    /** The title makes NO claim about age, at any size.
-     *
-     *  A previous round appended "not heard in the last hour." here for the STALE tier. Nothing
-     *  ever presented it: a detection marker's click listener returns true, so osmdroid's default
-     *  title InfoWindow never opens, and osmdroid publishes no per-marker accessibility node
-     *  either. On Android the non-visual route to a pin's age is the dossier the tap opens, whose
-     *  "Last seen" row prints it via relativeAgo (DetailScreen.kt). This test keeps an unrendered
-     *  sentence from being added back here. */
-    @Test
-    fun theTitleNeverClaimsAnAge() {
-        for (n in listOf(1, 2, 3, 120)) {
-            val title = pinTitle("ALPR", n)
-            assertFalse(title, title.contains("not heard"))
-            assertFalse(title, title.contains("hour"))
-        }
     }
 
     // ---- what the STALE tier is allowed to do to a tone ---------------------------------

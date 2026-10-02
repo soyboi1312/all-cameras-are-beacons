@@ -646,7 +646,7 @@ private val LOG_CATEGORIES = listOf(
     LogCategory("CAMERA", "NETWORK CAM", "Network camera", "Network Cam"),
     // Overlay lens: current stars keep their underlying type; historical firmware t=8 rows also
     // belong. Membership is resolved by isWatchedFilterMember, not DeviceType.category alone.
-    LogCategory(WATCHED_FILTER_KEY, "WATCHED", "Watched or starred", "Watched"),
+    LogCategory(WATCHED_FILTER_KEY, "WATCHED", "Watched device", "Watched"),
 )
 
 /** Per-emission tallies off the LIVE store, computed once per (detections, watermark,

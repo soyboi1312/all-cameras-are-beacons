@@ -37,10 +37,9 @@ import tech.acab.app.ui.desertRestoreNeedsPreConnectSurface
  * Compose surfaces (which control is wired to takePendingAlertModeRestore, and where the offer
  * draws) are view-only on both platforms; [desertSilenceSlot],
  * [desertRestoreNeedsDetachedSurface] and [desertRestoreNeedsPreConnectSurface] in AcabAppStateTest
- * pin the decisions they render, not the rendering. That the detached slot LEADS the Beacon tab is
- * held by firmware/tools/check-signature-drift.py; that AcabApp draws the same panel first on the
- * connect screen is held by nothing automated, because the drift script cannot read AcabApp.kt
- * without that path being added to firmware-ci.yml's two lists.
+ * pin the decisions they render, not the rendering. That the detached slot LEADS the Beacon tab,
+ * and that AcabApp draws the same panel first on the connect screen, are both held by
+ * firmware/tools/check-signature-drift.py.
  */
 class DesertAlertModeTest {
 

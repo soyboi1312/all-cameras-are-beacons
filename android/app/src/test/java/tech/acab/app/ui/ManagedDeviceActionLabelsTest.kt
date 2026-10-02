@@ -29,6 +29,6 @@ class ManagedDeviceActionLabelsTest {
     @Test
     fun unmuteAndUnstarActionsNameTheDevice() {
         assertEquals("unmute my own AirTag", unmuteClickLabel("my own AirTag"))
-        assertEquals("unstar partner's keys", unstarClickLabel("partner's keys"))
+        assertEquals("stop watching partner's keys", unstarClickLabel("partner's keys"))
     }
 }

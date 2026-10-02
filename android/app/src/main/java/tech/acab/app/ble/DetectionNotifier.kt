@@ -123,7 +123,6 @@ class DetectionNotifier(private val ctx: Context) {
             if (!anyEnabled(ctx)) return false
             if (!hasPostPermission(ctx)) return true
             if (!NotificationManagerCompat.from(ctx).areNotificationsEnabled()) return true
-            if (Build.VERSION.SDK_INT < Build.VERSION_CODES.O) return false
             val nm = ctx.getSystemService(Context.NOTIFICATION_SERVICE) as? NotificationManager
                 ?: return false
             val ch = nm.getNotificationChannel(CHANNEL_ID) ?: return false
@@ -138,7 +137,6 @@ class DetectionNotifier(private val ctx: Context) {
         fun liveChannelDeliverable(ctx: Context): Boolean {
             if (!hasPostPermission(ctx) ||
                 !NotificationManagerCompat.from(ctx).areNotificationsEnabled()) return false
-            if (Build.VERSION.SDK_INT < Build.VERSION_CODES.O) return true
             val nm = ctx.getSystemService(Context.NOTIFICATION_SERVICE) as? NotificationManager
             return nm?.getNotificationChannel(AcabLinkService.CHANNEL_ID)?.importance !=
                 NotificationManager.IMPORTANCE_NONE
@@ -155,7 +153,6 @@ class DetectionNotifier(private val ctx: Context) {
     }
 
     private fun ensureChannel() {
-        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.O) return
         val nm = ctx.getSystemService(Context.NOTIFICATION_SERVICE) as? NotificationManager ?: return
         if (nm.getNotificationChannel(CHANNEL_ID) != null) return
         nm.createNotificationChannel(

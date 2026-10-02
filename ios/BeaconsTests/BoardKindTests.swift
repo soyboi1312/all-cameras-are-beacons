@@ -6,27 +6,13 @@ import XCTest
 /// copy. The expected strings are the iOS column of the owner-approved wording table (38 rows,
 /// OUI-Spy plan, 2026-09-25): the beacon renderings are today's beacon text, except the connect
 /// surfaces the plan settled to one string shared with Android. Every store touch goes to a
-/// throwaway UserDefaults suite created and removed here, never the install.
+/// throwaway UserDefaults suite (isolatedDefaults), never the install.
 /// Android twin: BoardKindTest (same fixtures, Android's pairing words).
 final class BoardKindTests: XCTestCase {
-    private var suiteName = ""
-    private var defaults: UserDefaults!
+    private lazy var defaults = isolatedDefaults()
 
     private let boardA = UUID(uuidString: "11111111-1111-1111-1111-111111111111")!
     private let boardB = UUID(uuidString: "22222222-2222-2222-2222-222222222222")!
-
-    override func setUp() {
-        super.setUp()
-        suiteName = "tech.beacons.tests.boardKind.\(UUID().uuidString)"
-        defaults = UserDefaults(suiteName: suiteName)
-        defaults.removePersistentDomain(forName: suiteName)
-    }
-
-    override func tearDown() {
-        defaults.removePersistentDomain(forName: suiteName)
-        defaults = nil
-        super.tearDown()
-    }
 
     // MARK: model
 

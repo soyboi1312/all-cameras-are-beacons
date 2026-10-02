@@ -49,25 +49,6 @@ enum ContributionCsv {
     /// building or floor the operator stood on.
     static let operatorLocationCols: Set<String> = ["operator_lat", "operator_lon", "operator_alt_m"]
 
-    /// True when a device's presence overlaps a capture window. A bounded "Start -> observe -> Stop"
-    /// contribution exports ONLY the devices audible during [startMs, stopMs], not the whole history.
-    /// Membership is OVERLAP, not containment: a device first heard before Start but still present
-    /// during the window WAS observed during it. A device with no phone-side timestamp is excluded.
-    /// Millis (not Date) to stay byte-identical to Android ContributionCsv.inCaptureWindow.
-    static func inCaptureWindow(_ firstSeenMs: Int64?, _ lastSeenMs: Int64?, _ startMs: Int64, _ stopMs: Int64) -> Bool {
-        guard let f = firstSeenMs, let l = lastSeenMs else { return false }
-        return f <= stopMs && l >= startMs
-    }
-
-    /// Timestamp written by a bounded capture. The full-history CSV uses first-ever sighting, but
-    /// a capture row must name when that device was actually heard inside this window. The caller
-    /// freezes `lastSeenMs` at Stop; clamping is a final invariant guard against clock/boundary
-    /// skew and guarantees every emitted instant lies inside [startMs, stopMs].
-    static func captureTimestamp(_ lastSeenMs: Int64?, _ startMs: Int64, _ stopMs: Int64) -> Int64? {
-        guard let lastSeenMs else { return nil }
-        return min(stopMs, max(startMs, lastSeenMs))
-    }
-
     static func blankColumns(includeObserverLocation: Bool, includeDroneLocation: Bool,
                              includeOperatorLocation: Bool) -> Set<String> {
         var s = Set<String>()

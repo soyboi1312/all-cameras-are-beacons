@@ -326,15 +326,14 @@ final class NrfDfuBaselineScanner: NSObject, CBCentralManagerDelegate {
     private var nearby = Set<UUID>()
     private var finished = false
     private var scanStarted = false
-    private var scanDuration: TimeInterval = 2
+    private let scanDuration: TimeInterval = 2
     private let onFinish: (Result<Set<UUID>, Error>) -> Void
 
     init(onFinish: @escaping (Result<Set<UUID>, Error>) -> Void) {
         self.onFinish = onFinish
     }
 
-    func start(duration: TimeInterval = 2) {
-        scanDuration = duration
+    func start() {
         central = CBCentralManager(delegate: self, queue: .main)
         let startup = DispatchWorkItem { [weak self] in
             self?.finish(.failure(ScanError.unavailable))

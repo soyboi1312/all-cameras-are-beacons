@@ -184,12 +184,6 @@ class MuteAndNearbyPolicyTest {
     }
 
     @Test
-    fun sampleManagedEditsNeverPersist() {
-        assertFalse(managedListPersistenceAllowed(demoMode = true))
-        assertTrue(managedListPersistenceAllowed(demoMode = false))
-    }
-
-    @Test
     fun exactMacIndexNormalizesOnceForConstantTimeIngestLookup() {
         val rules = (0 until 256).map { i ->
             IgnoredDevice(

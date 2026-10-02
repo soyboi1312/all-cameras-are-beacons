@@ -24,6 +24,7 @@ import tech.acab.app.model.DeviceStatus
 import tech.acab.app.net.FirmwareBuild
 import tech.acab.app.net.NrfBuild
 import tech.acab.app.net.firmwareArtifactResponseAllowed
+import tech.acab.app.net.readBounded
 import tech.acab.app.net.trustedFirmwareArtifactUrl
 import java.io.ByteArrayInputStream
 import java.io.File
@@ -520,17 +521,8 @@ class NrfDfuCoordinator(
             if (!firmwareArtifactResponseAllowed(parsed, conn.url, responseCode))
                 throw PrepError("Couldn't download the co-processor update. Check your connection and try again.")
             val cap = expectedSize.coerceIn(1L, 4L * 1024 * 1024) + 4096
-            val out = java.io.ByteArrayOutputStream(cap.toInt())
-            conn.inputStream.use { input ->
-                val tmp = ByteArray(16 * 1024); var total = 0L
-                while (true) {
-                    val r = input.read(tmp); if (r < 0) break
-                    total += r
-                    if (total > cap) throw PrepError("The co-processor update was the wrong size, so it wasn't installed.")
-                    out.write(tmp, 0, r)
-                }
-            }
-            out.toByteArray()
+            conn.inputStream.use { readBounded(it, cap) }
+                ?: throw PrepError("The co-processor update was the wrong size, so it wasn't installed.")
         } finally { conn.disconnect() }
 
         if (bytes.size.toLong() != expectedSize)
@@ -932,19 +924,7 @@ internal fun nrfPackageApplicationVersion(zipBytes: ByteArray): Long? = runCatch
                 if (manifest != null || entry.size > MAX_NRF_MANIFEST_BYTES) {
                     return@runCatching null
                 }
-                val out = java.io.ByteArrayOutputStream(
-                    if (entry.size in 1..MAX_NRF_MANIFEST_BYTES) entry.size.toInt() else 1024,
-                )
-                val buffer = ByteArray(1024)
-                var total = 0
-                while (true) {
-                    val read = zip.read(buffer)
-                    if (read < 0) break
-                    total += read
-                    if (total > MAX_NRF_MANIFEST_BYTES) return@runCatching null
-                    out.write(buffer, 0, read)
-                }
-                manifest = out.toByteArray()
+                manifest = readBounded(zip, MAX_NRF_MANIFEST_BYTES) ?: return@runCatching null
             } else {
                 if (entry.size > NrfBuild.MAX_PACKAGE_BYTES) return@runCatching null
                 val buffer = ByteArray(16 * 1024)
@@ -1002,19 +982,7 @@ private fun storedRootZipEntry(zipBytes: ByteArray, wanted: String, maxBytes: In
                 if (entry.name != wanted) continue
                 if (entry.isDirectory || entry.method != ZipEntry.STORED ||
                     entry.size > maxBytes) return@use null
-                val out = java.io.ByteArrayOutputStream(
-                    if (entry.size in 1..maxBytes.toLong()) entry.size.toInt() else 64,
-                )
-                val buffer = ByteArray(1024)
-                var total = 0
-                while (true) {
-                    val read = zip.read(buffer)
-                    if (read < 0) break
-                    total += read
-                    if (total > maxBytes) return@use null
-                    out.write(buffer, 0, read)
-                }
-                found = out.toByteArray()
+                found = readBounded(zip, maxBytes.toLong()) ?: return@use null
             }
             found
         }

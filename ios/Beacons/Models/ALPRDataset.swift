@@ -928,8 +928,8 @@ final class ALPRStore: ObservableObject {
             // iterator resumption per byte, and nothing here measured or removed that.
             // URLSession.AsyncBytes has no chunked accessor, so dropping it needs a
             // URLSessionDataDelegate that can cancel mid-body - the same per-byte loop still runs in
-            // BLEManager+OTA (S3 image), BLEManager+NrfDFU (nRF zip) and FirmwareManifest, and they
-            // all want that one change together rather than four separate ones.
+            // BLEManager+OTA (S3 image) and BLEManager+NrfDFU (nRF zip), and they all want that one
+            // change together rather than three separate ones.
             //
             // Staged rather than filling one [UInt8] and converting with Data(buffer) at the end,
             // because that conversion copies: the whole payload would be live TWICE at that instant,

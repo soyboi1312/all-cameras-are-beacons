@@ -195,13 +195,6 @@ class OnboardingRecoveryPolicyTest {
     }
 
     @Test
-    fun demoEntryStopsOnlyAnActiveScan() {
-        assertTrue(shouldStopScanBeforeDemo(ConnState.SCANNING))
-        assertTrue(!shouldStopScanBeforeDemo(ConnState.DISCONNECTED))
-        assertTrue(!shouldStopScanBeforeDemo(ConnState.READY))
-    }
-
-    @Test
     fun secureReadinessCoversAlreadyBondedAndFreshBondPaths() {
         assertTrue(awaitingSecureReadiness(ConnState.CONNECTING))
         assertTrue(awaitingSecureReadiness(ConnState.BONDING))

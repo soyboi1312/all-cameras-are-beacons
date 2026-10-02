@@ -96,21 +96,56 @@ class DetailTimeLabelsTest {
      *  assertion; "NAME MATCH" fails the third; a `.lowercase()` ("manufacturer id") the fourth. */
     @Test
     fun methodChipLabelPrefersVendorOnlyOverChipsetOnly() {
-        assertEquals("OUI · VENDOR ONLY", methodChipLabel(1, "Axon Enterprise", "OUI match"))
-        assertEquals("OUI · CHIPSET ONLY", methodChipLabel(1, null, "OUI match"))
-        assertEquals("device name", methodChipLabel(2, null, "device name"))
-        assertEquals("manufacturer ID", methodChipLabel(3, null, "manufacturer ID"))
-        assertEquals("Remote ID", methodChipLabel(7, null, "Remote ID"))
+        assertEquals("OUI · VENDOR ONLY", methodChipLabel(DeviceType.BODY_CAM, 1, "Axon Enterprise", "OUI match"))
+        assertEquals("OUI · CHIPSET ONLY", methodChipLabel(DeviceType.FLOCK_CAMERA, 1, null, "OUI match"))
+        assertEquals("device name", methodChipLabel(DeviceType.TRACKER, 2, null, "device name"))
+        assertEquals("manufacturer ID", methodChipLabel(DeviceType.GLASSES, 3, null, "manufacturer ID"))
+        assertEquals("Remote ID", methodChipLabel(DeviceType.DRONE, 7, null, "Remote ID"))
+    }
+
+    /** A Desert-mode row matched no signature, so no dossier line calls it a match, whatever method
+     *  desert_detect.cpp stamped (SSID on WiFi, none on BLE): "matched on" reads "no signature",
+     *  confidence reads "Not a match" with no percent, and the flagged line names only the radio.
+     *  The same method or confidence on any other type keeps its usual words. Wrong inputs: keying
+     *  on the method or the number instead of the type fails a non-Desert assertion; dropping an
+     *  arm fails its Desert assertion. TWIN: iOS DetectionDetailTimeTests
+     *  testNearbyDeviceRowsClaimNoSignature. */
+    @Test
+    fun nearbyDeviceRowsClaimNoSignature() {
+        assertEquals("no signature", methodChipLabel(DeviceType.NEARBY_DEVICE, 5, null, "SSID"))
+        assertEquals("no signature", methodChipLabel(DeviceType.NEARBY_DEVICE, 0, null, "unknown"))
+        assertEquals("SSID", methodChipLabel(DeviceType.FLOCK_CAMERA, 5, null, "SSID"))
+        assertEquals("Not a match", dossierConfidenceLine(DeviceType.NEARBY_DEVICE, 0))
+        assertEquals("Weak match, verify · 0%", dossierConfidenceLine(DeviceType.UNKNOWN, 0))
+        assertEquals("Heard over WiFi in desert mode.", dossierFlaggedLine(DeviceType.NEARBY_DEVICE, "SSID", "WiFi"))
+        assertEquals("Heard over BLE in desert mode.", dossierFlaggedLine(DeviceType.NEARBY_DEVICE, "unknown", "BLE"))
+        assertEquals("Flagged by SSID over WiFi.", dossierFlaggedLine(DeviceType.FLOCK_CAMERA, "SSID", "WiFi"))
+    }
+
+    /** The Desert-mode explainer: the no-match sentence, then a gloss on the firmware's address
+     *  label when it is one of the three desert_detect.cpp writes. Wrong inputs: swapping two arms
+     *  fails the label check; an arm that drops the base fails the prefix check; a gloss on an
+     *  unknown label or a buffered row (no detail) fails the last two. TWIN: iOS
+     *  DetectionDetailTimeTests testNearbyDeviceLineSaysNoSignatureMatched. */
+    @Test
+    fun nearbyDeviceLineSaysNoSignatureMatched() {
+        val base = "Desert mode lists every nearby device it hears, and no signature matched this one."
+        for (label in listOf("randomized MAC", "hardware OUI", "OUI unknown")) {
+            val line = dossierNearbyDeviceLine(label)
+            assertTrue(line, line.startsWith("$base \"$label\" means "))
+        }
+        assertEquals(base, dossierNearbyDeviceLine(null))
+        assertEquals(base, dossierNearbyDeviceLine("some future label"))
     }
 
     /** The "confidence" row: the verdict, then the percent, at the verdict edges 50 and 80 (the
      *  same thresholds as iOS). A verdict that read 50 as weak, or a percent placed first, fails. */
     @Test
     fun confidenceRowReadsTheVerdictThenThePercent() {
-        assertEquals("Weak match, verify · 49%", dossierConfidenceLine(49))
-        assertEquals("Partial match · 50%", dossierConfidenceLine(50))
-        assertEquals("Partial match · 79%", dossierConfidenceLine(79))
-        assertEquals("Strong match · 80%", dossierConfidenceLine(80))
+        assertEquals("Weak match, verify · 49%", dossierConfidenceLine(DeviceType.FLOCK_CAMERA, 49))
+        assertEquals("Partial match · 50%", dossierConfidenceLine(DeviceType.FLOCK_CAMERA, 50))
+        assertEquals("Partial match · 79%", dossierConfidenceLine(DeviceType.FLOCK_CAMERA, 79))
+        assertEquals("Strong match · 80%", dossierConfidenceLine(DeviceType.FLOCK_CAMERA, 80))
     }
 
     /** Watch and Mute sit two-up below font scale 1.5 and stack from it, the threshold
@@ -126,11 +161,11 @@ class DetailTimeLabelsTest {
      *  value with no dot fails. */
     @Test
     fun dossierValueHoldsEachMiddleDotToTheWordBeforeIt() {
-        assertEquals("Strong match\u00A0\u00B7 80%", dossierValueForDisplay(dossierConfidenceLine(80)))
+        assertEquals("Strong match\u00A0\u00B7 80%", dossierValueForDisplay(dossierConfidenceLine(DeviceType.FLOCK_CAMERA, 80)))
         assertEquals("12\u00A0\u00B7 first ~3 min ago", dossierValueForDisplay("12 \u00B7 first ~3 min ago"))
         assertEquals("a\u00A0\u00B7 b\u00A0\u00B7 c", dossierValueForDisplay("a \u00B7 b \u00B7 c"))
         assertEquals("AA:BB:CC:DD:EE:FF", dossierValueForDisplay("AA:BB:CC:DD:EE:FF"))
-        assertTrue(dossierConfidenceLine(80).contains(" \u00B7 "))
+        assertTrue(dossierConfidenceLine(DeviceType.FLOCK_CAMERA, 80).contains(" \u00B7 "))
     }
 
     @Test
@@ -167,8 +202,8 @@ class DetailTimeLabelsTest {
      *  the old template, "Flagged by Remote ID over Remote ID.". */
     @Test
     fun flaggedLineNeverRepeatsTheSameWord() {
-        assertEquals("Flagged by Remote ID.", dossierFlaggedLine("Remote ID", "Remote ID"))
-        assertEquals("Flagged by OUI match over WiFi.", dossierFlaggedLine("OUI match", "WiFi"))
+        assertEquals("Flagged by Remote ID.", dossierFlaggedLine(DeviceType.DRONE, "Remote ID", "Remote ID"))
+        assertEquals("Flagged by OUI match over WiFi.", dossierFlaggedLine(DeviceType.FLOCK_CAMERA, "OUI match", "WiFi"))
     }
 
     /** U3-b: the hero subtitle drops the maker when the headline already says it (ignoring case),

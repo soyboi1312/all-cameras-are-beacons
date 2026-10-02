@@ -104,6 +104,7 @@ import androidx.compose.runtime.compositionLocalOf
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.key
 import androidx.compose.runtime.mutableFloatStateOf
+import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
@@ -157,7 +158,6 @@ import tech.acab.app.ble.ConnState
 import tech.acab.app.ble.CombinedUpdatePhase
 import tech.acab.app.ble.CombinedUpdateProgress
 import tech.acab.app.ble.DetectionNotifier
-import tech.acab.app.ble.DemoStatusToggle
 import tech.acab.app.ble.connectedBoardKind
 import tech.acab.app.ble.isBoardBackedMute
 import tech.acab.app.ble.isFirmwareVersionOlder
@@ -181,6 +181,16 @@ private val NotificationToggleMapSaver = mapSaver<Map<Int, Boolean>>(
 
 internal fun shouldHandleOpenToken(token: Int, handledWatermark: Int): Boolean =
     token > handledWatermark
+
+/** One deep-link token, handled once: [action] runs only when [token] passes this call site's own
+ *  saveable watermark ([shouldHandleOpenToken]), which starts at [seed]. */
+@Composable
+internal fun OnOpenToken(token: Int, seed: Int = 0, action: () -> Unit) {
+    var handled by rememberSaveable { mutableIntStateOf(seed) }
+    LaunchedEffect(token) {
+        if (shouldHandleOpenToken(token, handled)) { handled = token; action() }
+    }
+}
 
 /** The Beacon tab's two segments: the board's own settings and this phone's. Session state with
  *  [BOARD] as the default; it is never written to preferences, so a relaunch starts on BOARD.
@@ -1346,38 +1356,11 @@ internal fun DeviceScreen(
         if (s != BeaconSegment.BOARD && page?.let { it in BOARD_SEGMENT_PAGES } == true) page = null
         segment = s
     }
-    var handledDetectorsToken by rememberSaveable { mutableStateOf(0) }
-    LaunchedEffect(openDetectorsToken) {
-        if (shouldHandleOpenToken(openDetectorsToken, handledDetectorsToken)) {
-            handledDetectorsToken = openDetectorsToken
-            selectSegment(BeaconSegment.BOARD)
-            page = BeaconRowId.DETECTORS
-        }
-    }
-    var handledNotifyToken by rememberSaveable { mutableStateOf(0) }
-    LaunchedEffect(openNotifyToken) {
-        if (shouldHandleOpenToken(openNotifyToken, handledNotifyToken)) {
-            handledNotifyToken = openNotifyToken
-            selectSegment(BeaconSegment.PHONE)
-            page = BeaconRowId.NOTIFICATIONS
-        }
-    }
-    var handledLiveModeToken by rememberSaveable { mutableStateOf(0) }
-    LaunchedEffect(openLiveModeToken) {
-        if (shouldHandleOpenToken(openLiveModeToken, handledLiveModeToken)) {
-            handledLiveModeToken = openLiveModeToken
-            selectSegment(BeaconSegment.PHONE)
-            page = BeaconRowId.LIVE_MODE
-        }
-    }
-    var handledContributeToken by rememberSaveable { mutableStateOf(0) }
-    LaunchedEffect(openContributeToken) {
-        if (shouldHandleOpenToken(openContributeToken, handledContributeToken)) {
-            handledContributeToken = openContributeToken
-            selectSegment(BeaconSegment.PHONE)
-            contribVm.open = true
-        }
-    }
+    // Seed 0 on all four: this screen can compose for the first time AFTER the bump that opens it.
+    OnOpenToken(openDetectorsToken) { selectSegment(BeaconSegment.BOARD); page = BeaconRowId.DETECTORS }
+    OnOpenToken(openNotifyToken) { selectSegment(BeaconSegment.PHONE); page = BeaconRowId.NOTIFICATIONS }
+    OnOpenToken(openLiveModeToken) { selectSegment(BeaconSegment.PHONE); page = BeaconRowId.LIVE_MODE }
+    OnOpenToken(openContributeToken) { selectSegment(BeaconSegment.PHONE); contribVm.open = true }
 
     // Firmware: the SAME update-available check FirmwareCard uses (manifest entry vs installed).
     // An update exists -> the promoted banner; otherwise firmware is the Firmware row in ON THE
@@ -1583,12 +1566,12 @@ internal fun DeviceScreen(
             CardKicker("SCAN RADIOS")
             ToggleRow("Bluetooth", "ALPR · drone · trackers", checked = bleOn, pending = blePending && !demo) {
                 bleOn = it; blePending = true
-                if (demo) ble.previewDemoStatusToggle(DemoStatusToggle.BLE, it) else ble.setBleScan(it)
+                if (demo) ble.previewDemoStatusToggle { copy(ble = it) } else ble.setBleScan(it)
             }
             HorizontalDivider(color = Acab.line)
             ToggleRow("Wi-Fi", "2.4 GHz · ALPR · drone RID", checked = wifiOn, pending = wifiPending && !demo) {
                 wifiOn = it; wifiPending = true
-                if (demo) ble.previewDemoStatusToggle(DemoStatusToggle.WIFI, it) else ble.setWifiScan(it)
+                if (demo) ble.previewDemoStatusToggle { copy(wifi = it) } else ble.setWifiScan(it)
             }
             // Eco: battery boards only (the board reports "bat" only with the sense divider), and
             // only while Wi-Fi is on. Duty-cycles the Wi-Fi RX to stretch runtime; Bluetooth is
@@ -1605,7 +1588,7 @@ internal fun DeviceScreen(
                             Spacer(Modifier.size(7.dp))
                         }
                         Text(if (wifiEco == 0) "always on" else "sleeps ${wifiEco}s / sweep",
-                            color = Acab.dim, fontSize = 10.sp, fontFamily = Acab.mono)
+                            color = Acab.dim, fontSize = 10.sp)
                     }
                     val ecoSteps = listOf(0 to "MAX", 3 to "3s", 7 to "7s", 15 to "15s")
                     SingleChoiceSegmentedButtonRow(Modifier.fillMaxWidth()) {
@@ -1619,7 +1602,7 @@ internal fun DeviceScreen(
                         }
                     }
                     Text("stretches battery by sweeping Wi-Fi less often. you may miss a Wi-Fi-only camera between sweeps; Bluetooth detection is unaffected.",
-                        color = Acab.faint, fontSize = 9.5.sp, fontFamily = Acab.mono)
+                        color = Acab.faint, fontSize = 9.5.sp)
                 }
             }
         }
@@ -1630,13 +1613,13 @@ internal fun DeviceScreen(
             ToggleRow("ALPR radio signals", "flock over bluetooth or 2.4 GHz wifi · raven over bluetooth · many installs now stay silent",
                 checked = flockOn, pending = flockPending && !demo) {
                 flockOn = it; flockPending = true
-                if (demo) ble.previewDemoStatusToggle(DemoStatusToggle.FLOCK, it) else ble.setFlock(it)
+                if (demo) ble.previewDemoStatusToggle { copy(flock = it) } else ble.setFlock(it)
             }
             HorizontalDivider(color = Acab.line)
             ToggleRow("Drones (remote ID)", "FAA remote ID · operator location",
                 checked = droneOn, pending = dronePending && !demo) {
                 droneOn = it; dronePending = true
-                if (demo) ble.previewDemoStatusToggle(DemoStatusToggle.DRONE, it) else ble.setDrone(it)
+                if (demo) ble.previewDemoStatusToggle { copy(drone = it) } else ble.setDrone(it)
             }
             // Subordinate to the drones toggle: inset + shown-disabled while drone detection is
             // off, so the sub-option stays discoverable (mirrors iOS). Default off - it can flag a
@@ -1645,14 +1628,14 @@ internal fun DeviceScreen(
                 checked = droneOuiOn, enabled = droneOn, pending = droneOuiPending && !demo,
                 modifier = Modifier.padding(start = 22.dp).alpha(if (droneOn) 1f else 0.4f)) {
                 droneOuiOn = it; droneOuiPending = true
-                if (demo) ble.previewDemoStatusToggle(DemoStatusToggle.DRONE_OUI, it)
+                if (demo) ble.previewDemoStatusToggle { copy(droui = it) }
                 else ble.setDroneOuiEnabled(it)
             }
             HorizontalDivider(color = Acab.line)
             ToggleRow("Body cams", "Axon · Utility BodyWorn · Motorola vendor match",
                 checked = bodyCamOn, pending = bodyCamPending && !demo) {
                 bodyCamOn = it; bodyCamPending = true
-                if (demo) ble.previewDemoStatusToggle(DemoStatusToggle.BODY_CAM, it) else ble.setBodyCam(it)
+                if (demo) ble.previewDemoStatusToggle { copy(bodyCam = it) } else ble.setBodyCam(it)
             }
             // Subordinate to the body-cam toggle, same shape as the drone-OUI row above:
             // classification needs BOTH, so it sits inset + disabled while the category is off.
@@ -1668,7 +1651,7 @@ internal fun DeviceScreen(
                     checked = motoOn, enabled = bodyCamOn, pending = motoPending && !demo,
                     modifier = Modifier.padding(start = 22.dp).alpha(if (bodyCamOn) 1f else 0.4f)) {
                     motoOn = it; motoPending = true
-                    if (demo) ble.previewDemoStatusToggle(DemoStatusToggle.MOTOROLA, it)
+                    if (demo) ble.previewDemoStatusToggle { copy(moto = it) }
                     else ble.setMotorolaOui(it)
                 }
             }
@@ -1676,13 +1659,13 @@ internal fun DeviceScreen(
             ToggleRow("Bluetooth trackers", "AirTag · Tile · SmartTag · opt-in",
                 checked = trackerOn, pending = trackerPending && !demo) {
                 trackerOn = it; trackerPending = true
-                if (demo) ble.previewDemoStatusToggle(DemoStatusToggle.TRACKER, it) else ble.setTracker(it)
+                if (demo) ble.previewDemoStatusToggle { copy(tracker = it) } else ble.setTracker(it)
             }
             HorizontalDivider(color = Acab.line)
             ToggleRow("Recording glasses", "Ray-Ban / Oakley Meta · Snap · Vuzix · experimental",
                 checked = glassesOn, exp = true, pending = glassesPending && !demo) {
                 glassesOn = it; glassesPending = true
-                if (demo) ble.previewDemoStatusToggle(DemoStatusToggle.GLASSES, it) else ble.setGlasses(it)
+                if (demo) ble.previewDemoStatusToggle { copy(glasses = it) } else ble.setGlasses(it)
             }
             HorizontalDivider(color = Acab.line)
             // Opt-in + default off: it enables 802.11 DATA-frame source-MAC inspection (off by default).
@@ -1691,7 +1674,7 @@ internal fun DeviceScreen(
             ToggleRow("Network cameras", "known IP-camera brands on wifi, opt-in, cannot find every camera",
                 checked = netcamOn, pending = netcamPending && !demo) {
                 netcamOn = it; netcamPending = true
-                if (demo) ble.previewDemoStatusToggle(DemoStatusToggle.NETWORK_CAMERA, it)
+                if (demo) ble.previewDemoStatusToggle { copy(ncam = it) }
                 else ble.setNetcamEnabled(it)
             }
         }
@@ -1735,12 +1718,12 @@ internal fun DeviceScreen(
                     Column(Modifier.weight(1f)) {
                         // Sentence case like every row title (P3-11). TWIN: iOS OFFLINE BUFFER card
                         // "Buffered log" (SettingsView.swift).
-                        Text("Buffered log", color = Acab.text, fontSize = 14.sp, fontFamily = Acab.display)
+                        Text("Buffered log", color = Acab.text, fontSize = 14.sp)
                         // While the board is still sweeping a deferred erase, say so rather than
                         // inviting another erase against an about-to-be-zero count.
                         Text(if (status?.wiping == true) "clearing buffer…"
                             else "erase what the board stored while away",
-                            color = Acab.dim, fontSize = 11.sp, fontFamily = Acab.mono)
+                            color = Acab.dim, fontSize = 11.sp)
                     }
                     if (status?.wiping == true) {
                         // Mid-wipe the Erase action swaps for the plain word CLEARING (mirrors iOS):
@@ -1788,7 +1771,7 @@ internal fun DeviceScreen(
             // (beaconLiveRowValue) and this line says the switch is a preview. Live behaviour and
             // the ongoing notification are untouched (L5).
             if (demo) {
-                Text(LIVE_MODE_PREVIEW_NOTE, color = Acab.faint, fontSize = 11.sp, fontFamily = Acab.mono)
+                Text(LIVE_MODE_PREVIEW_NOTE, color = Acab.faint, fontSize = 11.sp)
             }
             ToggleRow(
                 "Live counter notification",
@@ -1806,7 +1789,7 @@ internal fun DeviceScreen(
             }
             if (driveMode && !notifGranted) {
                 Text("Allow notifications to see the counter.",
-                    color = Acab.warn, fontSize = 11.sp, fontFamily = Acab.mono)
+                    color = Acab.warn, fontSize = 11.sp)
             }
             HorizontalDivider(color = Acab.line)
             // The subtitle names ALL THREE surfaces this switch reaches on Android, because it
@@ -1837,7 +1820,7 @@ internal fun DeviceScreen(
                 pending = desertPending && !demo,
             ) { desertOn = it; desertPending = true; if (!demo) ble.setDesert(it) }
             Text("Off the grid, anything new on the air means something arrived. Each device is tagged hardware or randomized (phone) MAC, or OUI unknown when the radio cannot tell.",
-                color = Acab.faint, fontSize = 11.sp, fontFamily = Acab.mono)
+                color = Acab.faint, fontSize = 11.sp)
             if (desertOn) {
                 // The startup jingle is NOT exempt from the mute (alerts.cpp, 2026-08-24: the boot
                 // motif is a UserAlert, so a muted board never announces itself - an unattended
@@ -1848,7 +1831,7 @@ internal fun DeviceScreen(
                 // separate cue and does still chirp through the mute.
                 // iOS twin: the same string in SettingsView.swift's desertModeCard.
                 Text("Detection alerts are muted while Desert mode runs. With every nearby device reporting in, a beep for each would never let up. The shutdown cue still plays unless volume is 0; the startup jingle is muted along with everything else.",
-                    color = Acab.warn, fontSize = 11.sp, fontFamily = Acab.mono)
+                    color = Acab.warn, fontSize = 11.sp)
             }
             // Desert is over and the alert mode stayed SILENT. Nothing above says so, and a user
             // who left Desert expecting their beeps back reads the silence as a dead detector.
@@ -1869,7 +1852,7 @@ internal fun DeviceScreen(
             )) {
                 DesertSilenceSlot.NOTICE ->
                     Text(DESERT_SILENCE_NOTICE,
-                        color = Acab.faint, fontSize = 11.sp, fontFamily = Acab.mono)
+                        color = Acab.faint, fontSize = 11.sp)
                 DesertSilenceSlot.OFFER -> AlertRestoreOffer { ble.takePendingAlertModeRestore() }
                 DesertSilenceSlot.NONE -> Unit
             }
@@ -1885,7 +1868,7 @@ internal fun DeviceScreen(
                 pending = ledPending && !demo,
             ) { lightsOut = it; ledPending = true; if (!demo) ble.setLed(!it) }
             Text("On by default the board LED gives a slow heartbeat so you can see it's alive, and flashes on a hit. Lights out keeps it completely dark.",
-                color = Acab.faint, fontSize = 11.sp, fontFamily = Acab.mono)
+                color = Acab.faint, fontSize = 11.sp)
         }
     }
 
@@ -2230,7 +2213,7 @@ internal fun DeviceScreen(
         }
         if (watched.isEmpty() && ignored.isEmpty() && boardOnlyMuteCount == 0) {
             Text("No watched or muted devices yet.",
-                color = Acab.dim, fontSize = 12.sp, fontFamily = Acab.mono)
+                color = Acab.dim, fontSize = 12.sp)
         }
     }
     val aboutContent: @Composable () -> Unit = {
@@ -3146,7 +3129,7 @@ private fun FirmwareCard(
             // flasher button follows, because that link goes to the disagreeing listing's page.
             !revisionCompatible -> Text(
                 "Update unavailable: this firmware listing does not match the beacon's reported board revision. No update will be offered from this listing.",
-                color = Acab.warn, fontSize = 11.sp, fontFamily = Acab.mono,
+                color = Acab.warn, fontSize = 11.sp,
             )
 
             // Either radio behind and self-updatable: offer the single one-click update. This is
@@ -3159,18 +3142,18 @@ private fun FirmwareCard(
                 Text(
                     if (s3Stale) "Update available: v$latest. You can install it here, over Bluetooth."
                     else "Co-processor update available. The board firmware is already current; this updates the second radio, over Bluetooth.",
-                    color = Acab.warn, fontSize = 11.sp, fontFamily = Acab.mono,
+                    color = Acab.warn, fontSize = 11.sp,
                 )
                 CardButton("Update", filled = true, enabled = canStartUpdate) {
                     entry?.let { onCombinedUpdate(it) }
                 }
                 if (!canStartUpdate) {
                     Text("Reconnect and wait for current board status before starting the update.",
-                        color = Acab.faint, fontSize = 11.sp, fontFamily = Acab.mono)
+                        color = Acab.faint, fontSize = 11.sp)
                 }
                 Text(
                     "Installs over Bluetooth and usually takes about 2-3 minutes. The board restarts on its own partway through. Keep this phone next to the beacon with the app open until it finishes.",
-                    color = Acab.faint, fontSize = 11.sp, fontFamily = Acab.mono,
+                    color = Acab.faint, fontSize = 11.sp,
                 )
             }
 
@@ -3178,19 +3161,19 @@ private fun FirmwareCard(
             outdated -> {
                 Text(
                     "Update available. Reflash your board to v$latest in your browser.",
-                    color = Acab.warn, fontSize = 11.sp, fontFamily = Acab.mono,
+                    color = Acab.warn, fontSize = 11.sp,
                 )
                 CardButton("Open the Browser Flasher") { onFlash(flasher) }
             }
 
             installed == null -> Text(
                 "Waiting for board status before comparing firmware versions.",
-                color = Acab.dim, fontSize = 11.sp, fontFamily = Acab.mono,
+                color = Acab.dim, fontSize = 11.sp,
             )
 
             entry == null -> Text(
                 "No current update listing is available for this beacon. Check again when online before treating its version as current.",
-                color = Acab.dim, fontSize = 11.sp, fontFamily = Acab.mono,
+                color = Acab.dim, fontSize = 11.sp,
             )
 
             // TWIN: byte-identical to the healthy arm of iOS beaconFirmwareStatusPresentation.
@@ -3200,7 +3183,7 @@ private fun FirmwareCard(
             // describe (no board status, no listing) is exactly what those rows cannot show.
             else -> Text(
                 "firmware is up to date.",
-                color = Acab.dim, fontSize = 11.sp, fontFamily = Acab.mono,
+                color = Acab.dim, fontSize = 11.sp,
             )
         }
 
@@ -3249,7 +3232,7 @@ private fun CombinedStatus(
         Spacer(Modifier.weight(1f))
         if (combined.isRunning) {
             Text("${(combined.progress * 100).roundToInt()}%", color = tone,
-                fontSize = 12.sp, fontFamily = Acab.mono, fontWeight = FontWeight.SemiBold)
+                fontSize = 12.sp, fontWeight = FontWeight.SemiBold)
         }
     }
 
@@ -3261,7 +3244,7 @@ private fun CombinedStatus(
         val e = combined.elapsedSeconds
         // Locale.US: the default-locale overload localizes %d digits on some phones.
         Text(String.format(java.util.Locale.US, "elapsed %d:%02d", e / 60, e % 60),
-            color = Acab.faint, fontSize = 11.sp, fontFamily = Acab.mono)
+            color = Acab.faint, fontSize = 11.sp)
     }
 
     val detail = when (combined.phase) {
@@ -3277,12 +3260,12 @@ private fun CombinedStatus(
         else -> combined.notice
     }
     detail?.let {
-        Text(it, color = tone, fontSize = 11.sp, fontFamily = Acab.mono)
+        Text(it, color = tone, fontSize = 11.sp)
     }
 
     if (combined.isRunning) {
         Text("Keep this phone next to the beacon with the app open. Don't lock it or leave this screen.",
-            color = Acab.faint, fontSize = 11.sp, fontFamily = Acab.mono)
+            color = Acab.faint, fontSize = 11.sp)
     }
 
     when {
@@ -3296,7 +3279,7 @@ private fun CombinedStatus(
             }
             if (!canStartUpdate) {
                 Text("Reconnect and wait for current board status before finishing the update.",
-                    color = Acab.faint, fontSize = 11.sp, fontFamily = Acab.mono)
+                    color = Acab.faint, fontSize = 11.sp)
             }
             CardButton("Not Now", tint = Acab.dim) { onDismiss() }
         }
@@ -3354,7 +3337,7 @@ private fun CheckForUpdatesRow(checking: Boolean, onCheckingChange: (Boolean) ->
             else if (justChecked) "Check Finished"
             else "Check for Updates",
             color = Acab.dim,
-            fontSize = 11.sp, fontWeight = FontWeight.Bold, fontFamily = Acab.mono,
+            fontSize = 11.sp, fontWeight = FontWeight.Bold,
         )
     }
 }
@@ -3412,7 +3395,7 @@ private fun DisplayCard() {
             if (ContrastMode.systemWantsHigher)
                 "Android asks for higher contrast, so it stays on while this switch is off."
             else "text size and bold text follow the Android settings.",
-            color = Acab.faint, fontSize = 11.sp, fontFamily = Acab.mono,
+            color = Acab.faint, fontSize = 11.sp,
         )
     }
 }
@@ -3435,12 +3418,12 @@ private fun NotifyCard(
             // are covered. Say it plainly instead.
             Text(
                 "Android is blocking these. Turn notifications on for beacons in Settings, or nothing here will arrive.",
-                color = Acab.warn, fontSize = 11.sp, fontFamily = Acab.mono, lineHeight = 16.sp,
+                color = Acab.warn, fontSize = 11.sp, lineHeight = 16.sp,
             )
         }
         Text(
             notifyCardExplainer(demo),
-            color = Acab.faint, fontSize = 11.sp, fontFamily = Acab.mono, lineHeight = 16.sp,
+            color = Acab.faint, fontSize = 11.sp, lineHeight = 16.sp,
         )
         DetectionNotifier.NOTIFIABLE.forEach { t ->
             val on = isOn(t)
@@ -3457,13 +3440,13 @@ private fun NotifyCard(
             if (on && detectorOff(t)) {
                 Text(
                     notifyDetectorOffWarning(t),
-                    color = Acab.warn, fontSize = 10.sp, fontFamily = Acab.mono, lineHeight = 14.sp,
+                    color = Acab.warn, fontSize = 10.sp, lineHeight = 14.sp,
                 )
             }
         }
         Text(
             "The same device won't notify again for ten minutes, so one camera can't keep buzzing you. Muted devices never notify at all.",
-            color = Acab.faint, fontSize = 11.sp, fontFamily = Acab.mono, lineHeight = 16.sp,
+            color = Acab.faint, fontSize = 11.sp, lineHeight = 16.sp,
         )
     }
 }
@@ -3527,7 +3510,7 @@ private fun notifySubtitle(t: DeviceType): String = when (t) {
     DeviceType.NETWORK_CAMERA -> "cameras on nearby wifi"
     DeviceType.DRONE -> "remote ID broadcasts"
     DeviceType.TRACKER -> "separated AirTag \u00B7 Tile \u00B7 SmartTag"
-    DeviceType.WATCHED -> "devices you starred"
+    DeviceType.WATCHED -> "devices you watch"
     else -> ""
 }
 
@@ -3566,7 +3549,7 @@ private fun BuzzerCard(
                 AlertMode.VIBRATE -> "detection beeps off, the shutdown cue still plays unless volume is 0. This phone buzzes on new hits"
                 AlertMode.SILENT -> "detection beeps and phone feedback off, the shutdown cue still plays unless volume is 0"
             },
-            color = Acab.faint, fontSize = 11.sp, fontFamily = Acab.mono,
+            color = Acab.faint, fontSize = 11.sp,
         )
 
         if (restoreOffered) AlertRestoreOffer(onRestore)
@@ -3726,7 +3709,7 @@ private fun VolumeSlider(
                 fontWeight = if (bold) FontWeight.Medium else FontWeight.Normal)
             Spacer(Modifier.weight(1f))
             Text("${value.toInt()}",
-                color = tone, fontSize = 12.sp, fontWeight = FontWeight.SemiBold, fontFamily = Acab.mono)
+                color = tone, fontSize = 12.sp, fontWeight = FontWeight.SemiBold)
         }
         Slider(
             value = value, onValueChange = onValueChange, onValueChangeFinished = onCommit,
@@ -3751,10 +3734,10 @@ internal fun managedDeviceName(label: String): String = label.ifEmpty { "Unknown
  *  apart. */
 internal fun renameDeviceDescription(label: String): String = "Rename ${managedDeviceName(label)}"
 
-/** TalkBack's "double tap to ..." action for the Unmute and Unstar pills. The visible word stays
- *  short; the spoken action names the device it acts on. */
+/** TalkBack's "double tap to ..." action for the Unmute and Stop Watching pills. The visible
+ *  text stays short; the spoken action names the device it acts on. */
 internal fun unmuteClickLabel(label: String): String = "unmute ${managedDeviceName(label)}"
-internal fun unstarClickLabel(label: String): String = "unstar ${managedDeviceName(label)}"
+internal fun unstarClickLabel(label: String): String = "stop watching ${managedDeviceName(label)}"
 
 /** Muted devices, each with an Unmute button. */
 @Composable
@@ -3776,7 +3759,7 @@ private fun IgnoredCard(
                     // sets the managed MAC (a monospaced-design site, which resolves to it).
                     Text(dev.mac.uppercase(), color = Acab.faint, fontSize = 11.sp, fontFamily = JetBrainsMono)
                     Text(dev.scopeLabel.uppercase(), color = Acab.faint, fontSize = 9.sp,
-                        letterSpacing = 0.4.sp, fontFamily = Acab.mono)
+                        letterSpacing = 0.4.sp)
                 }
                 Spacer(Modifier.size(8.dp))
                 // Naming a muted device matters as much as naming a starred one: six weeks on,
@@ -3796,8 +3779,7 @@ private fun IgnoredCard(
                         }
                         .padding(horizontal = 8.dp, vertical = 8.dp),
                 ) {
-                    Text("Unmute", color = Acab.accentText, fontSize = 10.sp, fontWeight = FontWeight.Bold,
-                        fontFamily = Acab.mono)
+                    Text("Unmute", color = Acab.accentText, fontSize = 10.sp, fontWeight = FontWeight.Bold)
                 }
             }
             if (i != ignored.lastIndex) HorizontalDivider(color = Acab.line)
@@ -3827,7 +3809,6 @@ private fun IgnoredCard(
                             "phone cannot show or remove those devices individually.",
                         color = Acab.faint,
                         fontSize = 10.sp,
-                        fontFamily = Acab.mono,
                     )
                 }
             }
@@ -3894,8 +3875,7 @@ private fun WatchedCard(
                         }
                         .padding(horizontal = 8.dp, vertical = 8.dp),
                 ) {
-                    Text("Unstar", color = Acab.watchTone, fontSize = 10.sp, fontWeight = FontWeight.Bold,
-                        fontFamily = Acab.mono)
+                    Text("Stop Watching", color = Acab.watchTone, fontSize = 10.sp, fontWeight = FontWeight.Bold)
                 }
             }
             if (i != watched.lastIndex) HorizontalDivider(color = Acab.line)
@@ -3949,7 +3929,7 @@ private fun AboutCard(showColonel: Boolean, onSoyboi: () -> Unit, onHowItDetects
     Column(Modifier.fillMaxWidth().panel(), verticalArrangement = Arrangement.spacedBy(12.dp)) {
         CardKicker("ABOUT")
         Text("built for the beacon. also works on the Colonel Panic hardware.",
-            color = Acab.dim, fontSize = 11.sp, fontFamily = Acab.mono)
+            color = Acab.dim, fontSize = 11.sp)
         HorizontalDivider(color = Acab.line)
         AboutLink("soyboi.tech", "the beacon board", onSoyboi)
         HorizontalDivider(color = Acab.line)
@@ -3964,7 +3944,7 @@ private fun AboutCard(showColonel: Boolean, onSoyboi: () -> Unit, onHowItDetects
         // Not "no data leaves your device": explicit export and contribution exist, and the
         // privacy promise has to survive contact with the share sheet. Uploads: never automatic.
         AboutLink("Privacy", "nothing is uploaded automatically", onPrivacy)
-        Text("Made by soyboi", color = Acab.faint, fontSize = 10.sp, fontFamily = Acab.mono,
+        Text("Made by soyboi", color = Acab.faint, fontSize = 10.sp,
             modifier = Modifier.fillMaxWidth().minimumInteractiveComponentSize()
                 .clickable(onClick = onMadeBy).padding(top = 4.dp), textAlign = androidx.compose.ui.text.style.TextAlign.Center)
     }
@@ -3978,7 +3958,7 @@ private fun AboutLink(title: String, sub: String, onClick: () -> Unit) {
     ) {
         Column(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(2.dp)) {
             Text(title, color = Acab.text, fontSize = 14.sp, fontWeight = FontWeight.Medium)
-            Text(sub, color = Acab.faint, fontSize = 11.sp, fontFamily = Acab.mono)
+            Text(sub, color = Acab.faint, fontSize = 11.sp)
         }
         Text("↗", color = Acab.accentText, fontSize = 14.sp, fontWeight = FontWeight.SemiBold)
     }
@@ -4144,7 +4124,7 @@ private fun ToggleRow(
                     ExpTag()
                 }
             }
-            Text(sub, color = Acab.faint, fontSize = 11.sp, fontFamily = Acab.mono)
+            Text(sub, color = Acab.faint, fontSize = 11.sp)
         }
         // The switch below has no touch-target margin of its own (onCheckedChange is null, the row
         // is the toggle), so without this gap a long subtitle ran into the switch track (Display's

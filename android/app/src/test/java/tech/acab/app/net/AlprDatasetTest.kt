@@ -1,6 +1,7 @@
 package tech.acab.app.net
 
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
@@ -328,9 +329,11 @@ class AlprDatasetTest {
 
     /** Resolve the parsed maker indices into the names iOS's parser returns directly.
      *
-     *  This is the ONE shape difference between the two parsers, and it is not a behaviour
+     *  This is a shape difference between the two parsers, and it is not a behaviour
      *  difference: Android hands back the raw index plus the self-describing table and resolves at
-     *  read time, iOS resolves inside parse. Copied from the two read sites (AlprStore.nearest and
+     *  read time, iOS resolves inside parse. (iOS's parser also returns per-node NodeMetadata;
+     *  AlprStore.parse validates the ALP4 source block and does not return it.) Copied from the
+     *  two read sites (AlprStore.nearest and
      *  MapAlpr's `makerTable.getOrElse(makerIdx[node]) { "" }`) rather than reimplemented, so a
      *  fixture cannot pass on a label the map would never actually draw. */
     private fun makers(idx: IntArray, table: Array<String>): List<String> =
@@ -346,7 +349,10 @@ class AlprDatasetTest {
     // ---- The four magics ----
 
     @Test
-    fun testValidALP4RetainsTierAndSourceMetadata() {
+    fun testValidALP4RetainsTier() {
+        // AlprStore.parse validates the source block and does not return it. These edge values
+        // must still be accepted: an osmId with the top bit set, an in-range direction,
+        // and the null direction (0xFFFF on the wire).
         val nodes = listOf(
             Node(32.7157, -117.1611, maker = 1, tier = 1, osmType = 0,
                 osmId = 9_223_372_036_854_775_808uL, sourceEpoch = 1_786_320_000,
@@ -359,18 +365,6 @@ class AlprDatasetTest {
         assertEquals(2, p.rawCount)
         assertEquals(listOf(1, 2), p.rawTier.toList())
         assertEquals(listOf(true, false), p.confirmed.toList())
-        val first = requireNotNull(p.metadata[0])
-        assertEquals(0, first.osmType)
-        assertEquals(9_223_372_036_854_775_808uL, first.osmId)
-        assertEquals(1_786_320_000L, first.sourceEpoch)
-        assertEquals(27_050, first.directionCdeg)
-        assertEquals(20_310L, first.checkDateDay)
-        val second = requireNotNull(p.metadata[1])
-        assertEquals(2, second.osmType)
-        assertEquals(42uL, second.osmId)
-        assertEquals(null, second.sourceEpoch)
-        assertEquals(null, second.directionCdeg)
-        assertEquals(null, second.checkDateDay)
     }
 
     @Test
@@ -390,7 +384,6 @@ class AlprDatasetTest {
         assertEquals(1, p.coords.size / 2)
         assertEquals(listOf(2), p.makerIdx.toList())
         assertEquals(listOf(2), p.rawTier.toList())
-        assertEquals(22uL, p.metadata.single()!!.osmId)
     }
 
     @Test
@@ -667,5 +660,75 @@ class AlprDatasetTest {
         assertEquals(2, parsed(alp("ALP3", nodes = onTheLimit), "the limits are real places").coords.size / 2)
         val justPast = listOf(Node(lat = 90.0000001, lon = 180.0), Node(lat = -90.0, lon = -180.0000001))
         assertEquals(0, parsed(alp("ALP3", nodes = justPast), "one unit past the limit is corrupt").coords.size / 2)
+    }
+
+    // ---- manifest container guard (security review 2026-09-29) ----
+
+    /** The published manifest's shape (soyboi.tech tools/build_alpr_dataset.py): ten fixed
+     *  containers, plus three per coverage seed tile (a region_bbox entry, and a coverage_probes
+     *  object with its bbox array). doFetch reads only schema, updated, count and data; the rest is
+     *  provenance, and the guard counts it all. */
+    private fun publishedManifestShape(seedTiles: Int): String {
+        val tile = "[-1250000000,320000000,-1140000000,420000000]"
+        val bboxes = List(seedTiles) { tile }.joinToString(",")
+        val probes = List(seedTiles) { """{"bbox":$tile,"expected":100,"received":100}""" }.joinToString(",")
+        return """{"schema":1,"updated":"2026-09-27","count":153462,"confirmed":1,"unverified":1,""" +
+            """"tagged":1,"source":"osm","osm_snapshot":"x","bbox":"x","publishable":true,""" +
+            """"tiers":{"structured_manufacturer":1,"canonical_without_structured_maker":1,""" +
+            """"legacy_alias_candidate":1},"makers":["Flock Safety","Motorola"],""" +
+            """"region_bbox":[$bboxes],"extent_e7":{"minLat":1,"minLon":1,"maxLat":2,"maxLon":2},""" +
+            """"provenance":{"generator":"g","generator_sha256":"s","query_sha256":"q",""" +
+            """"coverage_probes":[$probes],"mirrors":["https://a"],"quarantined_mirrors":[]},""" +
+            """"data":{"url":"https://soyboi.tech/data/alpr-v4.bin","sha256":"${"a".repeat(64)}",""" +
+            """"size":1234567,"format":"ALP4"}}"""
+    }
+
+    private fun containers(raw: String) = raw.count { it == '{' || it == '[' }
+
+    /** The crash the review reproduced: a manifest under the 64 KB read cap that opens thousands
+     *  of arrays. Android's org.json recursed off the stack on it, and StackOverflowError got past
+     *  doFetch's catch(Exception). The guard refuses the body before the parser runs. */
+    @Test
+    fun deeplyNestedManifestIsRefusedBeforeParsing() {
+        val arrays = "[".repeat(30_000) + "]".repeat(30_000)
+        assertTrue("the attack fits the read cap", arrays.length < 64 * 1024)
+        assertFalse(alprManifestContainersOk(arrays))
+        val objects = """{"a":""".repeat(1_000) + "1" + "}".repeat(1_000)
+        assertFalse("objects count as well as arrays", alprManifestContainersOk(objects))
+    }
+
+    /** The published shape opens 61 containers today (17 seed tiles), and the re-review caught a
+     *  first cap of 64 that two more tiles would have broken on every Android install, silently.
+     *  So the guard must pass today's shape AND a manifest with several times the tiles. */
+    @Test
+    fun publishedManifestShapeAndItsGrowthPassTheGuard() {
+        assertEquals(61, containers(publishedManifestShape(17)))
+        assertTrue(alprManifestContainersOk(publishedManifestShape(17)))
+        assertTrue(alprManifestContainersOk(publishedManifestShape(150)))
+    }
+
+    /** The bound is a count, so the boundary is exact: 512 openings pass, 513 do not. Pinning the
+     *  number here means changing it is a deliberate edit, not a drive-by. */
+    @Test
+    fun containerGuardBoundaryIsExact() {
+        assertEquals(512, ALPR_MANIFEST_MAX_CONTAINERS)
+        assertTrue(alprManifestContainersOk("[".repeat(ALPR_MANIFEST_MAX_CONTAINERS)))
+        assertFalse(alprManifestContainersOk("[".repeat(ALPR_MANIFEST_MAX_CONTAINERS + 1)))
+    }
+
+    /** Why the guard counts instead of tracking strings: org.json also reads single-quoted
+     *  strings and skips comments, so a double quote inside either would blind a string-aware
+     *  scan to every bracket after it. A plain count cannot be blinded. */
+    @Test
+    fun containerGuardCannotBeBlindedByQuotesOrComments() {
+        val deep = "[".repeat(600) + "]".repeat(601)
+        assertFalse(alprManifestContainersOk("['\"', $deep"))
+        assertFalse(alprManifestContainersOk("[/* \" */ $deep"))
+        // A depth tracker that ignores strings is blinded the other way: closing brackets inside a
+        // string drive its depth down, so real nesting after them never reaches the cap. With the
+        // nesting on BOTH sides of the string, a tracker peaks at 300 whether or not it clamps at
+        // zero, while the count sees 600. A count is not fooled, which is why the guard counts.
+        val split = "[".repeat(300) + "\"" + "]".repeat(300) + "\"," + "[".repeat(300)
+        assertFalse(alprManifestContainersOk(split))
     }
 }

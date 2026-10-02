@@ -1,6 +1,5 @@
 # PlatformIO build output
 .pio/
-firmware/.pio/
 
 # Local reference copies of the upstream oui-spy repo (not part of ACAB)
 _reference/
@@ -36,6 +35,9 @@ firmware/OTA.md
 # XcodeGen generates these from ios/project.yml (run `xcodegen generate`)
 ios/*.xcodeproj/
 ios/Beacons/Resources/Info.plist
+ios/Beacons/Beacons.entitlements
+ios/BeaconsWidget/BeaconsWidget.entitlements
+ios/BeaconsWidget/Info.plist
 
 # OTA image-signing PRIVATE keys: keep offline, NEVER commit. Only the public key
 # (lib/acab_core/ota_pubkey.h) ships. Losing this key just means re-keying + a web-flash.

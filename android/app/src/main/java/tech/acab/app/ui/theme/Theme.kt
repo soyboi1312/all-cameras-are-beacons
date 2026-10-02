@@ -125,9 +125,6 @@ fun TextStyle.tabular(): TextStyle = copy(fontFeatureSettings = TABULAR_FIGURES)
  *  categoryHuesMatchIosAndTheWidgets; iOS twin ContrastPaletteTests). The iOS widget's
  *  WidgetTheme repeats the six detection hues; the Android widget draws none.
  *
- *  The legacy names (bg, text, dim, accent, ...) are alias properties over the roles, so every
- *  reader that has not moved to MaterialTheme.colorScheme keeps compiling.
- *
  *  The four radar* tokens are the Status radar's own instrument colours and nothing else reads
  *  them: the pre-redesign disc, rings, edge and sweep, which the owner kept on 2026-09-25 over
  *  the Route A grey disc and low-alpha primary sweep. They are no M3 role and map to none in
@@ -167,22 +164,6 @@ data class AcabPalette(
      *  crimsonInkTwinsTheIosTint. */
     val crimsonInk: Color,
 ) {
-    // LEGACY aliases: every reader outside a composition (mapInfoColors, MapMarkers, dimTone) and
-    // every screen not yet moved to scheme roles keeps compiling through these.
-    val bg: Color get() = surface
-    val bg2: Color get() = surfaceContainer
-    val bg3: Color get() = surfaceContainerHigh
-    val line: Color get() = outlineVariant
-    val lineStrong: Color get() = outline
-    val text: Color get() = onSurface
-    val dim: Color get() = onSurfaceVariant
-    /** The three-step ink is retired: faint IS dim now. A dim-vs-faint ternary carries no cue. */
-    val faint: Color get() = onSurfaceVariant
-    val accent: Color get() = primary
-    /** On Android the tint is already the text-safe crimson, so the fill and text cuts are one. */
-    val accentText: Color get() = primary
-    val onAccent: Color get() = onPrimary
-
     companion object {
         val Normal = AcabPalette(
             surfaceContainerLowest = Color(0xFF140C0D),
@@ -308,21 +289,22 @@ object Acab {
     /** The crimson (primary) for readers outside a composition. */
     val tint: Color get() = palette.primary
 
-    // LEGACY aliases (see AcabPalette).
-    val bg: Color get() = palette.bg
-    val bg2: Color get() = palette.bg2
-    val bg3: Color get() = palette.bg3
-    val line: Color get() = palette.line
-    val lineStrong: Color get() = palette.lineStrong
+    // LEGACY aliases, each one a palette role under its old name.
+    val bg: Color get() = palette.surface
+    val bg2: Color get() = palette.surfaceContainer
+    val bg3: Color get() = palette.surfaceContainerHigh
+    val line: Color get() = palette.outlineVariant
+    val lineStrong: Color get() = palette.outline
 
-    val text: Color get() = palette.text
-    val dim: Color get() = palette.dim
-    val faint: Color get() = palette.faint
+    val text: Color get() = palette.onSurface
+    val dim: Color get() = palette.onSurfaceVariant
+    /** The three-step ink is retired: faint IS dim now. A dim-vs-faint ternary carries no cue. */
+    val faint: Color get() = palette.onSurfaceVariant
 
-    val accent: Color get() = palette.accent
+    val accent: Color get() = palette.primary
     /** Crimson for TEXT. On Android this is the same colour as [accent]: the tint is text-safe. */
-    val accentText: Color get() = palette.accentText
-    val onAccent: Color get() = palette.onAccent
+    val accentText: Color get() = palette.primary
+    val onAccent: Color get() = palette.onPrimary
     val warn: Color get() = palette.warn
 
     val flockTone: Color get() = palette.flockTone
@@ -333,13 +315,6 @@ object Acab {
     val watchTone: Color get() = palette.watchTone
     val netcamTone: Color get() = palette.netcamTone
     val sandTone: Color get() = palette.sandTone
-
-    // Both legacy faces are the system face (Roboto), C4: their readers are prose and buttons in
-    // sub-screens, so they did NOT move to the instrument face. The two bundled faces that app
-    // screens draw are named on their own: [JetBrainsMono] through [telemetry] (R16) and
-    // [WordmarkFace]. The TTFs in res/font also serve the home-screen widget layouts.
-    val display: FontFamily = FontFamily.Default
-    val mono: FontFamily = FontFamily.Default
 
     val radius = 12.dp      // = AcabShapes.medium, the M3 card radius (Android's own, C5)
     val radiusSm = 8.dp     // = AcabShapes.small

@@ -37,7 +37,7 @@ struct DashboardSnapshot {
     /// Second caption line. The second clause is the sentence that tells the user the 14-dot cap
     /// does not cap the counters (`total` and the breakdown count every recent device). TWIN:
     /// android StatusScreen.kt `STATUS_RADAR_CAPTION_DETAIL`, byte-identical.
-    static let radarCaptionDetail = "matches and stars first · counts include every recent device"
+    static let radarCaptionDetail = "matches and watched devices first · counts include every recent device"
 
     /// The two count cards that split TOTAL NEARBY, a title and a detail line each. TWIN: android
     /// StatusScreen.kt `STATUS_MATCHED_CARD_TITLE` / `STATUS_MATCHED_CARD_DETAIL` /
@@ -45,7 +45,7 @@ struct DashboardSnapshot {
     /// the four literals. "MATCHED + WATCHED" because a star counts as a match here
     /// (`DashboardSighting.matched`), and the detail names the two things that means.
     static let matchedCardTitle = "MATCHED + WATCHED"
-    static let matchedCardDetail = "signatures or exact stars"
+    static let matchedCardDetail = "signatures or your watchlist"
     static let ambientCardTitle = "AMBIENT"
     static let ambientCardDetail = "Desert-mode broadcasts"
 

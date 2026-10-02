@@ -2,6 +2,7 @@ package tech.acab.app.ui
 
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
+import org.json.JSONObject
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNull
@@ -21,35 +22,8 @@ class StatusRadarScopeSemanticsTest {
         mac: String,
         type: DeviceType,
         rssi: Int = -70,
-    ) = Detection(
-        type = type,
-        source = 0,
-        method = 0,
-        confidence = 80,
-        mac = mac,
-        rssi = rssi,
-        name = null,
-        rid = null,
-        detail = null,
-        lat = null,
-        lon = null,
-        pilotLat = null,
-        pilotLon = null,
-        altitude = null,
-        speedH = null,
-        speedV = null,
-        heading = null,
-        heightAGL = null,
-        pilotAlt = null,
-        ridStatus = null,
-        count = 1,
-        isNew = false,
-        gpsAgeSec = null,
-        hist = false,
-        seq = 0L,
-        at = 0L,
-        approx = false,
-    )
+    ) = Detection.fromJson(
+        JSONObject().put("t", type.raw).put("c", 80).put("mac", mac).put("rssi", rssi))
 
     @Test
     fun radarContentDescriptionSpeaksCountCapAndCaveat() {
@@ -67,7 +41,7 @@ class StatusRadarScopeSemanticsTest {
         // in Components.swift.
         assertEquals(
             "18 recently heard devices nearby. 14 dots drawn, at most 14, " +
-                "with matches and stars first. Radar shows signal strength only, not direction.",
+                "with matches and watched devices first. Radar shows signal strength only, not direction.",
             summary.radarContentDescription,
         )
     }
@@ -80,14 +54,14 @@ class StatusRadarScopeSemanticsTest {
         val one = statusNearbySummary(listOf(row("one", DeviceType.TRACKER)), emptySet())
         assertEquals(
             "1 recently heard device nearby. 1 dot drawn, at most 14, " +
-                "with matches and stars first. Radar shows signal strength only, not direction.",
+                "with matches and watched devices first. Radar shows signal strength only, not direction.",
             one.radarContentDescription,
         )
 
         val none = statusNearbySummary(emptyList(), emptySet())
         assertEquals(
             "0 recently heard devices nearby. 0 dots drawn, at most 14, " +
-                "with matches and stars first. Radar shows signal strength only, not direction.",
+                "with matches and watched devices first. Radar shows signal strength only, not direction.",
             none.radarContentDescription,
         )
     }

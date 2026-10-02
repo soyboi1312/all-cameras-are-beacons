@@ -8,13 +8,6 @@ final class PersistenceSafetyTests: XCTestCase {
 
     private enum WriteFailure: Error { case refused }
 
-    private func isolatedDefaults() -> (defaults: UserDefaults, suite: String) {
-        let suite = "PersistenceSafetyTests.\(UUID().uuidString)"
-        let defaults = UserDefaults(suiteName: suite)!
-        defaults.removePersistentDomain(forName: suite)
-        return (defaults, suite)
-    }
-
     func testRealClearInvalidatesAlreadyQueuedPersistedLoad() {
         var gate = PersistedDetectionLoadGate()
         let queuedBeforeClear = gate.beginLoad()
@@ -37,9 +30,8 @@ final class PersistenceSafetyTests: XCTestCase {
     }
 
     func testPendingClearSurvivesRelaunchAndBlocksLoadUntilDeleteRetrySucceeds() {
-        let isolated = isolatedDefaults()
-        defer { isolated.defaults.removePersistentDomain(forName: isolated.suite) }
-        let firstProcess = PersistedDetectionClearTombstone(defaults: isolated.defaults)
+        let defaults = isolatedDefaults()
+        let firstProcess = PersistedDetectionClearTombstone(defaults: defaults)
         XCTAssertTrue(firstProcess.arm())
 
         var fileExists = true
@@ -51,13 +43,13 @@ final class PersistenceSafetyTests: XCTestCase {
                        "failed deletion must not let the condemned file reload")
 
         // New value object over the same suite models a new process reading the durable tombstone.
-        let relaunched = PersistedDetectionClearTombstone(defaults: isolated.defaults)
+        let relaunched = PersistedDetectionClearTombstone(defaults: defaults)
         XCTAssertTrue(relaunched.isPending)
         XCTAssertTrue(performConfirmedPersistedDetectionDeletion(
             fileExists: { fileExists },
             remove: { fileExists = false }))
         XCTAssertTrue(relaunched.retire())
-        XCTAssertFalse(PersistedDetectionClearTombstone(defaults: isolated.defaults).isPending)
+        XCTAssertFalse(PersistedDetectionClearTombstone(defaults: defaults).isPending)
         XCTAssertTrue(persistedDetectionLoadAllowed(clearPending: relaunched.isPending))
     }
 

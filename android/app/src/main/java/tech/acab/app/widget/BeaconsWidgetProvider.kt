@@ -48,6 +48,7 @@ import kotlinx.coroutines.launch
 import tech.acab.app.MainActivity
 import tech.acab.app.R
 import tech.acab.app.ble.AcabBleManager
+import tech.acab.app.ui.relativeAgo
 
 /** Responsive Glance widget for launcher home screens. The provider declares home_screen only:
  *  this face carries the TODAY count, the category strip and the last hit's category, none of
@@ -86,12 +87,7 @@ class BeaconsWidgetProvider : GlanceAppWidgetReceiver() {
         // manager's store pass, the launcher keeps a safe disconnected zero rather than the prior
         // placement's private count/last hit.
         resetSummary(context)
-        val manager = AcabBleManager.peekInstance()
-        when (widgetSummaryLifecycleAction(enabled = true, managerAvailable = manager != null)) {
-            WidgetSummaryLifecycleAction.SEED_AUTHORITATIVE ->
-                manager?.seedWidgetSummary()
-            WidgetSummaryLifecycleAction.RESET_SAFE -> Unit
-        }
+        AcabBleManager.peekInstance()?.seedWidgetSummary()
     }
 
     override fun onDisabled(context: Context) {
@@ -215,16 +211,8 @@ class BeaconsWidgetProvider : GlanceAppWidgetReceiver() {
     }
 }
 
-/** Pure lifecycle policy so the remove/re-add/cold-process boundary is pinned by local JVM tests. */
-internal enum class WidgetSummaryLifecycleAction { RESET_SAFE, SEED_AUTHORITATIVE }
-
-internal fun widgetSummaryLifecycleAction(
-    enabled: Boolean,
-    managerAvailable: Boolean,
-): WidgetSummaryLifecycleAction =
-    if (enabled && managerAvailable) WidgetSummaryLifecycleAction.SEED_AUTHORITATIVE
-    else WidgetSummaryLifecycleAction.RESET_SAFE
-
+/** Pure render gate so the cold-process and old-process snapshot boundary is pinned by local JVM
+ * tests. */
 internal fun widgetPersistedSummaryMayRender(
     managerAvailable: Boolean,
     processMarkedReadable: Boolean,
@@ -386,15 +374,4 @@ private fun lastIcon(cat: String): Int = when (cat) {
     "CAMERA" -> R.drawable.ic_w_netcam
     "WATCHED" -> R.drawable.ic_w_star
     else -> R.drawable.ic_w_shield
-}
-
-private fun relativeAgo(atMs: Long, nowMs: Long): String {
-    val secs = ((nowMs - atMs) / 1000).coerceAtLeast(0)
-    return when {
-        secs < 5 -> "now"
-        secs < 60 -> "${secs}s ago"
-        secs < 3600 -> "${secs / 60}m ago"
-        secs < 86_400 -> "${secs / 3600}h ago"
-        else -> "${secs / 86_400}d ago"
-    }
 }

@@ -219,9 +219,8 @@ struct GlyphTile: View {
 
 // MARK: - Brand
 
-/// Big centered wordmark for the connect screen, with an optional subtitle sentence.
+/// Big centered wordmark for the connect screen.
 struct ACABWordmark: View {
-    var subtitle: String? = nil
     var body: some View {
         VStack(spacing: 8) {
             // The pre-redesign wordmark face, restored (R16): Space Grotesk Bold at 46pt on the
@@ -233,17 +232,9 @@ struct ACABWordmark: View {
                 .font(Font.custom("SpaceGrotesk-Bold", size: 46, relativeTo: .largeTitle))
                 .foregroundStyle(ACABTheme.text)
                 // One line that shrinks to fit instead of truncating: the wordmark is the brand,
-                // and "Beac..." is worse than smaller type. It also sets this VStack's width, so
-                // an overflow here would drag the subtitle off both edges with it.
+                // and "Beac..." is worse than smaller type.
                 .lineLimit(1)
                 .minimumScaleFactor(0.4)
-            if let subtitle {
-                Text(subtitle)
-                    .font(ACABTheme.font(.body))
-                    .foregroundStyle(ACABTheme.dim)
-                    .multilineTextAlignment(.center)
-                    .fixedSize(horizontal: false, vertical: true)
-            }
         }
         // Never wider than the screen, whatever the text size. Without this the VStack reports an
         // ideal width larger than the viewport and everything inside it is clipped symmetrically.
@@ -311,33 +302,9 @@ struct LinkChip: View {
     }
 }
 
-/// Blinking "live" dot.
-struct ScanDot: View {
-    var color: Color = ACABTheme.tint
-    @State private var on = true
-    // Reduce Motion parks the blink: the dot stays lit (state is still conveyed by colour +
-    // the kicker text beside it), it just stops pulsing.
-    @Environment(\.accessibilityReduceMotion) private var reduceMotion
-    var body: some View {
-        Circle().fill(color).frame(width: 7, height: 7)
-            .opacity(on ? 1 : 0.25)
-            .onAppear(perform: updateAnimation)
-            .onChange(of: reduceMotion) { _, _ in updateAnimation() }
-    }
-
-    private func updateAnimation() {
-        var parked = Transaction(animation: nil)
-        parked.disablesAnimations = true
-        withTransaction(parked) { on = true }
-        guard !reduceMotion else { return }
-        withAnimation(.easeInOut(duration: 0.9).repeatForever(autoreverses: true)) { on = false }
-    }
-}
-
 // MARK: - Category glyph
 
-/// A category glyph, tinted by category: bare on the Dynamic Type curve, on a neutral tile, or
-/// on a hue tile (`Style`).
+/// A category glyph, tinted by category: bare on the Dynamic Type curve or on a tile (`Style`).
 struct CatGlyph: View {
     enum Style {
         /// No tile: the glyph alone in a column that scales with Dynamic Type, for rows that
@@ -345,8 +312,6 @@ struct CatGlyph: View {
         case bare
         /// A rounded tile in `fill` (default bg3) with the glyph in the category tint.
         case tile(fill: Color = ACABTheme.bg3)
-        /// A tile filled with the category tint and the glyph in onAccent (a Settings-style tile).
-        case hue
     }
     let type: DeviceType
     var size: CGFloat = 34
@@ -375,8 +340,6 @@ struct CatGlyph: View {
                         .font(.system(size: size * 0.46, weight: .medium))
                         .foregroundStyle(type.tint)
                 )
-        case .hue:
-            GlyphTile(symbol: type.symbol, fill: type.tint, glyph: ACABTheme.onAccent, size: size)
         }
     }
 }
@@ -614,7 +577,7 @@ struct RadarScope: View {
         // One spoken element for the whole instrument: the dots and rings are positional
         // decoration a screen reader cannot use, so say what the scope actually knows.
         .accessibilityElement(children: .ignore)
-        .accessibilityLabel("\(count) recently heard device\(count == 1 ? "" : "s") nearby. \(dots.count) dot\(dots.count == 1 ? "" : "s") drawn, at most \(cap), with matches and stars first. Radar shows signal strength only, not direction.")
+        .accessibilityLabel("\(count) recently heard device\(count == 1 ? "" : "s") nearby. \(dots.count) dot\(dots.count == 1 ? "" : "s") drawn, at most \(cap), with matches and watched devices first. Radar shows signal strength only, not direction.")
     }
 
     /// Reports `view`'s frame in the scope's square under `key`, for the dot placement.
@@ -896,7 +859,7 @@ extension Detection {
         case .tracker:                  return "Item tracker"
         case .drone:                    return "Drone maker"
         case .recordingGlasses:         return "Smart glasses"
-        case .watched:                  return "Starred device"
+        case .watched:                  return "Watched device"
         // The dossier leads with `maker` (the "<vendor> on wifi" detail) when the board named
         // the brand; this is the honest fallback when it did not.
         case .networkCamera:            return "IP camera"

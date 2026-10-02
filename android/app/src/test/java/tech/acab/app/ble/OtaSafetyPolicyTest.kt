@@ -142,26 +142,6 @@ class OtaSafetyPolicyTest {
             requestAccepted = false,
         ))
 
-        var ownRequests = 0
-        assertTrue(acquireOtaHoldBoundary(
-            reuseConfirmedHold = true,
-            serviceActive = true,
-            requestOwnHold = { ownRequests++; false },
-        ))
-        assertEquals(0, ownRequests)
-        assertFalse(acquireOtaHoldBoundary(
-            reuseConfirmedHold = true,
-            serviceActive = false,
-            requestOwnHold = { ownRequests++; true },
-        ))
-        assertEquals(0, ownRequests)
-        assertTrue(acquireOtaHoldBoundary(
-            reuseConfirmedHold = false,
-            serviceActive = true,
-            requestOwnHold = { ownRequests++; true },
-        ))
-        assertEquals(1, ownRequests)
-
         assertFalse(nrfArmMutationAllowed(
             ownsLiveSession = true,
             phase = NrfDfuPhase.PREPARING,

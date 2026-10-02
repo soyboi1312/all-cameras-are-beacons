@@ -38,16 +38,19 @@ private func localDayIndex() -> Int {
 // MARK: - Theme
 
 // Widget-local slice of the app's Crimson theme. The extension does not compile the app
-// target's Theme.swift, so the widget owns its own tokens (kept in sync with the values
-// in DetectionLiveActivity.swift). Fonts are bundled into the extension (see Info.plist
+// target's Theme.swift, so the widget target owns its own tokens (DetectionLiveActivity.swift
+// uses this enum too). Fonts are bundled into the extension (see Info.plist
 // UIAppFonts): Space Grotesk Bold for digits, JetBrains Mono Medium for kickers.
-private enum WidgetTheme {
+enum WidgetTheme {
     static let crimson = Color(red: 0xEE / 255, green: 0x40 / 255, blue: 0x34 / 255)
     static let amber   = Color(red: 0xF2 / 255, green: 0xB5 / 255, blue: 0x3C / 255)
     static let bodyCam = Color(red: 0xCD / 255, green: 0xC1 / 255, blue: 0xC3 / 255)
     static let tracker = Color(red: 0x49 / 255, green: 0xC5 / 255, blue: 0xB1 / 255)
     static let glasses = Color(red: 0xB0 / 255, green: 0x7C / 255, blue: 0xFF / 255)
     static let netcam  = Color(red: 0x3D / 255, green: 0x8B / 255, blue: 0xFF / 255)
+    /// Live Activity network-camera column (the home widget uses `netcam`). Distinct from `tracker`,
+    /// which it briefly shared, so two adjacent columns are not the same colour at a glance.
+    static let teal    = Color(red: 0x6E / 255, green: 0xA8 / 255, blue: 0xE0 / 255)
 
     /// Display face for digits: Space Grotesk Bold.
     static func digits(_ size: CGFloat) -> Font { .custom("SpaceGrotesk-Bold", size: size) }

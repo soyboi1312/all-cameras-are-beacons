@@ -157,6 +157,41 @@ internal fun parseAlprManifestCount(raw: Any): Int? {
     return value.takeIf { it in 0 until 5_000_000L }?.toInt()
 }
 
+/** Most objects and arrays an ALPR manifest may open, counted anywhere in the body. Set by what
+ *  the parser can survive, NOT by today's manifest shape: the published manifest (2026-09-27)
+ *  opens 61, ten fixed plus three per coverage seed tile (a region_bbox entry and a
+ *  coverage_probes object with its bbox), and it grew from 43 when two seeds were split into
+ *  quadrants. 512 leaves room for about 160 seed tiles and matches the nesting depth at which
+ *  iOS's JSONDecoder refuses a body. The reviews ran AOSP org.json on a desktop JVM with a 1 MiB
+ *  stack: it overflowed at roughly 2,500 levels with compiled frames and 3,600 to 4,000
+ *  interpreted. ART on a phone was not measured, so 512 is kept well under the lowest of those,
+ *  and doFetch's StackOverflowError catch stays behind it. See [alprManifestContainersOk]. */
+internal const val ALPR_MANIFEST_MAX_CONTAINERS = 512
+
+/**
+ * True when [raw] contains at most [ALPR_MANIFEST_MAX_CONTAINERS] `{` or `[` characters.
+ *
+ * WHY. Android's org.json parses nested values by recursion with no depth limit. A manifest under
+ * the 64 KB read cap that opens a few thousand arrays throws StackOverflowError, which is an
+ * Error, not an Exception, so doFetch's catch let it escape and the default handler killed the
+ * app. The layer is on by default and the manifest is fetched on every start, so a compromised
+ * soyboi.tech could crash the app on every online launch (security review 2026-09-29).
+ *
+ * WHY A COUNT AND NOT A DEPTH SCAN. Nesting depth can never exceed the number of opening
+ * characters, so this bound holds whatever org.json accepts. A string-aware depth scan does not:
+ * org.json also reads single-quoted strings and skips comments, so a `"` inside either would
+ * blind such a scan to the brackets after it. Brackets inside real strings count too, which can
+ * only reject a manifest, never let a deep one through. iOS needs no twin: JSONDecoder enforces
+ * its own depth limit and throws.
+ */
+internal fun alprManifestContainersOk(raw: String): Boolean {
+    var opened = 0
+    for (c in raw) {
+        if ((c == '{' || c == '[') && ++opened > ALPR_MANIFEST_MAX_CONTAINERS) return false
+    }
+    return true
+}
+
 internal fun shouldFallbackToAlprV3(httpStatus: Int): Boolean =
     httpStatus == HttpURLConnection.HTTP_NOT_FOUND
 
@@ -429,6 +464,9 @@ class AlprStore private constructor(context: Context) {
                 if (lastStatus == HttpURLConnection.HTTP_NOT_FOUND) outcome = RefreshOutcome.NOT_PUBLISHED
                 return
             }
+            // Before org.json sees it: a deeply nested body would recurse the parser off the
+            // stack (see alprManifestContainersOk).
+            if (!alprManifestContainersOk(manifestRaw)) return
             val m = JSONObject(manifestRaw)
             if (m.optInt("schema", 0) != 1) return
             val data = m.optJSONObject("data") ?: return
@@ -497,6 +535,9 @@ class AlprStore private constructor(context: Context) {
             }
         } catch (_: Exception) {
             // keep whatever we already have
+        } catch (_: StackOverflowError) {
+            // Second layer behind alprManifestContainersOk: an Error is not an Exception, and one
+            // escaping this IO scope (no handler) kills the process. Keep what we already have.
         } finally {
             // outcome BEFORE loading, so an observer waking on loading=false reads the
             // verdict of THIS fetch, never the previous one's
@@ -679,25 +720,15 @@ class AlprStore private constructor(context: Context) {
                 INSTANCE ?: AlprStore(context.applicationContext).also { INSTANCE = it }
             }
 
-        /** ALP4 source metadata retained in row order even though the current map does not render
-         * it yet. Unsigned wire fields stay unsigned so a future consumer never inherits a signed
-         * reinterpretation from this parser boundary. */
-        internal data class SourceMetadata(
-            val osmType: Int,
-            val osmId: ULong,
-            val sourceEpoch: Long?,
-            val directionCdeg: Int?,
-            val checkDateDay: Long?,
-        )
-
-        /** Parsed dataset: coordinates and every parallel block. rawTier preserves ALP4 tier 2
+        /** Parsed dataset: coordinates plus the maker and tier blocks. The ALP4 source block is
+         * validated in parse() and is not returned. rawTier preserves ALP4 tier 2
          * and the pre-tier legacy sentinel; confirmed is only a compatibility display bit. */
         internal class Parsed(val wireFormat: String, val rawCount: Int, val coords: IntArray,
                             val makerIdx: IntArray, val table: Array<String>,
-                            val confirmed: BooleanArray, val rawTier: IntArray,
-                            val metadata: Array<SourceMetadata?>)
+                            val confirmed: BooleanArray, val rawTier: IntArray)
 
-        /** Parse ALP4 (coords + maker + tier + stable source metadata). Also accepts legacy ALP3,
+        /** Parse ALP4 (coords + maker + tier; the per-node source block is length-checked and
+         *  validated, then discarded, because nothing on Android reads it). Also accepts legacy ALP3,
          *  ALP2 and ALP1, so a cache from an
          *  older build still loads. Bounds-checked throughout; returns null on any malformation
          *  (bad length, a table that runs past the buffer, etc.). A maker index past the table
@@ -796,22 +827,17 @@ class AlprStore private constructor(context: Context) {
             val rawTier = IntArray(count) { if (hasTier) 1 else ALPR_TIER_LEGACY_FORMAT }
             if (hasTier) for (i in 0 until count) rawTier[i] = buf.get().toInt() and 0xFF
             if (v4 && rawTier.any { it !in 0..2 }) return null
-            val rawMetadata = arrayOfNulls<SourceMetadata>(count)
+            // ALP4 source block: every row is validated (same accept/reject rule as iOS
+            // ALPRStore.parse) and then discarded. All five reads stay, in wire order, so the
+            // direction is read from the correct offset.
             if (v4) for (i in 0 until count) {
                 val osmType = buf.get().toInt() and 0xFF
                 val osmId = buf.long.toULong()
-                val sourceEpoch = buf.int.toLong() and 0xFFFF_FFFFL
+                buf.int                              // sourceEpoch (unused here)
                 val directionRaw = buf.short.toInt() and 0xFFFF
-                val checkDayRaw = buf.int.toLong() and 0xFFFF_FFFFL
+                buf.int                              // checkDateDay (unused here)
                 if (osmType !in 0..2 || osmId == 0uL ||
                     (directionRaw != 0xFFFF && directionRaw !in 0..35_999)) return null
-                rawMetadata[i] = SourceMetadata(
-                    osmType = osmType,
-                    osmId = osmId,
-                    sourceEpoch = sourceEpoch.takeUnless { it == 0L },
-                    directionCdeg = directionRaw.takeUnless { it == 0xFFFF },
-                    checkDateDay = checkDayRaw.takeUnless { it == 0L },
-                )
             }
 
             val keep = ArrayList<Int>(count)
@@ -821,14 +847,12 @@ class AlprStore private constructor(context: Context) {
             val n = keep.size
             val coords = IntArray(n * 2); val makerIdx = IntArray(n)
             val confirmed = BooleanArray(n); val tiers = IntArray(n)
-            val metadata = arrayOfNulls<SourceMetadata>(n)
             for (k in 0 until n) {
                 val i = keep[k]
                 coords[k * 2] = rawLat[i]; coords[k * 2 + 1] = rawLon[i]
                 makerIdx[k] = rawIdx[i]
                 tiers[k] = rawTier[i]
                 confirmed[k] = rawTier[i] == 1 || rawTier[i] == ALPR_TIER_LEGACY_FORMAT
-                metadata[k] = rawMetadata[i]
             }
             val wireFormat = when {
                 v4 -> "ALP4"
@@ -836,7 +860,7 @@ class AlprStore private constructor(context: Context) {
                 v2 -> "ALP2"
                 else -> "ALP1"
             }
-            return Parsed(wireFormat, count, coords, makerIdx, table, confirmed, tiers, metadata)
+            return Parsed(wireFormat, count, coords, makerIdx, table, confirmed, tiers)
         }
 
         private fun sha256Hex(bytes: ByteArray): String {
@@ -846,19 +870,8 @@ class AlprStore private constructor(context: Context) {
             return sb.toString()
         }
 
-        private fun readBounded(input: java.io.InputStream, cap: Long, label: String): ByteArray {
-            val out = java.io.ByteArrayOutputStream(minOf(cap, 64L * 1024L).toInt())
-            val tmp = ByteArray(16 * 1024)
-            var total = 0L
-            while (true) {
-                val r = input.read(tmp)
-                if (r < 0) break
-                total += r
-                if (total > cap) throw java.io.IOException("$label exceeds byte limit")
-                out.write(tmp, 0, r)
-            }
-            return out.toByteArray()
-        }
+        private fun readBounded(input: java.io.InputStream, cap: Long, label: String): ByteArray =
+            readBounded(input, cap) ?: throw java.io.IOException("$label exceeds byte limit")
 
         private const val MAX_MANIFEST_BYTES = 64L * 1024L
         private const val MAX_REDIRECTS = 3

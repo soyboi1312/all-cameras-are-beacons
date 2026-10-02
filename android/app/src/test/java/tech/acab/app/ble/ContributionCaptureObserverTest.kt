@@ -1,5 +1,6 @@
 package tech.acab.app.ble
 
+import org.json.JSONObject
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNull
@@ -8,36 +9,9 @@ import tech.acab.app.model.Detection
 import tech.acab.app.model.DeviceType
 
 class ContributionCaptureObserverTest {
-    private fun row(id: String, rssi: Int = -50, replay: Boolean = false) = Detection(
-        type = DeviceType.NEARBY_DEVICE,
-        source = 0,
-        method = 0,
-        confidence = 1,
-        mac = id,
-        rssi = rssi,
-        name = null,
-        rid = null,
-        detail = null,
-        lat = null,
-        lon = null,
-        pilotLat = null,
-        pilotLon = null,
-        altitude = null,
-        speedH = null,
-        speedV = null,
-        heading = null,
-        heightAGL = null,
-        pilotAlt = null,
-        ridStatus = null,
-        count = 1,
-        isNew = true,
-        gpsAgeSec = null,
-        hist = replay,
-        seq = 0L,
-        at = 0L,
-        approx = false,
-        offline = replay,
-    )
+    private fun row(id: String, rssi: Int = -50, replay: Boolean = false) = Detection.fromJson(
+        JSONObject().put("t", DeviceType.NEARBY_DEVICE.raw).put("c", 1).put("mac", id)
+            .put("rssi", rssi).put("new", true).put("hist", replay).put("offline", replay))
 
     @Test
     fun latestInWindowSampleWinsAndExplicitNullSuppressesFallback() {

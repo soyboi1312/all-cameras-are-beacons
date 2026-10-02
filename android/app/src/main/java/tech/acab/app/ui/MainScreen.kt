@@ -175,8 +175,6 @@ private val LogFilterSeedSaver = Saver<LogFilter?, String>(
 @Composable
 internal fun MainScreen(
     ble: AcabBleManager,
-    initialTab: Int = 0,
-    initialLogFilter: LogFilter? = null,
     reconnecting: Boolean = false,
     locationGranted: Boolean = false,
     onRequestLocation: () -> Unit = {},
@@ -203,7 +201,7 @@ internal fun MainScreen(
     // Saveable: no configChanges are declared, so a dark-theme flip or multi-window resize
     // recreates the activity; without this the shell would snap back to the Status tab
     // (iOS SwiftUI state survives the equivalent).
-    var tab by rememberSaveable { mutableIntStateOf(initialTab) }
+    var tab by rememberSaveable { mutableIntStateOf(0) }
     // The open dossier: a Detection SNAPSHOT, frozen at tap (MapScreen re-resolves the live row
     // on tap; the ~3 Hz feed must not recompose the whole dossier).
     var selected by remember { mutableStateOf<Detection?>(null) }
@@ -227,7 +225,7 @@ internal fun MainScreen(
     // Filter seed handed to LogScreen; cleared on the next manual tab tap so a consumed
     // deep link doesn't keep re-applying the NEW lens forever. Saveable (with logScreenKey):
     // rotation right after a deep link must restore the same lens, not silently reset it.
-    var logFilterSeed by rememberSaveable(stateSaver = LogFilterSeedSaver) { mutableStateOf(initialLogFilter) }
+    var logFilterSeed by rememberSaveable(stateSaver = LogFilterSeedSaver) { mutableStateOf<LogFilter?>(null) }
     var logScreenKey by rememberSaveable { mutableIntStateOf(0) }
     var openDetectorsToken by rememberSaveable { mutableIntStateOf(0) }
     // Help + support opened from the Status toolbar: a full-screen overlay OVER the current tab,
@@ -302,27 +300,13 @@ internal fun MainScreen(
     // the next connect. The shell-owned tokens start at 0 with the shell, as DeviceScreen's
     // watermarks do, so the two can never disagree about which bumps are new. Saveable, so a
     // rotation neither switches tabs again nor re-pushes the page.
-    var handledNotifyTab by rememberSaveable { mutableIntStateOf(openNotifyToken) }
     var shellNotifyToken by rememberSaveable { mutableIntStateOf(0) }
-    LaunchedEffect(openNotifyToken) {
-        if (shouldHandleOpenToken(openNotifyToken, handledNotifyTab)) {
-            handledNotifyTab = openNotifyToken
-            shellNotifyToken++
-            setSelected(null)
-            helpOpen = false
-            tab = Tab.DEVICE.ordinal
-        }
+    OnOpenToken(openNotifyToken, seed = openNotifyToken) {
+        shellNotifyToken++; setSelected(null); helpOpen = false; tab = Tab.DEVICE.ordinal
     }
-    var handledLiveModeTab by rememberSaveable { mutableIntStateOf(openLiveModeToken) }
     var shellLiveModeToken by rememberSaveable { mutableIntStateOf(0) }
-    LaunchedEffect(openLiveModeToken) {
-        if (shouldHandleOpenToken(openLiveModeToken, handledLiveModeTab)) {
-            handledLiveModeTab = openLiveModeToken
-            shellLiveModeToken++
-            setSelected(null)
-            helpOpen = false
-            tab = Tab.DEVICE.ordinal
-        }
+    OnOpenToken(openLiveModeToken, seed = openLiveModeToken) {
+        shellLiveModeToken++; setSelected(null); helpOpen = false; tab = Tab.DEVICE.ordinal
     }
 
     // "Open in map" jump from a dossier's location thumbnail. The coordinate is stashed here
@@ -533,7 +517,7 @@ internal fun MainScreen(
                             Tab.entries.forEachIndexed { i, t ->
                                 NavigationRailItem(
                                     selected = tab == i,
-                                    onClick = { logFilterSeed = initialLogFilter; tab = i },
+                                    onClick = { logFilterSeed = null; tab = i },
                                     // The adjacent NavigationRailItem label names the destination; a
                                     // second description on the glyph makes TalkBack announce it twice.
                                     icon = { Icon(if (tab == i) t.selectedIcon else t.unselectedIcon, contentDescription = null) },
@@ -571,7 +555,7 @@ internal fun MainScreen(
                                 Tab.entries.forEachIndexed { i, t ->
                                     NavigationBarItem(
                                         selected = tab == i,
-                                        onClick = { logFilterSeed = initialLogFilter; tab = i },
+                                        onClick = { logFilterSeed = null; tab = i },
                                         icon = { Icon(if (tab == i) t.selectedIcon else t.unselectedIcon, contentDescription = null) },
                                         label = { Text(t.label) },
                                     )

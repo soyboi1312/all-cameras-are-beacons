@@ -41,8 +41,8 @@ struct ACABTone: Equatable {
 /// because UIColor.secondaryLabel measures under that on the cell.
 /// The seven category tones and `sandTone` are the same colour to 8-bit precision as Android
 /// `AcabPalette` at both levels (`axonTone` here is `bodyCamTone` there), and the hue columns
-/// of `DetectionsWidget.WidgetTheme` and `DetectionLiveActivity.WidgetTheme` match the Normal
-/// values, except the Live Activity's netcam column (`teal`, 6EA8E0), a per-surface difference.
+/// of the widget target's `WidgetTheme` (DetectionsWidget.swift) match the Normal values,
+/// except the Live Activity's netcam column (`teal`, 6EA8E0), a per-surface difference.
 /// Android documents its own M3 derivation of surfaces, inks and accent in Theme.kt.
 /// RETIRED on 2026-09-23: the rule that every shared token is the same colour on iOS, Android
 /// and the web css. Surfaces, inks, `tint` and `onAccent` differ per platform ON PURPOSE; do not
@@ -227,9 +227,9 @@ enum ACABTheme {
 
     // MARK: Type
     // System text styles (Dynamic Type) through ONE helper, `font(_:weight:design:tabular:)`;
-    // `fixed` is the documented exception off the Dynamic Type curve; `display` and `mono` are
-    // legacy names that forward to `font`. Higher contrast steps the weight one cut
-    // (TypePrefs.highContrast). Bold Text is not an input here: the system emboldens SF itself.
+    // `fixed` is the documented exception off the Dynamic Type curve. Higher contrast steps the
+    // weight one cut (TypePrefs.highContrast). Bold Text is not an input here: the system
+    // emboldens SF itself.
     // All @MainActor because TypePrefs is: fonts are built only inside view bodies.
 }
 
@@ -256,38 +256,6 @@ extension ACABTheme {
                       design: Font.Design = .default, tabular: Bool = false) -> Font {
         let f = Font.system(size: size, weight: TypePrefs.shared.effectiveWeight(weight), design: design)
         return tabular ? f.monospacedDigit() : f
-    }
-
-    /// Pure: which text style a legacy point size rides. The nearest default size wins, and
-    /// everything under 11.5 becomes caption2 (11pt), the smallest legible style: a floor on purpose.
-    static func textStyle(near size: CGFloat) -> Font.TextStyle {
-        switch size {
-        case ..<11.5: return .caption2     // 11
-        case ..<12.5: return .caption      // 12
-        case ..<14:   return .footnote     // 13
-        case ..<15.5: return .subheadline  // 15
-        case ..<16.5: return .callout      // 16
-        case ..<18.5: return .body         // 17
-        case ..<21:   return .title3       // 20
-        case ..<25:   return .title2       // 22
-        case ..<31:   return .title        // 28
-        default:      return .largeTitle   // 34
-        }
-    }
-
-    /// Legacy name, kept for the inherit-only path. Same face as `font`; the size picks the
-    /// style. In-scope lanes call `font(_:)` directly.
-    @MainActor
-    static func display(_ size: CGFloat, weight: Font.Weight = .regular) -> Font {
-        font(textStyle(near: size), weight: weight)
-    }
-    /// Legacy name, kept. NOT a monospaced face any more: it means "data", so it carries
-    /// tabular digits, which keeps the digit columns the old mono face aligned in the
-    /// inherit-only screens without a sweep. In-scope lanes migrate to `font(...)` and decide
-    /// per site between `tabular:` and `design: .monospaced`.
-    @MainActor
-    static func mono(_ size: CGFloat, weight: Font.Weight = .regular) -> Font {
-        font(textStyle(near: size), weight: weight, tabular: true)
     }
 
     // MARK: Instrument layer (JetBrains Mono)
@@ -456,7 +424,7 @@ struct Kicker: View {
             // rows that have no way to refuse. It has broken the layout TWICE, along two
             // different axes, and the second time is why this now reads as a flat "may wrap".
             //
-            // 1. FONT SIZE. Dynamic Type only started reaching this label when ACABTheme.mono
+            // 1. FONT SIZE. Dynamic Type only started reaching this label when the old mono helper
             //    gained `relativeTo:`; before that Font.custom(_:size:) was frozen at the literal
             //    point size so the hug was harmless. Once the text scaled, every row carrying a
             //    Kicker grew wider than the screen and the Beacon page ran off the left edge.

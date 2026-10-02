@@ -3,49 +3,17 @@ import WidgetKit
 import SwiftUI
 import AppIntents
 
-// Widget-local slice of the app's Crimson theme. The shared ActivityAttributes is
-// intentionally Color-free and the extension does not compile Theme.swift, so the
-// widget owns its own tokens. Fonts are bundled into the extension (see Info.plist
-// UIAppFonts): Space Grotesk Bold for digits, JetBrains Mono Medium for kickers.
-private enum WidgetTheme {
-    static let crimson = Color(red: 0xEE / 255, green: 0x40 / 255, blue: 0x34 / 255)
-    static let amber   = Color(red: 0xF2 / 255, green: 0xB5 / 255, blue: 0x3C / 255)
-    static let bodyCam = Color(red: 0xCD / 255, green: 0xC1 / 255, blue: 0xC3 / 255)
-    static let tracker = Color(red: 0x49 / 255, green: 0xC5 / 255, blue: 0xB1 / 255)
-    /// Network-camera column. Distinct from `tracker`, which it briefly shared, so two adjacent
-    /// columns are not the same colour at a glance.
-    static let teal    = Color(red: 0x6E / 255, green: 0xA8 / 255, blue: 0xE0 / 255)
-    static let glasses = Color(red: 0xB0 / 255, green: 0x7C / 255, blue: 0xFF / 255)
-
-    /// Display face for digits: Space Grotesk Bold.
-    static func digits(_ size: CGFloat) -> Font { .custom("SpaceGrotesk-Bold", size: size) }
-    /// Data / kicker face: JetBrains Mono Medium.
-    static func mono(_ size: CGFloat) -> Font { .custom("JetBrainsMono-Medium", size: size) }
-}
-
-// Widget-local presentation tokens for the six detection buckets. The symbol map
-// mirrors the app's DeviceType, kept self-contained here.
-private enum DetCat: String, CaseIterable {
-    // rawValue MUST equal the matching WidgetCategory rawValue: DetectionState.enabled
-    // carries those strings and this is what matches them back to a column.
-    case alpr = "ALPR", drone = "DRONE", bodyCam = "BODY", tracker = "TRACKER"
-    case glasses = "GLASSES", camera = "CAMERA"
-
-    var symbol: String {
-        switch self {
-        case .alpr:    return "camera.fill"
-        case .drone:   return "airplane"
-        case .bodyCam: return "person.fill.viewfinder"
-        case .tracker: return "dot.radiowaves.left.and.right"
-        case .glasses: return "eyeglasses"
-        case .camera:  return "video.fill"
-        }
-    }
+// Live Activity presentation tokens for the six detection buckets. Colours and fonts come from
+// WidgetTheme (DetectionsWidget.swift). `tint` is file-private here and in DetectionsWidget.swift
+// on purpose: the camera column differs per surface.
+private extension WidgetCategory {
+    /// WidgetCategory.symbol, except the camera column, which keeps its Live Activity glyph.
+    var liveSymbol: String { self == .camera ? "video.fill" : symbol }
     var tint: Color {
         switch self {
         case .alpr:    return WidgetTheme.crimson
         case .drone:   return WidgetTheme.amber
-        case .bodyCam: return WidgetTheme.bodyCam
+        case .body:    return WidgetTheme.bodyCam
         case .tracker: return WidgetTheme.tracker
         case .glasses: return WidgetTheme.glasses
         case .camera:  return WidgetTheme.teal   // its own tint: reusing the tracker colour made two adjacent columns indistinguishable
@@ -55,7 +23,7 @@ private enum DetCat: String, CaseIterable {
         switch self {
         case .alpr:    return "ALPR"
         case .drone:   return "DRONE"
-        case .bodyCam: return "BODY"
+        case .body:    return "BODY"
         case .tracker: return "TRACK"
         case .glasses: return "GLASS"
         case .camera:  return "CAM"
@@ -65,7 +33,7 @@ private enum DetCat: String, CaseIterable {
         switch self {
         case .alpr: return "automatic license plate readers"
         case .drone: return "drones"
-        case .bodyCam: return "body cameras"
+        case .body: return "body cameras"
         case .tracker: return "item trackers"
         case .glasses: return "recording glasses"
         case .camera: return "network cameras"
@@ -75,7 +43,7 @@ private enum DetCat: String, CaseIterable {
         switch self {
         case .alpr:    return s.alpr
         case .drone:   return s.drones
-        case .bodyCam: return s.bodyCams
+        case .body:    return s.bodyCams
         case .tracker: return s.trackers
         case .glasses: return s.glasses
         case .camera:  return s.cameras
@@ -91,23 +59,23 @@ private enum DetCat: String, CaseIterable {
 /// `enabled` is nil (no status yet, or an activity started by a build that predates the field);
 /// an EMPTY set means every detector is genuinely off and draws no columns - the call sites
 /// render "all detectors off" instead.
-private func visibleCats(_ s: DetectionActivityAttributes.DetectionState) -> [DetCat] {
+private func visibleCats(_ s: DetectionActivityAttributes.DetectionState) -> [WidgetCategory] {
     // nil = no status yet -> fall back to the historical five rather than render nothing.
     // [] = every detector genuinely OFF -> draw NOTHING. Those two cases used to collapse into the
     // same empty array, which made this branch unreachable and left five phantom columns claiming
     // coverage that is not running. Keep `enabled` optional for exactly this reason.
-    guard let on = s.enabled else { return [.alpr, .drone, .bodyCam, .tracker, .glasses] }
+    guard let on = s.enabled else { return [.alpr, .drone, .body, .tracker, .glasses] }
     let set = Set(on)
-    return DetCat.allCases.filter { set.contains($0.rawValue) }
+    return WidgetCategory.allCases.filter { set.contains($0.rawValue) }
 }
 
 /// Dynamic Island slots go to whichever buckets are actually firing: leading and
 /// trailing get the top two by live count, expanded bottom-left gets the third.
 /// Zero-count buckets never claim a slot, so all six (glasses and cameras included) are
 /// reachable; when everything is zero the first three fall back in fixed order.
-private func rankedCats(_ s: DetectionActivityAttributes.DetectionState) -> [DetCat] {
+private func rankedCats(_ s: DetectionActivityAttributes.DetectionState) -> [WidgetCategory] {
     // Imperative on purpose: the chained tuple map/sort was too much for the type-checker.
-    var live: [(idx: Int, cat: DetCat, n: Int)] = []
+    var live: [(idx: Int, cat: WidgetCategory, n: Int)] = []
     for (idx, cat) in visibleCats(s).enumerated() {
         let n = cat.count(s)
         if n > 0 { live.append((idx: idx, cat: cat, n: n)) }
@@ -345,12 +313,12 @@ private struct LockScreenView: View {
 }
 
 private struct StatTile: View {
-    let cat: DetCat
+    let cat: WidgetCategory
     let state: DetectionActivityAttributes.DetectionState
     var body: some View {
         let n = cat.count(state)
         VStack(spacing: 3) {
-            Image(systemName: cat.symbol).font(.system(size: 13))
+            Image(systemName: cat.liveSymbol).font(.system(size: 13))
                 .foregroundStyle(n > 0 ? cat.tint : .white.opacity(0.35))
             Text("\(n)")
                 .font(WidgetTheme.digits(18)).monospacedDigit()
@@ -368,12 +336,12 @@ private struct StatTile: View {
 // MARK: - Dynamic Island badge
 
 private struct StatBadge: View {
-    let cat: DetCat
+    let cat: WidgetCategory
     let state: DetectionActivityAttributes.DetectionState
     var body: some View {
         let n = cat.count(state)
         HStack(spacing: 4) {
-            Image(systemName: cat.symbol).font(.system(size: 12))
+            Image(systemName: cat.liveSymbol).font(.system(size: 12))
                 .foregroundStyle(n > 0 ? cat.tint : Color.white.opacity(0.6))
             Text("\(n)").font(WidgetTheme.digits(15)).monospacedDigit()
         }

@@ -240,6 +240,24 @@ internal fun pickerRowKind(owned: Boolean, kindHint: BoardKind?, rememberedKind:
  *  advert. The raw advertised name ("ACAB", "ACAB-mesh") never reaches the title. */
 internal fun scannedRowTitle(kind: BoardKind?): String = (kind ?: BoardKind.BEACON).noun
 
+/** The address line a picker row draws: the board's advertised address, or null for the DEBUG
+ *  board-kind stand-in (AcabBleManager.applyDebugBoardKind), whose address is a placeholder and
+ *  not a board's.
+ *
+ *  Do not test the address bits here. An earlier rule hid an address whose first octet has the
+ *  top bits 01, to hide the rotating Resolvable Private Address of a bench firmware build (that
+ *  build option is removed, see "Peripheral address, bonding and privacy" in
+ *  docs/ble-protocol.md). Those bits mean "resolvable private" only in a RANDOM address. The
+ *  board advertises its fixed PUBLIC factory address, where they mean nothing, so the rule hid
+ *  every board whose address starts 0x40 to 0x7F. The address type cannot gate the test either:
+ *  ScanResult carries none and BluetoothDevice.getAddressType is API 35, above this app's
+ *  minSdk. A bench board that still holds the old privacy build draws a rotating address here;
+ *  a firmware that rotates again must revisit this rule.
+ *
+ *  iOS has no equivalent line: CoreBluetooth never exposes a peer MAC. */
+internal fun pickerAddressLine(address: String): String? =
+    address.takeIf { it != AcabBleManager.DEBUG_REMEMBERED_ADDRESS }
+
 enum class NearbyPermissionDenial { NONE, RETRYABLE, SETTINGS }
 
 /** Turn the platform permission result into a stable, directly renderable recovery state. */
@@ -1062,7 +1080,7 @@ private fun RationaleRow(icon: ImageVector, lead: String, rest: String) {
 private val BoardRssiStyle = AcabTypography.bodySmall.tabular()
 
 /** One discovered board: cpu glyph, its kind's title (pickerRowKind; [rememberedKind] is the
- *  remembered record's stored kind), firmware version, short id, signal bars, RSSI (iOS
+ *  remembered record's stored kind), firmware version, address, signal bars, RSSI (iOS
  *  anatomy). An advert updates rssi and seenAt many times a second, so everything derived from
  *  them is remembered on the band it produces, not rebuilt per advert. */
 @Composable
@@ -1076,14 +1094,7 @@ private fun BoardRow(board: FoundBoard, rememberedKind: BoardKind?, onConnect: (
             else -> "weak"
         }
     }
-    val stableAddress = remember(board.device.address) {
-        val addrHi = board.device.address.substringBefore(':').toIntOrNull(16) ?: 0
-        // The DEBUG board-kind stand-in (AcabBleManager.applyDebugBoardKind) has a placeholder
-        // address, not a board's: it draws no address line, like the iOS stand-in.
-        board.device.address.takeIf {
-            (addrHi shr 6) != 0b01 && it != AcabBleManager.DEBUG_REMEMBERED_ADDRESS
-        }
-    }
+    val stableAddress = pickerAddressLine(board.device.address)
     // The row's title names its board's kind, never the raw advertised name ("ACAB" is an OUI-Spy,
     // "ACAB-mesh" a Mesh-Detect): "your OUI-Spy" for the remembered board, "OUI-Spy" for a scanned
     // one, "beacon" while the kind is unknown. TWIN: iOS ConnectView.boardTitleBlock.
@@ -1091,8 +1102,9 @@ private fun BoardRow(board: FoundBoard, rememberedKind: BoardKind?, onConnect: (
     val title = remember(board.owned, kind) {
         if (board.owned) RememberedBoardCopy.label(kind) else scannedRowTitle(kind)
     }
-    // Both labels mirror iOS ConnectView.boardRowAccessibilityLabel: the title, the signal, that it
-    // connects securely, then the firmware; Android adds the stable hardware address it draws.
+    // Both labels mirror iOS boardPickerRowAccessibilityLabel (ConnectView.swift): the title, the
+    // signal, that it connects securely, then the firmware; a scanned row on Android adds the
+    // hardware address it draws.
     val spoken = remember(title, board.owned, board.advertSeen, signal, board.firmware, stableAddress) {
         buildString {
             append(title)
@@ -1127,21 +1139,8 @@ private fun BoardRow(board: FoundBoard, rememberedKind: BoardKind?, onConnect: (
                         color = scheme.onSurfaceVariant)
                 }
             }
-            // Only show the advertised address when it is STABLE. With address privacy on, the
-            // board advertises a Resolvable Private Address that rotates roughly every 15 minutes,
-            // so this line showed a DIFFERENT value for the same board each time you opened the
-            // picker, and two boards could not be told apart across a rotation. Worse, someone who
-            // wrote it down would never match it again. Android does not reliably resolve a peer
-            // RPA to its identity inside scan results (it does that at connect), so the value here
-            // really is the rotating one even for a board you have already bonded.
-            //
-            // Detect it by the top two bits of the first octet: 01 = resolvable private. A board on
-            // older firmware, or built with ACAB_BLE_PRIVACY=0, still advertises a fixed public MAC
-            // that IS worth showing, so this hides the line rather than deleting it.
-            //
-            // iOS deliberately differs and needs no equivalent: CoreBluetooth never exposes a peer
-            // MAC at all, it substitutes a per-host UUID that stays stable for that phone, which is
-            // why ConnectView keeps showing its 8-character handle.
+            // The board's fixed address: it tells two boards of one kind apart. pickerAddressLine
+            // has the rule and why no address-bit test belongs in it.
             if (stableAddress != null) {
                 Text(stableAddress, style = MaterialTheme.typography.bodySmall, color = scheme.onSurfaceVariant)
             }

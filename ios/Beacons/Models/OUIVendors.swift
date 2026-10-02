@@ -16,6 +16,10 @@ enum OUIVendors {
         "0016ed": "Utility Inc",
         "00180a": "Cisco Meraki",
         "001885": "Motorola Solutions",
+        // WatchGuard Video's own MA-L block. Motorola Solutions owns WatchGuard, but the registry
+        // names WatchGuard, and so does the firmware's detail string ("WatchGuard Video OUI").
+        // Twin: OuiVendors.kt. Provenance in bodycam_vendor_signatures.h (WATCHGUARD_VIDEO_OUI).
+        "001d96": "WatchGuard Video",
         "001f92": "Motorola Solutions",
         "00236c": "Apple",
         // Axon's IEEE-registered block. Named here so the honest per-signature vendor below
@@ -117,14 +121,16 @@ enum BodyCamSignature: String {
     case axonOUI     = "Axon OUI"
     case utility     = "Utility BodyWorn"
     case motorola    = "Motorola Solutions OUI"
+    case watchguard  = "WatchGuard Video OUI"
 
     /// Who makes the device this signature fired on. Known exactly in every case, which
-    /// is the point: the category's guess would name three makers for all four.
+    /// is the point: the category's guess would name three makers for all five.
     var vendor: String {
         switch self {
         case .axonPayload, .axonOUI: return "Axon Enterprise"
         case .utility:               return "Utility Inc"
         case .motorola:              return "Motorola Solutions"
+        case .watchguard:            return "WatchGuard Video"
         }
     }
 }
@@ -179,7 +185,7 @@ extension Detection {
             return t   // verbatim: "Anker/eufy" keeps its slash, see below
         }
 
-        // 1. Body cam: the four-string wire contract both apps already match on exactly.
+        // 1. Body cam: the five-string wire contract both apps already match on exactly.
         if let sig = bodyCamSignature { return clean(sig.vendor) }
 
         // 2. Drone Remote ID. `ridManufacturer` passes an unrecognised CTA-2063 code straight

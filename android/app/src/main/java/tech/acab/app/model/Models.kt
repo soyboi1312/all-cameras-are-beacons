@@ -268,9 +268,8 @@ data class Detection(
     val isNew: Boolean,
     // GPS-fix age in seconds for the fix behind lat/lon (json "gage"). Present on any non-drone
     // row whose stamping fix was at least 1 s old, LIVE rows included - it is not a marker for
-    // offline or Desert rows. null means a fresh sub-second fix, no coordinate at all, the
-    // board's own onboard fix, a drone's broadcast position, or a hist row the replay trim
-    // ladder shed the fix from.
+    // offline or Desert rows. null means a fresh sub-second fix, no coordinate at all, a
+    // drone's broadcast position, or a hist row the replay trim ladder shed the fix from.
     val gpsAgeSec: Int?,
     // ---- offline-buffer replay fields (live detections leave these at defaults) ----
     val hist: Boolean,      // true for a replayed history record
@@ -512,7 +511,7 @@ val Detection.vendor: String
         DeviceType.TRACKER  -> "Item tracker"
         DeviceType.DRONE    -> "Drone maker"
         DeviceType.GLASSES  -> "Smart glasses"
-        DeviceType.WATCHED  -> "Starred device"
+        DeviceType.WATCHED  -> "Watched device"
         // The dossier leads with `maker` (the "<vendor> on wifi" detail) when the board named
         // the brand; this is the honest fallback when it did not.
         DeviceType.NETWORK_CAMERA -> "IP camera"

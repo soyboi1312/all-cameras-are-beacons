@@ -113,15 +113,14 @@ fun HelpScreen(
                 value = query,
                 onValueChange = { query = it },
                 singleLine = true,
-                textStyle = TextStyle(color = Acab.text, fontSize = 13.sp, fontFamily = Acab.mono),
+                textStyle = TextStyle(color = Acab.text, fontSize = 13.sp),
                 cursorBrush = SolidColor(Acab.accent),
                 modifier = Modifier.weight(1f).minimumInteractiveComponentSize()
                     .semantics { contentDescription = "Search help" },
                 decorationBox = { inner ->
                     Box(Modifier.fillMaxSize(), contentAlignment = Alignment.CenterStart) {
                         if (query.isEmpty()) {
-                            Text("search help", color = Acab.faint, fontSize = 13.sp,
-                                fontFamily = Acab.mono)
+                            Text("search help", color = Acab.faint, fontSize = 13.sp)
                         }
                         inner()
                     }
@@ -130,7 +129,7 @@ fun HelpScreen(
             if (query.isNotEmpty()) {
                 Text(
                     "Clear",
-                    color = Acab.dim, fontSize = 11.sp, fontFamily = Acab.mono,
+                    color = Acab.dim, fontSize = 11.sp,
                     modifier = Modifier.minimumInteractiveComponentSize().clickable { query = "" },
                 )
             }
@@ -148,7 +147,7 @@ fun HelpScreen(
                     Text(
                         "nothing here matches that. the support rows below reach a human, and the " +
                             "full FAQ online may be newer than this build.",
-                        color = Acab.dim, fontSize = 12.5.sp, fontFamily = Acab.mono, lineHeight = 17.sp,
+                        color = Acab.dim, fontSize = 12.5.sp, lineHeight = 17.sp,
                     )
                 } else {
                     results.forEachIndexed { i, (kicker, q) ->
@@ -247,18 +246,18 @@ private fun QuestionRow(
                 // Search results carry their section so an answer found out of context still says
                 // where it lives; the sectioned list does not, because the kicker is right above.
                 if (sectionKicker != null) {
-                    Text(sectionKicker, color = Acab.faint, fontSize = 9.sp, fontFamily = Acab.mono)
+                    Text(sectionKicker, color = Acab.faint, fontSize = 9.sp)
                     Spacer(Modifier.height(3.dp))
                 }
-                Text(q.q, color = Acab.text, fontSize = 13.5.sp, lineHeight = 18.sp, fontFamily = Acab.display)
+                Text(q.q, color = Acab.text, fontSize = 13.5.sp, lineHeight = 18.sp)
             }
             Spacer(Modifier.width(10.dp))
             Text(if (open) "−" else "+", color = Acab.faint, fontSize = 14.sp,
-                fontFamily = Acab.mono, modifier = Modifier.clearAndSetSemantics { })
+                modifier = Modifier.clearAndSetSemantics { })
         }
         if (open) {
             Spacer(Modifier.height(8.dp))
-            Text(q.a, color = Acab.dim, fontSize = 12.5.sp, lineHeight = 18.sp, fontFamily = Acab.mono)
+            Text(q.a, color = Acab.dim, fontSize = 12.5.sp, lineHeight = 18.sp)
         }
     }
 }
@@ -278,15 +277,15 @@ private fun SupportRow(row: FaqSupportRow, onClick: () -> Unit) {
     ) {
         Column(Modifier.weight(1f)) {
             Text(
-                row.title, color = Acab.text, fontSize = 13.5.sp, fontFamily = Acab.display,
+                row.title, color = Acab.text, fontSize = 13.5.sp,
                 textDecoration = if (row.external) TextDecoration.Underline else TextDecoration.None,
             )
             Spacer(Modifier.height(2.dp))
-            Text(row.sub, color = Acab.faint, fontSize = 11.sp, fontFamily = Acab.mono)
+            Text(row.sub, color = Acab.faint, fontSize = 11.sp)
         }
         // An outward-opening row says so before it is tapped: this app never opens a browser
         // without warning, because leaving the app is exactly the moment a network request happens.
-        Text(if (row.external) "↗" else "›", color = Acab.faint, fontSize = 13.sp, fontFamily = Acab.mono)
+        Text(if (row.external) "↗" else "›", color = Acab.faint, fontSize = 13.sp)
     }
 }
 

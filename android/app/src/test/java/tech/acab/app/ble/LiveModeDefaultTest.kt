@@ -5,10 +5,6 @@ import org.junit.Assert.assertTrue
 import org.junit.Test
 
 class LiveModeDefaultTest {
-    @Test fun freshInstallDefaultsOn() = assertTrue(liveModeWanted(null))
-    @Test fun explicitOffStaysOff() = assertFalse(liveModeWanted(false))
-    @Test fun explicitOnStaysOn() = assertTrue(liveModeWanted(true))
-
     @Test fun automaticStopPreservesWantedOn() =
         assertTrue(liveModeWantedAfterStop(currentWanted = true, userRequestedStop = false))
 

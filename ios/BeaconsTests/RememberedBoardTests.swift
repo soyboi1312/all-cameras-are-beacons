@@ -4,28 +4,14 @@ import CoreBluetooth
 
 /// Pins the remembered-board rules in RememberedBoard.swift: what is persisted and where, when it
 /// is replaced, which failures forget it, and how the picker merges it with scanned rows. Every
-/// store touch goes to a throwaway UserDefaults suite created and removed here, never the install.
+/// store touch goes to a throwaway UserDefaults suite (isolatedDefaults), never the install.
 /// Android twin: the remembered-board rules in AcabBleManager.kt (same spec, same copy).
 final class RememberedBoardTests: XCTestCase {
-    private var suiteName = ""
-    private var defaults: UserDefaults!
+    private lazy var defaults = isolatedDefaults()
 
     private let boardA = UUID(uuidString: "11111111-1111-1111-1111-111111111111")!
     private let boardB = UUID(uuidString: "22222222-2222-2222-2222-222222222222")!
     private let boardC = UUID(uuidString: "33333333-3333-3333-3333-333333333333")!
-
-    override func setUp() {
-        super.setUp()
-        suiteName = "tech.beacons.tests.rememberedBoard.\(UUID().uuidString)"
-        defaults = UserDefaults(suiteName: suiteName)
-        defaults.removePersistentDomain(forName: suiteName)
-    }
-
-    override func tearDown() {
-        defaults.removePersistentDomain(forName: suiteName)
-        defaults = nil
-        super.tearDown()
-    }
 
     private func scanned(_ id: UUID, _ name: String, rssi: Int, fw: String? = nil) -> BoardPickerEntry {
         BoardPickerEntry(id: id, name: name, rssi: rssi, firmware: fw, isRemembered: false)

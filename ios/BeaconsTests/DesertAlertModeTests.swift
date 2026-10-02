@@ -176,30 +176,17 @@ final class DesertAlertModeTests: XCTestCase {
     // the pure cases above cannot see: that the Alerts picker's origin reaches the transition, and
     // that setDesertMode performs the effect it is handed.
 
-    private var isolatedSuites: [(name: String, defaults: UserDefaults)] = []
+    private lazy var defaults = isolatedDefaults()
 
-    override func tearDown() {
-        for suite in isolatedSuites { suite.defaults.removePersistentDomain(forName: suite.name) }
-        isolatedSuites.removeAll()
-        super.tearDown()
-    }
-
-    private func makeManager() throws -> BLEManager {
-        let name = "tech.beacons.tests.desertalertmode.\(UUID().uuidString)"
-        let defaults = try XCTUnwrap(UserDefaults(suiteName: name))
-        defaults.removePersistentDomain(forName: name)
-        isolatedSuites.append((name, defaults))
-        return BLEManager(defaults: defaults)
-    }
+    private func makeManager() -> BLEManager { BLEManager(defaults: defaults) }
 
     /// A RELAUNCH, as faithfully as a unit test can stage one: a second manager over the SAME
     /// preference suite, with nothing carried across but what was written to disk. Every in-memory
     /// field of the first manager (the @Published offer, desertSeenOn, desertRanThisRun) is gone,
     /// which is exactly what a force-quit does and exactly what the durability fix has to survive.
-    private func relaunch(_ ble: BLEManager) throws -> BLEManager {
-        let suite = try XCTUnwrap(isolatedSuites.last)
+    private func relaunch(_ ble: BLEManager) -> BLEManager {
         _ = ble   // named so each call site reads as "this manager's process ended"
-        return BLEManager(defaults: suite.defaults)
+        return BLEManager(defaults: defaults)
     }
 
     /// A real decoded status frame, the same construction path the BLE link uses. Wire JSON rather
@@ -221,7 +208,7 @@ final class DesertAlertModeTests: XCTestCase {
     /// Desert off. Before the fix the hand-picked Silent left the token in place and this ended on
     /// .buzzer - an audible board for someone who had just asked for silence.
     func testHandPickedSilentIsNotOverriddenWhenTheUserEndsDesert() throws {
-        let ble = try makeManager()
+        let ble = makeManager()
         ble.setAlertMode(.buzzer, origin: .user)
         ble.setDesertMode(true)
         XCTAssertEqual(ble.alertMode, .silent, "Desert mutes on the way in")
@@ -237,7 +224,7 @@ final class DesertAlertModeTests: XCTestCase {
     /// puts Buzzer back. This is the assertion that fails if the fix over-corrects into never
     /// restoring at all.
     func testUserEndedDesertStillRestoresTheModeItMuted() throws {
-        let ble = try makeManager()
+        let ble = makeManager()
         ble.setAlertMode(.buzzer, origin: .user)
         ble.setDesertMode(true)
         XCTAssertEqual(ble.alertMode, .silent)
@@ -251,7 +238,7 @@ final class DesertAlertModeTests: XCTestCase {
     /// stays saved behind it. The offer is armed here through the manager's own Desert path rather
     /// than by reaching into its state.
     func testTakingTheOfferRestoresTheModeAndClearsTheOffer() throws {
-        let ble = try makeManager()
+        let ble = makeManager()
         ble.setAlertMode(.buzzer, origin: .user)
         ble.setDesertMode(true)
         try boardRunsAndEndsDesert(ble)
@@ -267,7 +254,7 @@ final class DesertAlertModeTests: XCTestCase {
 
     /// Picking a mode by hand closes the offer without it being taken.
     func testPickingAModeByHandClearsTheOfferOnTheManager() throws {
-        let ble = try makeManager()
+        let ble = makeManager()
         ble.setAlertMode(.buzzer, origin: .user)
         ble.setDesertMode(true)
         try boardRunsAndEndsDesert(ble)
@@ -330,13 +317,13 @@ final class DesertAlertModeTests: XCTestCase {
     /// per-run and comes back false, and the offer outranks the notice anyway, so the card is not
     /// left blank by the flag that did not survive.
     func testAnArmedOfferSurvivesARelaunchAndTheDesertCardStillDrawsIt() throws {
-        let first = try makeManager()
+        let first = makeManager()
         first.setAlertMode(.buzzer, origin: .user)
         first.setDesertMode(true)
         try boardRunsAndEndsDesert(first)
         XCTAssertEqual(first.pendingAlertModeRestore, .buzzer)
 
-        let ble = try relaunch(first)
+        let ble = relaunch(first)
 
         XCTAssertEqual(ble.pendingAlertModeRestore, .buzzer,
                        "the offer must outlive the run that armed it")
@@ -353,34 +340,34 @@ final class DesertAlertModeTests: XCTestCase {
     /// Taking it after that relaunch has to give back the mode this phone actually muted, not the
     /// default and not whatever the picker happens to show.
     func testTakingTheOfferAfterARelaunchRestoresTheRightMode() throws {
-        let first = try makeManager()
+        let first = makeManager()
         first.setAlertMode(.buzzer, origin: .user)
         first.setDesertMode(true)
         try boardRunsAndEndsDesert(first)
 
-        let ble = try relaunch(first)
+        let ble = relaunch(first)
         ble.takePendingAlertModeRestore()
 
         XCTAssertEqual(ble.alertMode, .buzzer)
         XCTAssertNil(ble.pendingAlertModeRestore, "taking it closes it")
-        XCTAssertNil(try relaunch(ble).pendingAlertModeRestore,
+        XCTAssertNil(relaunch(ble).pendingAlertModeRestore,
                      "and it stays closed through the NEXT launch, so a taken offer cannot return")
     }
 
     /// Declining it by hand across a relaunch. The stored copy has to go with the in-memory one,
     /// or the offer comes back on the launch after that and re-opens a question the user answered.
     func testPickingAModeByHandAcrossARelaunchClearsThePersistedOffer() throws {
-        let first = try makeManager()
+        let first = makeManager()
         first.setAlertMode(.buzzer, origin: .user)
         first.setDesertMode(true)
         try boardRunsAndEndsDesert(first)
 
-        let ble = try relaunch(first)
+        let ble = relaunch(first)
         XCTAssertNotNil(ble.pendingAlertModeRestore)
         ble.setAlertMode(.silent, origin: .user)   // the same mode, but chosen
 
         XCTAssertNil(ble.pendingAlertModeRestore)
-        XCTAssertNil(try relaunch(ble).pendingAlertModeRestore,
+        XCTAssertNil(relaunch(ble).pendingAlertModeRestore,
                      "a hand-picked mode must close the offer on disk, not just on screen")
     }
 
@@ -388,29 +375,29 @@ final class DesertAlertModeTests: XCTestCase {
     /// board is muted again, so a control promising the mode back would be undone by the next line
     /// of the same card.
     func testDesertReturningClearsAPersistedOffer() throws {
-        let first = try makeManager()
+        let first = makeManager()
         first.setAlertMode(.buzzer, origin: .user)
         first.setDesertMode(true)
         try boardRunsAndEndsDesert(first)
 
-        let ble = try relaunch(first)
+        let ble = relaunch(first)
         XCTAssertNotNil(ble.pendingAlertModeRestore)
         ble.reconcileDesert(try status(desert: true))
 
         XCTAssertNil(ble.pendingAlertModeRestore)
-        XCTAssertNil(try relaunch(ble).pendingAlertModeRestore)
+        XCTAssertNil(relaunch(ble).pendingAlertModeRestore)
     }
 
     /// THE MOMENT THE OFFER IS FOR. A board reboot or a factory reset is what arms it, so the link
     /// is usually down when the user sees it. Nothing about taking it may need the board: this
     /// manager never connected to one, and the offer is still there and still takes.
     func testTheOfferIsArmedAndTakeableWithNoBoardConnected() throws {
-        let first = try makeManager()
+        let first = makeManager()
         first.setAlertMode(.buzzer, origin: .user)
         first.setDesertMode(true)
         try boardRunsAndEndsDesert(first)
 
-        let ble = try relaunch(first)
+        let ble = relaunch(first)
         XCTAssertNotEqual(ble.connectionState, .connected, "no link in this process at all")
         XCTAssertEqual(ble.pendingAlertModeRestore, .buzzer,
                        "the offer does not wait for a board to come back")
@@ -432,12 +419,12 @@ final class DesertAlertModeTests: XCTestCase {
     /// deletes desertRestoreNeedsPreConnectSurface and this stops compiling; inverting its gate
     /// fails the first assertion; a demo-gate that stopped excluding the tour fails the third.
     func testWithNoBoardTheConnectScreenCarriesTheOfferAndTakingItThereWorks() throws {
-        let first = try makeManager()
+        let first = makeManager()
         first.setAlertMode(.buzzer, origin: .user)
         first.setDesertMode(true)
         try boardRunsAndEndsDesert(first)
 
-        let ble = try relaunch(first)
+        let ble = relaunch(first)
         XCTAssertNotEqual(ble.connectionState, .connected, "no link in this process at all")
         // mainShellVisible is RootView's mainIsUsable, and with no session and nothing mounted it
         // is false, which is exactly why ConnectView is the screen on the phone.

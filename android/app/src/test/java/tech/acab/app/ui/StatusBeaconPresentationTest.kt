@@ -9,10 +9,8 @@ import org.json.JSONObject
 import tech.acab.app.ble.CombinedUpdatePhase
 import tech.acab.app.ble.CombinedUpdateProgress
 import tech.acab.app.ble.ConnState
-import tech.acab.app.ble.DemoStatusToggle
 import tech.acab.app.ble.LOG_ACTIVE_SECTION_HEADER
 import tech.acab.app.ble.OtaPhase
-import tech.acab.app.ble.withDemoStatusToggle
 import tech.acab.app.model.Detection
 import tech.acab.app.model.DeviceStatus
 import tech.acab.app.model.DeviceType
@@ -24,35 +22,8 @@ class StatusBeaconPresentationTest {
         mac: String,
         type: DeviceType,
         rssi: Int = -70,
-    ) = Detection(
-        type = type,
-        source = 0,
-        method = 0,
-        confidence = 80,
-        mac = mac,
-        rssi = rssi,
-        name = null,
-        rid = null,
-        detail = null,
-        lat = null,
-        lon = null,
-        pilotLat = null,
-        pilotLon = null,
-        altitude = null,
-        speedH = null,
-        speedV = null,
-        heading = null,
-        heightAGL = null,
-        pilotAlt = null,
-        ridStatus = null,
-        count = 1,
-        isNew = false,
-        gpsAgeSec = null,
-        hist = false,
-        seq = 0L,
-        at = 0L,
-        approx = false,
-    )
+    ) = Detection.fromJson(
+        JSONObject().put("t", type.raw).put("c", 80).put("mac", mac).put("rssi", rssi))
 
     @Test
     fun nearbySummarySeparatesAmbientAndKeepsImportantRowsInsideDotCap() {
@@ -78,7 +49,7 @@ class StatusBeaconPresentationTest {
         // clause is the one that says the dot cap does not cap the counters.
         assertEquals("14 of 18 dots · 14 max", summary.radarCaption)
         assertEquals(
-            "matches and stars first · counts include every recent device",
+            "matches and watched devices first · counts include every recent device",
             STATUS_RADAR_CAPTION_DETAIL,
         )
         assertTrue(summary.dots.any { it.row.id == match.id })
@@ -213,7 +184,7 @@ class StatusBeaconPresentationTest {
     @Test
     fun nearbyBreakdownLiteralsMatchIosAndOnlyRenderWhenThereIsSomethingToSay() {
         assertEquals("MATCHED + WATCHED", STATUS_MATCHED_CARD_TITLE)
-        assertEquals("signatures or exact stars", STATUS_MATCHED_CARD_DETAIL)
+        assertEquals("signatures or your watchlist", STATUS_MATCHED_CARD_DETAIL)
         assertEquals("AMBIENT", STATUS_AMBIENT_CARD_TITLE)
         assertEquals("Desert-mode broadcasts", STATUS_AMBIENT_CARD_DETAIL)
 
@@ -232,7 +203,7 @@ class StatusBeaconPresentationTest {
         // combined children. RadarCountCard hands its two drawn lines straight to this function,
         // so the join under test is the one TalkBack hears.
         assertEquals(
-            "3 MATCHED + WATCHED, signatures or exact stars",
+            "3 MATCHED + WATCHED, signatures or your watchlist",
             statusRadarCountCardDescription(3, STATUS_MATCHED_CARD_TITLE, STATUS_MATCHED_CARD_DETAIL),
         )
     }
@@ -524,10 +495,9 @@ class StatusBeaconPresentationTest {
         val sample = DeviceStatus.fromJson(JSONObject(
             """{"fw":"beacon board 2.0.8","tracker":true,"ble":true,"wifi":true}""",
         ))
-        val trackerOff = sample.withDemoStatusToggle(DemoStatusToggle.TRACKER, false)
+        val trackerOff = sample.copy(tracker = false)
         val tile = statusCountTilePresentation("Tracker", count = 1, enabled = trackerOff.tracker)
 
-        assertFalse(trackerOff.tracker)
         assertEquals("1", tile.visibleCount)
         assertTrue(tile.off)
         assertEquals(StatusCountTileDestination.LOG, tile.destination)

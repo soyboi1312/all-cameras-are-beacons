@@ -196,8 +196,8 @@ fun ContributeContent(ble: AcabBleManager, vm: ContributionViewModel) {
                     border = BorderStroke(1.dp, Acab.accent),
                     colors = ButtonDefaults.outlinedButtonColors(contentColor = Acab.text),
                     shape = RoundedCornerShape(Acab.radiusSm),
-                ) { Text("Start Capture", fontFamily = Acab.mono, fontWeight = FontWeight.Bold, fontSize = 13.sp) }
-                Text("Discard", color = Acab.faint, fontSize = 12.sp, fontFamily = Acab.mono,
+                ) { Text("Start Capture", fontWeight = FontWeight.Bold, fontSize = 13.sp) }
+                Text("Discard", color = Acab.faint, fontSize = 12.sp,
                     modifier = Modifier.fillMaxWidth().minimumInteractiveComponentSize()
                         .clickable(enabled = !vm.sharePreparing, role = Role.Button) { vm.requestExit() }
                         .padding(vertical = 8.dp),
@@ -207,10 +207,10 @@ fun ContributeContent(ble: AcabBleManager, vm: ContributionViewModel) {
             // ---- CAPTURING: live count + elapsed, until the user stops ---------------------------
             CapturePhase.CAPTURING -> {
                 Text("CAPTURING", color = Acab.accentText, fontSize = 11.sp,
-                    fontWeight = FontWeight.Bold, fontFamily = Acab.mono, letterSpacing = 1.sp)
+                    fontWeight = FontWeight.Bold, letterSpacing = 1.sp)
                 Text("Walk around the device, then stop.", color = Acab.dim, fontSize = 13.sp)
                 Text("$liveCount observation${if (liveCount == 1) "" else "s"} heard  ·  ${elapsed(vm.startMs, vm.nowMs)}",
-                    color = Acab.text, fontSize = 16.sp, fontFamily = Acab.mono, fontWeight = FontWeight.Bold)
+                    color = Acab.text, fontSize = 16.sp, fontWeight = FontWeight.Bold)
                 OutlinedButton(
                     onClick = {
                         if (vm.sharePreparing) return@OutlinedButton
@@ -228,8 +228,8 @@ fun ContributeContent(ble: AcabBleManager, vm: ContributionViewModel) {
                     border = BorderStroke(1.dp, Acab.accent),
                     colors = ButtonDefaults.outlinedButtonColors(contentColor = Acab.text),
                     shape = RoundedCornerShape(Acab.radiusSm),
-                ) { Text("Stop Capture", fontFamily = Acab.mono, fontWeight = FontWeight.Bold, fontSize = 13.sp) }
-                Text("Discard", color = Acab.faint, fontSize = 12.sp, fontFamily = Acab.mono,
+                ) { Text("Stop Capture", fontWeight = FontWeight.Bold, fontSize = 13.sp) }
+                Text("Discard", color = Acab.faint, fontSize = 12.sp,
                     modifier = Modifier.fillMaxWidth().minimumInteractiveComponentSize()
                         .clickable(enabled = !vm.sharePreparing, role = Role.Button) { vm.requestExit() }
                         .padding(vertical = 8.dp),
@@ -251,12 +251,12 @@ fun ContributeContent(ble: AcabBleManager, vm: ContributionViewModel) {
                         verticalArrangement = Arrangement.spacedBy(6.dp),
                     ) {
                         Text("NOTHING HEARD", color = Acab.faint, fontSize = 11.sp,
-                            fontWeight = FontWeight.Bold, fontFamily = Acab.mono, letterSpacing = 0.5.sp)
+                            fontWeight = FontWeight.Bold, letterSpacing = 0.5.sp)
                         Text(
                             "Nothing was heard in this window. That means no compatible broadcast was " +
                                 "recognized while you captured - it doesn't prove nothing is there. Try " +
                                 "capturing closer to the device, or for longer.",
-                            color = Acab.dim, fontSize = 12.sp, fontFamily = Acab.mono,
+                            color = Acab.dim, fontSize = 12.sp,
                         )
                     }
                     // Primary action: try again. Nothing was captured, so no discard confirmation.
@@ -274,11 +274,11 @@ fun ContributeContent(ble: AcabBleManager, vm: ContributionViewModel) {
                         colors = ButtonDefaults.outlinedButtonColors(
                             containerColor = Acab.accent, contentColor = Acab.onAccent),
                         shape = RoundedCornerShape(Acab.radiusSm),
-                    ) { Text("Start a New Capture", fontFamily = Acab.mono, fontWeight = FontWeight.Bold, fontSize = 13.sp) }
+                    ) { Text("Start a New Capture", fontWeight = FontWeight.Bold, fontSize = 13.sp) }
                 } else {
                     Text("Captured $liveCount observation${if (liveCount == 1) "" else "s"} over ${elapsed(vm.startMs, vm.stopMs)} " +
                         "(${clockTime(vm.startMs)} to ${clockTime(vm.stopMs)}).",
-                        color = Acab.text, fontSize = 13.sp, fontFamily = Acab.mono)
+                        color = Acab.text, fontSize = 13.sp)
                 }
 
                 // An uppercase label: Kicker's instrument face (R16), as iOS ContributeView draws
@@ -301,7 +301,7 @@ fun ContributeContent(ble: AcabBleManager, vm: ContributionViewModel) {
                                 .padding(horizontal = 12.dp, vertical = 8.dp),
                         ) {
                             Text(k, color = if (on) Acab.text else Acab.dim, fontSize = 12.sp,
-                                fontFamily = Acab.mono, fontWeight = if (on) FontWeight.Bold else FontWeight.Normal)
+                                fontWeight = if (on) FontWeight.Bold else FontWeight.Normal)
                         }
                     }
                 }
@@ -334,7 +334,7 @@ fun ContributeContent(ble: AcabBleManager, vm: ContributionViewModel) {
                     ) {
                         Icon(Icons.Filled.Image,
                             contentDescription = null, modifier = Modifier.padding(end = 8.dp))
-                        Text("Attach a Photo (Optional)", fontFamily = Acab.mono, fontSize = 12.sp)
+                        Text("Attach a Photo (Optional)", fontSize = 12.sp)
                     }
                 } else {
                     // The actual picked image, so review shows what will really be attached, with
@@ -390,7 +390,7 @@ fun ContributeContent(ble: AcabBleManager, vm: ContributionViewModel) {
                             (if (vm.photo != null) "Photo location metadata removed automatically.\n" else "") +
                             "\nNothing is shared automatically. Diagnostic captures may contain identifiers " +
                             "from nearby devices. Review and export only what you choose.",
-                        color = Acab.dim, fontSize = 12.sp, fontFamily = Acab.mono,
+                        color = Acab.dim, fontSize = 12.sp,
                     )
                 }
 
@@ -407,9 +407,9 @@ fun ContributeContent(ble: AcabBleManager, vm: ContributionViewModel) {
                         CircularProgressIndicator(color = Acab.dim, strokeWidth = 2.dp,
                             modifier = Modifier.size(14.dp).padding(end = 0.dp))
                         Spacer(Modifier.padding(horizontal = 4.dp))
-                        Text("Preparing…", fontFamily = Acab.mono, fontWeight = FontWeight.Bold, fontSize = 13.sp)
+                        Text("Preparing…", fontWeight = FontWeight.Bold, fontSize = 13.sp)
                     } else {
-                        Text("Review & Share", fontFamily = Acab.mono, fontWeight = FontWeight.Bold, fontSize = 13.sp)
+                        Text("Review & Share", fontWeight = FontWeight.Bold, fontSize = 13.sp)
                     }
                 }
 
@@ -422,10 +422,10 @@ fun ContributeContent(ble: AcabBleManager, vm: ContributionViewModel) {
                     border = BorderStroke(1.dp, Acab.line),
                     colors = ButtonDefaults.outlinedButtonColors(contentColor = Acab.dim),
                     shape = RoundedCornerShape(Acab.radiusSm),
-                ) { Text("Save CSV Copy", fontFamily = Acab.mono, fontSize = 13.sp) }
+                ) { Text("Save CSV Copy", fontSize = 13.sp) }
 
                 Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
-                    Text("Start Over", color = Acab.faint, fontSize = 12.sp, fontFamily = Acab.mono,
+                    Text("Start Over", color = Acab.faint, fontSize = 12.sp,
                         modifier = Modifier.minimumInteractiveComponentSize()
                             .clickable(enabled = !vm.sharePreparing, role = Role.Button) {
                                 if (!vm.sharePreparing) {
@@ -437,7 +437,7 @@ fun ContributeContent(ble: AcabBleManager, vm: ContributionViewModel) {
                                 }
                             }
                             .padding(vertical = 8.dp))
-                    Text("Discard", color = Acab.faint, fontSize = 12.sp, fontFamily = Acab.mono,
+                    Text("Discard", color = Acab.faint, fontSize = 12.sp,
                         modifier = Modifier.minimumInteractiveComponentSize()
                             .clickable(enabled = !vm.sharePreparing, role = Role.Button) { vm.requestExit() }
                             .padding(vertical = 8.dp))
@@ -460,7 +460,6 @@ fun ContributeContent(ble: AcabBleManager, vm: ContributionViewModel) {
             },
             confirmButton = {
                 Text("Discard", color = Acab.accentText, fontSize = 12.sp, fontWeight = FontWeight.Bold,
-                    fontFamily = Acab.mono,
                     modifier = Modifier.minimumInteractiveComponentSize()
                         .clickable(enabled = !vm.sharePreparing, role = Role.Button) {
                             ble.cancelContributionCapture()
@@ -470,7 +469,6 @@ fun ContributeContent(ble: AcabBleManager, vm: ContributionViewModel) {
             },
             dismissButton = {
                 Text("Keep Capture", color = Acab.dim, fontSize = 12.sp, fontWeight = FontWeight.Bold,
-                    fontFamily = Acab.mono,
                     modifier = Modifier.minimumInteractiveComponentSize()
                         .clickable(enabled = !vm.sharePreparing, role = Role.Button) { vm.dismissDiscard() }
                         .padding(8.dp))
@@ -525,14 +523,14 @@ private fun PhotoAttachmentRow(
             }
         }
         Column(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(2.dp)) {
-            Text("Photo attached", color = Acab.text, fontSize = 13.sp, fontFamily = Acab.mono)
-            Text("location metadata removed on export", color = Acab.faint, fontSize = 10.sp, fontFamily = Acab.mono)
+            Text("Photo attached", color = Acab.text, fontSize = 13.sp)
+            Text("location metadata removed on export", color = Acab.faint, fontSize = 10.sp)
         }
-        Text("Replace", color = Acab.dim, fontSize = 12.sp, fontFamily = Acab.mono,
+        Text("Replace", color = Acab.dim, fontSize = 12.sp,
             fontWeight = FontWeight.Bold,
             modifier = Modifier.minimumInteractiveComponentSize()
                 .clickable(enabled = enabled, role = Role.Button, onClick = onReplace).padding(4.dp))
-        Text("Remove", color = Acab.accentText, fontSize = 12.sp, fontFamily = Acab.mono,
+        Text("Remove", color = Acab.accentText, fontSize = 12.sp,
             fontWeight = FontWeight.Bold,
             modifier = Modifier.minimumInteractiveComponentSize()
                 .clickable(enabled = enabled, role = Role.Button, onClick = onRemove).padding(4.dp))
@@ -771,8 +769,8 @@ private fun SwitchRow(
         verticalAlignment = Alignment.CenterVertically,
     ) {
         Column(Modifier.weight(1f)) {
-            Text(label, color = Acab.text, fontSize = 13.sp, fontFamily = Acab.mono)
-            Text(hint, color = Acab.faint, fontSize = 11.sp, fontFamily = Acab.mono)
+            Text(label, color = Acab.text, fontSize = 13.sp)
+            Text(hint, color = Acab.faint, fontSize = 11.sp)
         }
         Spacer(Modifier.padding(horizontal = 6.dp))
         // Scheme defaults (thumb onPrimary on a primary track). The old override put the light

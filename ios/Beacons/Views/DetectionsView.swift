@@ -5,13 +5,14 @@ import Combine
 /// The ordered category set shown as the Log's tools-menu categories and filter chip, and the
 /// Map's filter chips, defined once and shared so the surfaces stay in lockstep as categories
 /// grow. Each entry carries a representative DeviceType (supplies the tint + glyph), the
-/// `DeviceType.category` key it filters on, and its label. "Nearby Device" (Desert-mode ambient
-/// noise) is deliberately absent - it is not a filter category.
+/// `DeviceType.category` key it filters on, its labels and its VoiceOver name. "Nearby Device"
+/// (Desert-mode ambient noise) is deliberately absent - it is not a filter category.
 struct DetectionCategory: Identifiable {
     let type: DeviceType    // representative type: supplies tint + SF Symbol
     let key: String         // the DeviceType.category key this entry filters on
     let chipLabel: String   // label for the Map filter chip, the Log filter chip and the lens footer
     let menuLabel: String   // Title Case label for the Log tools menu's category item and Export label
+    let spoken: String      // VoiceOver name: the Map and Log chips, the tools menu, Connect's hears tiles
     var id: String { key }
 }
 
@@ -71,13 +72,13 @@ func logFirstOpenBaselineRuns(deepLinkNew: Bool, hasVisit: Bool,
 /// title-style capitalization. TWIN: Android `LOG_CATEGORIES` (`LogCategory.menuLabel`) in
 /// LogScreen.kt.
 let detectionCategories: [DetectionCategory] = [
-    .init(type: .flockCamera,      key: "ALPR",     chipLabel: "ALPR",        menuLabel: "ALPR"),
-    .init(type: .drone,            key: "DRONE",    chipLabel: "DRONE",       menuLabel: "Drone"),
-    .init(type: .axonBodyCam,      key: "BODY CAM", chipLabel: "BODY CAM",    menuLabel: "Body Cam"),
-    .init(type: .tracker,          key: "TRACKER",  chipLabel: "TRACKER",     menuLabel: "Tracker"),
-    .init(type: .recordingGlasses, key: "GLASSES",  chipLabel: "GLASSES",     menuLabel: "Glasses"),
-    .init(type: .networkCamera,    key: "CAMERA",   chipLabel: "NETWORK CAM", menuLabel: "Network Cam"),
-    .init(type: .watched,          key: "WATCHED",  chipLabel: "WATCHED",     menuLabel: "Watched"),
+    .init(type: .flockCamera,      key: "ALPR",     chipLabel: "ALPR",        menuLabel: "ALPR",        spoken: "automatic license plate readers"),
+    .init(type: .drone,            key: "DRONE",    chipLabel: "DRONE",       menuLabel: "Drone",       spoken: "drones"),
+    .init(type: .axonBodyCam,      key: "BODY CAM", chipLabel: "BODY CAM",    menuLabel: "Body Cam",    spoken: "body cameras"),
+    .init(type: .tracker,          key: "TRACKER",  chipLabel: "TRACKER",     menuLabel: "Tracker",     spoken: "item trackers"),
+    .init(type: .recordingGlasses, key: "GLASSES",  chipLabel: "GLASSES",     menuLabel: "Glasses",     spoken: "recording glasses"),
+    .init(type: .networkCamera,    key: "CAMERA",   chipLabel: "NETWORK CAM", menuLabel: "Network Cam", spoken: "network cameras"),
+    .init(type: .watched,          key: "WATCHED",  chipLabel: "WATCHED",     menuLabel: "Watched",     spoken: "watched devices"),
 ]
 
 /// A category filter key's drawn label: "CAMERA" reads "NETWORK CAM", as its chip does. The key
@@ -989,7 +990,9 @@ struct DetectionsView: View {
             .accessibilityValue(text)
         }
         if let f = filter, let label = logCategoryLabel(f) {
-            filterChip(label, systemImage: "xmark", spoken: spokenCategory(label),
+            // An unknown key passes through logCategoryLabel, so it speaks its own name.
+            let spoken = detectionCategories.first { $0.key == f }?.spoken ?? label.lowercased()
+            filterChip(label, systemImage: "xmark", spoken: spoken,
                        hint: "Clears this filter") { filter = nil }
         }
         if offlineOnly {
@@ -1037,7 +1040,7 @@ struct DetectionsView: View {
                 Button { filter = nil } label: { checkLabel("All Categories", on: filter == nil) }
                 ForEach(tuneCategories(watchedCount: snap.watchedCount)) { c in
                     Button { filter = c.key } label: { checkLabel(c.menuLabel, on: filter == c.key) }
-                        .accessibilityLabel(spokenCategory(c.chipLabel))
+                        .accessibilityLabel(c.spoken)
                 }
             }
             Toggle("Offline Only", isOn: $offlineOnly)
@@ -1099,21 +1102,6 @@ struct DetectionsView: View {
             .fixedSize(horizontal: false, vertical: true)
             .accessibilityLabel(logLensSummaryDescription(shown: snap.shown.count, total: total,
                                                           paused: paused, category: category))
-    }
-
-    private func spokenCategory(_ label: String) -> String {
-        // Callers pass chipLabel (the filter chip and the tools menu's category items).
-        // MapTabView keeps its own copy.
-        switch label {
-        case "ALPR": return "automatic license plate readers"
-        case "BODY CAM": return "body cameras"
-        case "DRONE": return "drones"
-        case "NETWORK CAM": return "network cameras"
-        case "TRACKER": return "item trackers"
-        case "GLASSES": return "recording glasses"
-        case "WATCHED": return "watched devices"
-        default: return label.lowercased()
-        }
     }
 
     @ViewBuilder

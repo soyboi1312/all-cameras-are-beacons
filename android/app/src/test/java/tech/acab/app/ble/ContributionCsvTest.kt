@@ -256,36 +256,6 @@ class ContributionCsvTest {
         assertEquals(renamed, redactCsvColumns(csv, setOf("approx_lat", "approx_lon")))
     }
 
-    // A capture window [1000, 2000]. Overlap membership, not containment.
-    @Test fun captureWindow_overlapSemantics() {
-        val start = 1000L; val stop = 2000L
-        // entirely before / after the window -> out
-        assertTrue(!inCaptureWindow(200, 800, start, stop))
-        assertTrue(!inCaptureWindow(2200, 2500, start, stop))
-        // entirely inside -> in
-        assertTrue(inCaptureWindow(1200, 1800, start, stop))
-        // present before Start but still audible during the window -> IN (the key overlap case)
-        assertTrue(inCaptureWindow(500, 1500, start, stop))
-        // first heard inside, still going after Stop -> in
-        assertTrue(inCaptureWindow(1500, 3000, start, stop))
-        // spans the whole window -> in
-        assertTrue(inCaptureWindow(0, 5000, start, stop))
-        // touches the boundary exactly -> in (inclusive)
-        assertTrue(inCaptureWindow(2000, 2000, start, stop))
-        assertTrue(inCaptureWindow(1000, 1000, start, stop))
-        // a device with no phone-side timestamp cannot be placed -> out
-        assertTrue(!inCaptureWindow(null, 1500, start, stop))
-        assertTrue(!inCaptureWindow(1500, null, start, stop))
-    }
-
-    @Test fun captureTimestamp_usesLastSighting_clampedInsideWindow() {
-        val start = 1000L; val stop = 2000L
-        assertEquals(start, captureTimestamp(800, start, stop))
-        assertEquals(1500L, captureTimestamp(1500, start, stop))
-        assertEquals(stop, captureTimestamp(2200, start, stop))
-        assertEquals(null, captureTimestamp(null, start, stop))
-    }
-
     @Test fun policySet_mapsToTheRightColumns() {
         assertEquals(OBSERVER_LOCATION_COLS, contributionBlankColumns(
             includeObserverLocation = false, includeDroneLocation = true, includeOperatorLocation = true))

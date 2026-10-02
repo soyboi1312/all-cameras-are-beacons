@@ -34,9 +34,10 @@ android {
         // layout all need eyes on a real 16 device.
         targetSdk = 36
         // versionCode is INDEPENDENT of versionName and must climb on every Play upload; Play
-        // rejects a re-upload at a used code. 28 shipped as 2.0.8, 29 as 2.0.9 (tag android-v2.0.9).
-        versionCode = 30
-        versionName = "2.1.0"
+        // rejects a re-upload at a used code. 28 shipped as 2.0.8, 29 as 2.0.9 (tag android-v2.0.9),
+        // 30 as 2.1.0 (tag android-v2.1.0).
+        versionCode = 31
+        versionName = "2.1.1"
     }
 
     signingConfigs {
@@ -71,18 +72,6 @@ android {
     kotlinOptions {
         jvmTarget = "17"
     }
-    // Lint policy, made explicit. NOTE these mostly RESTATE AGP defaults, they are documentation,
-    // NOT the gate. The actual gate is the `:app:lintRelease` step in .github/workflows/
-    // android-release.yml, because assembleRelease only triggers lintVitalRelease (the "fatal"
-    // subset) and that PROVABLY misses real errors: with the bare <View> reintroduced in the
-    // RemoteViews widget layout, lintVitalRelease still reported BUILD SUCCESSFUL (tested
-    // 2026-07-30). Do not delete the CI step and assume this block covers you.
-    // Warnings stay non-fatal, there are ~90 and triaging them should not block a release.
-    lint {
-        abortOnError = true
-        warningsAsErrors = false
-        checkReleaseBuilds = true
-    }
 
     buildFeatures {
         compose = true
@@ -103,9 +92,6 @@ dependencies {
     // Adafruit/Seeed bootloader, which speaks LEGACY Nordic DFU (service 0x1530), not secure DFU.
     // BSD-3, so it stays F-Droid-clean.
     implementation("no.nordicsemi.android:dfu:2.5.0")
-    // The DFU library's abort is driven over a local broadcast (DfuBaseService.BROADCAST_ACTION).
-    implementation("androidx.localbroadcastmanager:localbroadcastmanager:1.1.0")
-    implementation("androidx.lifecycle:lifecycle-runtime-ktx:2.8.7")
     implementation("androidx.lifecycle:lifecycle-viewmodel-compose:2.8.7")
     implementation("androidx.activity:activity-compose:1.9.3")
     // Photo contributions are re-encoded without metadata. AndroidX ExifInterface supplies
@@ -114,8 +100,6 @@ dependencies {
     implementation("androidx.exifinterface:exifinterface:1.4.1")
 
     implementation("androidx.compose.ui:ui")
-    implementation("androidx.compose.ui:ui-graphics")
-    implementation("androidx.compose.ui:ui-tooling-preview")
     implementation("androidx.compose.material3:material3")
     implementation("androidx.compose.material:material-icons-extended")
     // Home-screen launcher widget surface. widgetCategory is deliberately home_screen ONLY -
@@ -124,8 +108,6 @@ dependencies {
 
     // OpenStreetMap, no Google dependency. Wired in when the map screen lands.
     implementation("org.osmdroid:osmdroid-android:6.1.20")
-
-    debugImplementation("androidx.compose.ui:ui-tooling")
 
     // Local JVM unit tests: the policy, parser and parity fixtures under
     // src/test/java/tech/acab/app/{ble,model,net,ui}, written against logic that is kept free of

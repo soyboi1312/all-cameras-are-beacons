@@ -73,8 +73,10 @@ enum NrfDfuPackage {
             cursor += headerLength + nameLength + extraLength + commentLength
         }
         guard cursor == centralOffset + centralSize, let manifest else { return nil }
-        guard let decoded = decodeManifest(manifest), !decoded.hasForbiddenSections,
-              !decoded.binFile.isEmpty, !decoded.datFile.isEmpty,
+        guard let root = try? JSONDecoder().decode(PackageRoot.self, from: manifest),
+              !root.manifest.hasForbiddenSections else { return nil }
+        let decoded = root.manifest.application
+        guard !decoded.binFile.isEmpty, !decoded.datFile.isEmpty,
               !decoded.binFile.contains("/"), !decoded.datFile.contains("/"),
               entryNames == ["manifest.json", decoded.binFile, decoded.datFile],
               let initEntry = storedEntries[decoded.datFile],
@@ -86,8 +88,8 @@ enum NrfDfuPackage {
                   length: initEntry.length
               ),
               let packetVersion = legacyApplicationVersion(in: initPacket),
-              packetVersion == decoded.applicationVersion else { return nil }
-        return decoded.applicationVersion
+              packetVersion == decoded.initPacketData.applicationVersion else { return nil }
+        return decoded.initPacketData.applicationVersion
     }
 
     /// Legacy init packet layout: device type u16, device revision u16, application version u32,
@@ -120,16 +122,6 @@ enum NrfDfuPackage {
                   encoding: .utf8
               ), localName == expectedName else { return nil }
         return zip.subdata(in: payloadOffset..<(payloadOffset + length))
-    }
-
-    private static func decodeManifest(_ data: Data) -> DecodedManifest? {
-        guard let root = try? JSONDecoder().decode(PackageRoot.self, from: data) else { return nil }
-        return DecodedManifest(
-            applicationVersion: root.manifest.application.initPacketData.applicationVersion,
-            binFile: root.manifest.application.binFile,
-            datFile: root.manifest.application.datFile,
-            hasForbiddenSections: root.manifest.hasForbiddenSections
-        )
     }
 
     private static func findEnd(in data: Data) -> Int? {
@@ -204,12 +196,5 @@ enum NrfDfuPackage {
         enum CodingKeys: String, CodingKey {
             case applicationVersion = "application_version"
         }
-    }
-
-    private struct DecodedManifest {
-        let applicationVersion: UInt32
-        let binFile: String
-        let datFile: String
-        let hasForbiddenSections: Bool
     }
 }

@@ -806,10 +806,13 @@ private fun DisclosureSection(
  *  certainty. */
 @Composable
 private fun MatchQualityPanel(d: Detection) {
-    val weak = d.confidence < 50
+    // A Desert-mode row is confidence 0 because nothing matched, so it reads "Not a match"
+    // (dossierConfidenceLine) beside the plain gauge, with no weak match to verify. TWIN: iOS
+    // DetectionDetailView.confidenceIsWeak.
+    val weak = d.confidence < 50 && d.type != DeviceType.NEARBY_DEVICE
     // maker parses the detail and ouiVendor lowercases the MAC, so neither runs per publish.
     val (matchedOn, explainer) = remember(d.type, d.method, d.detail, d.mac, d.rid) {
-        methodChipLabel(d.method, d.maker, d.methodLabel) to plainMatchLine(d)
+        methodChipLabel(d.type, d.method, d.maker, d.methodLabel) to plainMatchLine(d)
     }
     Column(Modifier.fillMaxWidth()) {
         SectionLabel("MATCH QUALITY")
@@ -825,7 +828,7 @@ private fun MatchQualityPanel(d: Detection) {
                 Icon(Icons.Outlined.Fingerprint, contentDescription = null,
                     tint = if (d.isOuiMatch) Acab.warn else MaterialTheme.colorScheme.onSurfaceVariant)
             })
-            GroupedValueRow("confidence", dossierConfidenceLine(d.confidence), leading = {
+            GroupedValueRow("confidence", dossierConfidenceLine(d.type, d.confidence), leading = {
                 Icon(if (weak) Icons.Filled.Warning else Icons.Outlined.Speed, contentDescription = null,
                     tint = if (weak) Acab.warn else MaterialTheme.colorScheme.onSurfaceVariant)
             })
@@ -855,7 +858,7 @@ private fun MatchQualityPanel(d: Detection) {
     }
 }
 
-/** The "matched on" row value. Word for word iOS methodChipLabel(method:maker:) in
+/** The "matched on" row value. Word for word iOS methodChipLabel(type:method:maker:) in
  *  DetectionDetailView.swift. The two OUI telegrams are the only rewrites (the FAQ quotes both);
  *  every other method reads its own label VERBATIM, keeping its casing ("device name",
  *  "manufacturer ID", "Remote ID"). No "NAME MATCH": "matched on NAME MATCH" said match twice.
@@ -865,17 +868,26 @@ private fun MatchQualityPanel(d: Detection) {
  *  "chipset only" would understate what we know. What's uncertain is which of the vendor's
  *  products this is, which is why it keeps the amber weak-match cue. Keyed on `maker` rather than
  *  bodyCamSigDetail so network cameras stop sitting on the wrong side of this exact distinction,
- *  and so this stops being a THIRD hardcoded copy of the body-cam wire contract. */
-internal fun methodChipLabel(method: Int, maker: String?, methodLabel: String): String = when {
+ *  and so this stops being a THIRD hardcoded copy of the body-cam wire contract.
+ *
+ *  A Desert-mode row (NEARBY_DEVICE) matched nothing, yet desert_detect.cpp stamps its WiFi rows
+ *  with method SSID and its BLE rows with none, so the method label would read "SSID" or
+ *  "unknown" on a row no signature claimed. It reads "no signature" instead, keyed on the type. */
+internal fun methodChipLabel(type: DeviceType, method: Int, maker: String?, methodLabel: String): String = when {
+    type == DeviceType.NEARBY_DEVICE -> "no signature"
     method == 1 && maker != null -> "OUI · VENDOR ONLY"
     method == 1 -> "OUI · CHIPSET ONLY"
     else -> methodLabel
 }
 
 /** The "confidence" row value: the verdict, then the percent ("<verdict> · <n>%").
- *  Same name and same output as iOS dossierConfidenceLine(confidence:) in DetectionDetailView.swift. */
-internal fun dossierConfidenceLine(confidence: Int): String =
-    "${verdictLabel(confidence)} · $confidence%"
+ *  Same name and same output as iOS dossierConfidenceLine(type:confidence:) in DetectionDetailView.swift.
+ *
+ *  A Desert-mode row (NEARBY_DEVICE) is confidence 0 because nothing matched, not because a match
+ *  is weak, so it reads "Not a match" with no percent (the Log hides that 0 for the same reason). */
+internal fun dossierConfidenceLine(type: DeviceType, confidence: Int): String =
+    if (type == DeviceType.NEARBY_DEVICE) "Not a match"
+    else "${verdictLabel(confidence)} · $confidence%"
 
 private fun verdictLabel(pct: Int): String = when {
     pct < 50 -> "Weak match, verify"
@@ -886,7 +898,7 @@ private fun verdictLabel(pct: Int): String = when {
 /** What actually matched, in plain language, composed from the method and OUI vendor.
  *  Copy mirrors iOS matchExplainer word for word. */
 private fun plainMatchLine(d: Detection): AnnotatedString = buildAnnotatedString {
-    // Body cam covers four signatures of very different weight under one label, so the
+    // Body cam covers five signatures of very different weight under one label, so the
     // generic per-method line is too vague here (and its "shared chipset" wording is
     // wrong for a vendor's own OUI block). Name the signature that fired instead.
     val sig = d.bodyCamSigDetail
@@ -911,6 +923,13 @@ private fun plainMatchLine(d: Detection): AnnotatedString = buildAnnotatedString
     // sentences under the same two conditions.
     if (d.type == DeviceType.BODY_CAM) {
         append(dossierBodyCamFallbackLine(replay = d.hist || d.offline))
+        return@buildAnnotatedString
+    }
+    // Desert mode's ambient rows match no signature but still carry a method (SSID on WiFi), so
+    // the per-method lines below would claim a match. TWIN: iOS DetectionDetailView.matchExplainer,
+    // the same branch in the same place.
+    if (d.type == DeviceType.NEARBY_DEVICE) {
+        append(dossierNearbyDeviceLine(d.detail))
         return@buildAnnotatedString
     }
     when (d.method) {
@@ -947,7 +966,7 @@ private fun plainMatchLine(d: Detection): AnnotatedString = buildAnnotatedString
         7 -> append("The aircraft identified itself over Remote ID.")
         8 -> append("A service-data tag tied to this hardware matched.")
         9 -> append("A decoded manufacturer-data subtype matched a known signature.")
-        10 -> append("You starred this exact device, so every sighting matches.")
+        10 -> append("This exact device was on your watchlist, so every sighting matched.")
         else -> append("No match method was reported for this hit.")
     }
 }
@@ -959,6 +978,25 @@ internal fun dossierBodyCamFallbackLine(replay: Boolean): String =
     if (replay) "Matched a body-worn camera signature. This record came from the offline buffer, which doesn't keep which signature fired."
     else "Matched a body-worn camera signature. The board didn't report which one."
 
+/** The MATCH QUALITY explainer for a Desert-mode row (NEARBY_DEVICE, wire t=7). desert_detect.cpp
+ *  emits one for every device it hears, at confidence 0, with method SSID (WiFi) or none (BLE), so
+ *  the per-method lines would claim a signature matched. [detail] is that file's address label
+ *  (bleAddrLabel, desertClassifyWiFi), which the footer draws verbatim under this line; an unknown
+ *  label or none (a buffered record keeps no detail) gets the first sentence alone. TWIN: iOS
+ *  dossierNearbyDeviceLine(detail:) in DetectionDetailView.swift, same sentences. */
+internal fun dossierNearbyDeviceLine(detail: String?): String {
+    val base = "Desert mode lists every nearby device it hears, and no signature matched this one."
+    return when (detail) {
+        "randomized MAC" ->
+            "$base \"randomized MAC\" means the address isn't from a maker's registered block. Phones, watches, and earbuds use addresses like this and change them often, so the same device can come back under a new one."
+        "hardware OUI" ->
+            "$base \"hardware OUI\" means the address starts with a block registered to a maker, so it usually stays the same between sightings."
+        "OUI unknown" ->
+            "$base \"OUI unknown\" means the board couldn't tell whether the address comes from a maker's registered block or is randomized."
+        else -> base
+    }
+}
+
 /** The note under a tracker's verbatim "(offline)" firmware detail: the firmware means the tag is
  *  separated from its owner, which a reader can take for the app's OFFLINE buffer-replay tag.
  *  Tracker AND the suffix; any other category's "(offline)" gets no note. The firmware string
@@ -969,10 +1007,14 @@ internal fun trackerOfflineNote(type: DeviceType, detail: String?): String? =
     else null
 
 /** The dossier's "why flagged" footer. A method whose label equals the source ("Remote ID" over
- *  "Remote ID", a drone) says it once. TWIN: iOS dossierFlaggedLine(methodLabel:sourceLabel:). */
-internal fun dossierFlaggedLine(methodLabel: String, sourceLabel: String): String =
-    if (methodLabel.equals(sourceLabel, ignoreCase = true)) "Flagged by $methodLabel."
-    else "Flagged by $methodLabel over $sourceLabel."
+ *  "Remote ID", a drone) says it once. A Desert-mode row (NEARBY_DEVICE) was flagged by nothing:
+ *  its method is SSID on WiFi and none on BLE, so it names only the radio and desert mode.
+ *  TWIN: iOS dossierFlaggedLine(type:methodLabel:sourceLabel:). */
+internal fun dossierFlaggedLine(type: DeviceType, methodLabel: String, sourceLabel: String): String = when {
+    type == DeviceType.NEARBY_DEVICE -> "Heard over $sourceLabel in desert mode."
+    methodLabel.equals(sourceLabel, ignoreCase = true) -> "Flagged by $methodLabel."
+    else -> "Flagged by $methodLabel over $sourceLabel."
+}
 
 /** The hero subtitle: the node handle, then the maker or vendor unless the headline already
  *  says it (case-insensitive exact match, no fuzzy match: "Flock Safety" under "FlockSafety" stays).
@@ -985,18 +1027,18 @@ internal fun dossierHeroSubtitle(node: String, makerOrVendor: String, headline: 
  *  pilot coordinate (the operator marker on the thumbnail). TWIN: iOS droneOperatorCaption. */
 internal const val DRONE_OPERATOR_CAPTION = "operator position, from the drone's Remote ID"
 
-/** The firmware detail strings for the four body-cam signatures, exactly as axon_detect.cpp
+/** The firmware detail strings for the five body-cam signatures, exactly as axon_detect.cpp
  *  and police_detect.cpp write them. Membership selects a per-signature explainer
  *  below. */
 private val BODY_CAM_SIGNATURES =
-    setOf("BWC DEVICE", "Axon OUI", "Utility BodyWorn", "Motorola Solutions OUI")
+    setOf("BWC DEVICE", "Axon OUI", "Utility BodyWorn", "Motorola Solutions OUI", "WatchGuard Video OUI")
 
 /** The body-cam signature behind this hit, when the board reported one. Null for every other
  *  category, and for a buffered record (the offline store keeps no detail field). */
 private val Detection.bodyCamSigDetail: String?
     get() = detail?.takeIf { type == DeviceType.BODY_CAM && it in BODY_CAM_SIGNATURES }
 
-/** Which body-cam signature fired, and how much weight it carries. The four sources under
+/** Which body-cam signature fired, and how much weight it carries. The five sources under
  *  this one category range from Axon's own broadcast identifier to a vendor-block proxy, and
  *  without this they all read as "Body camera". Says nothing about the numbers: the verdict
  *  and percentage on the confidence row above already carry the strength. Copy mirrors iOS
@@ -1024,6 +1066,10 @@ private fun AnnotatedString.Builder.appendSignatureExplainer(d: Detection, sig: 
             append("Matched "); name()
             append(", a vendor proxy rather than a body cam signature. The block is Motorola Solutions' own, so the maker is right, but they also sell two-way radios, docks, and site infrastructure on it. Read this as their equipment nearby, not a confirmed camera.")
         }
+        "WatchGuard Video OUI" -> {
+            append("Matched "); name()
+            append(", a vendor proxy rather than a body cam signature. The block is WatchGuard Video's own, so the maker is right, but they also put in-car video systems and docks on it. WatchGuard belongs to Motorola Solutions, so the Motorola Solutions switch controls this match. Read this as their equipment nearby, not a confirmed body cam.")
+        }
     }
 }
 
@@ -1047,7 +1093,7 @@ private fun ConfirmItPanel(
                 else "Still here on a second pass? It's been seen ${d.count}× so far.",
                 checked = secondPass) { secondPass = !secondPass }
             GroupedRow(
-                headline = "Star it to get pinged every time this exact device shows up.",
+                headline = "Watch it to get pinged every time this exact device shows up.",
                 trailing = { WatchChip(watched, onWatch) },
             )
         }
@@ -1123,7 +1169,7 @@ private fun WhyFlagged(d: Detection, tone: Color) {
     ) {
         Icon(Icons.Filled.GpsFixed, contentDescription = null,
             tint = tone, modifier = Modifier.size(16.dp))
-        Text(dossierFlaggedLine(d.methodLabel, d.sourceLabel), Modifier.weight(1f),
+        Text(dossierFlaggedLine(d.type, d.methodLabel, d.sourceLabel), Modifier.weight(1f),
             style = MaterialTheme.typography.bodySmall,
             color = MaterialTheme.colorScheme.onSurfaceVariant)
     }
@@ -1943,12 +1989,12 @@ private fun WatchButton(watched: Boolean, onToggle: () -> Unit, modifier: Modifi
 @Composable
 private fun RandomAddrWarnDialog(type: DeviceType, onDismiss: () -> Unit, onConfirm: () -> Unit) {
     val body = when (type) {
-        DeviceType.TRACKER -> "This tag's address holds for about a day, then changes around 4am. The star stops matching when it does. The tracker detector finds it either way."
-        DeviceType.NEARBY_DEVICE -> "Most phones change their address every few minutes, so this star will likely stop matching within the hour."
+        DeviceType.TRACKER -> "This tag's address holds for about a day, then changes around 4am. The watchlist entry stops matching when it does. The tracker detector finds it either way."
+        DeviceType.NEARBY_DEVICE -> "Most phones change their address every few minutes, so the watchlist entry will likely stop matching within the hour."
         // No "trackers" here: TRACKER is handled one branch above, and a separated tag rotates
         // about once a day, not every few minutes. Repeating the near-owner interval in the
         // fallback would put the debunked claim straight back in front of the user.
-        else -> "This address looks randomized, so the star may stop matching this device."
+        else -> "This address looks randomized, so the watchlist entry may stop matching this device."
     }
     androidx.compose.material3.AlertDialog(
         onDismissRequest = onDismiss,
@@ -1971,7 +2017,7 @@ private fun WatchlistFullDialog(onDismiss: () -> Unit) {
     androidx.compose.material3.AlertDialog(
         onDismissRequest = onDismiss,
         title = { Text("Watchlist full") },
-        text = { Text("You can watch up to 256 devices at once. Un-watch one before adding another.") },
+        text = { Text("You can watch up to 256 devices at once. Stop watching one before adding another.") },
         confirmButton = { TextButton(onClick = onDismiss) { Text("OK") } },
     )
 }
@@ -2092,7 +2138,8 @@ private const val FIRST_SEEN_LABEL = "First seen"
  *  know the time. Pure in ([ms], [nowMs]): the body reads no clock. Every dossier call passes the
  *  screen's 1 s tick as [nowMs], because a wall-clock reading taken inside a skipped child
  *  composable stays at its last composition (see the nowMs tick comment in this file). The
- *  wall-clock default is for the one caller outside the dossier, MapScreen checkedAgo. TWIN: iOS
+ *  wall-clock default has one user, MapScreen checkedAgo; the other callers outside the dossier
+ *  (AcabLinkService lastLine, the widget's widgetLastLine) pass their own clock. TWIN: iOS
  *  `dossierRelativeAgo(_:now:)` in DetectionDetailView.swift, same buckets and edges. Pinned by
  *  DetailTimeLabelsTest and iOS DetectionDetailTimeTests; check-signature-drift.py's "dossier
  *  time labels" rule pins the same buckets in both bodies. */

@@ -62,16 +62,4 @@ class HistoryReplayPolicyTest {
         // A duplicate can balance or exceed the count without identifying which seq was missed.
         assertEquals(1, replayUnreplayedCount(100, 100, 101, transportComplete = false))
     }
-
-    @Test fun disconnectBeforeCheckpointReconnectsFromDurableTuple() {
-        val volatile = ReplayCursorTuple(sequence = 900, generation = 71)
-        val durable = ReplayCursorTuple(sequence = 600, generation = 71)
-        assertEquals(durable, replayCursorForReconnect(volatile, durable))
-
-        // Generation is part of the same decision; never pair a volatile generation with a
-        // durable sequence after switching boards or surviving a wipe.
-        val oldDurable = ReplayCursorTuple(sequence = 100, generation = 7)
-        val newVolatile = ReplayCursorTuple(sequence = 20, generation = 99)
-        assertEquals(oldDurable, replayCursorForReconnect(newVolatile, oldDurable))
-    }
 }

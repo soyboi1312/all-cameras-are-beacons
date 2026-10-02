@@ -54,7 +54,6 @@ enum FirmwareVersionPolicy {
 struct DeviceStatus: Equatable {
     let firmware: String     // "fw"
     let uptime: Int          // seconds ("up")
-    let total: Int           // detections this session
     let ble: Bool
     let wifi: Bool
     let wifiEco: Int         // WiFi eco sleep, seconds between sweeps (0/3/7/15); 0 = continuous
@@ -73,7 +72,6 @@ struct DeviceStatus: Equatable {
     let buzzer: Bool         // detection/session alert audio on/off; physical power cues are independent
     let volume: Int          // buzzer loudness, 0...100
     let ledEnabled: Bool     // onboard LED / idle heartbeat on ("ledon"; absent = on, the default)
-    let gps: Bool
     let bufCount: Int        // detections currently buffered on the board ("buf")
     let bufferingOn: Bool    // offline buffering enabled ("bufon")
     /// Stationary/record-all capture reached the raw-ring capacity. Sent only while true and
@@ -126,7 +124,7 @@ struct DeviceStatus: Equatable {
 
 extension DeviceStatus: Decodable {
     enum CodingKeys: String, CodingKey {
-        case fw, up, total, ble, wifi, wifiEco, flock, drone, axon, tracker, glasses, buzzer, gps
+        case fw, up, ble, wifi, wifiEco, flock, drone, axon, tracker, glasses, buzzer
         case bodycam     // clearer alias for `axon` (ble-protocol.md prefers it); today's firmware
                          // still EMITS only `axon`, so read bodycam first and fall back, exactly
                          // as Android does, so a firmware-side rename cannot strand this app
@@ -156,7 +154,6 @@ extension DeviceStatus: Decodable {
         protoVersion = (try? k.decode(Int.self, forKey: .proto)) ?? 0
         firmware = (try? k.decode(String.self, forKey: .fw)) ?? "ESP32"
         uptime   = (try? k.decode(Int.self, forKey: .up)) ?? 0
-        total    = (try? k.decode(Int.self, forKey: .total)) ?? 0
         ble      = (try? k.decode(Bool.self, forKey: .ble)) ?? false
         wifi     = (try? k.decode(Bool.self, forKey: .wifi)) ?? false
         wifiEco  = (try? k.decode(Int.self,  forKey: .wifiEco)) ?? 0
@@ -171,7 +168,6 @@ extension DeviceStatus: Decodable {
         buzzer   = (try? k.decode(Bool.self, forKey: .buzzer)) ?? false
         volume   = (try? k.decode(Int.self, forKey: .vol)) ?? 80
         ledEnabled = (try? k.decode(Bool.self, forKey: .ledon)) ?? true   // absent = on (default)
-        gps      = (try? k.decode(Bool.self, forKey: .gps)) ?? false
         bufCount    = (try? k.decode(Int.self, forKey: .buf)) ?? 0
         bufferingOn = (try? k.decode(Bool.self, forKey: .bufon)) ?? false
         bufferSaturated = (try? k.decode(Bool.self, forKey: .bufsat)) ?? false
@@ -279,8 +275,4 @@ extension DeviceStatus {
         FirmwareVersionPolicy.isValid(version) && FirmwareVersionPolicy.isValid(latest)
             && !FirmwareVersionPolicy.isAtLeast(version, latest)
     }
-
-    /// Offline-fallback update check (manifest not consulted). Kept as a convenience for any
-    /// call site that has no manifest handy; the UI routes through `updateAvailable(latest:)`.
-    var updateAvailable: Bool { updateAvailable(latest: Self.latestVersion) }
 }

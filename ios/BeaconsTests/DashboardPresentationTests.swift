@@ -39,7 +39,7 @@ final class DashboardPresentationTests: XCTestCase {
         // StatusBeaconPresentationTest too; the second clause is the one that says the dot cap
         // does not cap the counters.
         XCTAssertEqual(DashboardSnapshot.radarCaptionDetail,
-                       "matches and stars first · counts include every recent device")
+                       "matches and watched devices first · counts include every recent device")
     }
 
     func testAllCategoriesAndStarsAreAccountedWithoutDoubleCounting() throws {
@@ -142,7 +142,7 @@ final class DashboardPresentationTests: XCTestCase {
     /// is a by-hand edit. The two lines exist only when they have something to say.
     func testNearbyBreakdownLiteralsMatchAndroidAndOnlyRenderWhenThereIsSomethingToSay() throws {
         XCTAssertEqual(DashboardSnapshot.matchedCardTitle, "MATCHED + WATCHED")
-        XCTAssertEqual(DashboardSnapshot.matchedCardDetail, "signatures or exact stars")
+        XCTAssertEqual(DashboardSnapshot.matchedCardDetail, "signatures or your watchlist")
         XCTAssertEqual(DashboardSnapshot.ambientCardTitle, "AMBIENT")
         XCTAssertEqual(DashboardSnapshot.ambientCardDetail, "Desert-mode broadcasts")
 

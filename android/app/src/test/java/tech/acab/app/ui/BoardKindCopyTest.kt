@@ -4,6 +4,7 @@ import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNull
 import org.junit.Test
+import tech.acab.app.ble.AcabBleManager
 import tech.acab.app.ble.BoardKind
 import tech.acab.app.ble.RememberedBoardCopy
 import tech.acab.app.ble.renderBoardCopy
@@ -142,6 +143,17 @@ class BoardKindCopyTest {
         assertEquals("beacon", scannedRowTitle(BoardKind.BEACON))
         assertEquals("OUI-Spy", scannedRowTitle(spy))
         assertEquals("Mesh-Detect", scannedRowTitle(mesh))
+    }
+
+    @Test fun pickerRowDrawsEveryFactoryAddress() {
+        // One address per value of the first octet's top two bits (00, 01, 10, 11). The board's
+        // address is public, so those bits carry no meaning and every one draws. 01 is the bucket
+        // an earlier rule hid as "resolvable private".
+        for (address in listOf("1c:9d:c2:00:00:01", "48:27:e2:00:00:01", "a0:76:4e:00:00:01", "e8:3d:c1:00:00:01")) {
+            assertEquals(address, pickerAddressLine(address))
+        }
+        // The DEBUG stand-in's placeholder address is the one value that draws no line.
+        assertNull(pickerAddressLine(AcabBleManager.DEBUG_REMEMBERED_ADDRESS))
     }
 
     @Test fun heroTitlePerKind() {

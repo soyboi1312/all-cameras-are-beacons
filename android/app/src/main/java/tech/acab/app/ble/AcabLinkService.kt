@@ -27,6 +27,7 @@ import kotlinx.coroutines.flow.sample
 import kotlinx.coroutines.launch
 import tech.acab.app.MainActivity
 import tech.acab.app.R
+import tech.acab.app.ui.relativeAgo
 
 /**
  * What the Android 16 promoted-ongoing chip is allowed to say, as one pure decision.
@@ -45,8 +46,8 @@ internal fun shortCriticalText(total: Int, connected: Boolean, redact: Boolean):
  * is a process singleton) and posts an ongoing "glanceable counter" notification , a live
  * ALPR / drone / body-cam / tracker tally on the lock screen and in the shade. The phone
  * analog of the iOS Live Activity. On Android 16+ it promotes to a Live Update status-bar
- * chip (see promoteIfSupported). An in-flight OTA also holds it (HOLD_OTA) so the cached-app
- * freezer can't halt the chunk stream mid-flash; that face is a plain keep-alive line.
+ * chip (see promoteIfSupported). An in-flight update also holds it (HOLD_COMBINED) so the
+ * cached-app freezer can't halt the chunk stream mid-flash; that face is a plain keep-alive line.
  */
 class AcabLinkService : Service() {
 
@@ -171,7 +172,7 @@ class AcabLinkService : Service() {
      *  The snapshot is skipped outright when Live Mode is off, because render() returns the plain
      *  keep-alive face on its first line and never reads it. nearbySnapshot() is a whole-store pass
      *  under storeLock - the monitor the BLE thread takes for every arriving detection - and for a
-     *  user holding a HERE mute it first asks LocationManager for two last-known fixes. An OTA or
+     *  user holding a HERE mute it first asks LocationManager for two last-known fixes. A
      *  combined-update hold with drive off paid all of that and threw the result away: on the
      *  collector every RENDER_SAMPLE_MS for the length of the flash, and in onStartCommand on the
      *  MAIN thread, which is the thread driving the OTA progress UI. */
@@ -273,11 +274,11 @@ class AcabLinkService : Service() {
             // that nobody asked for - an OEM battery manager, `am stopservice` - leaves HOLD_DRIVE
             // in the set, and nothing ever takes it out: onLinkServiceStopped below clears
             // _driveMode, so stopDriveMode's `if (!_driveMode.value) return` fires before it
-            // reaches stop(). The next OTA then restarts the service and, when it releases
-            // HOLD_OTA, finds the set still non-empty, so stopService is never called and the
+            // reaches stop(). The next update then restarts the service and, when it releases
+            // HOLD_COMBINED, finds the set still non-empty, so stopService is never called and the
             // "FIRMWARE UPDATE" ongoing notification plus a connectedDevice foreground service
-            // stay pinned. HOLD_DRIVE only, not clear(): an OTA or combined-update hold is
-            // released by its own leg. Removing the drive hold is exactly consistent with the
+            // stay pinned. HOLD_DRIVE only, not clear(): a combined-update hold is
+            // released by its own run. Removing the drive hold is exactly consistent with the
             // drive flag this method already clears.
             holders.remove(HOLD_DRIVE)
             ble.onLinkServiceStopped()
@@ -329,7 +330,7 @@ class AcabLinkService : Service() {
             .mapNotNull(newestByCategory::get)
             .maxByOrNull { it.at }
             ?: return "no detections"
-        return "last ${newest.category} ${relativeAgo(newest.at)}"
+        return "last ${newest.category} ${relativeAgo(newest.at, System.currentTimeMillis())}"
     }
 
     /** The face shown while only a firmware update holds the service: a static keep-alive whose
@@ -345,19 +346,6 @@ class AcabLinkService : Service() {
             .setContentIntent(tapIntent())
             .setCategory(NotificationCompat.CATEGORY_STATUS)
             .build()
-
-    /** Short "ago" string, same tiers as the dossier's relativeAgo. */
-    private fun relativeAgo(ms: Long?): String {
-        if (ms == null) return "now"
-        val secs = ((System.currentTimeMillis() - ms) / 1000).coerceAtLeast(0)
-        return when {
-            secs < 5 -> "now"
-            secs < 60 -> "${secs}s ago"
-            secs < 3600 -> "${secs / 60}m ago"
-            secs < 86_400 -> "${secs / 3600}h ago"
-            else -> "${secs / 86_400}d ago"
-        }
-    }
 
     /** The redacted lock-screen face: no counts, no breakdown - just "active". */
     private fun buildPublic(tap: PendingIntent): Notification =
@@ -413,7 +401,6 @@ class AcabLinkService : Service() {
     }
 
     private fun createChannel() {
-        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.O) return
         val ch = NotificationChannel(CHANNEL_ID, "Live Mode", NotificationManager.IMPORTANCE_LOW).apply {
             description = "Live proximity detection counter while your beacon is connected"
             setShowBadge(false)
@@ -450,7 +437,7 @@ class AcabLinkService : Service() {
             // mode simply doesn't engage, rather than taking down the app.
             android.util.Log.w("AcabLinkService", "startForeground failed; stopping service", e)
             // The service is going down without anyone calling stop(): keep the bookkeeping in
-            // sync with reality. Clear the holder set so a later hold-release (OTA/combined)
+            // sync with reality. Clear the holder set so a later hold-release (combined update)
             // doesn't find a stale "drive" entry, skip stopService, and resurrect a drive-mode
             // notification the user never re-requested; and reset the manager's drive flag so
             // the in-app switch and the QS tile stop claiming ACTIVE for a service that never
@@ -505,16 +492,14 @@ class AcabLinkService : Service() {
         private const val RENDER_SAMPLE_MS = 2_000L
         private const val NEARBY_REFRESH_MS = 5_000L
 
-        /** Start reasons. Drive mode and an in-flight OTA hold the service independently -
-         *  endDriveMode used to stop it unconditionally, which would also have killed an OTA's
+        /** Start reasons. Drive mode and an in-flight update hold the service independently -
+         *  endDriveMode used to stop it unconditionally, which would also have killed an update's
          *  process keep-alive (and vice versa); stop() only tears the service down when the
          *  last holder releases. */
         const val HOLD_DRIVE = "drive"
-        const val HOLD_OTA = "ota"
-        // The one-click combined update holds the service across BOTH legs: the S3 OTA releases its
-        // own HOLD_OTA on its DONE, so without this independent hold the process could be frozen in
-        // the seam between the S3 finishing and the nRF DFU starting (and through the nRF leg, which
-        // takes no hold of its own).
+        // The one-click combined update holds the service across BOTH legs. Neither the S3 OTA nor
+        // the nRF DFU takes a hold of its own, so without this one the process could be frozen
+        // during either leg or in the seam between them.
         const val HOLD_COMBINED = "combined"
         private val holders = java.util.Collections.synchronizedSet(mutableSetOf<String>())
 

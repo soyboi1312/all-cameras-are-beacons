@@ -235,7 +235,7 @@ internal data class StatusNearbySummary(
     val radarContentDescription: String
         get() = "$total recently heard device${if (total == 1) "" else "s"} nearby. " +
             "${dots.size} dot${if (dots.size == 1) "" else "s"} drawn, at most $STATUS_RADAR_DOT_CAP, " +
-            "with matches and stars first. Radar shows signal strength only, not direction."
+            "with matches and watched devices first. Radar shows signal strength only, not direction."
 
     /** Under the count cards, only when there is something to say. TWIN: iOS
      *  `DashboardSnapshot.unclassifiedLine` / `watchedLine` in DashboardPresentation.swift,
@@ -265,7 +265,7 @@ internal fun statusRadarCountCardDescription(count: Int, title: String, detail: 
  *  the 14-dot cap does not cap the counters ([StatusNearbySummary.total] and the breakdown count
  *  every recent device). TWIN: iOS `DashboardSnapshot.radarCaptionDetail`, byte-identical. */
 internal const val STATUS_RADAR_CAPTION_DETAIL =
-    "matches and stars first · counts include every recent device"
+    "matches and watched devices first · counts include every recent device"
 
 /** The two count cards that split TOTAL NEARBY, a title and a detail line each. TWIN: iOS
  *  `DashboardSnapshot.matchedCardTitle` / `matchedCardDetail` / `ambientCardTitle` /
@@ -273,7 +273,7 @@ internal const val STATUS_RADAR_CAPTION_DETAIL =
  *  literals. "MATCHED + WATCHED" because a star counts as a match here ([statusNearbySummary]
  *  folds watched rows into `matched`), and the detail names the two things that means. */
 internal const val STATUS_MATCHED_CARD_TITLE = "MATCHED + WATCHED"
-internal const val STATUS_MATCHED_CARD_DETAIL = "signatures or exact stars"
+internal const val STATUS_MATCHED_CARD_DETAIL = "signatures or your watchlist"
 internal const val STATUS_AMBIENT_CARD_TITLE = "AMBIENT"
 internal const val STATUS_AMBIENT_CARD_DETAIL = "Desert-mode broadcasts"
 
@@ -603,10 +603,10 @@ internal val RadarCountStyle = AcabTypography.displayLarge.tabular()
 
 /** The radar count's ink: the text ink while the board is [scanning], the faint ink while the
  *  sweep is parked, so a 0 over radios that are not listening does not read as a result (STA-1).
- *  On Android [AcabPalette.text] is onSurface and [AcabPalette.faint] is onSurfaceVariant.
+ *  On Android [Acab.text] is onSurface and [Acab.faint] is onSurfaceVariant.
  *  TWIN: iOS RadarScope countBlock (Components.swift), `sweeping ? ACABTheme.text : ACABTheme.faint`. */
 internal fun radarCountInk(scanning: Boolean, palette: AcabPalette): Color =
-    if (scanning) palette.text else palette.faint
+    if (scanning) palette.onSurface else palette.onSurfaceVariant
 private val RingLabelStyle = AcabTypography.labelMedium.telemetry(tracked = true)
 
 /** The ring words and the ring each names (1 = inner, 2 = middle, 3 = the disc edge). The middle

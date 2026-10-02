@@ -60,7 +60,7 @@ struct HelpView: View {
                         }
                         supportCard
                         Text("answers ship with the app · no connection needed")
-                            .font(ACABTheme.mono(9.5)).foregroundStyle(ACABTheme.faint)
+                            .font(ACABTheme.font(.caption2, tabular: true)).foregroundStyle(ACABTheme.faint)
                             .frame(maxWidth: .infinity, alignment: .center)
                         Spacer(minLength: 8)
                     }
@@ -91,8 +91,8 @@ struct HelpView: View {
             Image(systemName: "magnifyingglass")
                 .font(.system(size: 12, weight: .medium)).foregroundStyle(ACABTheme.faint)
             TextField("", text: $query, prompt: Text("search help…")
-                .font(ACABTheme.mono(11.5)).foregroundColor(ACABTheme.faint))
-                .font(ACABTheme.mono(11.5))
+                .font(ACABTheme.font(.caption, tabular: true)).foregroundColor(ACABTheme.faint))
+                .font(ACABTheme.font(.caption, tabular: true))
                 .foregroundStyle(ACABTheme.text)
                 .textInputAutocapitalization(.never)
                 .autocorrectionDisabled()
@@ -125,7 +125,7 @@ struct HelpView: View {
                 .padding(.horizontal, 16).padding(.top, 16).padding(.bottom, 6)
             if results.isEmpty {
                 Text("nothing matches. try fewer words, or open the FAQ online below.")
-                    .font(ACABTheme.mono(11)).foregroundStyle(ACABTheme.dim)
+                    .font(ACABTheme.font(.caption2, tabular: true)).foregroundStyle(ACABTheme.dim)
                     .padding(.horizontal, 16).padding(.bottom, 18)
             } else {
                 ForEach(Array(results.enumerated()), id: \.element.question.id) { idx, row in
@@ -161,12 +161,12 @@ struct HelpView: View {
             } label: {
                 VStack(alignment: .leading, spacing: 3) {
                     if let k = sectionKicker {
-                        Text(k).font(ACABTheme.mono(9, weight: .medium))
+                        Text(k).font(ACABTheme.font(.caption2, weight: .medium, tabular: true))
                             .foregroundStyle(ACABTheme.faint)
                     }
                     HStack(alignment: .top, spacing: 10) {
                         Text(q.q)
-                            .font(ACABTheme.display(14, weight: .medium))
+                            .font(ACABTheme.font(.subheadline, weight: .medium))
                             .foregroundStyle(ACABTheme.text)
                             .lineSpacing(2)
                             .fixedSize(horizontal: false, vertical: true)
@@ -186,7 +186,7 @@ struct HelpView: View {
 
             if open {
                 Text(q.a)
-                    .font(ACABTheme.mono(11))
+                    .font(ACABTheme.font(.caption2, tabular: true))
                     .foregroundStyle(ACABTheme.dim)
                     .lineSpacing(6)
                     .fixedSize(horizontal: false, vertical: true)
@@ -206,7 +206,7 @@ struct HelpView: View {
             Kicker("SUPPORT")
                 .padding(.horizontal, 16).padding(.top, 16).padding(.bottom, 6)
             Text("spotted a false positive, or a device it missed? tell me what it flagged and what the device was.")
-                .font(ACABTheme.mono(11)).foregroundStyle(ACABTheme.dim)
+                .font(ACABTheme.font(.caption2, tabular: true)).foregroundStyle(ACABTheme.dim)
                 .lineSpacing(5)
                 .fixedSize(horizontal: false, vertical: true)
                 .padding(.horizontal, 16).padding(.bottom, 12)
@@ -245,8 +245,8 @@ struct HelpView: View {
     private func supportRowBody(_ row: FAQContent.SupportRow, glyph: String, tint: Color) -> some View {
         HStack(spacing: 10) {
             VStack(alignment: .leading, spacing: 2) {
-                Text(row.title).font(ACABTheme.display(14, weight: .medium)).foregroundStyle(ACABTheme.text)
-                Text(row.sub).font(ACABTheme.mono(10.5)).foregroundStyle(ACABTheme.faint)
+                Text(row.title).font(ACABTheme.font(.subheadline, weight: .medium)).foregroundStyle(ACABTheme.text)
+                Text(row.sub).font(ACABTheme.font(.caption2, tabular: true)).foregroundStyle(ACABTheme.faint)
                     .fixedSize(horizontal: false, vertical: true)
             }
             Spacer(minLength: 8)

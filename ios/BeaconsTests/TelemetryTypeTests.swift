@@ -78,8 +78,6 @@ final class TelemetryTypeTests: XCTestCase {
         }
         XCTAssertEqual(ACABTheme.font(.title3, weight: .semibold),
                        Font.system(.title3, design: .default).weight(.semibold))
-        // The legacy names mean "data", not mono: they stay SF with tabular digits.
-        XCTAssertEqual(ACABTheme.mono(13), ACABTheme.font(.footnote, tabular: true))
     }
 
     /// The face as the text system resolves it, not only as it was asked for: a Font.custom

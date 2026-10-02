@@ -84,11 +84,8 @@ struct ContributeView: View {
     @State private var startMs: Int64 = 0
     @State private var stopMs: Int64 = 0
     @State private var nowMs: Int64 = 0
-    // Frozen exactly once at Stop: membership plus each device's last in-window sighting. Review /
-    // share must never re-evaluate the mutable log, and bounded CSV timestamps must stay in-window.
-    @State private var capturedAtByID: [String: Int64] = [:]
-    // ALSO frozen exactly once at Stop: the full, UNREDACTED windowed CSV, rendered from the log
-    // in the same main-actor instant the membership map is. The review count and disclosure derive
+    // Frozen exactly once at Stop: the full, UNREDACTED windowed CSV, rendered from the one
+    // snapshot finishContributionCapture returns. The review count and disclosure derive
     // from THIS string, and share redacts THIS string (pure text ops) - the mutable log is never
     // re-read after Stop, so rows evicted between Stop and Share (ignore, clear log) can no longer
     // vanish out of the export while the header still claims the frozen count. Unredacted on
@@ -114,9 +111,10 @@ struct ContributeView: View {
     private var liveCount: Int {
         switch phase {
         case .capturing: return ble.windowObservationCount(startMs: startMs, stopMs: nowMs)
-        // Review counts the ARTIFACT (data rows of the frozen CSV), not the membership map, so
-        // the number on screen can never disagree with the file that leaves. Counted at Stop,
-        // not here: this getter is read repeatedly per body evaluation (see frozenRowCount).
+        // Review counts the ARTIFACT (data rows of the frozen CSV), not the Stop snapshot's
+        // capturedAtByID map, so the number on screen can never disagree with the file that
+        // leaves. Counted at Stop, not here: this getter is read repeatedly per body evaluation
+        // (see frozenRowCount).
         case .review:    return frozenRowCount
         case .idle:      return 0
         }
@@ -242,10 +240,10 @@ struct ContributeView: View {
         Text("Found a device beacons didn't identify? Start a short capture, walk around the device, "
            + "then stop. Only what the beacon heard during that window is exported, so your "
            + "contribution is a focused diagnostic capture, not your whole history.")
-            .font(ACABTheme.mono(12)).foregroundStyle(ACABTheme.dim)
+            .font(ACABTheme.font(.caption, tabular: true)).foregroundStyle(ACABTheme.dim)
         if !canStartCapture {
             Text("connect a real beacon before starting a capture.")
-                .font(ACABTheme.mono(11)).foregroundStyle(ACABTheme.warn)
+                .font(ACABTheme.font(.caption2, tabular: true)).foregroundStyle(ACABTheme.warn)
         }
         primaryButton("Start Capture") { startCapture() }
             .disabled(!canStartCapture)
@@ -255,16 +253,15 @@ struct ContributeView: View {
 
     // ---- CAPTURING: live count + elapsed, until the user stops -------------------------------
     @ViewBuilder private var capturingStep: some View {
-        Text("CAPTURING").font(ACABTheme.mono(11, weight: .bold)).foregroundStyle(ACABTheme.accentText)
-        Text("Walk around the device, then stop.").font(ACABTheme.mono(13)).foregroundStyle(ACABTheme.dim)
+        Text("CAPTURING").font(ACABTheme.font(.caption2, weight: .bold, tabular: true)).foregroundStyle(ACABTheme.accentText)
+        Text("Walk around the device, then stop.").font(ACABTheme.font(.footnote, tabular: true)).foregroundStyle(ACABTheme.dim)
         Text("\(liveCount) observation\(liveCount == 1 ? "" : "s") heard  ·  \(Self.elapsed(startMs, nowMs))")
-            .font(ACABTheme.mono(16, weight: .bold)).foregroundStyle(ACABTheme.text)
+            .font(ACABTheme.font(.callout, weight: .bold, tabular: true)).foregroundStyle(ACABTheme.text)
         primaryButton("Stop Capture") {
             let stopped = Self.nowMillis()
             // One manager call freezes live-ledger membership, row fields, exact timestamps, and
             // matching capture-local phone positions before ingest can advance another row.
             let snapshot = ble.finishContributionCapture(startMs: startMs, stopMs: stopped)
-            capturedAtByID = snapshot.capturedAtByID
             stopMs = stopped
             // FREEZE AT STOP: render the full unredacted CSV from that atomic snapshot. Review and
             // share never re-read the mutable manager store or its coalesced UI projection.
@@ -292,7 +289,7 @@ struct ContributeView: View {
         } else {
             Text("Captured \(liveCount) observation\(liveCount == 1 ? "" : "s") over \(Self.elapsed(startMs, stopMs)) "
                + "(\(Self.clockTime(startMs)) to \(Self.clockTime(stopMs))).")
-                .font(ACABTheme.mono(13)).foregroundStyle(ACABTheme.text)
+                .font(ACABTheme.font(.footnote, tabular: true)).foregroundStyle(ACABTheme.text)
             kindSection
             makerAndPhotoSection
             locationToggles
@@ -305,11 +302,11 @@ struct ContributeView: View {
     // maker, photo, toggles, disclosure) renders BELOW the explanation, never hidden: whatever
     // would ride the share must be reviewable, even when the CSV is empty.
     @ViewBuilder private var emptyReviewStep: some View {
-        Text("NOTHING HEARD").font(ACABTheme.mono(11, weight: .bold)).foregroundStyle(ACABTheme.dim)
+        Text("NOTHING HEARD").font(ACABTheme.font(.caption2, weight: .bold, tabular: true)).foregroundStyle(ACABTheme.dim)
         Text("Nothing was heard in this window. That means no compatible broadcast was recognized "
            + "while you captured - it doesn't prove nothing is there. Try capturing closer to the "
            + "device, or for longer.")
-            .font(ACABTheme.mono(13)).foregroundStyle(ACABTheme.text)
+            .font(ACABTheme.font(.footnote, tabular: true)).foregroundStyle(ACABTheme.text)
             .fixedSize(horizontal: false, vertical: true)
         primaryButton("Start a New Capture") { requestNewCapture() }
             .disabled(preparing)
@@ -322,7 +319,7 @@ struct ContributeView: View {
             HStack(spacing: 8) {
                 ProgressView().tint(ACABTheme.dim)
                 Text(photoLoading ? "Preparing photo\u{2026}" : "Preparing export\u{2026}")
-                    .font(ACABTheme.mono(12)).foregroundStyle(ACABTheme.dim)
+                    .font(ACABTheme.font(.caption, tabular: true)).foregroundStyle(ACABTheme.dim)
             }
             .frame(maxWidth: .infinity).padding(.vertical, 4)
         }
@@ -330,7 +327,7 @@ struct ContributeView: View {
         // data point) but deliberately reads as the secondary path.
         Button { buildAndShare(mode: .send) } label: {
             Text("Share the Empty Capture Anyway")
-                .font(ACABTheme.mono(12)).foregroundStyle(ACABTheme.faint)
+                .font(ACABTheme.font(.caption, tabular: true)).foregroundStyle(ACABTheme.faint)
                 .frame(maxWidth: .infinity).frame(minHeight: 44)
                 .contentShape(Rectangle())
         }
@@ -339,7 +336,7 @@ struct ContributeView: View {
         .opacity(exportBusy ? 0.5 : 1)
         Button { buildAndShare(mode: .save) } label: {
             Text("Save a Copy")
-                .font(ACABTheme.mono(12, weight: .bold)).foregroundStyle(ACABTheme.dim)
+                .font(ACABTheme.font(.caption, weight: .bold, tabular: true)).foregroundStyle(ACABTheme.dim)
                 .frame(maxWidth: .infinity).padding(.vertical, 12)
                 .frame(minHeight: 44)
                 .overlay(RoundedRectangle(cornerRadius: 12).strokeBorder(ACABTheme.line, lineWidth: 1))
@@ -366,7 +363,7 @@ struct ContributeView: View {
         let on = kind == k
         return Button { kind = on ? nil : k } label: {
             Text(k)
-                .font(ACABTheme.mono(11, weight: on ? .bold : .regular))
+                .font(ACABTheme.font(.caption2, weight: on ? .bold : .regular, tabular: true))
                 .foregroundStyle(on ? ACABTheme.text : ACABTheme.dim)
                 .frame(maxWidth: .infinity)
                 .padding(.horizontal, 10).padding(.vertical, 9)
@@ -382,7 +379,7 @@ struct ContributeView: View {
 
     @ViewBuilder private var makerAndPhotoSection: some View {
         TextField("Manufacturer / model (optional)", text: $makerModel)
-            .font(ACABTheme.mono(12)).foregroundStyle(ACABTheme.text)
+            .font(ACABTheme.font(.caption, tabular: true)).foregroundStyle(ACABTheme.text)
             .padding(12)
             .background(ACABTheme.bg3, in: RoundedRectangle(cornerRadius: 12))
             .overlay(RoundedRectangle(cornerRadius: 12).strokeBorder(ACABTheme.line, lineWidth: 1))
@@ -394,11 +391,11 @@ struct ContributeView: View {
         // Both actions ride the existing generation/cleanup machinery: Replace is just another
         // pick (loadPhoto supersedes + deletes the old file), Remove clears the selection (which
         // loadPhoto(nil) treats as deselection and cleans up).
-        // Both font builders are @MainActor and PhotosPicker's label closure is @Sendable, so it
-        // runs nonisolated (a SwiftUI Button's label is not @Sendable, which is why Button labels
-        // may call them). The fonts are built here in body and only read inside the picker.
+        // ACABTheme's font builders are @MainActor and PhotosPicker's label closure is @Sendable,
+        // so it runs nonisolated (a SwiftUI Button's label is not @Sendable, which is why Button
+        // labels may call them). The fonts are built here in body and only read inside the picker.
         if let thumb = photoThumb, photoURL != nil {
-            let replaceFont = ACABTheme.mono(10, weight: .bold)
+            let replaceFont = ACABTheme.font(.caption2, weight: .bold, tabular: true)
             HStack(spacing: 12) {
                 Image(uiImage: thumb)
                     .resizable().scaledToFill()
@@ -409,10 +406,10 @@ struct ContributeView: View {
                     .accessibilityLabel("Attached photo preview")
                 VStack(alignment: .leading, spacing: 2) {
                     Text(photoLoading ? "Preparing replacement\u{2026}" : "Photo attached")
-                        .font(ACABTheme.mono(12)).foregroundStyle(ACABTheme.text)
+                        .font(ACABTheme.font(.caption, tabular: true)).foregroundStyle(ACABTheme.text)
                     Text(photoLoading ? "The current photo stays attached until this finishes"
                                       : "location metadata removed on export")
-                        .font(ACABTheme.mono(10)).foregroundStyle(ACABTheme.faint)
+                        .font(ACABTheme.font(.caption2, tabular: true)).foregroundStyle(ACABTheme.faint)
                 }
                 Spacer(minLength: 8)
                 PhotosPicker(selection: $photoItem, matching: .images) {
@@ -429,7 +426,7 @@ struct ContributeView: View {
                     // path as a deselection, which bumps the generation and deletes the file.
                     if photoItem != nil { photoItem = nil } else { loadPhoto(nil) }
                 } label: {
-                    Text("Remove").font(ACABTheme.mono(10, weight: .bold))
+                    Text("Remove").font(ACABTheme.font(.caption2, weight: .bold, tabular: true))
                         .foregroundStyle(ACABTheme.accentText)
                         .padding(.horizontal, 8).padding(.vertical, 5)
                         .overlay(Capsule().strokeBorder(ACABTheme.line, lineWidth: 1))
@@ -443,7 +440,7 @@ struct ContributeView: View {
             .background(ACABTheme.bg2, in: RoundedRectangle(cornerRadius: 12))
             .overlay(RoundedRectangle(cornerRadius: 12).strokeBorder(ACABTheme.line, lineWidth: 1))
         } else {
-            let attachFont = ACABTheme.mono(12)
+            let attachFont = ACABTheme.font(.caption, tabular: true)
             PhotosPicker(selection: $photoItem, matching: .images) {
                 Label(photoLoading ? "Preparing Photo\u{2026}" : "Attach a Photo (Optional)",
                       systemImage: photoLoading ? "hourglass" : "photo")
@@ -459,7 +456,7 @@ struct ContributeView: View {
             HStack(spacing: 8) {
                 ProgressView().controlSize(.small).tint(ACABTheme.tint)
                 Text("Decoding and removing location metadata. Share and Save stay off until the photo is ready.")
-                    .font(ACABTheme.mono(10)).foregroundStyle(ACABTheme.dim)
+                    .font(ACABTheme.font(.caption2, tabular: true)).foregroundStyle(ACABTheme.dim)
                     .fixedSize(horizontal: false, vertical: true)
             }
             .accessibilityElement(children: .combine)
@@ -470,7 +467,7 @@ struct ContributeView: View {
                 Image(systemName: "exclamationmark.triangle.fill")
                     .foregroundStyle(ACABTheme.warn)
                 Text(photoError + " Choose the photo again to retry.")
-                    .font(ACABTheme.mono(10.5)).foregroundStyle(ACABTheme.warn)
+                    .font(ACABTheme.font(.caption2, tabular: true)).foregroundStyle(ACABTheme.warn)
                     .fixedSize(horizontal: false, vertical: true)
             }
             .accessibilityElement(children: .combine)
@@ -497,8 +494,8 @@ struct ContributeView: View {
     private func toggleRow(_ label: String, _ hint: String, _ binding: Binding<Bool>) -> some View {
         Toggle(isOn: binding) {
             VStack(alignment: .leading, spacing: 2) {
-                Text(label).font(ACABTheme.mono(12)).foregroundStyle(ACABTheme.text)
-                Text(hint).font(ACABTheme.mono(10)).foregroundStyle(ACABTheme.faint)
+                Text(label).font(ACABTheme.font(.caption, tabular: true)).foregroundStyle(ACABTheme.text)
+                Text(hint).font(ACABTheme.font(.caption2, tabular: true)).foregroundStyle(ACABTheme.faint)
             }
         }
         .tint(ACABTheme.tint)
@@ -511,7 +508,7 @@ struct ContributeView: View {
     private var disclosureCard: some View {
         VStack(alignment: .leading, spacing: 6) {
             Kicker("WHAT THIS EXPORT CONTAINS")
-            Text(disclosureText).font(ACABTheme.mono(11)).foregroundStyle(ACABTheme.dim)
+            Text(disclosureText).font(ACABTheme.font(.caption2, tabular: true)).foregroundStyle(ACABTheme.dim)
         }
         .padding(14)
         .frame(maxWidth: .infinity, alignment: .leading)
@@ -528,7 +525,7 @@ struct ContributeView: View {
             HStack(spacing: 8) {
                 ProgressView().tint(ACABTheme.dim)
                 Text(photoLoading ? "Preparing photo\u{2026}" : "Preparing export\u{2026}")
-                    .font(ACABTheme.mono(12)).foregroundStyle(ACABTheme.dim)
+                    .font(ACABTheme.font(.caption, tabular: true)).foregroundStyle(ACABTheme.dim)
             }
             .frame(maxWidth: .infinity).padding(.vertical, 12)
         }
@@ -536,7 +533,7 @@ struct ContributeView: View {
             .disabled(exportBusy)
             .opacity(exportBusy ? 0.5 : 1)
         Button { buildAndShare(mode: .save) } label: {
-            Text("Save a Copy").font(ACABTheme.mono(12, weight: .bold)).foregroundStyle(ACABTheme.dim)
+            Text("Save a Copy").font(ACABTheme.font(.caption, weight: .bold, tabular: true)).foregroundStyle(ACABTheme.dim)
                 .frame(maxWidth: .infinity).padding(.vertical, 12)
                 .frame(minHeight: 44)
                 .overlay(RoundedRectangle(cornerRadius: 12).strokeBorder(ACABTheme.line, lineWidth: 1))
@@ -548,7 +545,7 @@ struct ContributeView: View {
         HStack {
             // Both destructive exits route through the discard confirmation (see body).
             Button { requestStartOver() } label: {
-                Text("Start Over").font(ACABTheme.mono(12)).foregroundStyle(ACABTheme.faint)
+                Text("Start Over").font(ACABTheme.font(.caption, tabular: true)).foregroundStyle(ACABTheme.faint)
                     .padding(.vertical, 8)
                     .frame(minHeight: 44)   // 44pt targets for the quiet links too
                     .contentShape(Rectangle())
@@ -557,7 +554,7 @@ struct ContributeView: View {
             .disabled(preparing)
             Spacer()
             Button { requestDiscard() } label: {
-                Text("Discard").font(ACABTheme.mono(12)).foregroundStyle(ACABTheme.faint)
+                Text("Discard").font(ACABTheme.font(.caption, tabular: true)).foregroundStyle(ACABTheme.faint)
                     .padding(.vertical, 8)
                     .frame(minHeight: 44)
                     .contentShape(Rectangle())
@@ -572,7 +569,7 @@ struct ContributeView: View {
     // button style. Kept tiny so the type-checker never faces a big nested action expression.
     private func primaryButton(_ title: String, _ action: @escaping () -> Void) -> some View {
         Button(action: action) {
-            Text(title).font(ACABTheme.mono(13, weight: .bold)).foregroundStyle(ACABTheme.text)
+            Text(title).font(ACABTheme.font(.footnote, weight: .bold, tabular: true)).foregroundStyle(ACABTheme.text)
                 .frame(maxWidth: .infinity).padding(.vertical, 12)
                 .frame(minHeight: 44)   // 44pt target
                 .overlay(RoundedRectangle(cornerRadius: 12).strokeBorder(ACABTheme.tint, lineWidth: 1))
@@ -584,7 +581,7 @@ struct ContributeView: View {
     }
     private var discardLink: some View {
         Button { requestDiscard() } label: {
-            Text("Discard").font(ACABTheme.mono(12)).foregroundStyle(ACABTheme.faint)
+            Text("Discard").font(ACABTheme.font(.caption, tabular: true)).foregroundStyle(ACABTheme.faint)
                 .frame(maxWidth: .infinity).padding(.vertical, 8)
                 .frame(minHeight: 44)   // 44pt target
                 .contentShape(Rectangle())
@@ -644,7 +641,6 @@ struct ContributeView: View {
         // an unchanged value). Routing through the binding keeps the generation machinery honest.
         if photoItem != nil { photoItem = nil }
         cleanupTemp()
-        capturedAtByID = [:]
         frozenCsv = ""
         frozenRowCount = 0
         switch target {
@@ -658,7 +654,6 @@ struct ContributeView: View {
     /// (performDiscard), or never existed (idle).
     private func startCapture() {
         guard canStartCapture else { return }
-        capturedAtByID = [:]
         frozenCsv = ""
         frozenRowCount = 0
         startMs = Self.nowMillis(); nowMs = startMs

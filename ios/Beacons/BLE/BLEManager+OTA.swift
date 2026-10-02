@@ -137,9 +137,10 @@ extension BLEManager {
                                                        boardKind(for: link.peripheral.identifier)))
             return
         }
-        // entry.ota must be true AND the image verifiable. The Device screen already gates on
-        // otaEligible, but the engine enforces it too (defense in depth): never start an update
-        // for a build the manifest marked ota:false, even if a future caller reaches here directly.
+        // entry.ota must be true AND the image verifiable. startCombinedUpdate already plans this
+        // leg only when s3UpdateStale holds, but the engine enforces it too (defense in depth):
+        // never start an update for a build the manifest marked ota:false, even if a future caller
+        // reaches here directly.
         guard entry.ota, entry.hasVerifiableImage, let url = URL(string: entry.app.url),
               FirmwareDownloadPolicy.permits(url) else {
             otaState = .failed(reason: "This update isn't available to install over the air yet.")
@@ -208,6 +209,15 @@ extension BLEManager {
             return true
         }
         guard beganDownload else { return }
+        // Every failure below ends the run the same way, unless a cancel or a newer run owns it.
+        func fail(_ reason: String) async {
+            await MainActor.run {
+                guard self.otaGeneration == generation,
+                      self.otaOwnerPeripheralID == ownerID else { return }
+                self.otaDownloadTask = nil
+                self.otaState = .failed(reason: reason)
+            }
+        }
         var req = URLRequest(url: url)
         req.timeoutInterval = 60
         req.cachePolicy = .reloadIgnoringLocalCacheData
@@ -220,49 +230,24 @@ extension BLEManager {
             guard let http = response as? HTTPURLResponse,
                   FirmwareDownloadPolicy.permits(http.url),
                   (200..<300).contains(http.statusCode) else {
-                await MainActor.run {
-                    guard self.otaGeneration == generation,
-                          self.otaOwnerPeripheralID == ownerID else { return }
-                    self.otaDownloadTask = nil
-                    self.otaState = .failed(reason: "Couldn't download the update. Check your connection and try again.")
-                }
-                return
+                return await fail("Couldn't download the update. Check your connection and try again.")
             }
             // Reject up front if the server advertises a body larger than the ceiling.
             if http.expectedContentLength > Int64(cap) {
-                await MainActor.run {
-                    guard self.otaGeneration == generation,
-                          self.otaOwnerPeripheralID == ownerID else { return }
-                    self.otaDownloadTask = nil
-                    self.otaState = .failed(reason: "The download was the wrong size, so it wasn't installed.")
-                }
-                return
+                return await fail("The download was the wrong size, so it wasn't installed.")
             }
             if cap > 0 { data.reserveCapacity(cap) }
             for try await byte in bytes {
                 data.append(byte)
                 if data.count > cap {
                     // Server kept sending past the ceiling; stop buffering and reject.
-                    await MainActor.run {
-                        guard self.otaGeneration == generation,
-                              self.otaOwnerPeripheralID == ownerID else { return }
-                        self.otaDownloadTask = nil
-                        self.otaState = .failed(reason: "The download was the wrong size, so it wasn't installed.")
-                    }
-                    return
+                    return await fail("The download was the wrong size, so it wasn't installed.")
                 }
             }
         } catch {
-            let cancelled = Task.isCancelled   // URLSession.bytes throws when the Task is cancelled
-            await MainActor.run {
-                guard self.otaGeneration == generation,
-                      self.otaOwnerPeripheralID == ownerID else { return }
-                self.otaDownloadTask = nil
-                self.otaState = cancelled
-                    ? .failed(reason: "Update cancelled.")
-                    : .failed(reason: "Couldn't download the update. Check your connection and try again.")
-            }
-            return
+            // URLSession.bytes throws when the Task is cancelled
+            return await fail(Task.isCancelled ? "Update cancelled."
+                : "Couldn't download the update. Check your connection and try again.")
         }
 
         // Freeze the accumulated bytes into an immutable value for the verify + handoff steps
@@ -279,23 +264,11 @@ extension BLEManager {
         }
         guard beganVerification else { return }
         guard image.count == expectedSize else {
-            await MainActor.run {
-                guard self.otaGeneration == generation,
-                      self.otaOwnerPeripheralID == ownerID else { return }
-                self.otaDownloadTask = nil
-                self.otaState = .failed(reason: "The download was the wrong size, so it wasn't installed.")
-            }
-            return
+            return await fail("The download was the wrong size, so it wasn't installed.")
         }
         let sha = SHA256.hash(data: image).map { String(format: "%02x", $0) }.joined()
         guard sha == expectedSha else {
-            await MainActor.run {
-                guard self.otaGeneration == generation,
-                      self.otaOwnerPeripheralID == ownerID else { return }
-                self.otaDownloadTask = nil
-                self.otaState = .failed(reason: "The download failed its integrity check, so it wasn't installed.")
-            }
-            return
+            return await fail("The download failed its integrity check, so it wasn't installed.")
         }
 
         // 3. Compute the standard zlib CRC-32 the board will re-check the whole image against.
@@ -303,13 +276,7 @@ extension BLEManager {
 
         // 4. Last chance to bail: if the user cancelled during download/verify, do NOT arm the board.
         if Task.isCancelled {
-            await MainActor.run {
-                guard self.otaGeneration == generation,
-                      self.otaOwnerPeripheralID == ownerID else { return }
-                self.otaDownloadTask = nil
-                self.otaState = .failed(reason: "Update cancelled.")
-            }
-            return
+            return await fail("Update cancelled.")
         }
         // Hand off to the BLE state machine on the main actor (all CoreBluetooth work).
         await MainActor.run {

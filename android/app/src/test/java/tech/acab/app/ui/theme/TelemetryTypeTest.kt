@@ -83,10 +83,10 @@ class TelemetryTypeTest {
         assertEquals(0.sp, AcabTypography.labelSmall.telemetry().letterSpacing)
     }
 
-    /** L1 holds outside the instrument layer: every M3 role (titles, body, buttons, labels) and
-     *  both legacy faces stay the system face. */
+    /** L1 holds outside the instrument layer: every M3 role (titles, body, buttons, labels) stays
+     *  the system face. */
     @Test
-    fun everyM3RoleAndTheLegacyFacesStayTheSystemFace() {
+    fun everyM3RoleStaysTheSystemFace() {
         val m3 = Typography()
         val roles: List<Pair<String, Pair<TextStyle, TextStyle>>> = listOf(
             "displayLarge" to (AcabTypography.displayLarge to m3.displayLarge),
@@ -105,8 +105,6 @@ class TelemetryTypeTest {
             assertNotEquals(name, JetBrainsMono, ours.fontFamily)
             assertNotEquals(name, WordmarkFace, ours.fontFamily)
         }
-        assertEquals(FontFamily.Default, Acab.mono)
-        assertEquals(FontFamily.Default, Acab.display)
     }
 
     // ---- the wordmark ----

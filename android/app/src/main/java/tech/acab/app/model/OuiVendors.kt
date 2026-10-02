@@ -19,6 +19,10 @@ val OUI_VENDORS: Map<String, String> = mapOf(
     "0016ed" to "Utility Inc",
     "00180a" to "Cisco Meraki",
     "001885" to "Motorola Solutions",
+    // WatchGuard Video's own MA-L block. Motorola Solutions owns WatchGuard, but the registry
+    // names WatchGuard, and so does the firmware's detail string ("WatchGuard Video OUI").
+    // Twin: OUIVendors.swift. Provenance in bodycam_vendor_signatures.h (WATCHGUARD_VIDEO_OUI).
+    "001d96" to "WatchGuard Video",
     "001f92" to "Motorola Solutions",
     "00236c" to "Apple",
     // Axon's IEEE-registered block. Named here so an Axon OUI hit reads the real vendor instead
@@ -210,15 +214,17 @@ enum class BodyCamSignature(val raw: String) {
     AXON_PAYLOAD("BWC DEVICE"),
     AXON_OUI("Axon OUI"),
     UTILITY("Utility BodyWorn"),
-    MOTOROLA("Motorola Solutions OUI");
+    MOTOROLA("Motorola Solutions OUI"),
+    WATCHGUARD("WatchGuard Video OUI");
 
     /** Who makes the device this signature fired on. Known exactly in every case, which
-     *  is the point: the category's guess would name three makers for all four. */
+     *  is the point: the category's guess would name three makers for all five. */
     val vendor: String
         get() = when (this) {
             AXON_PAYLOAD, AXON_OUI -> "Axon Enterprise"
             UTILITY                -> "Utility Inc"
             MOTOROLA               -> "Motorola Solutions"
+            WATCHGUARD             -> "WatchGuard Video"
         }
 
     companion object {
@@ -285,7 +291,7 @@ fun isChipsetRegistrant(vendor: String): Boolean = vendor in setOf(
  *  correctly degrades to the category. Do not fill that gap with a guess. */
 val Detection.maker: String?
     get() {
-        // 1. Body cam: the four-string wire contract both apps already match on exactly.
+        // 1. Body cam: the five-string wire contract both apps already match on exactly.
         bodyCamSignature?.let { return cleanMaker(it.vendor) }
         // 2. Drone Remote ID. ridManufacturer passes an unrecognised CTA-2063 code straight
         //    through as "Mfr 7A3C", which must never become a row title.

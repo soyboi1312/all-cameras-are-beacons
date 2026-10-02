@@ -16,27 +16,24 @@ import java.net.HttpURLConnection
 import java.net.URL
 import java.util.concurrent.atomic.AtomicBoolean
 
-/** Read an HTTP body with both declared-length and streaming ceilings. Null means refusal. */
-internal fun readBoundedManifestBody(
-    input: InputStream,
-    declaredLength: Long,
-    maxBytes: Int,
-): ByteArray? {
-    if (declaredLength > maxBytes || maxBytes <= 0) return null
-    val out = ByteArrayOutputStream(
-        if (declaredLength in 1..maxBytes.toLong()) declaredLength.toInt() else minOf(maxBytes, 16 * 1024),
-    )
-    val buf = ByteArray(8 * 1024)
-    var total = 0
+/** Read [input] to its end without closing it. Null when it holds more than [cap] bytes. */
+internal fun readBounded(input: InputStream, cap: Long): ByteArray? {
+    val out = ByteArrayOutputStream(minOf(cap, 64L * 1024L).toInt())
+    val buf = ByteArray(16 * 1024)
+    var total = 0L
     while (true) {
         val read = input.read(buf)
         if (read < 0) break
         total += read
-        if (total > maxBytes) return null
+        if (total > cap) return null
         out.write(buf, 0, read)
     }
     return out.toByteArray()
 }
+
+/** Read an HTTP body with both declared-length and streaming ceilings. Null means refusal. */
+internal fun readBoundedManifestBody(input: InputStream, declaredLength: Long, maxBytes: Int): ByteArray? =
+    if (declaredLength > maxBytes || maxBytes <= 0) null else readBounded(input, maxBytes.toLong())
 
 /** Firmware artifacts are intentionally confined to the product's exact HTTPS origin. */
 internal fun trustedFirmwareArtifactUrl(raw: String): URL? = runCatching {
@@ -152,14 +149,6 @@ class FirmwareManifest private constructor(context: Context) {
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     private val fetching = AtomicBoolean(false)
 
-    /** The current entry for a board's fw label (null when the manifest has none). */
-    fun build(forFwLabel: String?): FirmwareBuild? = _manifest.value.build(forFwLabel)
-
-    /** The current published version for a board's fw label, or null when unknown. Callers
-     *  compare this to the installed version with their own numeric comparator. */
-    fun latestVersion(forFwLabel: String?): String? =
-        _manifest.value.build(forFwLabel)?.version
-
     /**
      * Refresh in the background if the cache is stale (older than [ttlMs]) or forced. Returns
      * immediately; the [manifest] flow updates if a good fetch lands. Safe to call on app
@@ -168,39 +157,24 @@ class FirmwareManifest private constructor(context: Context) {
     fun refresh(force: Boolean = false) {
         val age = System.currentTimeMillis() - prefs.getLong(KEY_FETCHED_AT, 0L)
         if (!force && age < TTL_MS) return
-        if (!fetching.compareAndSet(false, true)) return
-        scope.launch {
-            try {
-                val body = withContext(Dispatchers.IO) { httpGet(MANIFEST_URL) }
-                val parsed = body?.let { runCatching { parse(it) }.getOrNull() }
-                if (parsed != null) {
-                    // Persist the raw body (last-good) and stamp it, then publish.
-                    prefs.edit()
-                        .putString(KEY_JSON, body)
-                        .putLong(KEY_FETCHED_AT, System.currentTimeMillis())
-                        .apply()
-                    _manifest.value = parsed
-                }
-                // On any failure we simply keep the existing value: cache or fallback.
-            } finally {
-                fetching.set(false)
-            }
-        }
+        scope.launch { refreshNow() }
     }
 
     /**
      * Force a fetch past the TTL and suspend until it resolves, for the manual "check for
-     * updates" control. Failure-tolerant like [refresh]: a bad network or malformed JSON
-     * leaves the last-good cache (or fallback) in place and never throws. The [manifest] flow
-     * updates in place if a good fetch lands, so callers can just re-read it afterward.
+     * updates" control; also the fetch that [refresh] launches. Failure-tolerant: a bad network
+     * or malformed JSON leaves the last-good cache (or fallback) in place and never throws. The
+     * [manifest] flow updates in place if a good fetch lands, so callers can just re-read it
+     * afterward.
      */
     suspend fun refreshNow() {
-        // Skip if a background fetch is already in flight; its result lands on the same flow.
+        // Skip if a fetch is already in flight; its result lands on the same flow.
         if (!fetching.compareAndSet(false, true)) return
         try {
             val body = withContext(Dispatchers.IO) { httpGet(MANIFEST_URL) }
             val parsed = body?.let { runCatching { parse(it) }.getOrNull() }
             if (parsed != null) {
+                // Persist the raw body (last-good) and stamp it, then publish.
                 prefs.edit()
                     .putString(KEY_JSON, body)
                     .putLong(KEY_FETCHED_AT, System.currentTimeMillis())
@@ -323,8 +297,8 @@ class FirmwareManifest private constructor(context: Context) {
          *  The manifest goes through the same origin gate as the artifacts it points at: this
          *  body decides the version string, the update banner and the flasher link, so a 30x
          *  must not be allowed to move it to another host. [firmwareArtifactResponseAllowed]
-         *  already encodes that rule, and iOS refuses the same redirect with
-         *  FirmwareManifestRejectRedirectsDelegate. */
+         *  already encodes that rule, and iOS refuses the same redirect in
+         *  ALPRStore.boundedData. */
         private fun httpGet(url: String): String? {
             var conn: HttpURLConnection? = null
             return try {

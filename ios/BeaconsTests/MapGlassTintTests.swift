@@ -95,8 +95,9 @@ final class MapGlassTintTests: XCTestCase {
 
     /// R21: the selected chip is the category hue, opaque, with `onAccent` text (the chip stays
     /// opaque so the selection cue never depends on what tile is under it). Text, so 4.5:1 on
-    /// every chip hue at both levels: the seven category tones the Map's `catTint` returns
-    /// (ALPR, DRONE, BODY CAM, TRACKER, GLASSES, CAMERA, WATCHED) and `tint` for ALL.
+    /// every chip hue at both levels: the seven category tones the Map chip reads from
+    /// `DetectionCategory.type.tint` (ALPR, DRONE, BODY CAM, TRACKER, GLASSES, CAMERA, WATCHED)
+    /// and `tint` for ALL.
     /// ContrastPaletteTests pins the same ink at the 3:1 glyph floor; the chip is text, so the
     /// floor here is the text one.
     func testSelectedChipInkClearsTheTextFloorOnEveryChipHue() {

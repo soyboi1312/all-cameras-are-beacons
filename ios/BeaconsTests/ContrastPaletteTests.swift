@@ -56,19 +56,6 @@ final class ContrastPaletteTests: XCTestCase {
                        Font.system(.body, design: .default).weight(.regular).monospacedDigit())
     }
 
-    /// The legacy `display(size)` / `mono(size)` names ride the nearest system text style, and
-    /// everything small floors at caption2.
-    func testLegacySizeHelpersSnapToTheNearestTextStyle() {
-        let expected: [(CGFloat, Font.TextStyle)] = [
-            (7.5, .caption2), (10.5, .caption2), (12, .caption), (13, .footnote),
-            (15, .subheadline), (16, .callout), (17, .body), (18, .body), (20, .title3),
-            (22, .title2), (26, .title), (46, .largeTitle), (62, .largeTitle),
-        ]
-        for (size, style) in expected {
-            XCTAssertEqual(ACABTheme.textStyle(near: size), style, "\(size)pt")
-        }
-    }
-
     // MARK: WCAG maths
 
     private func channel(_ c: Double) -> Double {
@@ -259,7 +246,7 @@ final class ContrastPaletteTests: XCTestCase {
     func testOnAccentReadsOnAccentFillInBothPalettes() {
         for p in [ACABPalette.normal, ACABPalette.high] {
             XCTAssertGreaterThanOrEqual(ratio(p.onAccent, on: p.tint), 4.5)
-            // A glyph on a hue tile (GlyphTile, CatGlyph .hue): the non-text minimum on every hue.
+            // A glyph on a hue tile (GlyphTile): the non-text minimum on every hue.
             for (tn, t) in toneTokens(p) + [("flockTone", p.flockTone)] {
                 XCTAssertGreaterThanOrEqual(ratio(p.onAccent, on: t), 3.0, "onAccent on \(tn)")
             }

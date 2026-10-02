@@ -1,5 +1,6 @@
 package tech.acab.app.ui
 
+import org.json.JSONObject
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
@@ -15,36 +16,10 @@ import tech.acab.app.model.sourceLabel
  *  Title Case ("ALPR Camera", "Body Camera") sat beside "Network camera" in one list. A nameless
  *  row keeps source · method. TWIN: iOS DetectionRowSubtitleTests (DetectionRow.subtitle(for:)). */
 class LogRowSubtitleTest {
-    private fun row(type: DeviceType, name: String?) = Detection(
-        type = type,
-        source = 0,
-        method = 1,
-        confidence = 75,
-        mac = "aa:bb:cc:dd:ee:01",
-        rssi = -60,
-        name = name,
-        rid = null,
-        detail = null,
-        lat = null,
-        lon = null,
-        pilotLat = null,
-        pilotLon = null,
-        altitude = null,
-        speedH = null,
-        speedV = null,
-        heading = null,
-        heightAGL = null,
-        pilotAlt = null,
-        ridStatus = null,
-        count = 1,
-        isNew = true,
-        gpsAgeSec = null,
-        hist = false,
-        seq = 0L,
-        at = 0L,
-        approx = false,
-        offline = false,
-    )
+    private fun row(type: DeviceType, name: String?) = Detection.fromJson(
+        JSONObject().put("t", type.raw).put("meth", 1).put("c", 75)
+            .put("mac", "aa:bb:cc:dd:ee:01").put("rssi", -60).putOpt("name", name)
+            .put("new", true))
 
     /** FAILS IF the named branch goes back to `label` ("ALPR Camera · ...", "Body Camera · ..."). */
     @Test

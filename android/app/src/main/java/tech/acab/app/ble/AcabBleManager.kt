@@ -35,6 +35,7 @@ import android.os.VibratorManager
 import android.security.keystore.KeyGenParameterSpec
 import android.security.keystore.KeyProperties
 import androidx.core.content.ContextCompat
+import androidx.core.content.edit
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -72,6 +73,7 @@ import tech.acab.app.model.sourceLabel
 import tech.acab.app.net.FirmwareBuild
 import tech.acab.app.net.FirmwareManifest
 import tech.acab.app.net.firmwareArtifactResponseAllowed
+import tech.acab.app.net.readBounded
 import tech.acab.app.net.trustedFirmwareArtifactUrl
 import tech.acab.app.widget.BeaconsWidgetProvider
 import java.time.LocalDate
@@ -89,39 +91,13 @@ import tech.acab.app.model.maker
 
 enum class ConnState { DISCONNECTED, SCANNING, CONNECTING, BONDING, READY, POWERED_OFF }
 
-/** Board-backed switches that the sample Beacon screen can preview across tabs. These updates
- * modify only the synthetic in-memory [DeviceStatus]; the real config writer and preferences are
- * never involved. Keeping this typed prevents a sample UI callback from accidentally targeting an
- * unrelated status field. */
-internal enum class DemoStatusToggle {
-    BLE,
-    WIFI,
-    FLOCK,
-    DRONE,
-    DRONE_OUI,
-    BODY_CAM,
-    MOTOROLA,
-    TRACKER,
-    GLASSES,
-    NETWORK_CAMERA,
-}
-
-/** Pure half of the sample-status echo, kept independently testable from Android's BLE stack. */
-internal fun DeviceStatus.withDemoStatusToggle(
-    toggle: DemoStatusToggle,
-    on: Boolean,
-): DeviceStatus = when (toggle) {
-    DemoStatusToggle.BLE -> copy(ble = on)
-    DemoStatusToggle.WIFI -> copy(wifi = on)
-    DemoStatusToggle.FLOCK -> copy(flock = on)
-    DemoStatusToggle.DRONE -> copy(drone = on)
-    DemoStatusToggle.DRONE_OUI -> copy(droui = on)
-    DemoStatusToggle.BODY_CAM -> copy(bodyCam = on)
-    DemoStatusToggle.MOTOROLA -> copy(moto = on)
-    DemoStatusToggle.TRACKER -> copy(tracker = on)
-    DemoStatusToggle.GLASSES -> copy(glasses = on)
-    DemoStatusToggle.NETWORK_CAMERA -> copy(ncam = on)
-}
+/** Pure half of the sample-status echo, kept independently testable from Android's BLE stack. The
+ * [edit] runs only in sample mode and only on a frame that exists, so a real retained status frame
+ * comes back unchanged. */
+internal fun DeviceStatus?.withDemoStatusEdit(
+    demoMode: Boolean,
+    edit: DeviceStatus.() -> DeviceStatus,
+): DeviceStatus? = if (demoMode) this?.edit() else this
 
 /** Outcome for one replay end sentinel. A bounded retry stops radio churn for this connection,
  * but DEFER_INCOMPLETE deliberately does not authorize advancing past a sequence gap. */
@@ -233,17 +209,6 @@ internal fun replayUnreplayedCount(
     }
     return if (transportComplete) missing else maxOf(1, missing)
 }
-
-internal data class ReplayCursorTuple(val sequence: Long, val generation: Long)
-
-/** A reconnect can advertise only the durable tuple. The volatile cursor may be ahead while the
- * detection-store checkpoint is still in flight; trusting it would let firmware omit RAM-only
- * rows permanently. The otherwise-unused argument makes that rejected choice explicit and keeps
- * the crash-window policy directly testable. */
-internal fun replayCursorForReconnect(
-    @Suppress("UNUSED_PARAMETER") volatileCursor: ReplayCursorTuple,
-    durableCursor: ReplayCursorTuple,
-): ReplayCursorTuple = durableCursor
 
 internal enum class PairingFailure {
     START_REJECTED,
@@ -399,8 +364,6 @@ internal fun shouldHandleCurrentBonded(
     activeAttemptGeneration > 0L && handledBondedGeneration != activeAttemptGeneration &&
     platformStateIsBonded
 
-internal fun shouldStopScanBeforeDemo(state: ConnState): Boolean = state == ConnState.SCANNING
-
 internal fun awaitingSecureReadiness(state: ConnState): Boolean =
     state == ConnState.CONNECTING || state == ConnState.BONDING
 
@@ -438,6 +401,144 @@ enum class AlertMode { BUZZER, VIBRATE, SILENT }
 enum class AlertModeOrigin {
     USER,   // a tap on the Alerts picker, or on the restore offer
     APP,    // Desert's forced mute, or a restore the app is carrying out
+}
+
+/** What the connect path writes to the board's buzzer: the stored mode's buzzer state, or NOTHING
+ *  (null) when this phone holds no stored mode (a fresh install, a reinstall, cleared data, a
+ *  second phone).
+ *
+ *  WHY NOTHING AND NOT "SOUND ON" (security review 2026-09-29). The in-memory mode defaults to
+ *  BUZZER when nothing is stored, and finishReady used to push that default. A board the user had
+ *  muted from another install or phone was un-muted and saved the change to its own flash, Desert
+ *  included, with nobody tapping anything. allowBackup=false means every reinstall got here. Only
+ *  the user changes whether the detector makes sound (see desertAlertModeTransition), so a phone
+ *  with no stored mode mirrors the board instead ([mirroredAlertMode]) and writes nothing at
+ *  connect until the user picks a mode.
+ *  iOS twin: connectBuzzerWrite in BLEManager.swift. */
+internal fun connectBuzzerWrite(hasStoredMode: Boolean, mode: AlertMode): Boolean? =
+    if (hasStoredMode) mode == AlertMode.BUZZER else null
+
+/** The alert mode a status frame puts on screen, or null when this phone is holding a mode of its
+ *  own and the frame is only something to reconcile against.
+ *
+ *  A phone MIRRORS the board when it holds no stored mode and the app has not set one on this link
+ *  (Desert's mute or restore, see [AcabBleManager.setAlertMode]). Sound on reads as BUZZER; a muted
+ *  board reads as SILENT, never VIBRATE: the board cannot say which quiet mode was picked
+ *  elsewhere, and SILENT adds no feedback on THIS phone that nobody asked for. A Mesh-Detect board
+ *  has no buzzer and always reports false, so it mirrors as SILENT too, which is true: it cannot
+ *  make a sound. That matters for Desert, which captures the mode on screen: an unmirrored BUZZER
+ *  default captured on a mesh board used to come back as a real un-mute on the next beacon. In
+ *  memory only; a mirror is never stored. iOS twin: mirroredAlertMode in BLEManager.swift. */
+internal fun mirroredAlertMode(hasStoredMode: Boolean, heldThisLink: Boolean, boardBuzzer: Boolean): AlertMode? =
+    if (hasStoredMode || heldThisLink) null
+    else if (boardBuzzer) AlertMode.BUZZER else AlertMode.SILENT
+
+/** The one Config write that turns Desert on. When Desert's transition mutes, the mute rides in the
+ *  SAME object: the board applies every key of one Config write together, so a link lost between
+ *  two writes can no longer leave the board in Desert and audible. That mattered once a phone with
+ *  no stored mode stopped re-asserting Desert's SILENT at the next connect (security review
+ *  2026-09-29, second re-review). iOS twin: desertEnableConfig in BLEManager.swift. */
+internal fun desertEnableConfig(mutes: Boolean): JSONObject =
+    JSONObject().put("desert", true).apply { if (mutes) put("buzzer", false) }
+
+/** The one Config write that turns Desert off: Desert and the restored buzzer state together, for
+ *  the same reason as [desertEnableConfig]. Split in two, a link lost between them dropped the
+ *  restore on a phone with no stored mode (its restore holds for the link only), and a failed
+ *  desert:false followed by a landed buzzer:true left the board in Desert AND audible.
+ *  iOS twin: desertDisableConfig in BLEManager.swift. */
+internal fun desertDisableConfig(restoreTo: AlertMode?): JSONObject =
+    JSONObject().put("desert", false).apply { if (restoreTo != null) put("buzzer", restoreTo == AlertMode.BUZZER) }
+
+/** One-time upgrade rule for a mode stored by 2.1.0 and earlier, which stored EVERY mode it set,
+ *  Desert's APP-origin mute and restore included. Only BUZZER can be a mode nobody picked: the
+ *  in-memory default was BUZZER, and nothing but a picker tap ever produced VIBRATE.
+ *   - A stored BUZZER may be Desert's restore rather than a pick, and kept, it would un-mute a board
+ *     muted from another phone at every connect. It is dropped, and the phone mirrors the board
+ *     until the user picks, the quiet direction.
+ *   - A stored mode beside a saved pre-Desert BUZZER ([desertSaved] == BUZZER) is dropped too. That
+ *     stored mode is SILENT, Desert's forced mute (from 2.0.8 a hand pick empties the saved mode;
+ *     before it a hand-picked SILENT could stay beside one, which is the same SILENT). Kept, it made
+ *     the phone one that stores a mode, and Desert-off then stored the saved BUZZER for good,
+ *     possibly a default nobody picked. The saved mode stays, so Desert-off still restores the
+ *     board, for that link only.
+ *   - Otherwise the stored mode stays: a legacy SILENT or VIBRATE only ever mutes, and beside a
+ *     saved VIBRATE (always a hand pick) the forced SILENT stays so Desert-off stores that pick.
+ *  Applied once, gated by a stored flag. iOS twin: alertModeKeptFromLegacyStore in BLEManager.swift. */
+internal fun alertModeKeptFromLegacyStore(stored: AlertMode?, desertSaved: AlertMode?): AlertMode? =
+    if (desertSaved == AlertMode.BUZZER || stored == AlertMode.BUZZER) null else stored
+
+/** How long a flag row counts as one of the newest arrivals when the detection store is over its
+ *  cap, and how many such rows at once mark a flood. iOS twins: storeFloodWindow and
+ *  storeFloodCohortRows in BLEManager.swift. The numbers must stay identical; both suites pin them. */
+internal const val STORE_FLOOD_WINDOW_MS = 600_000L
+internal const val STORE_FLOOD_COHORT_ROWS = 500
+
+/**
+ * Which rows leave the detection store when it is [overflow] rows over its cap. [rows] is the
+ * whole store in the order the call site ages it, oldest first: by last filing here within a
+ * session (file() re-adds a row at the tail every time it files one, and a replay files at replay
+ * time; rows reloaded at launch come back in their persisted sort-key order, first-seen for live
+ * rows), by lastSeen on iOS.
+ *
+ * THE ATTACK THIS SHAPES (security review 2026-09-29). Rows are keyed type:mac, so a transmitter
+ * that fakes default-on signatures (Flock names, Axon OUIs, Remote ID serials) from fresh addresses
+ * adds one row per fake. Under the old rule a full store dropped its OLDEST flag rows, so earlier
+ * sessions, replayed history and watched devices went first, and the next checkpoint sealed the
+ * loss to disk. While a phone is connected the board does not buffer, so this log is the only
+ * record.
+ *
+ * THE RULE, pass by pass:
+ *  1. Ambient rows (Desert's confidence-0 nearby devices), oldest first.
+ *  2. During a flood, flag rows first seen within [STORE_FLOOD_WINDOW_MS], oldest first. A flood is MORE than [STORE_FLOOD_COHORT_ROWS] such rows in the store at once, far
+ *     past what a real drive adds in ten minutes, so a flood evicts its own rows and older
+ *     evidence stays.
+ *  3. Any flag row, oldest first: the ordinary rolling log.
+ *  4. Watched rows, only when nothing else is left.
+ * A row with no first-seen clock reading counts as old. Here a bracketed or unknown replay row
+ * keeps its near-2001 pseudo stamp (resolveBrackets updates histTime, never firstSeenAt), so it
+ * never falls inside the window; iOS re-keys such rows near the sync time and so passes nil for
+ * them. An anchored replay row carries its real capture time, which the board's own flood limit
+ * caps at a few hundred rows in ten minutes.
+ *
+ * WHAT IT DOES NOT DO. A flood slower than the threshold still ages old rows out, as ordinary
+ * traffic would; it only takes far longer. A real device first seen DURING a flood competes with
+ * the fakes, which outnumber it.
+ *
+ * COST. Pass 1 stops at the first unwatched ambient row, so the Desert firehose, the high-rate
+ * case, pays what the old firstOrNull did. The full-store count in pass 2 runs only when a flag
+ * row has to go. iOS twin: storeEvictionVictims in BLEManager.swift, same passes in the same order.
+ */
+internal fun <T> storeEvictionVictims(
+    rows: Collection<T>,
+    overflow: Int,
+    nowMs: Long,
+    id: (T) -> String,
+    isAmbient: (T) -> Boolean,
+    isWatched: (T) -> Boolean,
+    firstSeenMs: (T) -> Long?,
+): List<String> {
+    if (overflow <= 0) return emptyList()
+    val out = ArrayList<String>(overflow)
+    val taken = HashSet<String>()
+    fun take(keep: (T) -> Boolean) {
+        for (row in rows) {
+            if (out.size >= overflow) return
+            if (!keep(row)) continue
+            val key = id(row)
+            if (taken.add(key)) out.add(key)
+        }
+    }
+    val cutoff = nowMs - STORE_FLOOD_WINDOW_MS
+    val inFloodWindow = { row: T ->
+        !isAmbient(row) && (firstSeenMs(row)?.let { it >= cutoff } ?: false) && !isWatched(row)
+    }
+    take { isAmbient(it) && !isWatched(it) }                          // 1
+    if (out.size < overflow && rows.count(inFloodWindow) > STORE_FLOOD_COHORT_ROWS) {
+        take(inFloodWindow)                                           // 2
+    }
+    take { !isAmbient(it) && !isWatched(it) }                         // 3
+    take(isWatched)                                                   // 4
+    return out
 }
 
 /** The alert-mode state a Desert run owns, as ONE value.
@@ -582,14 +683,19 @@ internal fun desertAlertModeTransition(
 private const val FOUND_STALE_MS = 6_000L
 
 /** Bench tooling, OFF in every shipped build. Flip true to log each scanned board's advertised
- *  address and its type. Exists because Android is the ONLY platform that exposes a peer's real
- *  MAC (iOS and macOS substitute a per-host UUID), which makes it the only way to confirm the
- *  firmware's BLE address privacy is actually rotating rather than silently compiled out. */
+ *  address and the address types its top two bits allow. Exists because Android is the ONLY
+ *  platform that exposes a peer's real MAC (iOS and macOS substitute a per-host UUID), which made
+ *  it the only app-side way to confirm that a bench build with BLE address privacy really rotated
+ *  its address. That build option is removed from the firmware (docs/ble-protocol.md has the
+ *  bench note); released firmware advertises a fixed address. */
 private const val SCAN_ADDR_DEBUG = false
 
-/** One board seen while scanning. [seenAt] exists because the board now advertises a ROTATING
- *  Resolvable Private Address (ACAB_BLE_PRIVACY): the list is keyed on device.address, so when an
- *  address rotates mid-scan the old entry would otherwise linger as a phantom second board.
+/** One board seen while scanning. [seenAt] exists for a board that advertises a ROTATING
+ *  Resolvable Private Address: the list is keyed on device.address, so when an address rotates
+ *  mid-scan the old entry would otherwise linger as a phantom second board. No released firmware
+ *  rotates (a bench build did; that build option is removed, see "Peripheral address, bonding and
+ *  privacy" in docs/ble-protocol.md), so the prune is kept for a firmware that rotates again and
+ *  for a bench board that still holds that build.
  *
  *  THIS IS NOT AN ANDROID-ONLY PROBLEM, and the prune below must not be deleted as Android-specific
  *  complexity. It was reviewed as one, on the reading that iOS keys its discovered list on
@@ -600,8 +706,8 @@ private const val SCAN_ADDR_DEBUG = false
  *      keep issuing one UUID for one peer while it can tie successive advertisements to a stable
  *      identity, and for an LE peer that means resolving the RPA against an IRK it holds.
  *   2. The board hands its IRK over at BONDING and nowhere else: acab_ble_service.cpp sets
- *      BLE_SM_PAIR_KEY_DIST_ID explicitly on both key-distribution masks precisely so a bonded
- *      phone can follow the rotation, and states in the same comment that a stranger cannot.
+ *      BLE_SM_PAIR_KEY_DIST_ID explicitly on both key-distribution masks, so a bonded phone
+ *      holds the key that follows a rotation and a stranger does not.
  *   3. The picker IS the unbonded case. It exists to choose a board that has not been paired yet
  *      (first run, or after the user forgets the device), so at the moment this list is being built
  *      neither platform holds the key. An unresolvable rotated address is a new peer to
@@ -615,8 +721,8 @@ private const val SCAN_ADDR_DEBUG = false
  *  _found per scan result. Recorded here rather than left implicit because "iOS uses a UUID, so iOS
  *  is fine" is a reasonable-sounding argument that will be made again.
  *
- *  Exposure is the same size on both, and it is small: the rotation period is
- *  CONFIG_BT_NIMBLE_RPA_TIMEOUT (900 s, see the advCompleteCb comment in acab_ble_service.cpp) and
+ *  Exposure is the same size on both, and it is small: the rotation period of that build is
+ *  CONFIG_BT_NIMBLE_RPA_TIMEOUT (900 s, the NimBLE-Arduino default in nimconfig.h) and
  *  both platforms cap one picker scan at 45 s and clear the list when a scan starts. A phantom
  *  needs a rotation to land inside a single 45 s window. Small is not zero, and the failure is
  *  user-visible in the worst possible place: two rows for one board on the screen where a user
@@ -650,8 +756,8 @@ data class FoundBoard(val device: BluetoothDevice, val name: String, val rssi: I
  *  which still advertises the UUID: the scanned row simply merges into the remembered one.
  *
  *  Android keys it on the board's address. That works because the board advertises a stable public
- *  MAC today (ACAB_BLE_PRIVACY defaults to 0 in acab_ble_service.h and platformio.ini sets it in no
- *  env). Turning RPA privacy on would need this keying re-verified on hardware before it ships.
+ *  MAC: the firmware has no address-privacy build option (it was removed, see docs/ble-protocol.md).
+ *  A firmware that rotates its address would need this keying re-verified on hardware before it ships.
  *
  *  iOS twin: the remembered-board rules in ios/Beacons/BLE/RememberedBoard.swift. iOS cannot key on a MAC
  *  (CoreBluetooth never exposes one) and cannot read the bond list, so the key and the forget signal
@@ -885,78 +991,6 @@ internal data class MapDetectionEvidence(
  * MapScreen never scans/associates the full feed (up to FEED_CAP rows) on every radio
  * publication. */
 internal data class MapDynamicRing(val id: String, val rssi: Int)
-
-/** Order-independent fingerprint of the ACTIVE projection's membership, which is the set of device
- * ids the map and the dossier are currently allowed to see. Accumulated in the same walk that
- * builds the projection, so deciding whether map geometry went stale costs three primitive
- * comparisons instead of a HashSet of up to FEED_CAP ids allocated and compared on every publish,
- * at about 3 Hz, to answer a question whose answer is usually no.
- *
- * Order-independent ON PURPOSE. A routine sighting re-adds its row at the front of the
- * insertion-ordered store without changing who is on the map, and that reorder must not invalidate
- * the geometry; the set compare this replaces ignored order for the same reason.
- *
- * Count, xor and sum together are what a count alone or a sum alone is not. Dropping an id moves
- * the count; swapping one id for another at the same count moves both accumulators. So every
- * membership change the set compare caught still moves the revision: a first sighting, a re-add
- * that is a genuinely new id, an eviction, a clear, a replay filing, a mute or watch list edit, a
- * mute expiring, the demo seed and leaving demo.
- *
- * What it can fail to invalidate on: a ONE-ROW swap at an unchanged count whose leaving id and
- * arriving id fold to the same 64-bit [membershipHash64]. That is ONE collision, not two: the xor
- * moves by h(gone) xor h(arrived) and the sum by h(arrived) - h(gone), and both are zero on
- * exactly the same equality, so for a single swap these two accumulators are one test. They are
- * independent only for a count-preserving change of MORE than one row, where a set that collides
- * has to match the xor and the sum at once. A wrong yes hides BOTH sides of the swap: the
- * arriving row gets no pin, and the row that LEFT keeps the pin and the marker it already had,
- * because MapScreen's marker rebuild resolves its rows as `currentById[it.id] ?: it` and so
- * redraws the cached plan's copy of a row the store has already dropped. The row that leaves is
- * usually the one the user acted on: ignoreDevice, ignoreDevices, unignore and pruneExpiredMutes
- * all end in publishNow() and bump nothing themselves, so mute, unmute and mute expiry reach the
- * map through this signature alone. The state clears at the next membership change.
- * [membershipHash64] is a real mix and not String.hashCode precisely so near-identical ids,
- * which is what these ids are, cannot land near each other. */
-internal class MembershipSignature {
-    private var count = 0
-    private var xorAcc = 0L
-    private var sumAcc = 0L
-
-    /** The store is keyed by detection id, so one walk cannot present the same id twice and this
-     *  multiset fold is exactly a set compare here. */
-    fun add(id: String) {
-        val h = membershipHash64(id)
-        count++
-        xorAcc = xorAcc xor h
-        sumAcc += h
-    }
-
-    /** True when [other] covers the same ids, in any order. */
-    fun sameAs(other: MembershipSignature): Boolean =
-        count == other.count && xorAcc == other.xorAcc && sumAcc == other.sumAcc
-
-    companion object {
-        /** The whole set at once, for tests and for reasoning about a clear: a signature with
-         *  nothing added is the empty projection, which is the state every teardown resets to. */
-        fun of(ids: Iterable<String>): MembershipSignature =
-            MembershipSignature().apply { for (id in ids) add(id) }
-    }
-}
-
-/** 64-bit fold of one detection id for [MembershipSignature]: FNV-1a over the characters, then the
- * murmur3 finalizer so that ids differing by one hex digit, which is what a MAC set looks like,
- * land far apart in both accumulators instead of a few units apart. */
-internal fun membershipHash64(id: String): Long {
-    var h = -0x340d631b7bdddcdbL          // 0xcbf29ce484222325, the FNV-1a 64 offset basis
-    for (c in id) {
-        h = h xor c.code.toLong()
-        h *= 0x100000001b3L               // the FNV-1a 64 prime
-    }
-    h = h xor (h ushr 33)
-    h *= -0xae502812aa7333L               // 0xff51afd7ed558ccd
-    h = h xor (h ushr 29)
-    h *= -0x3b314601e57a13adL             // 0xc4ceb9fe1a85ec53
-    return h xor (h ushr 32)
-}
 
 /** Everything the DOSSIER's own map thumbnail reads out of the per-device side maps for ONE row.
  * A value, not a revision, so the dossier can key its coordinate and trail on its own device
@@ -1223,8 +1257,6 @@ internal fun shouldOwnLocation(
 ): Boolean = locationGranted && state == ConnState.READY &&
     (appForegrounded || (driveMode && driveServiceActive))
 
-internal fun liveModeWanted(storedChoice: Boolean?): Boolean = storedChoice ?: true
-
 /** Automatic service/link teardown suspends the surface without rewriting the user's preference.
  * Only an explicit off action turns the persisted intent off. */
 internal fun liveModeWantedAfterStop(currentWanted: Boolean, userRequestedStop: Boolean): Boolean =
@@ -1244,9 +1276,6 @@ internal fun defaultLiveModeStartReady(
  * proves foreground promotion succeeded. */
 internal fun defaultLiveModeStartConfirmed(driveModeOn: Boolean, driveServiceReady: Boolean): Boolean =
     driveModeOn && driveServiceReady
-
-/** Sample-data managed-list edits are session previews and must never reach disk or a board. */
-internal fun managedListPersistenceAllowed(demoMode: Boolean): Boolean = !demoMode
 
 /** NEW-lens membership from frozen first-seen values, never from manager side maps that may have
  * evicted these ids after Pause. The two watermark axes intentionally match [newIdSet]. */
@@ -1330,14 +1359,6 @@ internal fun rejectedForegroundRequestRemovesHolder(
     holderInsertedByThisRequest: Boolean,
     requestAccepted: Boolean,
 ): Boolean = holderInsertedByThisRequest && !requestAccepted
-
-/** A combined S3 leg starts after the original foreground tap and reuses that run's confirmed
- * hold. Direct S3 must invoke [requestOwnHold] instead. */
-internal fun acquireOtaHoldBoundary(
-    reuseConfirmedHold: Boolean,
-    serviceActive: Boolean,
-    requestOwnHold: () -> Boolean,
-): Boolean = if (reuseConfirmedHold) serviceActive else requestOwnHold()
 
 /** A lost keep-alive may stop S3 work only before the image-commit boundary. */
 internal fun otaUserCancellationAllowed(phase: OtaPhase, imageEnded: Boolean): Boolean =
@@ -1691,7 +1712,7 @@ internal val DEMO_SAMPLE_ROWS: List<String> = listOf(
     """{"t":4,"s":2,"meth":7,"c":99,"mac":"DA:7E:E0:44:21:09","rssi":-61,"id":"1581F4FED0A2B7","lat":37.7816,"lon":-122.4169,"plat":37.7821,"plon":-122.4151,"alt":84,"n":1,"new":true}""",
     // The body cam row is the firmware's Axon OUI-only arm (axon_detect.cpp, the
     // sigHit branch): an address on Axon's registered 00:25:DF block, s=0 SRC_BLE,
-    // meth=1 M_OUI, c=75 (AXON_REGISTRY_CANDIDATE's baseConfidence), detail "Axon OUI"
+    // meth=1 M_OUI, c=75 (that branch's fixed confidence), detail "Axon OUI"
     // verbatim, so bodyCamSigDetail resolves and the dossier names the signature. -88
     // dBm is what the owner-verified OUI-only field hits read. It used to carry meth=3 /
     // c=45 and no detail, which no board sends for a body cam, and the dossier then
@@ -2153,7 +2174,7 @@ class AcabBleManager(private val context: Context) {
     // One-click combined update: a single "Update" flow that runs the nRF leg first while the
     // physical-start authorization is live, then S3, merging both progress streams onto one bar. It
     // COMPOSES the two engines above (it re-implements no transfer) and holds the foreground service
-    // across BOTH legs (HOLD_COMBINED), since the S3 OTA releases its own hold on its DONE.
+    // across BOTH legs (HOLD_COMBINED). The S3 leg takes no hold of its own; it reuses this one.
     @Volatile private var combinedHoldingService = false
     private val combinedDelegate = lazy {
         CombinedUpdateCoordinator(
@@ -2161,7 +2182,7 @@ class AcabBleManager(private val context: Context) {
             nrfProgress = nrfDfu.progress,
             status = _status.asStateFlow(),
             otaCapable = _otaCapable.asStateFlow(),
-            startS3 = { startOta(it, reuseConfirmedCombinedHold = true) },
+            startS3 = { startOta(it) },
             cancelS3 = { cancelOta() },
             canCancelS3 = { otaCancellableNow() },
             dismissS3 = { clearOtaResult() },
@@ -2288,6 +2309,34 @@ class AcabBleManager(private val context: Context) {
 
     private val _alertMode = MutableStateFlow(AlertMode.BUZZER)
     val alertMode: StateFlow<AlertMode> = _alertMode.asStateFlow()
+
+    /** True once THIS phone stores an alert mode: the user picked one here, or one was already
+     *  stored at launch. [setAlertMode] is the only writer of the "alertMode" pref, and it stores an
+     *  APP-origin mode (Desert's mute or restore) only on a phone that already stores one. False on
+     *  a fresh install, a reinstall, cleared data and a second phone until the user picks; such a
+     *  phone mirrors the board and writes nothing at connect ([connectBuzzerWrite],
+     *  [mirroredAlertMode]). DECLARED ABOVE the init block that sets it: a property declared below
+     *  it would run its `= false` initializer afterwards and wipe the value read from prefs.
+     *  Written under [alertModeLock]. iOS twin: hasStoredAlertMode in BLEManager. */
+    @Volatile private var hasStoredAlertMode = false
+
+    /** An APP-origin mode (Desert's mute or restore) set on a phone with NO stored mode. It holds for
+     *  THIS link only, so [reconcileBuzzer] keeps the board at that mode (and keeps re-sending a mute
+     *  the board has not taken), but it is never stored. It is cleared where every link STARTS
+     *  (STATE_CONNECTED, beside connectGen++), and that clear is the guarantee: connect(), the
+     *  connect watchdog and the bond-retry receiver can close a client without cleanup(), and a
+     *  main-thread APP-origin set can land after a binder-thread cleanup(). It is also cleared in
+     *  cleanup() and at READY. Stored instead, it made the phone assert a mode nobody picked on every later
+     *  connect: a Desert on-and-off from a second phone un-muted a board muted elsewhere (security
+     *  review 2026-09-29, re-review). Written under [alertModeLock].
+     *  iOS twin: appHeldAlertModeThisLink in BLEManager. */
+    @Volatile private var appHeldAlertModeThisLink = false
+
+    /** Guards the pair (hasStoredAlertMode or appHeldAlertModeThisLink, _alertMode) against a
+     *  torn read. [reconcileBuzzer]'s mirror runs on the GATT callback thread and [setAlertMode] on
+     *  the main thread; without one lock, a mirror that read "no mode" just before a user pick could
+     *  write BUZZER over the pick, and the reconciler would then re-assert sound against a mute. */
+    private val alertModeLock = Any()
 
     private val _driveMode = MutableStateFlow(false)
     val driveMode: StateFlow<Boolean> = _driveMode.asStateFlow()
@@ -2519,17 +2568,28 @@ class AcabBleManager(private val context: Context) {
         // `val ble = getInstance(app)` is a property initializer, and AcabLinkService resolves the
         // same lazy from a main-thread service callback). They ride persistLoadJob instead, ahead
         // of the detections; see its declaration below. Everything from here down is plain
-        // SharedPreferences reads.
-        _alertMode.value = runCatching {
-            AlertMode.valueOf(prefs.getString("alertMode", null) ?: "BUZZER")
-        }.getOrDefault(AlertMode.BUZZER)
+        // SharedPreferences reads, apart from the once-per-install alert-mode flag write below.
+        var storedAlertMode = prefs.getString("alertMode", null)
+            ?.let { runCatching { AlertMode.valueOf(it) }.getOrNull() }
+        if (!prefs.getBoolean(KEY_ALERT_MODE_ORIGIN_AWARE, false)) {
+            // Once per install: see alertModeKeptFromLegacyStore for why a legacy BUZZER is dropped.
+            val desertSaved = prefs.getString(PREF_ALERT_MODE_BEFORE_DESERT, null)
+                ?.let { runCatching { AlertMode.valueOf(it) }.getOrNull() }
+            storedAlertMode = alertModeKeptFromLegacyStore(storedAlertMode, desertSaved)
+            prefs.edit {
+                if (storedAlertMode == null) remove("alertMode")
+                putBoolean(KEY_ALERT_MODE_ORIGIN_AWARE, true)
+            }
+        }
+        synchronized(alertModeLock) {
+            _alertMode.value = storedAlertMode ?: AlertMode.BUZZER   // shown until a status frame says otherwise
+            hasStoredAlertMode = storedAlertMode != null
+        }
         // Default false = counts visible; getBoolean's default only applies when the user never
         // set the toggle, so an explicit stored choice (either way) is preserved.
         _redactLockScreen.value = prefs.getBoolean("redactLock", false)
         // The lock-screen Live Mode surface is opt-out. A stored false is still respected.
-        _driveModeWanted.value = liveModeWanted(
-            if (prefs.contains("liveModeWanted")) prefs.getBoolean("liveModeWanted", true) else null
-        )
+        _driveModeWanted.value = prefs.getBoolean("liveModeWanted", true)
         _seenWatermark.value = prefs.getLong("seenWatermark", 0L)
         approxWatermark = prefs.getLong("approxWatermark", HIST_PSEUDO_BASE)
         // Track the phone's Bluetooth radio for the process lifetime so the connect screen can say
@@ -2661,13 +2721,16 @@ class AcabBleManager(private val context: Context) {
     private var gatt: BluetoothGatt? = null
     private var target: BluetoothDevice? = null
     private val store = LinkedHashMap<String, Detection>()
-    // Order-independent (see MembershipSignature) because routine sightings reorder the
-    // insertion-ordered store. Only actual active membership changes should invalidate the cached
-    // Map geometry projection. Guarded by storeLock, like the generation it decides. The instance
-    // stored here is the one the last publish built and nothing mutates it afterwards, so holding
-    // the accumulator itself is safe and costs one small object per membership change instead of
-    // a HashSet of up to FEED_CAP ids per publish.
-    private var lastPublishedMembership = MembershipSignature()
+    // The ids of the ACTIVE projection as of the last publish, which is the set of devices the map
+    // and the dossier are currently allowed to see. A set and not a list because routine sightings
+    // reorder the insertion-ordered store, and only an actual change of active membership should
+    // invalidate the cached Map geometry projection. ignoreDevice, ignoreDevices and unignore end
+    // in publishNow() and bump nothing themselves, and neither does pruneExpiredMutes, so mute,
+    // unmute and mute expiry reach the map through the compare in feedSnapshots alone. The
+    // reference is guarded by storeLock, like the generation it decides. Nothing mutates a set
+    // once it is stored here, so feedSnapshots reads its contents outside the lock, and it builds
+    // a new set only when membership changed.
+    private var lastPublishedMembership: Set<String> = emptySet()
     private val firstSeenAt = HashMap<String, Long>()
     private val lastSeenAt = HashMap<String, Long>()
     private val rssiHistory = HashMap<String, MutableList<Int>>()
@@ -2995,22 +3058,24 @@ class AcabBleManager(private val context: Context) {
             val now = android.os.SystemClock.elapsedRealtime()
             // DEBUG-ONLY address log. Android is the ONLY platform that hands an app a peer's real
             // MAC: iOS and macOS substitute a per-host UUID, so neither can tell a rotating address
-            // from a fixed one. That made the firmware's BLE privacy change effectively unverifiable
-            // until this line existed. Top two bits of the first octet say which kind it is:
-            // These bits classify the address ONLY IF it is random. Android hands us the advertised
-            // address with no type attached, so a fixed public factory MAC is indistinguishable by
-            // bits alone and lands in whichever bucket its first octet happens to select: an
-            // Espressif e8:3d:c1 reads as 11, exactly like a static-random address. The real proof
-            // that privacy is live is the address CHANGING across boots and across the rotation,
-            // not the bucket this prints. 01 = resolvable private, 11 = static random or public,
-            // 00 = non-resolvable or public.
+            // from a fixed one. That made the bench firmware's address rotation (a build option that
+            // is now removed) unverifiable from an app until this line existed. The top two bits of
+            // the first octet classify the address ONLY IF it is random. This log reads the
+            // advertised address with no type attached (ScanResult carries none;
+            // BluetoothDevice.getAddressType is API 35, above minSdk), so a fixed public factory MAC
+            // is indistinguishable by bits alone and lands in whichever bucket its first octet
+            // happens to select: an Espressif e8:3d:c1 reads as 11, exactly like a static-random
+            // address. The real proof that an address rotates is the address CHANGING across boots
+            // and across the rotation, not the bucket this prints. Each label names every address
+            // type its bits allow: a public address can hold any value, and 10 is reserved in a
+            // random address.
             if (SCAN_ADDR_DEBUG) {
                 val b0 = address.substringBefore(':').toIntOrNull(16) ?: 0
                 val kind = when (b0 shr 6) {
-                    0b01 -> "RESOLVABLE-PRIVATE (rotates)"
-                    0b11 -> "static-random"
-                    0b00 -> "non-resolvable-private"
-                    else -> "PUBLIC (not private)"
+                    0b01 -> "resolvable-private or public"
+                    0b11 -> "static-random or public"
+                    0b00 -> "non-resolvable-private or public"
+                    else -> "public"
                 }
                 android.util.Log.d("ACAB-scan", "board $name addr=$address type=$kind rssi=${result.rssi}")
             }
@@ -3021,10 +3086,10 @@ class AcabBleManager(private val context: Context) {
             val kindHint = carriedAdvertHint(advertName, prev?.kindHint)
             val board = FoundBoard(dev, name, result.rssi, fw ?: prev?.firmware, now, kindHint = kindHint)
             // Drop entries not heard from recently. Keying on address is still right (it is what
-            // distinguishes two real boards from each other), but with address privacy on, an
-            // address the board has rotated away from would sit in the picker forever as a
-            // duplicate of the same physical unit. A board advertises many times a second, so a
-            // few seconds of silence means gone, not quiet.
+            // distinguishes two real boards from each other), but if a board rotates its address (no
+            // released firmware does; a bench build did), an address the board has rotated away
+            // from would sit in the picker forever as a duplicate of the same physical unit. A board
+            // advertises many times a second, so a few seconds of silence means gone, not quiet.
             _found.value = (_found.value
                 .filterNot { safeDeviceAddress(it.device) == address }
                 .filter { it.seenAt == 0L || now - it.seenAt < FOUND_STALE_MS } + board)
@@ -3646,6 +3711,10 @@ class AcabBleManager(private val context: Context) {
 
     private fun cleanup(forAutoReconnect: Boolean = false) {
         val endedConnectGen = connectGen
+        // An app-set alert mode holds for its link only (see appHeldAlertModeThisLink). Most
+        // teardowns of an established session run through here (STATE_DISCONNECTED, onRadioOff, a
+        // permission revoke); the STATE_CONNECTED clear covers the rest.
+        synchronized(alertModeLock) { appHeldAlertModeThisLink = false }
         bondTimeoutJob?.cancel()
         bondTimeoutJob = null
         secureReadyTimeoutJob?.cancel()
@@ -3679,14 +3748,9 @@ class AcabBleManager(private val context: Context) {
         histResyncAttempts = 0
         // A per-record advance is only volatile until its matching store checkpoint completes.
         // Reconnect from the durable tuple, never from RAM that a process kill could still lose.
-        val resumeCursor = synchronized(cursorLock) {
-            replayCursorForReconnect(
-                ReplayCursorTuple(lastSeq, activeLogGeneration),
-                ReplayCursorTuple(lastSeqPersisted, lastLogGenerationPersisted),
-            )
-        }
-        lastSeq = resumeCursor.sequence
-        activeLogGeneration = resumeCursor.generation
+        val resumeCursor = synchronized(cursorLock) { lastSeqPersisted to lastLogGenerationPersisted }
+        lastSeq = resumeCursor.first
+        activeLogGeneration = resumeCursor.second
         // A drain cut short never reaches resolveBrackets, and the cursor didn't advance, so the
         // next session replays these same records. Drop the half-batch rather than bracketing
         // those rows twice over; they stay unknown until a replay closes cleanly.
@@ -3924,6 +3988,8 @@ class AcabBleManager(private val context: Context) {
                 autoReconnecting = false
                 reconnectClientArmed = false
                 connectGen++
+                // A new link never inherits an app-set alert mode (see appHeldAlertModeThisLink).
+                synchronized(alertModeLock) { appHeldAlertModeThisLink = false }
                 // Already bonded? Go straight to discovery. Otherwise bond first.
                 if (runCatching { g.device.bondState == BluetoothDevice.BOND_BONDED }.getOrDefault(false)) {
                     armSecureReadyTimeout(g.device)
@@ -4320,7 +4386,14 @@ class AcabBleManager(private val context: Context) {
         buzzerReassertAttempts = 0                       // fresh link: first status frame is pre-write
         lastBuzzerMuteWrite = 0L                         // and the slow mute retry starts over with it
         ignorePushAttempts = 0; watchPushAttempts = 0    // and a fresh board gets a fresh convergence budget
-        setBuzzer(_alertMode.value == AlertMode.BUZZER)   // a fresh board boots with the buzzer on; sync it to the phone's mode
+        // Only a phone that stores a mode writes the buzzer here. One that does not (fresh install,
+        // reinstall, second phone) mirrors the board from its first status frame instead, so a
+        // board muted elsewhere stays muted. See connectBuzzerWrite.
+        val connectWrite = synchronized(alertModeLock) {
+            appHeldAlertModeThisLink = false   // already cleared at STATE_CONNECTED; repeated at the session edge
+            connectBuzzerWrite(hasStoredAlertMode, _alertMode.value)
+        }
+        connectWrite?.let { setBuzzer(it) }
         // Board just connected: make sure the firmware manifest is current so the update nudge
         // and OTA gate reflect the latest published build. Non-blocking; no-ops if cache is fresh.
         runCatching { FirmwareManifest.getInstance(context).refresh() }
@@ -4367,11 +4440,9 @@ class AcabBleManager(private val context: Context) {
     //   version (disarming rollback) or reports that the board rolled back and is safe.
 
     /** Kick off an in-app update to [build]. No-op if one is already running or the board isn't
-     *  OTA-capable. Downloads + hashing happen off the main thread. */
-    fun startOta(build: FirmwareBuild) =
-        startOta(build, reuseConfirmedCombinedHold = false)
-
-    private fun startOta(build: FirmwareBuild, reuseConfirmedCombinedHold: Boolean) {
+     *  OTA-capable. Downloads + hashing happen off the main thread. The combined update's S3 leg
+     *  is the only caller. */
+    private fun startOta(build: FirmwareBuild) {
         val currentPhase = _otaProgress.value.phase
         if (currentPhase != OtaPhase.IDLE && currentPhase != OtaPhase.DONE &&
             currentPhase != OtaPhase.FAILED) return
@@ -4402,10 +4473,10 @@ class AcabBleManager(private val context: Context) {
                 message = renderBoardCopy(OTA_RECONNECT_BEFORE_RETRY_TEMPLATE, _targetKind.value))
             return
         }
-        // Request the keep-alive while this user action is unquestionably foreground. Download
-        // and verification may outlive the Activity; accepting the Intent is necessary but not
-        // sufficient, so the coroutine rechecks confirmed promotion before touching the board.
-        if (!acquireOtaHold(reuseConfirmedCombinedHold)) {
+        // Reuse the combined run's keep-alive, requested at the foreground tap. Download and
+        // verification may outlive the Activity, so a hold that is live now is necessary but not
+        // sufficient: the coroutine rechecks confirmed promotion before touching the board.
+        if (!acquireOtaHold()) {
             setOtaPhase(OtaPhase.FAILED,
                 message = "Android could not start the protected update session. Nothing was sent to the board; keep the app open and try again.")
             return
@@ -4900,51 +4971,37 @@ class AcabBleManager(private val context: Context) {
     // ---- OTA foreground-service hold ----
     // The chunk stream is paced by binder callbacks into THIS process; a backgrounded app can
     // be frozen (Android 12+ cached-app freezer, OEM battery managers), halting the stream
-    // until both stall watchdogs abort the update. Hold the foreground service - shared with
-    // Drive mode via start reasons, so neither lifecycle can kill the other's hold - from the
-    // foreground user tap, before the download can outlive the Activity, through
-    // REBOOTING/CONFIRMING (the reconnect loop needs the process alive too). Actual board writes
-    // additionally wait for confirmed promotion; terminal phases release through setOtaPhase.
-    @Volatile private var otaHoldingService = false
+    // until both stall watchdogs abort the update. The combined run holds the foreground service
+    // (HOLD_COMBINED; shared with Drive mode via start reasons, so neither lifecycle can kill the
+    // other's hold) from the foreground user tap through both legs. The S3 leg takes no hold of
+    // its own: it marks that it runs under that one, from startOta through REBOOTING/CONFIRMING
+    // (the reconnect loop needs the process alive too). Actual board writes additionally wait
+    // for confirmed promotion; terminal phases clear the marker through setOtaPhase.
     @Volatile private var otaUsingCombinedServiceHold = false
     @Volatile private var otaHoldRequestedAt = 0L
 
     @Synchronized
-    private fun acquireOtaHold(reuseConfirmedCombinedHold: Boolean): Boolean {
-        if (otaHoldingService || otaUsingCombinedServiceHold) return true
-        val accepted = acquireOtaHoldBoundary(
-            reuseConfirmedHold = reuseConfirmedCombinedHold,
-            serviceActive = driveServiceActive,
-            requestOwnHold = {
-                runCatching {
-                    AcabLinkService.start(context, AcabLinkService.HOLD_OTA)
-                }.getOrDefault(false)
-            },
-        )
-        if (!accepted) return false
-        // Do not claim the hold before the framework accepts its Intent. Promotion itself is
-        // asynchronous and is proved separately by driveServiceActive. A combined leg already
-        // passed that proof and must not request a new FGS start minutes after the foreground tap.
-        if (reuseConfirmedCombinedHold) otaUsingCombinedServiceHold = true
-        else otaHoldingService = true
+    private fun acquireOtaHold(): Boolean {
+        if (otaUsingCombinedServiceHold) return true
+        // Never request a new FGS start here: this leg can start minutes after the foreground
+        // tap. It runs only under the combined run's hold, and driveServiceActive proves that
+        // hold's promotion.
+        if (!driveServiceActive) return false
+        otaUsingCombinedServiceHold = true
         otaHoldRequestedAt = SystemClock.elapsedRealtime()
         return true
     }
 
     @Synchronized
     private fun releaseOtaHold() {
-        val owned = otaHoldingService
-        if (!owned && !otaUsingCombinedServiceHold) return
-        otaHoldingService = false
         otaUsingCombinedServiceHold = false
         otaHoldRequestedAt = 0L
-        if (owned) runCatching { AcabLinkService.stop(context, AcabLinkService.HOLD_OTA) }
     }
 
     private suspend fun awaitOtaHoldReady(session: Int): Boolean {
         while (session == otaSessionId) {
             val decision = foregroundServiceHoldDecision(
-                requestAccepted = otaHoldingService || otaUsingCombinedServiceHold,
+                requestAccepted = otaUsingCombinedServiceHold,
                 serviceActive = driveServiceActive,
                 elapsedMs = (SystemClock.elapsedRealtime() - otaHoldRequestedAt).coerceAtLeast(0L),
                 timeoutMs = OTA_HOLD_PROMOTION_TIMEOUT_MS,
@@ -4959,7 +5016,7 @@ class AcabBleManager(private val context: Context) {
     }
 
     private fun otaProtectedHoldReady(): Boolean =
-        (otaHoldingService || otaUsingCombinedServiceHold) && driveServiceActive
+        otaUsingCombinedServiceHold && driveServiceActive
 
     private fun setOtaPhase(phase: OtaPhase, pct: Int = _otaProgress.value.pct, message: String = _otaProgress.value.message) {
         when (phase) {
@@ -4989,19 +5046,8 @@ class AcabBleManager(private val context: Context) {
             // Read at most the declared size (+ a hard 8 MB ceiling); a longer stream is rejected
             // before it can exhaust memory. The exact size is re-checked against the manifest after.
             val cap = expectedSize.coerceIn(1L, 8L * 1024 * 1024)
-            val out = java.io.ByteArrayOutputStream(cap.toInt())
-            conn.inputStream.use { input ->
-                val tmp = ByteArray(16 * 1024)
-                var total = 0L
-                while (true) {
-                    val r = input.read(tmp)
-                    if (r < 0) break
-                    total += r
-                    if (total > cap) throw java.io.IOException("firmware exceeds declared size")
-                    out.write(tmp, 0, r)
-                }
-            }
-            return out.toByteArray()
+            return conn.inputStream.use { readBounded(it, cap) }
+                ?: throw java.io.IOException("firmware exceeds declared size")
         } finally {
             conn.disconnect()
         }
@@ -5747,16 +5793,25 @@ class AcabBleManager(private val context: Context) {
             previous.type != d.type || previous.lat != d.lat || previous.lon != d.lon ||
                 previous.pilotLat != d.pilotLat || previous.pilotLon != d.pilotLon))
         if (mapFieldsChanged) noteSpatialEvidenceChanged()
-        // Bound memory over a long drive. Priority-aware: an airport-density flood of
-        // confidence-0 "nearby device" rows must never push a real flag (tracker, body cam,
-        // drone, glasses, or a starred/watched device) out of the store. Evict the oldest
-        // ambient row first (store is insertion-ordered, so the first NEARBY_DEVICE match is
-        // the oldest); only if the store is somehow all flags past the cap do we fall back to
-        // evicting the oldest row outright.
-        while (store.size > STORE_CAP) {
-            val victim = store.entries.firstOrNull { it.value.type == DeviceType.NEARBY_DEVICE }?.key
-                ?: store.keys.firstOrNull() ?: break
-            evictKey(victim)
+        // Bound memory over a long drive. Which rows go is storeEvictionVictims: ambient rows
+        // first, a flood's own rows next, then the oldest flags, and watched rows last, so neither
+        // an airport-density Desert firehose nor a flood of faked signatures can push older
+        // evidence out of the store. The store is insertion-ordered and file() re-adds its row at
+        // the tail above, so within a session store.values is least recently FILED first (a replay
+        // files at replay time; rows reloaded at launch keep their persisted sort-key order; iOS
+        // ages by lastSeen instead, see storeEvictionVictims).
+        if (store.size > STORE_CAP) {
+            val watched = managedListIndexes.watchedMacs
+            val victims = storeEvictionVictims(
+                rows = store.values,
+                overflow = store.size - STORE_CAP,
+                nowMs = System.currentTimeMillis(),
+                id = { it.id },
+                isAmbient = { it.type == DeviceType.NEARBY_DEVICE },
+                isWatched = { watched.isNotEmpty() && it.mac.lowercase() in watched },
+                firstSeenMs = { firstSeenAt[it.id] },
+            )
+            for (k in victims) evictKey(k)
         }
         val dla = d.lat; val dlo = d.lon
         if (d.type == DeviceType.DRONE && dla != null && dlo != null && validCoord(dla, dlo)) {   // valid coords only
@@ -5782,41 +5837,61 @@ class AcabBleManager(private val context: Context) {
     private fun feedSnapshots(): FeedSnapshots {
         // Copy the store's values under storeLock so we don't iterate the shared LinkedHashMap
         // while the BLE callback thread mutates it (ConcurrentModificationException). Keep the
-        // critical section to the copy; do the reverse + cap outside the lock.
+        // critical section to the copy and one reference read; do the reverse + cap outside the
+        // lock. The membership set comes out with the copy so the two are one consistent view.
         val now = System.currentTimeMillis()
         val indexes = managedListIndexes
         val muted = activeIgnoredMacs(now, indexes)
         val watched = indexes.watchedMacs
-        val storedRows = synchronized(storeLock) { store.values.toList() }
+        val storedRows: List<Detection>
+        val lastMembership: Set<String>
+        synchronized(storeLock) {
+            storedRows = store.values.toList()
+            lastMembership = lastPublishedMembership
+        }
         val all = storedRows.asReversed()
         val log = if (all.size > FEED_CAP) all.take(FEED_CAP) else all
-        // ONE walk for all three products of the active projection: the rows, the membership
-        // signature that decides whether map geometry is stale, and the no-fix drone rings. This
-        // was a filtering sequence, then a HashSet of up to FEED_CAP ids, then a third pass for
-        // the rings, all of it per publish at about 3 Hz. The early exit is kept: take(FEED_CAP)
-        // stopped walking at the cap and so does the break.
+        // ONE walk for all three products of the active projection: the rows, the count of rows
+        // whose id the last published membership already holds, which decides whether map
+        // geometry is stale, and the no-fix drone rings. The break stops the walk at FEED_CAP.
         val active = ArrayList<Detection>(minOf(all.size, FEED_CAP))
-        val membership = MembershipSignature()
+        var known = 0
         var rings: ArrayList<MapDynamicRing>? = null
         for (d in all) {
             if (active.size >= FEED_CAP) break
             if (!activeProjectionIncludes(d.mac, d.mac.lowercase() in watched, muted)) continue
             active.add(d)
-            membership.add(d.id)
+            if (d.id in lastMembership) known++
             if (d.type == DeviceType.DRONE && !validCoord(d.lat, d.lon)) {
                 val list = rings ?: ArrayList<MapDynamicRing>(4)
                 list.add(MapDynamicRing(d.id, d.rssi))
                 rings = list
             }
         }
+        // The store is keyed by detection id (every write is store[d.id] = d), so one walk cannot
+        // present the same id twice. With no repeats, "every active id is in the last set" plus
+        // "the two sizes match" is exact set equality in any order, so a routine sighting that
+        // only reorders the store changes nothing here. The new set is built only on a change,
+        // and before the lock: a publish that changes no membership allocates nothing for this.
+        val changedMembership: Set<String>? =
+            if (known != active.size || active.size != lastMembership.size)
+                active.mapTo(HashSet<String>(active.size)) { it.id }
+            else null
         val spatialRevision = synchronized(storeLock) {
             // Deliberately a SECOND short section rather than folding the walk above into the copy
             // that precedes it. storeLock is the monitor the BLE ingest thread takes for every
             // advert, and holding it across an O(active) projection would stall ingest to save one
-            // uncontended acquire. What it guards is now three primitive comparisons instead of a
-            // set equality over up to FEED_CAP ids.
-            if (!membership.sameAs(lastPublishedMembership)) {
-                lastPublishedMembership = membership
+            // uncontended acquire. What it guards is one reference compare and one assignment,
+            // never a set compare or a set build.
+            if (changedMembership != null) {
+                lastPublishedMembership = changedMembership
+                spatialEvidenceGeneration++
+            } else if (lastPublishedMembership !== lastMembership) {
+                // Another publish or a reset replaced the set between the two sections, so these
+                // rows match the set this publish read and not the one stored now. Put that set
+                // back and bump, so the stored set is always the membership of the last publish.
+                // A race can cost a redundant revision; it cannot hide a membership change.
+                lastPublishedMembership = lastMembership
                 spatialEvidenceGeneration++
             }
             spatialEvidenceGeneration
@@ -6236,17 +6311,17 @@ class AcabBleManager(private val context: Context) {
      *  haptics would otherwise never stop. Disabling it restores the mode it muted, so the
      *  board doesn't stay silent forever. The user can also switch sound back on by hand. */
     fun setDesert(on: Boolean) {
-        writeConfig(JSONObject().put("desert", on))
         if (on) {
             // Capture the mode we are about to mute, and close any offer left over from the last
             // run: the user picked a new mute over a mode they were being offered back, so one tap
             // must not undo the mute they just asked for. desertAlertModeTransition owns both
             // decisions, including "already SILENT means nothing to give back". Mirrors iOS.
-            if (applyDesertAlertModeEvent(DesertAlertModeEvent.USER_ENABLED_DESERT).effect ==
+            val mutes = applyDesertAlertModeEvent(DesertAlertModeEvent.USER_ENABLED_DESERT).effect ==
                 DesertAlertModeEffect.MUTE_TO_SILENT
-            ) {
-                setAlertMode(AlertMode.SILENT, AlertModeOrigin.APP)
-            }
+            // Desert and its mute in ONE write (see desertEnableConfig). setAlertMode below sends
+            // the mute again, which is idempotent.
+            writeConfig(desertEnableConfig(mutes))
+            if (mutes) setAlertMode(AlertMode.SILENT, AlertModeOrigin.APP)
             desertSeenOn = false   // wait for the board to confirm before arming the reconciler
         } else {
             // THE USER ended Desert, right here, so the mode is restored rather than offered: the
@@ -6255,9 +6330,11 @@ class AcabBleManager(private val context: Context) {
             // which is why it offers instead. Origin APP, because nobody picked this mode now - they
             // picked it before Desert started. Mirrors iOS.
             val outcome = applyDesertAlertModeEvent(DesertAlertModeEvent.USER_ENDED_DESERT)
-            if (outcome.effect == DesertAlertModeEffect.RESTORE && outcome.restoreTo != null) {
-                setAlertMode(outcome.restoreTo, AlertModeOrigin.APP)
-            }
+            val restoreTo = if (outcome.effect == DesertAlertModeEffect.RESTORE) outcome.restoreTo else null
+            // Desert-off and its restore in ONE write (see desertDisableConfig). setAlertMode below
+            // sends the buzzer state again, which is idempotent.
+            writeConfig(desertDisableConfig(restoreTo))
+            if (restoreTo != null) setAlertMode(restoreTo, AlertModeOrigin.APP)
         }
     }
 
@@ -6279,14 +6356,9 @@ class AcabBleManager(private val context: Context) {
         val key = keyHex() ?: return false
         // Reload again at the point of use: an auto-reconnect may race an async checkpoint that
         // completed after cleanup. Either durable position is safe; an ahead volatile one is not.
-        val resumeCursor = synchronized(cursorLock) {
-            replayCursorForReconnect(
-                ReplayCursorTuple(lastSeq, activeLogGeneration),
-                ReplayCursorTuple(lastSeqPersisted, lastLogGenerationPersisted),
-            )
-        }
-        lastSeq = resumeCursor.sequence
-        activeLogGeneration = resumeCursor.generation
+        val resumeCursor = synchronized(cursorLock) { lastSeqPersisted to lastLogGenerationPersisted }
+        lastSeq = resumeCursor.first
+        activeLogGeneration = resumeCursor.second
         // We've asked the board to replay everything past lastSeq. The pill is driven by the
         // board's {"hist":"begin"} lead-in, NOT this handshake: the board streams sentinels only
         // when it actually buffered records, so a buffer-off/empty connect shows no pill (and can't
@@ -6353,12 +6425,31 @@ class AcabBleManager(private val context: Context) {
      *   3. The correction was persisted, so one transient fault could rewrite a stored preference.
      *      It is now in-memory for the session.
      *
+     *  A LATER FIX (security review 2026-09-29): a phone with NO stored mode used to assert the
+     *  in-memory default, BUZZER, and un-mute a board muted from another install or phone. Such a
+     *  phone now only mirrors the board (the [mirroredAlertMode] branch below).
+     *
      *  THE TWO DIRECTIONS ARE NOT SYMMETRIC, which is the whole shape of this function. Wanting
      *  sound and getting silence is an inconvenience the UI can just tell the truth about. Wanting
      *  silence and getting sound is a beacon making noise for someone who asked for none, so the
      *  mute write is re-sent for as long as the two disagree - see the terminal branch.
      *  Mirrors iOS reconcileBuzzer() branch for branch, including that retry and its cadence. */
     private fun reconcileBuzzer(s: DeviceStatus) {
+        // A phone holding no mode shows what the board does and writes nothing. The board's state
+        // is the last choice anyone made for it, and only a pick on THIS phone may change it (see
+        // connectBuzzerWrite). BEFORE the mesh bail, so a mesh board mirrors as SILENT instead of
+        // leaving the BUZZER placeholder for Desert to capture (see mirroredAlertMode). The decision
+        // and the write happen under alertModeLock, so a user pick on the main thread lands either
+        // wholly before (and the mirror stands down) or wholly after (and overwrites the mirror).
+        val mirrored = synchronized(alertModeLock) {
+            mirroredAlertMode(hasStoredAlertMode, appHeldAlertModeThisLink, s.buzzer)
+                ?.also { _alertMode.value = it }
+        }
+        if (mirrored != null) {
+            buzzerReassertAttempts = 0
+            lastBuzzerMuteWrite = 0L
+            return
+        }
         if (s.isMeshDetect) { buzzerReassertAttempts = 0; return }   // no buzzer to reconcile
 
         val wantBuzzer = _alertMode.value == AlertMode.BUZZER
@@ -6398,8 +6489,18 @@ class AcabBleManager(private val context: Context) {
     /** Pick how sightings get announced. VIBRATE and SILENT both mute the board's buzzer, for when
      *  a chirp would give you away; VIBRATE buzzes this phone instead. */
     fun setAlertMode(mode: AlertMode, origin: AlertModeOrigin) {
-        _alertMode.value = mode
-        prefs.edit().putString("alertMode", mode.name).apply()
+        // Stored only when a user picked it, or when this phone already stores a mode. An APP-origin
+        // mode on a phone with no stored mode holds for this link only (appHeldAlertModeThisLink):
+        // Desert still mutes and restores the board, but the phone goes back to mirroring on the
+        // next connect instead of asserting a mode nobody picked here. Flag and value change together
+        // under alertModeLock (see its doc).
+        val store = synchronized(alertModeLock) {
+            val store = origin == AlertModeOrigin.USER || hasStoredAlertMode
+            if (store) hasStoredAlertMode = true else appHeldAlertModeThisLink = true
+            _alertMode.value = mode
+            store
+        }
+        if (store) prefs.edit().putString("alertMode", mode.name).apply()
         // A user pick drops everything the app was holding on their behalf: the mode captured on the
         // way into Desert AND an offer still on screen. SILENT IS INCLUDED, which is the whole point
         // - choosing silence by hand is a choice, not a mute to undo later. This used to key off
@@ -6825,10 +6926,10 @@ class AcabBleManager(private val context: Context) {
         if (combinedHoldingService && combinedDelegate.isInitialized()) {
             combined.onProtectedHoldLost()
         }
-        // A direct S3 run has no combined coordinator to observe the teardown. The combined
-        // callback above cancels its own cancellable S3 leg and clears the inherited marker before
-        // this check, so the same run cannot be failed twice.
-        if ((otaHoldingService || otaUsingCombinedServiceHold) && otaCancellableNow()) {
+        // Fail-closed backstop for an S3 leg the coordinator did not cancel. The combined callback
+        // above cancels its own cancellable S3 leg and clears the inherited marker before this
+        // check, so the same run cannot be failed twice.
+        if (otaUsingCombinedServiceHold && otaCancellableNow()) {
             failOta(
                 "Android could not keep the protected update session active. " +
                     "The update stopped before it committed; keep the app open and try again.",
@@ -7067,7 +7168,7 @@ class AcabBleManager(private val context: Context) {
             // The store and every per-device side map, off the one list, so a map added later
             // is cleared here too (see perDeviceMaps).
             for (m in perDeviceMaps) m.clear()
-            lastPublishedMembership = MembershipSignature()
+            lastPublishedMembership = emptySet()
             // The boot bounds go with the rows they were derived from: keeping them would let a
             // cleared log's anchors bracket records the user can no longer see the basis for.
             // Keyed by boot counter, not detection id, so they're not in perDeviceMaps.
@@ -7118,35 +7219,6 @@ class AcabBleManager(private val context: Context) {
 
     private fun csvInstant(ms: Long): String = csvInstantFmt.format(Instant.ofEpochMilli(ms))
 
-    /** CSV of the current log: when, what, and where for each detection. Location is
-     *  the phone's rough position from when we first heard it (the board has no GPS),
-     *  or blank if we didn't have one.
-     *
-     *  [category] is a DeviceType.category key (ALPR / DRONE / BODY CAM / TRACKER), or null for
-     *  everything. Callers pass the filter the user is already looking at in the log, so export
-     *  means "give me what is on screen" rather than silently handing over the whole history.
-     *  Mirrors iOS writeDetections(_:category:). */
-    /** A contribution CSV: the detection log with location redacted per the three policy switches.
-     *  Redacts the EXPORTED copy only (redactCsvColumns is pure over its input); the app's own log
-     *  is never mutated. Defaults match the composer: observer location OUT, drone aircraft
-     *  broadcast IN, operator broadcast OUT (it can point at a person on the ground). */
-    fun contributionCsv(includeObserverLocation: Boolean = false,
-                        includeDroneLocation: Boolean = true,
-                        includeOperatorLocation: Boolean = false): String =
-        redactCsvColumns(detectionsCsv(null),
-            contributionBlankColumns(includeObserverLocation, includeDroneLocation, includeOperatorLocation))
-
-    /** A BOUNDED contribution CSV from the immutable ID -> in-window timestamp map frozen when
-     *  Stop was tapped, with location redacted per policy. This preserves membership but does not
-     *  atomically freeze changing row fields; UI Stop paths must use [freezeContributionWindow]. */
-    @Deprecated("Use freezeContributionWindow at Stop so membership and row content are atomic")
-    fun windowedContributionCsv(capturedAtById: Map<String, Long>,
-                                includeObserverLocation: Boolean = false,
-                                includeDroneLocation: Boolean = true,
-                                includeOperatorLocation: Boolean = false): String =
-        redactCsvColumns(detectionsCsv(detectedAtOverrides = capturedAtById),
-            contributionBlankColumns(includeObserverLocation, includeDroneLocation, includeOperatorLocation))
-
     /** Freeze the capture-local live ledger and render it in one critical section. History replay
      *  never enters this ledger, and each row carries one latest Detection, phone-clock instant,
      *  and optional observer fix from the same live callback. */
@@ -7177,22 +7249,6 @@ class AcabBleManager(private val context: Context) {
     /** Drop capture-local samples when a capture is discarded before Stop. */
     fun cancelContributionCapture() = synchronized(storeLock) {
         contributionCapture.cancel()
-    }
-
-    /** Device ID -> last in-window sighting, snapshotted exactly once at Stop. Frozen keys prevent
-     *  post-Stop membership changes; frozen values keep detected_at inside the capture instead of
-     *  printing a first-ever session sighting. This does not freeze row content by itself. */
-    @Deprecated("Use freezeContributionWindow at Stop so membership and row content are atomic")
-    fun windowObservationTimes(startMs: Long, stopMs: Long): Map<String, Long> = synchronized(storeLock) {
-        buildMap {
-            for (d in store.values) {
-                val first = firstSeenAt[d.id]
-                val last = lastSeenAt[d.id]
-                if (inCaptureWindow(first, last, startMs, stopMs)) {
-                    captureTimestamp(last, startMs, stopMs)?.let { put(d.id, it) }
-                }
-            }
-        }
     }
 
     /** Live count while capturing. Review uses the frozen timestamp map captured at Stop. */
@@ -7227,13 +7283,9 @@ class AcabBleManager(private val context: Context) {
     }
 
     /** The destructive Clear sheet's escape hatch intentionally snapshots the complete store. */
-    internal fun freezeWholeLogExport(category: String? = null): DetectionExportSnapshot =
+    internal fun freezeWholeLogExport(): DetectionExportSnapshot =
         synchronized(storeLock) {
-            val rows = store.values.asSequence()
-                .filter { category == null || it.type.category == category }
-                .toList()
-                .asReversed()
-            freezeDetectionExportLocked(rows)
+            freezeDetectionExportLocked(store.values.toList().asReversed())
         }
 
     internal fun renderDetectionsCsv(snapshot: DetectionExportSnapshot): String =
@@ -7247,7 +7299,6 @@ class AcabBleManager(private val context: Context) {
     /** [detectedAtOverrides], when set, restricts export to its frozen keys and writes its in-window
      *  phone-clock values as detected_at. Null (the default) preserves full-history semantics. */
     fun detectionsCsv(
-        category: String? = null,
         detectedAtOverrides: Map<String, Long>? = null,
         observerCoordOverrides: Map<String, Pair<Double, Double>?>? = null,
         detectionOverrides: List<Detection>? = null,
@@ -7262,13 +7313,12 @@ class AcabBleManager(private val context: Context) {
         // Export the full store (newest first), not the bounded live feed, so nothing is lost.
         // Snapshot the values under storeLock so the export can't collide with the BLE callback
         // thread mutating the shared map mid-iteration; build the CSV rows outside the lock.
-        // The category and frozen-time filters only read immutable Detection fields but run inside
-        // the lock with the store snapshot so there is one atomic membership decision. Null
+        // The frozen-time filter only reads immutable Detection fields but runs inside the lock
+        // with the store snapshot so there is one atomic membership decision. Null
         // detectedAtOverrides (the default) exports the full store, unchanged.
         val selectedRows = synchronized(storeLock) {
             (detectionOverrides ?: store.values).filter { d ->
-                (category == null || d.type.category == category) &&
-                    (detectedAtOverrides == null || d.id in detectedAtOverrides)
+                detectedAtOverrides == null || d.id in detectedAtOverrides
             }.toList()
         }
         // Store values are oldest-first; explicit snapshots already carry the exact UI order.
@@ -7408,9 +7458,6 @@ class AcabBleManager(private val context: Context) {
      *  run under plain JUnit; make it callable without a manager and reuse the ExportTests.swift
      *  JSON fixtures verbatim. Treat any change on this side as unguarded until a Kotlin test
      *  runs renderDetectionsGpx on those shared fixtures. */
-    fun detectionsGpx(category: String? = null): String =
-        renderDetectionsGpx(freezeWholeLogExport(category))
-
     internal fun renderDetectionsGpx(snapshot: DetectionExportSnapshot): String {
         val out = StringBuilder(
             "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n" +
@@ -7838,7 +7885,8 @@ class AcabBleManager(private val context: Context) {
      *  [userEdit] false is the STATUS reconciler re-stating a list the board has not matched: it
      *  is spending a bounded budget, so it must not refill the budget on its way through. */
     private fun sendWatchList(userEdit: Boolean = true) {
-        if (!managedListPersistenceAllowed(_demoMode.value)) return
+        // Sample-data managed-list edits are session previews and must never reach disk or a board.
+        if (_demoMode.value) return
         if (!managedListsReady) return
         if (userEdit) watchPushAttempts = 0
         // The destructive empty intent was committed atomically with the exact list snapshot in
@@ -8124,7 +8172,8 @@ class AcabBleManager(private val context: Context) {
      * [userEdit] false is the STATUS reconciler spending its bounded re-push budget; see
      * [sendWatchList]. */
     private fun sendIgnoreList(intentionalClear: Boolean = false, userEdit: Boolean = true) {
-        if (!managedListPersistenceAllowed(_demoMode.value)) return
+        // Sample-data managed-list edits are session previews and must never reach disk or a board.
+        if (_demoMode.value) return
         if (!managedListsReady) return
         if (userEdit) ignorePushAttempts = 0
         val permanent = boardIgnoredMacs()
@@ -8182,13 +8231,11 @@ class AcabBleManager(private val context: Context) {
     // ---- demo mode (explore the UI with sample data, no board) ----
 
     /** Echo a sample radio/detector switch into the shared synthetic status so Status and Beacon
-     * tell the same story. The demo gate is checked inside StateFlow's atomic update: an Exit racing
-     * this callback cannot apply a preview to a real retained status frame. No config write or
-     * preference path is reachable from here. */
-    internal fun previewDemoStatusToggle(toggle: DemoStatusToggle, on: Boolean) {
-        _status.update { current ->
-            if (_demoMode.value) current?.withDemoStatusToggle(toggle, on) else current
-        }
+     * tell the same story. [edit] is the row's own `copy(field = value)`. The demo gate is checked
+     * inside StateFlow's atomic update: an Exit racing this callback cannot apply a preview to a
+     * real retained status frame. No config write or preference path is reachable from here. */
+    internal fun previewDemoStatusToggle(edit: DeviceStatus.() -> DeviceStatus) {
+        _status.update { current -> current.withDemoStatusEdit(_demoMode.value, edit) }
     }
 
     /** Seed sample detections so the whole UI works without a board.
@@ -8196,7 +8243,7 @@ class AcabBleManager(private val context: Context) {
     fun seedDemoData() {
         // Demo replaces the scan screen with a synthetic READY session. Retire the scanner first,
         // including its timeout and delayed retry generation, so LOW_LATENCY work cannot leak.
-        if (shouldStopScanBeforeDemo(_state.value)) stopScan()
+        if (_state.value == ConnState.SCANNING) stopScan()
         // Keep the real New baseline so exitDemo can put it back: placeDemoDetections and a sample
         // MARK SEEN move both watermarks in memory. Only on entry, never on a re-seed while already
         // in sample data (that would snapshot the sample baseline). Twin of iOS
@@ -8253,7 +8300,7 @@ class AcabBleManager(private val context: Context) {
             // row's pin, closest-approach RSSI or breadcrumbs left in a side map would outlive
             // the row it belonged to.
             for (m in perDeviceMaps) m.clear()
-            lastPublishedMembership = MembershipSignature()
+            lastPublishedMembership = emptySet()
             for (s in DEMO_SAMPLE_ROWS) {
                 val o = JSONObject(s)
                 if (baseLat != null && baseLon != null && o.has("lat") && o.has("lon")) {
@@ -8339,7 +8386,7 @@ class AcabBleManager(private val context: Context) {
     private fun loadOrCreateKey(): ByteArray? = synchronized(bufferKeyLock) {
         resolveDurableBufferKey(
             stored = prefs.getString("bufKey", null),
-            unwrap = { runCatching { unwrapKey(it) }.getOrNull() },
+            unwrap = { runCatching { gcmOpen(it) }.getOrNull() },
             generate = {
                 runCatching {
                     ByteArray(DURABLE_BUFFER_KEY_BYTES).also {
@@ -8347,7 +8394,7 @@ class AcabBleManager(private val context: Context) {
                     }
                 }.getOrNull()
             },
-            wrap = { runCatching { wrapKey(it) }.getOrNull() },
+            wrap = { runCatching { gcmSeal(it) }.getOrNull() },
             persist = { sealed ->
                 // commit() is synchronous and reports the disk result. Read back the exact blob
                 // before exposing its plaintext counterpart to the BLE handshake.
@@ -8357,27 +8404,8 @@ class AcabBleManager(private val context: Context) {
         )
     }
 
-    /** AES-GCM-encrypt the raw key with the Keystore wrapping key; store iv:ciphertext hex. */
-    private fun wrapKey(raw: ByteArray): String {
-        val cipher = javax.crypto.Cipher.getInstance("AES/GCM/NoPadding")
-        cipher.init(javax.crypto.Cipher.ENCRYPT_MODE, wrappingKey())
-        val ct = cipher.doFinal(raw)
-        return cipher.iv.joinToString("") { "%02x".format(it) } + ":" +
-            ct.joinToString("") { "%02x".format(it) }
-    }
-
-    private fun unwrapKey(stored: String): ByteArray {
-        val (ivHex, ctHex) = stored.split(":", limit = 2)
-        val cipher = javax.crypto.Cipher.getInstance("AES/GCM/NoPadding")
-        cipher.init(
-            javax.crypto.Cipher.DECRYPT_MODE, wrappingKey(),
-            javax.crypto.spec.GCMParameterSpec(128, ivHex.hexToBytes()),
-        )
-        return cipher.doFinal(ctHex.hexToBytes())
-    }
-
     /** AES-GCM-seal arbitrary bytes with the Keystore wrapping key; returns iv:ciphertext hex.
-     *  Same construction as wrapKey, exposed for the at-rest detection log. */
+     *  Wraps the buffer key (loadOrCreateKey) and seals the at-rest lists and detection log. */
     private fun gcmSeal(plain: ByteArray): String {
         val cipher = javax.crypto.Cipher.getInstance("AES/GCM/NoPadding")
         cipher.init(javax.crypto.Cipher.ENCRYPT_MODE, wrappingKey())
@@ -8386,7 +8414,8 @@ class AcabBleManager(private val context: Context) {
             ct.joinToString("") { "%02x".format(it) }
     }
 
-    /** Reverse of gcmSeal; throws on a tampered/foreign blob (callers treat that as "start fresh"). */
+    /** Reverse of gcmSeal; throws on a tampered/foreign blob. Each caller decides what that means:
+     *  the at-rest lists and log read as absent, loadOrCreateKey aborts and never rotates the key. */
     private fun gcmOpen(sealed: String): ByteArray {
         val (ivHex, ctHex) = sealed.split(":", limit = 2)
         val cipher = javax.crypto.Cipher.getInstance("AES/GCM/NoPadding")
@@ -8989,10 +9018,15 @@ class AcabBleManager(private val context: Context) {
         // only good to a couple of seconds, and claiming better would be claiming more than we know.
         private const val TIME_ANCHOR_FLOOR_SEC = 2
         // Cap on distinct devices held in memory / persisted, so a long drive can't grow the
-        // store without bound. Evicts oldest-first. 5000 is high enough to just keep logging
-        // through any realistic session (~5MB) while still guarding against a runaway firehose;
-        // the board's offline black box is the uncapped record.
+        // store without bound. Which rows go past it is storeEvictionVictims (ambient first, a
+        // flood's own rows next, then the oldest flags, watched last). 5000 is high enough to just
+        // keep logging through any realistic session (~5MB) while still guarding against a runaway
+        // firehose.
         private const val STORE_CAP = 5000
+        /** Set once the stored alert mode has been through alertModeKeptFromLegacyStore. From then
+         *  on only a user pick, or a mode on a phone that already stores one, is ever stored
+         *  (setAlertMode). iOS twin: BLEManager.alertModeOriginAwareKey. */
+        private const val KEY_ALERT_MODE_ORIGIN_AWARE = "alertModeOriginAware"
         // Cap on rows handed to the live feed (newest-first). A Desert-mode firehose stays
         // responsive; the full store still backs the map, CSV, and counts.
         private const val FEED_CAP = 5000

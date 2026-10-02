@@ -52,22 +52,10 @@ fun rememberPlainCategoryMarkers(): Map<DeviceType, BitmapDrawable> =
 fun rememberDimCategoryMarkers(): Map<DeviceType, BitmapDrawable> =
     categoryMarkers(dim = true, ringed = false)
 
+// Every DeviceType gets a pin: MapScreen.kt and DetailScreen.kt draw one with getValue(type).
 @Composable
-private fun categoryMarkers(dim: Boolean, ringed: Boolean): Map<DeviceType, BitmapDrawable> = mapOf(
-    DeviceType.FLOCK_CAMERA to rememberCategoryMarker(DeviceType.FLOCK_CAMERA, dim, ringed),
-    DeviceType.FLOCK_RAVEN to rememberCategoryMarker(DeviceType.FLOCK_RAVEN, dim, ringed),
-    DeviceType.BODY_CAM to rememberCategoryMarker(DeviceType.BODY_CAM, dim, ringed),
-    DeviceType.DRONE to rememberCategoryMarker(DeviceType.DRONE, dim, ringed),
-    DeviceType.TRACKER to rememberCategoryMarker(DeviceType.TRACKER, dim, ringed),
-    DeviceType.GLASSES to rememberCategoryMarker(DeviceType.GLASSES, dim, ringed),
-    // Network cameras grid-cluster with the other high-volume types, but a lone member still
-    // renders as an individual pin via markers.getValue(d.type); without this entry a located
-    // NETWORK_CAMERA would throw NoSuchElementException the moment that pin is drawn.
-    DeviceType.NETWORK_CAMERA to rememberCategoryMarker(DeviceType.NETWORK_CAMERA, dim, ringed),
-    DeviceType.NEARBY_DEVICE to rememberCategoryMarker(DeviceType.NEARBY_DEVICE, dim, ringed),
-    DeviceType.WATCHED to rememberCategoryMarker(DeviceType.WATCHED, dim, ringed),
-    DeviceType.UNKNOWN to rememberCategoryMarker(DeviceType.UNKNOWN, dim, ringed),
-)
+private fun categoryMarkers(dim: Boolean, ringed: Boolean): Map<DeviceType, BitmapDrawable> =
+    DeviceType.entries.associateWith { rememberCategoryMarker(it, dim, ringed) }
 
 /** The STALE tier's version of a category tone: pulled part-way toward its own luminance grey so
  *  it desaturates, then part-way toward the surface role (Acab.palette.surface) so it recedes.

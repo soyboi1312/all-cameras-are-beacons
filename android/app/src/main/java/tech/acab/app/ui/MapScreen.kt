@@ -528,26 +528,6 @@ internal fun mapStalePinFlag(previous: Boolean, seenAt: Map<String, Long>, drawn
     return if (now == previous) null else now
 }
 
-/**
- * The text a detection marker carries: the category its artwork is drawing, and how many rows it
- * stands for when it leads a same-spot group.
- *
- * NOT A USER-FACING CUE ON THIS PLATFORM, and nothing may be routed through it. osmdroid uses
- * Marker.title for one thing, its default title InfoWindow, and every detection marker consumes
- * its own tap (the click listener returns true), so that window never opens; osmdroid also draws
- * markers as overlays on ONE opaque surface and publishes no per-marker accessibility node, so no
- * screen reader reads this either. A previous round appended a "not heard in the last hour"
- * sentence here for the STALE tier and it reached nobody.
- *
- * The cues that DO reach the user: the group count is the badge composited into the pin bitmap
- * (PinBadgeFactory), the recency tier is the ring and the dimmed artwork, the screen-reader
- * companion for the whole map is the member list the legend card's headline row opens, and a
- * pin's age IN WORDS is in the dossier the tap opens,
- * whose "Last seen" row prints it via relativeAgo (DetailScreen.kt).
- */
-internal fun pinTitle(category: String, groupSize: Int): String =
-    if (groupSize <= 1) category else "$groupSize detections here, showing $category"
-
 // ---- Large-text layout rules (font scale 2.0 must leave a usable map). Pure, pinned by
 // MapLayoutTest. Every px value is measured by the screen; nothing here reads a density.
 
@@ -1376,7 +1356,7 @@ fun MapScreen(
     var cardHeaderPx by remember(density) { mutableIntStateOf(0) }
     // The card's ceiling (mapLegendCardMaxPx): a share of the slot, never up into the chrome,
     // never below the header row plus the card's 4dp top padding, one 48dp key row and its 16dp
-    // bottom padding (MapLegendCardContent's paddings, outside its scroll).
+    // bottom padding (MapLegendCard's paddings, outside its scroll).
     val cardMaxPx = with(density) {
         mapLegendCardMaxPx(
             slotPx = slotPx,
@@ -1742,7 +1722,6 @@ fun MapScreen(
                                 position = GeoPoint(point.first, point.second)
                                 val age = ageOf(d)
                                 pinIcon(d.type, age, showLabels, pinArt, pinBadges, n)
-                                title = pinTitle(d.type.category, n)
                                 setOnMarkerClickListener { _, _ ->
                                     if (n == 1) selectFresh(d) else {
                                         legendOpen = false
@@ -1759,7 +1738,6 @@ fun MapScreen(
                             fresh.add(Marker(map).apply {
                                 position = GeoPoint(group.lat, group.lon)
                                 pinIcon(d.type, ageOf(d), showLabels, pinArt, pinBadges, 1)
-                                title = pinTitle(d.type.category, 1)
                                 setOnMarkerClickListener { _, _ -> selectFresh(d); true }
                             })
                         } else {
@@ -1771,7 +1749,6 @@ fun MapScreen(
                                 position = GeoPoint(group.lat, group.lon)
                                 icon = clusterFactory.marker(members.size, tone)
                                 setAnchor(Marker.ANCHOR_CENTER, Marker.ANCHOR_CENTER)
-                                title = "${members.size} detections"
                                 setOnMarkerClickListener { _, _ ->
                                     legendOpen = false
                                     memberSheetIsViewport = false
@@ -2155,7 +2132,7 @@ fun MapScreen(
                     modifier = Modifier.padding(horizontal = 16.dp, vertical = 8.dp)
                         .semantics { heading() },
                 )
-                MapOptionsHeader { Kicker("DISPLAY") }
+                SectionLabel("DISPLAY", Modifier.fillMaxWidth())
                 GroupedSwitchRow(
                     "phone breadcrumb trails",
                     showBreadcrumbs,
@@ -2177,8 +2154,8 @@ fun MapScreen(
                 // FILTERS")`, header and the ALPR note below alike: the toggles here draw
                 // reference data over the map and never hide a detection, and the two sheets
                 // must say so in the same words.
-                MapOptionsHeader { Kicker("REFERENCE OVERLAYS · NOT FILTERS") }
-                // Not GroupedSwitchRow: its `pending` would disable the row during a download,
+                SectionLabel("REFERENCE OVERLAYS · NOT FILTERS", Modifier.fillMaxWidth())
+                // Not GroupedSwitchRow: this row draws the download spinner beside its switch,
                 // and turning the layer OFF mid-download has always been allowed. The source
                 // credit ("cameras: OpenStreetMap ODbL · DeFlock") is the map legend's job on both
                 // phones; this note carries the privacy disclosure.
@@ -2312,23 +2289,6 @@ private val MAP_CHROME_CAROUSEL_MIN = 48.dp
  *  measures its label at the FULL width and then adds this slot beside it (javap of
  *  SegmentedButtonContentMeasurePolicy), so a label that fills the segment overflows it by this. */
 private val MAP_SEGMENT_CHECK_WIDTH = 26.dp
-
-/** The options sheet's section headers render like SectionLabel (titleSmall, onSurfaceVariant)
- *  while the call inside stays a bare `Kicker("...")`, the shape the drift needle on the
- *  REFERENCE header reads. The nested MaterialTheme re-provides typography only, only inside the
- *  open sheet. */
-private val MapOptionsHeaderTypography = AcabTypography.copy(bodyMedium = AcabTypography.titleSmall)
-
-@Composable
-private fun MapOptionsHeader(content: @Composable () -> Unit) {
-    Box(
-        Modifier.fillMaxWidth()
-            .padding(start = 16.dp, end = 16.dp, top = 16.dp, bottom = 8.dp)
-            .semantics(mergeDescendants = true) { heading() },
-    ) {
-        MaterialTheme(typography = MapOptionsHeaderTypography, content = content)
-    }
-}
 
 /** The chrome above the map. In a window at least [MAP_CHROME_COMPACT_HEIGHT_DP] tall (a portrait
  *  phone, a tablet either way) under [MAP_CHROME_CAP_FONT_SCALE], top to bottom: the floating
@@ -2727,15 +2687,30 @@ private fun MapCategoryChip(
 /** One legend key: a swatch colour, its label, and whether the swatch is a hollow ring. */
 private data class LegendEntry(val color: Color, val label: String, val hollow: Boolean)
 
-/** The legend card: [MapLegendCardContent] on an opaque surfaceContainerHigh card (the floating
- *  bar's surface; Android has no glass), at most 420dp wide and [maxHeightPx] tall
- *  (mapLegendCardMaxPx; Int.MAX_VALUE = uncapped). It scales out of the info button's corner, or
- *  only fades while the system's animator duration scale is 0 (rememberReduceMotion). An M3
- *  Surface, so it takes the touches that land on it; a tap on the bare map beside it, or on a
- *  known-ALPR ring, closes it (afterTap). Its pane title makes TalkBack announce it. Its own
- *  composable, so the Reduce Motion read and the card skip the screen's feed-rate
- *  recompositions; the parameters are the content's plus [visible], [maxHeightPx] and
- *  [modifier] (the caller's placement). */
+/** The legend card: an opaque surfaceContainerHigh card (the floating bar's surface; Android has
+ *  no glass), at most 420dp wide and [maxHeightPx] tall (mapLegendCardMaxPx; Int.MAX_VALUE =
+ *  uncapped). It scales out of the info button's corner, or only fades while the system's
+ *  animator duration scale is 0 (rememberReduceMotion). An M3 Surface, so it takes the touches
+ *  that land on it; a tap on the bare map beside it, or on a known-ALPR ring, closes it
+ *  (afterTap). Its pane title makes TalkBack announce it. Its content (owner decision
+ *  2026-09-26), in order: the header row ([MapLegendCardHeader]), the honesty headline FIRST
+ *  with the close button beside it; then the body ([MapLegendCardBody]): the qualifier (counts)
+ *  line, ONE key grid (the six categories, then the ALPR keys), the conditional keys (dimmed,
+ *  wide ring, Drone operator) and the ALPR data credit. Two forms under the ceiling
+ *  [maxHeightPx] (mapLegendHeaderScrolls): while the header and the body's first key row fit,
+ *  the header stays fixed and the body scrolls under it (a card with room hugs its content:
+ *  fill = false, and the scroll has no range); when they do not (a phone in portrait at font
+ *  scale 2.0), the header scrolls WITH the body, so the keys are reachable and no line is cut at
+ *  the fold under a fixed header. The card's 4dp top and 16dp bottom padding sit OUTSIDE the
+ *  scroll, so the fold never runs flush to the card's edge, and the fold fades while more is
+ *  below it ([legendFold]): a line at the fold once read as clipping. The header's height is
+ *  reported through [onHeaderMeasured] for the card's floor. The OSM tile credit is not here: it
+ *  is the map's own fixed overlay under the card ([MapOsmCredit]), so it stays visible and still
+ *  whether the card is open or not. Its own composable, and every parameter is a primitive, a
+ *  string, a remembered list, a lambda or [modifier] (the caller's placement), so the Reduce
+ *  Motion read and the card skip the screen's BLE-rate recompositions. TWIN: iOS
+ *  MapTabView.legendCard (its accessibility-size forms: the header fixed over scrolling keys,
+ *  else legendHeaderScroll). */
 @Composable
 private fun MapLegendCard(
     visible: Boolean,
@@ -2773,97 +2748,49 @@ private fun MapLegendCard(
                 .heightIn(max = maxHeight)
                 .semantics { paneTitle = "Map legend" },
         ) {
-            MapLegendCardContent(
-                maxHeightPx = maxHeightPx,
-                headline = headline,
-                countsLine = countsLine,
-                visibleCount = visibleCount,
-                onOpenList = onOpenList,
-                keyLegend = keyLegend,
-                hasStalePins = hasStalePins,
-                hasOperatorPins = hasOperatorPins,
-                alprEnabled = alprEnabled,
-                alprPeekCount = alprPeekCount,
-                onClose = onClose,
-                onHeaderMeasured = onHeaderMeasured,
-            )
-        }
-    }
-}
-
-/** The legend card's content (owner decision 2026-09-26), in order: the header row
- *  ([MapLegendCardHeader]), the honesty headline FIRST with the close button beside it; then the
- *  body ([MapLegendCardBody]): the qualifier (counts) line, ONE key grid (the six categories,
- *  then the ALPR keys), the conditional keys (dimmed, wide ring, Drone operator) and the ALPR
- *  data credit. Two forms under the card's ceiling [maxHeightPx] (mapLegendHeaderScrolls): while
- *  the header and the body's first key row fit, the header stays fixed and the body scrolls under
- *  it (a card with room hugs its content: fill = false, and the scroll has no range); when they
- *  do not (a phone in portrait at font scale 2.0), the header scrolls WITH the body, so the keys
- *  are reachable and no line is cut at the fold under a fixed header. The card's 4dp top and 16dp
- *  bottom padding sit OUTSIDE the scroll, so the fold never runs flush to the card's edge, and
- *  the fold fades while more is below it ([legendFold]): a line at the fold once read as
- *  clipping. The header's height is reported through [onHeaderMeasured] for
- *  the card's floor. The OSM tile credit is not here: it is the map's own fixed overlay under
- *  the card ([MapOsmCredit]), so it stays visible and still whether the card is open or not.
- *  Every parameter is a primitive, a string, a remembered list or a lambda, so the BLE-rate
- *  recompositions of the screen skip it. TWIN: iOS MapTabView.legendCard (its accessibility-size
- *  forms: the header fixed over scrolling keys, else legendHeaderScroll). */
-@Composable
-private fun MapLegendCardContent(
-    maxHeightPx: Int,
-    headline: String,
-    countsLine: String,
-    visibleCount: Int,
-    onOpenList: () -> Unit,
-    keyLegend: List<LegendEntry>,
-    hasStalePins: Boolean,
-    hasOperatorPins: Boolean,
-    alprEnabled: Boolean,
-    alprPeekCount: Int,
-    onClose: () -> Unit,
-    onHeaderMeasured: (Int) -> Unit,
-) {
-    // The header row and the counts line, measured for the form choice; 0 until laid out (the
-    // header stays fixed until both are known). Fresh on every open: AnimatedVisibility drops
-    // this content when the card closes.
-    var headerPx by remember { mutableIntStateOf(0) }
-    var countsPx by remember { mutableIntStateOf(0) }
-    // The least the card needs under the header to show its first key row: the 4dp top and 16dp
-    // bottom padding here, the body's 8dp top padding, the counts line, the grid's 8dp top
-    // padding and one 48dp key row (the same row the card's floor reserves).
-    val restPx = with(LocalDensity.current) { (4.dp + 16.dp + 8.dp + 8.dp + 48.dp).roundToPx() } + countsPx
-    val headerScrolls = mapLegendHeaderScrolls(cardMaxPx = maxHeightPx, headerPx = headerPx, restPx = restPx)
-    val scroll = rememberScrollState()
-    Column(Modifier.fillMaxWidth().padding(top = 4.dp, bottom = 16.dp)) {
-        val header: @Composable () -> Unit = {
-            MapLegendCardHeader(
-                headline = headline,
-                visibleCount = visibleCount,
-                onOpenList = onOpenList,
-                onClose = onClose,
-                onMeasured = { headerPx = it; onHeaderMeasured(it) },
-            )
-        }
-        val body: @Composable () -> Unit = {
-            MapLegendCardBody(
-                countsLine = countsLine,
-                keyLegend = keyLegend,
-                hasStalePins = hasStalePins,
-                hasOperatorPins = hasOperatorPins,
-                alprEnabled = alprEnabled,
-                alprPeekCount = alprPeekCount,
-                onCountsMeasured = { countsPx = it },
-            )
-        }
-        val fold = MaterialTheme.colorScheme.surfaceContainerHigh
-        if (headerScrolls) {
-            Column(Modifier.weight(1f, fill = false).legendFold(scroll, fold).verticalScroll(scroll)) {
-                header()
-                body()
+            // The header row and the counts line, measured for the form choice; 0 until laid out
+            // (the header stays fixed until both are known). Fresh on every open:
+            // AnimatedVisibility drops this content when the card closes.
+            var headerPx by remember { mutableIntStateOf(0) }
+            var countsPx by remember { mutableIntStateOf(0) }
+            // The least the card needs under the header to show its first key row: the 4dp top and
+            // 16dp bottom padding here, the body's 8dp top padding, the counts line, the grid's 8dp
+            // top padding and one 48dp key row (the same row the card's floor reserves).
+            val restPx = with(LocalDensity.current) { (4.dp + 16.dp + 8.dp + 8.dp + 48.dp).roundToPx() } + countsPx
+            val headerScrolls = mapLegendHeaderScrolls(cardMaxPx = maxHeightPx, headerPx = headerPx, restPx = restPx)
+            val scroll = rememberScrollState()
+            Column(Modifier.fillMaxWidth().padding(top = 4.dp, bottom = 16.dp)) {
+                val header: @Composable () -> Unit = {
+                    MapLegendCardHeader(
+                        headline = headline,
+                        visibleCount = visibleCount,
+                        onOpenList = onOpenList,
+                        onClose = onClose,
+                        onMeasured = { headerPx = it; onHeaderMeasured(it) },
+                    )
+                }
+                val body: @Composable () -> Unit = {
+                    MapLegendCardBody(
+                        countsLine = countsLine,
+                        keyLegend = keyLegend,
+                        hasStalePins = hasStalePins,
+                        hasOperatorPins = hasOperatorPins,
+                        alprEnabled = alprEnabled,
+                        alprPeekCount = alprPeekCount,
+                        onCountsMeasured = { countsPx = it },
+                    )
+                }
+                val fold = MaterialTheme.colorScheme.surfaceContainerHigh
+                if (headerScrolls) {
+                    Column(Modifier.weight(1f, fill = false).legendFold(scroll, fold).verticalScroll(scroll)) {
+                        header()
+                        body()
+                    }
+                } else {
+                    header()
+                    Column(Modifier.weight(1f, fill = false).legendFold(scroll, fold).verticalScroll(scroll)) { body() }
+                }
             }
-        } else {
-            header()
-            Column(Modifier.weight(1f, fill = false).legendFold(scroll, fold).verticalScroll(scroll)) { body() }
         }
     }
 }
@@ -2895,7 +2822,7 @@ private fun Modifier.legendFold(scroll: ScrollState, color: Color): Modifier = d
 }
 
 /** The legend card's header row: the honesty headline and the close button. Its height goes to
- *  [onMeasured] (the card's floor and its form choice, see [MapLegendCardContent]). */
+ *  [onMeasured] (the card's floor and its form choice, see [MapLegendCard]). */
 @Composable
 private fun MapLegendCardHeader(
     headline: String,
@@ -2947,7 +2874,7 @@ private fun MapLegendCardHeader(
 
 /** The legend card's body under the header row: the counts line (its height goes to
  *  [onCountsMeasured] for the card's form choice), the key grid, the conditional keys and the
- *  ALPR data credit. The caller scrolls it (see [MapLegendCardContent]). */
+ *  ALPR data credit. The caller scrolls it (see [MapLegendCard]). */
 @Composable
 private fun MapLegendCardBody(
     countsLine: String,

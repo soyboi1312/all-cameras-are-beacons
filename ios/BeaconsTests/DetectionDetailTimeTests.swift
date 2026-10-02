@@ -81,12 +81,12 @@ final class DetectionDetailTimeTests: XCTestCase {
     /// The confidence row: the verdict band, then the percent, at both band edges (50 and 80).
     /// Wrong input it catches: the weak band spelled `case ...50:` (50 reads weak).
     func testConfidenceLineNamesTheBandAndThePercent() {
-        XCTAssertEqual(dossierConfidenceLine(confidence: 0), "Weak match, verify \u{00B7} 0%")
-        XCTAssertEqual(dossierConfidenceLine(confidence: 49), "Weak match, verify \u{00B7} 49%")
-        XCTAssertEqual(dossierConfidenceLine(confidence: 50), "Partial match \u{00B7} 50%")
-        XCTAssertEqual(dossierConfidenceLine(confidence: 79), "Partial match \u{00B7} 79%")
-        XCTAssertEqual(dossierConfidenceLine(confidence: 80), "Strong match \u{00B7} 80%")
-        XCTAssertEqual(dossierConfidenceLine(confidence: 100), "Strong match \u{00B7} 100%")
+        XCTAssertEqual(dossierConfidenceLine(type: .flockCamera, confidence: 0), "Weak match, verify \u{00B7} 0%")
+        XCTAssertEqual(dossierConfidenceLine(type: .flockCamera, confidence: 49), "Weak match, verify \u{00B7} 49%")
+        XCTAssertEqual(dossierConfidenceLine(type: .flockCamera, confidence: 50), "Partial match \u{00B7} 50%")
+        XCTAssertEqual(dossierConfidenceLine(type: .flockCamera, confidence: 79), "Partial match \u{00B7} 79%")
+        XCTAssertEqual(dossierConfidenceLine(type: .flockCamera, confidence: 80), "Strong match \u{00B7} 80%")
+        XCTAssertEqual(dossierConfidenceLine(type: .flockCamera, confidence: 100), "Strong match \u{00B7} 100%")
     }
 
     /// A dossier value draws through keepingMiddleDotsAttached: a no-break space before each
@@ -96,9 +96,9 @@ final class DetectionDetailTimeTests: XCTestCase {
     /// space returns), a joiner AFTER the dot instead of before it, and a helper that joins only
     /// the first dot. It does not see the view: dossierRowValue must keep drawing this builder.
     func testDossierValueKeepsEachMiddleDotOnItsWordsLine() {
-        XCTAssertEqual(dossierValueForDisplay(dossierConfidenceLine(confidence: 80)),
+        XCTAssertEqual(dossierValueForDisplay(dossierConfidenceLine(type: .flockCamera, confidence: 80)),
                        "Strong match\u{00A0}\u{00B7} 80%")
-        XCTAssertEqual(dossierValueForDisplay(methodChipLabel(method: .oui, maker: "Axon")),
+        XCTAssertEqual(dossierValueForDisplay(methodChipLabel(type: .axonBodyCam, method: .oui, maker: "Axon")),
                        "OUI\u{00A0}\u{00B7} VENDOR ONLY")
         XCTAssertEqual(dossierValueForDisplay("3 \u{00B7} first 4m ago \u{00B7} derived"),
                        "3\u{00A0}\u{00B7} first 4m ago\u{00A0}\u{00B7} derived")
@@ -158,9 +158,9 @@ final class DetectionDetailTimeTests: XCTestCase {
 
     /// U3-a: no "Remote ID over Remote ID". Wrong input: always "over <source>".
     func testFlaggedLineDropsARepeatedSource() {
-        XCTAssertEqual(dossierFlaggedLine(methodLabel: "Remote ID", sourceLabel: "Remote ID"),
+        XCTAssertEqual(dossierFlaggedLine(type: .drone, methodLabel: "Remote ID", sourceLabel: "Remote ID"),
                        "Flagged by Remote ID.")
-        XCTAssertEqual(dossierFlaggedLine(methodLabel: "OUI match", sourceLabel: "WiFi"),
+        XCTAssertEqual(dossierFlaggedLine(type: .flockCamera, methodLabel: "OUI match", sourceLabel: "WiFi"),
                        "Flagged by OUI match over WiFi.")
     }
 
@@ -180,12 +180,48 @@ final class DetectionDetailTimeTests: XCTestCase {
     /// retired "NAME MATCH". TWIN: android DetailTimeLabelsTest
     /// methodChipLabelPrefersVendorOnlyOverChipsetOnly.
     func testMethodChipLabelKeepsEachLabelsOwnCasing() {
-        XCTAssertEqual(methodChipLabel(method: .oui, maker: "Axon"), "OUI · VENDOR ONLY")
-        XCTAssertEqual(methodChipLabel(method: .oui, maker: nil), "OUI · CHIPSET ONLY")
-        XCTAssertEqual(methodChipLabel(method: .name, maker: nil), "device name")
-        XCTAssertEqual(methodChipLabel(method: .mfgID, maker: "Meta"), "manufacturer ID")
-        XCTAssertEqual(methodChipLabel(method: .ssid, maker: nil), "SSID")
-        XCTAssertEqual(methodChipLabel(method: .remoteID, maker: nil), "Remote ID")
+        XCTAssertEqual(methodChipLabel(type: .axonBodyCam, method: .oui, maker: "Axon"), "OUI · VENDOR ONLY")
+        XCTAssertEqual(methodChipLabel(type: .flockCamera, method: .oui, maker: nil), "OUI · CHIPSET ONLY")
+        XCTAssertEqual(methodChipLabel(type: .tracker, method: .name, maker: nil), "device name")
+        XCTAssertEqual(methodChipLabel(type: .recordingGlasses, method: .mfgID, maker: "Meta"), "manufacturer ID")
+        XCTAssertEqual(methodChipLabel(type: .flockCamera, method: .ssid, maker: nil), "SSID")
+        XCTAssertEqual(methodChipLabel(type: .drone, method: .remoteID, maker: nil), "Remote ID")
+    }
+
+    /// A Desert-mode row matched no signature, so no dossier line calls it a match, whatever
+    /// method desert_detect.cpp stamped (SSID on WiFi, none on BLE): "matched on" reads "no
+    /// signature", confidence reads "Not a match" with no percent, and the flagged line names only
+    /// the radio. The same method or confidence on any other type keeps its usual words. Wrong
+    /// inputs: keying on the method or the number instead of the type fails a non-Desert
+    /// assertion; dropping an arm fails its Desert assertion. TWIN: android DetailTimeLabelsTest
+    /// nearbyDeviceRowsClaimNoSignature.
+    func testNearbyDeviceRowsClaimNoSignature() {
+        XCTAssertEqual(methodChipLabel(type: .nearbyDevice, method: .ssid, maker: nil), "no signature")
+        XCTAssertEqual(methodChipLabel(type: .nearbyDevice, method: .none, maker: nil), "no signature")
+        XCTAssertEqual(methodChipLabel(type: .flockCamera, method: .ssid, maker: nil), "SSID")
+        XCTAssertEqual(dossierConfidenceLine(type: .nearbyDevice, confidence: 0), "Not a match")
+        XCTAssertEqual(dossierConfidenceLine(type: .unknown, confidence: 0), "Weak match, verify \u{00B7} 0%")
+        XCTAssertEqual(dossierFlaggedLine(type: .nearbyDevice, methodLabel: "SSID", sourceLabel: "WiFi"),
+                       "Heard over WiFi in desert mode.")
+        XCTAssertEqual(dossierFlaggedLine(type: .nearbyDevice, methodLabel: "unknown", sourceLabel: "BLE"),
+                       "Heard over BLE in desert mode.")
+        XCTAssertEqual(dossierFlaggedLine(type: .flockCamera, methodLabel: "SSID", sourceLabel: "WiFi"),
+                       "Flagged by SSID over WiFi.")
+    }
+
+    /// The Desert-mode explainer: the no-match sentence, then a gloss on the firmware's address
+    /// label when it is one of the three desert_detect.cpp writes. Wrong inputs: swapping two arms
+    /// fails the label check; an arm that drops the base fails the prefix check; a gloss on an
+    /// unknown label or a buffered row (no detail) fails the last two. TWIN: android
+    /// DetailTimeLabelsTest nearbyDeviceLineSaysNoSignatureMatched.
+    func testNearbyDeviceLineSaysNoSignatureMatched() {
+        let base = "Desert mode lists every nearby device it hears, and no signature matched this one."
+        for label in ["randomized MAC", "hardware OUI", "OUI unknown"] {
+            let line = dossierNearbyDeviceLine(detail: label)
+            XCTAssertTrue(line.hasPrefix("\(base) \"\(label)\" means "), line)
+        }
+        XCTAssertEqual(dossierNearbyDeviceLine(detail: nil), base)
+        XCTAssertEqual(dossierNearbyDeviceLine(detail: "some future label"), base)
     }
 
     /// U3-f: the body-cam fallback sentence names the offline buffer only for a real replay.

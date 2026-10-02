@@ -319,6 +319,7 @@ struct ConnectView: View {
                 spacing: expandedHearsLayout ? 14 : 8
             ) {
                 ForEach(hears, id: \.1) { type, label in
+                    let spoken = detectionCategories.first { $0.type == type }?.spoken ?? label.lowercased()
                     VStack(spacing: 7) {
                         CatGlyph(type: type, size: 30)
                         // Tiles align on their top edge so the six glyphs share one line. A
@@ -335,7 +336,7 @@ struct ConnectView: View {
                     }
                     .frame(maxWidth: .infinity)
                     .accessibilityElement(children: .ignore)
-                    .accessibilityLabel(spokenHearsLabel(label))
+                    .accessibilityLabel(spoken)
                 }
             }
             Text("trackers and network cameras are opt-in, switch them on in Beacon settings.")
@@ -552,18 +553,6 @@ struct ConnectView: View {
             Spacer(minLength: 0)
         }
         .padding(.horizontal, 4)
-    }
-
-    private func spokenHearsLabel(_ label: String) -> String {
-        switch label {
-        case "ALPR": return "automatic license plate readers"
-        case "DRONES": return "drones"
-        case "BODY CAMS": return "body cameras"
-        case "TRACKERS": return "item trackers"
-        case "GLASSES": return "recording glasses"
-        case "NET CAM": return "network cameras"
-        default: return label.lowercased()
-        }
     }
 
     /// The filled primary button face: onAccent on tint, radius 12, grows with a wrapped title.
