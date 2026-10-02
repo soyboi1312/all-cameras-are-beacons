@@ -6,9 +6,9 @@ detection is passive: shipping firmware never probes, jams, spoofs, controls, or
 
 ## getting started
 
-the apps are free, but live detection needs a compatible board. without one, you can still use sample mode and your saved Log.
+the apps are free, but live detection needs a compatible board. without one, you can still use sample data and your saved Log.
 
-- **buy a beacon** on [Tindie](https://www.tindie.com/stores/soyboitech/). [soyboi.tech](https://soyboi.tech) has current pricing and availability.
+- **buy a beacon** on [Tindie](https://www.tindie.com/stores/soyboitech/) or [Etsy](https://www.etsy.com/shop/soyboitech): the slim model ([Tindie](https://www.tindie.com/products/soyboitech/beacon-slim-pocket-counter-surveillance-detector/), [Etsy](https://www.etsy.com/listing/4587255406/airtag-and-bluetooth-tracker-detector)) or the battery model ([Tindie](https://www.tindie.com/products/soyboitech/beacon-battery-pocket-counter-surveillance/), [Etsy](https://www.etsy.com/listing/4587261765/rechargeable-airtag-and-bluetooth)). [soyboi.tech](https://soyboi.tech) has current pricing and availability.
 - **try the app without hardware:** install it for [iPhone](https://apps.apple.com/us/app/beacons-surveillance-scanner/id6781841861) or [Android](https://play.google.com/store/apps/details?id=tech.soyboi.beacons) and tap **See How It Works** for a tour with made-up detections.
 - **connect a board:** turn it on, tap **Scan for Beacons**, pick your board, and approve the pairing request. the app takes you through setup and permissions. do the first pairing somewhere you trust; see the [pairing guide](docs/app-guide.md#try-it-or-connect-a-board).
 - **flash your own OUI-Spy or Mesh-Detect** with the [DIY flasher](https://soyboi1312.github.io/all-cameras-are-beacons/) or [from the command line](#flashing-from-the-command-line).
@@ -24,8 +24,8 @@ all three boards run the same detector engine and the same per-category settings
 | hardware | radios | alerts |
 |---|---|---|
 | **the beacon** (rev-A and rev-B) | nRF52840 dedicated to Bluetooth scanning; ESP32-S3 for Wi-Fi and the app link | phone app, onboard buzzer, optional encrypted offline log |
-| **OUI-Spy** | Seeed XIAO ESP32-S3, one radio shared between Wi-Fi and Bluetooth | phone app |
-| **Mesh-Detect** | the same XIAO build, plus a wired Heltec V3 running Meshtastic | phone app and mesh alerts, with optional phone location while connected |
+| **OUI-Spy** | Seeed XIAO ESP32-S3, one radio shared between Wi-Fi and Bluetooth | phone app, onboard buzzer, optional encrypted offline log |
+| **Mesh-Detect** | the same XIAO build, plus a wired Heltec V3 running Meshtastic | phone app and mesh alerts, with optional phone location while connected, and an optional encrypted offline log |
 
 the beacon is about the size of an AirPods case and runs on USB-C power; the battery model charges through the same port. retail units come pre-flashed. pair one with the app to choose detector categories, alerts, and optional location or offline logging. firmware updates come through the app, and USB recovery is specific to each board revision (see [production beacon](#production-beacon)).
 
@@ -35,10 +35,10 @@ for Mesh-Detect, [mesh setup](docs/mesh-setup.md) covers the Heltec wiring and t
 
 | category | radio | default | notes |
 |---|---|---|---|
-| **Flock cameras** (license-plate readers) | Bluetooth + Wi-Fi | on | a supported name or SSID is strong evidence; a vendor-prefix match needs confirming |
+| **Flock cameras** (license-plate readers) | Bluetooth + Wi-Fi | on | a camera's own Flock- network name, the FS Ext Battery name, or a name with Flock's manufacturer ID is strong evidence; other names and vendor-prefix matches need confirming |
 | **Flock Raven** audio sensors | Bluetooth | on | matches Raven-specific services seen in field captures |
-| **Remote ID drones** | Bluetooth + Wi-Fi | on | broadcasts can include the aircraft's position; a separate, opt-in vendor fallback may identify a controller |
-| **body cams** (Axon and Utility BodyWorn) | Bluetooth + Wi-Fi | on | Axon's device tag is the strongest match; the Motorola vendor match is broad, weak, and a separate opt-in |
+| **Remote ID drones** | Bluetooth + Wi-Fi | on | broadcasts can include the aircraft's position; a separate, opt-in vendor match flags drones without Remote ID, but a hit may be a controller or other vendor gear |
+| **body cams** (Axon and Utility BodyWorn) | Bluetooth + Wi-Fi | on | Axon's device tag is the strongest match; the Motorola vendor match (Motorola Solutions and WatchGuard Video blocks) is broad, weak, and a separate opt-in |
 | **item trackers** | Bluetooth | off | Find My, Find Hub, Tile, and SmartTag; Find My and Find Hub tags only count once separated from their owner; no buzzer alerts on the board |
 | **smart or recording glasses** | Bluetooth | on | eyewear-specific evidence is stronger; some Meta identifiers also appear on other hardware |
 | **network cameras** | Wi-Fi | off | a vendor match may be a camera, recorder, hub, or accessory |
@@ -51,25 +51,25 @@ diagnostic builds also log [capture candidates](docs/signatures.md#capture-only-
 
 ### confidence
 
-a decoded Remote ID payload or a device-specific signature is strong evidence. a match on a vendor's radio-address prefix (OUI) is weaker: it identifies the registered vendor, not the exact product. prefixes from chip suppliers that would flag unrelated consumer gear are excluded.
+a decoded Remote ID payload or a device-specific signature is strong evidence. a match on a vendor's radio-address prefix (OUI) is weaker: it identifies the registered vendor, not the exact product. prefixes from chip suppliers that would flag unrelated consumer gear are excluded, with one exception: four Liteon Wi-Fi prefixes seen at Flock Falcon sites still match probe requests, so a laptop can trigger them.
 
 tap a detection to see how it was matched, its confidence, and the evidence. **confidence describes how specific the evidence is.** it is not signal strength, and it is not the probability that a camera is there. treat weak matches as leads to check.
 
 ### what it can hear
 
-the board only listens on 2.4 GHz; there is no 5 GHz radio. it cannot see equipment that never makes a supported broadcast, such as wired-only or purely optical gear. Wi-Fi is scanned one channel at a time, so short transmissions can be missed, and battery-saver mode adds more gaps. OUI-Spy and Mesh-Detect split one radio's time between Wi-Fi and Bluetooth; the beacon's dedicated Bluetooth scanner runs the whole time during normal scanning.
+the board only listens on 2.4 GHz; there is no 5 GHz radio. it cannot see equipment that never makes a supported broadcast, such as wired-only or purely optical gear. Wi-Fi is scanned one channel at a time, so short transmissions can be missed, and Wi-Fi eco mode adds more gaps. OUI-Spy and Mesh-Detect split one radio's time between Wi-Fi and Bluetooth; the beacon's dedicated Bluetooth scanner runs the whole time during normal scanning.
 
-an empty screen means nothing supported was recognized while the board was listening. **it does not mean you are unwatched.** [radio coverage](docs/radio-coverage.md) has the channel schedule, duty cycles, and battery-saver tradeoffs.
+an empty screen means nothing supported was recognized while the board was listening. **it does not mean you are unwatched.** [radio coverage](docs/radio-coverage.md) has the channel schedule, duty cycles, and Wi-Fi eco tradeoffs.
 
 ## privacy
 
-there are no accounts, analytics, or third-party trackers, and nothing is uploaded automatically. detections stay on your board and phone unless you export or contribute them yourself. the apps do go online to load map tiles, firmware files, and the optional mapped-camera dataset, but those requests never include your detections.
+there are no accounts, analytics, or third-party trackers, and nothing is uploaded automatically. detections stay on your board and phone unless you export or contribute them yourself. Mesh-Detect is the exception: it sends detections out as mesh alerts, which can include your phone's location while it is connected, and the default build posts them on the public channel that anyone on the mesh can read. the apps do go online to load map tiles, firmware files, and the optional mapped-camera dataset, but those requests never include your detections.
 
 if you allow location access, the phone geotags sightings and sends its position to the board over the encrypted link. offline records can keep that location. exports can include both where you were and the positions drones broadcast, so check an export before you share it.
 
 two things these protections do not cover:
 
-- **the board can be tracked.** it advertises a fixed factory Bluetooth address so bonded iPhones can reconnect reliably.
+- **the board can be tracked.** it advertises a fixed factory Bluetooth address, because iPhones could not connect to a rotating one in testing.
 - **offline encryption does not protect a seized board from forensic access.** while buffering is on, the key is stored on the board.
 
 read the [privacy policy](web/privacy.html) and the [Bluetooth privacy details](docs/ble-protocol.md#peripheral-address-bonding-and-privacy) before you rely on any of this.
@@ -85,14 +85,14 @@ both apps have the same four tabs:
 
 **most pins show where your phone heard a signal, not where the device is.** Remote ID drones are the exception, since they can broadcast their own position. the community camera layer is reference data, so a missing pin does not mean there is no camera.
 
-you can star or mute individual devices, turn on phone notifications per category (they all start off), and check counts at a glance with Live Mode or home-screen widgets. permanent mutes sync to the board. timed and place mutes only apply on the phone, so the board can still sound for that device. both apps support screen readers, larger text, and higher contrast, and are English-only for now.
+you can **Watch** or mute individual devices, turn on phone notifications per category (they all start off), and check counts at a glance with Live Mode or home-screen widgets. permanent mutes sync to the board. timed and place mutes only apply on the phone, so the board can still sound for that device. both apps support screen readers, larger text, and higher contrast, and are English-only for now.
 
 | platform | requires | install | build from source |
 |---|---|---|---|
 | iPhone | iOS 18 or newer | [App Store](https://apps.apple.com/us/app/beacons-surveillance-scanner/id6781841861) | [iOS README](ios/README.md) |
 | Android | Android 8 or newer | [Google Play](https://play.google.com/store/apps/details?id=tech.soyboi.beacons) | [Android README](android/README.md) |
 
-the [app guide](docs/app-guide.md) covers pairing, permissions, sample mode, alerts and mutes, tracker evidence, Live Mode, widgets, and accessibility.
+the [app guide](docs/app-guide.md) covers pairing, permissions, sample data, alerts and mutes, tracker evidence, Live Mode, widgets, and accessibility.
 
 ## flashing
 
@@ -103,7 +103,7 @@ normal updates come through the app. USB recovery depends on the board revision:
 - [rev-A beacon flasher](https://soyboi.tech/flash.html)
 - [rev-B beacon flasher](https://soyboi.tech/flash-revb.html)
 
-**never flash one revision's image onto the other, or a DIY image onto a production beacon.** the wrong image can leave the board needing USB recovery. each flasher page says whether a current recovery image is available.
+**never flash one revision's image onto the other, or a DIY image onto a production beacon.** the wrong image can leave the board needing USB recovery.
 
 ### DIY OUI-Spy and Mesh-Detect
 
@@ -136,7 +136,7 @@ pio device monitor -b 115200
 |---|---|
 | [firmware/](firmware/) | shared detector engine, board entry points, tests, and release tools |
 | [ios/](ios/) and [android/](android/) | native apps and system widgets |
-| [web/](web/) | browser flashers and DIY release manifests |
+| [web/](web/) | the DIY browser flasher and its release manifests |
 | [docs/](docs/) | app guide, radio coverage, signature evidence, protocol, mesh setup, and map performance checks |
 
 good places to start:
@@ -151,7 +151,7 @@ the companion nRF firmware and the beacon's hardware design files are not in thi
 
 ## project status
 
-the source tree is at **2.0.9** for the ESP32-S3 firmware and **2.1.0** for both apps. published releases can trail the source, so check the app's firmware update screen and the store listings for what is actually available.
+the source tree is at **2.1.0** for the ESP32-S3 firmware and **2.1.1** for both apps. published releases can trail the source, so check the app's firmware update screen and the store listings for what is actually available.
 
 the detector, mesh path, apps, and update flows have all been tested on real hardware. field testing continues, especially for the capture candidates. the [OTA protocol](docs/ble-protocol.md#firmware-update-ota) documents the update order.
 

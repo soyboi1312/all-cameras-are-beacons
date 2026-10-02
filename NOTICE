@@ -4,9 +4,8 @@ Copyright 2026 soyboi
 This product includes software from the OpenDroneID project
 (opendroneid-core-c), licensed under the Apache License, Version 2.0.
 That component's license is retained alongside its source at
-firmware/lib/acab_core/opendroneid/LICENSE (a second copy, used by the
-host-side simulator, lives at firmware/src/odid-sim/ and carries SPDX
-Apache-2.0 headers in each file).
+firmware/lib/acab_core/opendroneid/LICENSE (the one vendored copy; the
+bench simulator at firmware/src/odid-sim/ compiles that same source).
 
 The firmware binaries also include three permissively-licensed libraries linked
 at build time:

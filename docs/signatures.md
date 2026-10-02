@@ -97,10 +97,10 @@ only with independent Flock-specific evidence.
   the same `ext=1` gate as an unvalidated OUI row (`FLOCK_SSID_FALCON_SUFFIX_EXT`, read by
   `falconSsidSuffix()`), which is compile-time false with no runtime toggle, so both the conf-85 and
   the conf-72 half fold away in every build and no shipped firmware reports a `-FALCON` name as
-  anything. The labels are now spelled `fwnote:falcon-oui-data` / `fwnote:falcon-oui-probe` so the
-  round trip cannot be made again. The `Flock-` prefix rules are untouched. To ship it: a capture of
-  a real beacon (`0x8`) or probe-response (`0x5`) SSID IE ending in `-FALCON`, from a unit confirmed
-  to be a Falcon by something other than this table.
+  anything. The probe label is now spelled `fwnote:falcon-oui-probe`, and the data-frame line is a
+  `FAL-DATA n=...` counter record, so the round trip cannot be made again. The `Flock-` prefix rules
+  are untouched. To ship it: a capture of a real beacon (`0x8`) or probe-response (`0x5`) SSID IE
+  ending in `-FALCON`, from a unit confirmed to be a Falcon by something other than this table.
 - **Watchlist (diag only):** the BLE name `Pigvision` is a candidate Flock signature carried ONLY in
   the `ACAB_DIAG` build (it logs `*** PIGVISION CANDIDATE ***`), never in production. A confirmed
   field sighting is the trigger to promote it into `FLOCK_NAME_PATTERNS`.
@@ -206,7 +206,10 @@ the body-cam type (the apps have no separate Motorola category), with the detail
 naming the honest source ("Motorola Solutions OUI") and confidence held at 45, below the
 apps' weak-match threshold (50), so every hit renders as amber "weak match, verify"
 rather than a calm partial match. Do not raise it above 50 and do not label it "ALPR
-camera": either is a false-certainty bug, not a tuning choice.
+camera": either is a false-certainty bug, not a tuning choice. Since 2.1.0 the same detector
+also matches WatchGuard Video's block `00:1D:96` (Motorola Solutions owns WatchGuard) from its own
+table, under its own detail string "WatchGuard Video OUI", with the same toggle and the same 45;
+see the WatchGuard Video subsection in the body cam section.
 
 ### Considered and REJECTED: Sierra Wireless AirLink and Cradlepoint vehicle routers (2026-08-02)
 
@@ -216,8 +219,9 @@ IEEE-confirmed against a fresh `standards-oui.ieee.org` pull:
 `Sierra Wireless, ULC` = `50:13:9D 84:DB:2F 64:CE:6E CC:93:4A 00:A0:D5 28:A3:31`;
 `CradlePoint, Inc` = `00:30:44 00:E0:1C`. **Rejected anyway**, for three independent reasons:
 
-1. **The table cannot say who it matched.** `POLICE_OUI[][3]` has no per-row vendor field, and
-   `police_detect.cpp` hard-codes `"Motorola Solutions OUI"` into the detail string. Appending
+1. **The table could not say who it matched.** In 2026-08 `POLICE_OUI[][3]` had no per-row vendor
+   field, and `police_detect.cpp` hard-coded `"Motorola Solutions OUI"` into the detail string
+   (2.1.0 changed this; see the 2026-10-01 update below). Appending
    these blocks would report a Sierra AirLink on a transit bus **as a Motorola body cam** , a lie
    about the vendor on every hit. That is why this is not an "add the rows at low confidence"
    situation: the confidence would be honest and the vendor name would not.
@@ -237,6 +241,50 @@ IEEE-confirmed against a fresh `standards-oui.ieee.org` pull:
 
 Re-proposing these needs a captured BSSID from a marked vehicle, and a per-row vendor field in
 `POLICE_OUI` before any hit could be labelled honestly.
+
+**Update 2026-09-30: field data answers point 3; points 1 and 2 still stand.**
+
+- Cradlepoint radios do transmit on Cradlepoint's own block. `drive_home_9-4.log` (own capture,
+  gitignored with the other raw logs in `firmware/tools/detection logs`) holds 67 distinct
+  `00:30:44` BSSIDs, among them `00:30:44:B3:06:6B` advertising the fleet-style SSID `OPD 3484`.
+  So the BSSID carries the vendor block, not a module maker's.
+- That volume is also why point 2 holds. On the 2026-09-27 drive, Desert mode ran for 38 minutes
+  on US-101 between Agoura Hills and Oxnard and logged 21 distinct `00:30:44` BSSIDs, about one
+  every two minutes. On 2026-09-30, `00:30:44:B4:2D:33` appeared 25 s after two Axon hits beside
+  patrol cars (owner-confirmed; see the body cam section). Desert ran for only 53 s there, and one
+  router in 53 s is the freeway base rate, so the co-location is not evidence.
+- The SSID is the only field that could tell a patrol install from a bus, and each fleet names
+  its own, so there is no general pattern to match. Point 1 (no per-row vendor field in
+  `POLICE_OUI`) is unchanged.
+
+**Update 2026-10-01: a second agency SSID, and the reason it still is not a pattern.**
+
+- `oct012026.log` (own capture, gitignored like the other raw logs): `00:30:44:B1:09:30` beaconed
+  the SSID `VCSO 3425` at 08:42:27 PDT, one frame at -88 dBm, 89 s after an owner ground-truth
+  marker for law enforcement on scene (08:40:57). `VCSO` reads as the Ventura County Sheriff's
+  Office, which fits the place (a Camarillo SSID is in the same window). It has the same form as
+  `OPD 3484`: agency letters, a space, a unit number.
+- The same scene has a second tie to that agency. At 08:40:59, 2 s after the marker, a client with
+  a randomized MAC (`0E:D0:97:9F:75:E2`, so no vendor block) sent a probe request for the SSID
+  `VCSO-Radio`. On 2026-09-27 a Motorola unit probed for the same SSID; see the Motorola road
+  ground truth below.
+- Why this still does not make a rule: across all the raw logs in `firmware/tools/detection logs`,
+  664 distinct SSIDs have the form "2 to 5 capitals, a space, 3 to 5 digits". `OPD 3484` and
+  `VCSO 3425` are the only agency names among them. Most of the others are car hotspots such as
+  `BMW 24631` and `MINI 45552`. A person can read an agency SSID; a matcher cannot.
+- Point 2 again: this one log holds 154 distinct `00:30:44` BSSIDs in about 4 h 20 min, and 54
+  never showed an SSID. The Cradlepoints near the owner's other markers that morning had no SSID,
+  so they prove nothing. A fleet with bare-number SSIDs (`2004`, `2408`, `2783`, ...) on
+  `00:30:44:22` was beside the afternoon body cam scene, but the `aug-9-drive*.log` captures show
+  the same block with a dozen other numbers, so it is a common fleet and not evidence.
+- Point 1 changed in 2.1.0. `police_detect.cpp` now takes the detail string from the table that
+  matched, and WatchGuard Video has its own table and label (see the WatchGuard Video subsection
+  under body cams). The same route could name a Cradlepoint honestly, at the cost of a new table
+  and a wire string both apps must learn. Point 2 still decides it: a patrol install and a bus
+  install look the same on the air.
+- `OPD 3484` is always the same BSSID, `00:30:44:B3:06:6B`, on four drives (2026-09-04, 09-13,
+  09-27 and 10-01). It is a router at one place on the owner's route, not a car that follows the
+  owner. The WatchGuard Video section below has two sightings from that same stretch of road.
 
 **Coverage went from 1 block to 7 (2026-07-19).** The table shipped only `4C:CC:34`, which
 left six sibling blocks of the same vendor's gear invisible. This is now the COMPLETE set
@@ -273,6 +321,46 @@ therefore a coverage fix, not a precision regression.
 site), which is what establishes this vendor as detectable on this board at all; the six
 siblings are the same product lines from the same registrant.
 src: IEEE OUI registry -> https://maclookup.app/macaddress/4CCC34
+
+**Road ground truth (2026-07-25 to 2026-09-30): on the road, these blocks have landed on
+law-enforcement gear.** The 2026-07-23 airport result measured fixed equipment. Every Motorola
+road hit the owner has confirmed since then was law-enforcement gear on scene. Hits is the app
+CSV's `sightings` column; the 2026-09 rows come from app CSV exports that are not kept in the
+repo. Three other road hits stayed unconfirmed; the owner did not check them either way:
+`4C:CC:34:2E:C4:B4` on a residential block (`santabarbara.log`, 2026-09-02, one frame at -94),
+`4C:CC:34:E8:FF:02` probing for the SSID `LACAPX`, which reads as an APX radio (`913.log`,
+2026-09-13), and `4C:CC:34:90:84:84` next to a hotel (`los_angeles.log`, 2026-09-19, one frame).
+
+| Date | Where | MAC | Hits | What the owner saw |
+|---|---|---|---|---|
+| 2026-07-25 | downtown San Diego waterfront | 8 MACs on `10:74:6F` | | body cams on scene, at the same spot as about a dozen tagged Axon cams (owner report; capture not kept) |
+| 2026-09-27 | I-5, Anaheim | `4C:CC:34:93:56:02` | 3 | law enforcement on scene, at freeway speed |
+| 2026-09-27 | US-101, Camarillo | `10:74:6F:66:E7:6F` | 3 | law enforcement on scene, at freeway speed |
+| 2026-09-30 | Camarillo | `10:74:6F:66:D7:CF` | 66 | driving beside patrol cars, next to a tagged and an untagged Axon device |
+| 2026-09-30 | Camarillo, 3.4 km further south | `10:74:6F:21:CF:8E` | 1 | driving past a patrol car |
+
+What this shows, and what it does not:
+
+- A road hit on these blocks is worth surfacing. It is still not proof of a body cam. The owner
+  confirmed law enforcement on scene, not the device type. On 2026-09-30 the same officers
+  carried Axon gear, and agencies usually standardize on one body-cam vendor, so that Motorola
+  unit was more likely a radio or in-car video. Conf 45, the amber "verify" treatment and the
+  opt-in default all stay: fixed equipment, the airport failure mode, is still where the match
+  goes wrong.
+- **Moving vs fixed, measured once.** `10:74:6F:66:D7:CF` was first heard at 12:14:28 PDT, and
+  its strongest reading came about 700 m further down the road, so it traveled with the
+  observer. The airport's fixed unit logged 20 sightings from effectively one spot (see the
+  ground-truth note in `bodycam_vendor_signatures.h`). The raw count does not separate the two;
+  sightings spread over distance moved does. That header asks for exactly this worn-vs-mounted
+  discriminator before any default change. It is an observation, not a shipped rule.
+- The two Camarillo MACs four days apart, `10:74:6F:66:E7:6F` and `10:74:6F:66:D7:CF`, are 4,000
+  addresses apart: one production run, probably one local fleet's model.
+- **The 2026-09-27 Camarillo unit was looking for a radio network.** In the raw log
+  (`sep272026.log`, 21:32:20 to 21:32:21 PDT, -90 to -92 dBm), all three frames from
+  `10:74:6F:66:E7:6F` are probe requests for the SSID `VCSO-Radio`. A device that asks for a radio
+  network reads as a radio, the same as `LACAPX` above, so this unit was probably not a body cam.
+  On 2026-10-01 a client with a randomized MAC probed for the same SSID 2 s after an owner marker
+  for law enforcement on scene (see the Cradlepoint update above).
 
 > **Own toggle, opt-in on every board.** The Motorola OUI match
 > is a SUB-TOGGLE of the body-cam category (`{"motorola":bool}` on the wire, `moto` in
@@ -598,9 +686,26 @@ names nobody for the second:
   catches it. That is why the tier stays: 3 of 3 confirmed, no non-cam Axon device seen on the block
   yet. It is NOT a reason to raise the 75; a dock or other Axon gear on the same block would look
   identical on the air.
+- **Two more untagged hits came from traffic, with law enforcement confirmed on scene but no
+  camera seen on a person.** `00:25:DF:C0:AF:44` (2026-09-30, Camarillo; its strongest reading
+  came one second after that of the tagged cam `00:25:DF:8E:FD:66`, conf 90, while the owner drove
+  beside patrol cars) and `00:25:DF:7F:D6:19` (2026-09-27, I-5 at Camp Pendleton, the BLE side of
+  the WiFi device in the next bullet). Both come from app CSV exports. They count as Axon gear
+  present, not as confirmed worn cams: worn cams stay at 3 of 3, and Axon gear on scene is 5 of 5.
+  An untagged `00:25:DF` advert from a car can also be in-car or other Axon equipment.
+- **The WiFi path (`axonClassifyWiFi`, conf 65) has two field hits, and each is one device with
+  WiFi at the base address and BLE at base + 1.** 2026-08-03
+  ([`docs/captures/lvt-2026-08-03-summary.txt`](captures/lvt-2026-08-03-summary.txt)): WiFi
+  `00:25:DF:A3:5D:7B` four seconds after BLE `00:25:DF:A3:5D:7C`, whose advert carried the
+  `BWCDEVICE` tag, so that WiFi transmitter was a body cam's. 2026-09-27, I-5 at Camp Pendleton
+  (app CSV export): WiFi `00:25:DF:7F:D6:18`, 22 hits at -72 dBm, and at the same spot BLE
+  `00:25:DF:7F:D6:19`, untagged, one packet; the owner confirmed law enforcement on scene. Count
+  such a pair once. So WiFi is not only docks, terminals and Fleet: at least one body cam transmits
+  on it. The 65 stays, because two hits do not say how often a WiFi `00:25:DF` hit is fixed
+  station gear.
 
-Both OUIs share one `baseConfidence` (75) because `AxonSignature` has no per-OUI confidence field;
-splitting them would be a struct change, not a table edit.
+Both OUIs share one confidence: an OUI-only BLE hit on either block reports the fixed 75 in
+`axonClassifyBLE` (`axon_detect.cpp`). Splitting them would be a code change, not a table edit.
 
 The Axon payload needle is `BWCDEVICE` with NO space: the on-wire capture is the
 little-endian-reversed `AXJANUSBWCDEVICE`, and the matcher (`axon_signatures.h` via
@@ -654,6 +759,59 @@ to visually confirmed hardware; label a trigger as `camera activation accessory`
 Technologies** (a network-firewall vendor), a different company from WatchGuard Video (the
 in-car / body camera brand now folded into Motorola Solutions), so they are not body-cam
 signals and stay off the table.
+
+### WatchGuard Video `00:1D:96`: matched behind the Motorola opt-in (2.1.0)
+
+`00:1D:96` is WatchGuard Video's own MA-L block (registrant "WatchGuard Video", Plano TX;
+re-checked 2026-10-01). Motorola Solutions owns WatchGuard. Until 2.1.0 the block sat in the
+field-validation queue in `bodycam_vendor_signatures.h`; the owner promoted it on 2026-10-01 on
+the field record below. A pass over all the raw logs in `firmware/tools/detection logs` found nine
+MACs on the block:
+
+| Date | Log | MAC | Radio | Frames | RSSI (dBm) | What it sent |
+|---|---|---|---|---|---|---|
+| 2026-09-07 | `drive_to_camarillo_9-7.log` | `00:1D:96:28:BA:3D` | WiFi | 1 | -94 | probe for `CPenPD` |
+| 2026-09-13 | `913.log` | `00:1D:96:28:9B:AC` | WiFi | 3 | -93 to -88 | probes for `CPenPD`, `CP3N` |
+| 2026-09-13 | `913.log` | `00:1D:96:28:BA:25` | WiFi | 1 | -92 | wildcard probe |
+| 2026-09-13 | `913.log` | `00:1D:96:28:B9:D4` | WiFi | 5 | -93 to -90 | probes for `CPenPD`, `CP3N`, wildcard |
+| 2026-09-13 | `913.log` | `00:1D:96:28:BA:1C` | WiFi | 9 | -93 to -90 | probes for `CPenPD`, `CP3N`, wildcard |
+| 2026-09-13 | `913.log` | `00:1D:96:29:2D:40` | WiFi | 3 | -94 to -92 | probes for `CPenPD`, `CP3N`, wildcard |
+| 2026-09-19 | `los_angeles.log` | `00:1D:96:29:24:C5` | WiFi | 5 | -95 to -87 | probes for `CPenPD`, `CP3N`, wildcard |
+| 2026-09-27 | `sep272026.log` | `00:1D:96:28:BA:46` | WiFi | 1 | -91 | probe for `CPenPD` |
+| 2026-10-01 | `oct012026.log` | `00:1D:96:E7:97:4F` | BLE | 2 | -88 to -82 | one 128-bit service UUID, nothing else |
+
+- **The eight WiFi MACs are one fleet with one configuration.** Every frame is a probe request
+  (a client looking for its network, never an access point), every MAC is in the narrow range
+  `00:1D:96:28:9B:AC` to `00:1D:96:29:2D:40`, and every named probe asks for `CPenPD` or `CP3N`.
+  Neither SSID is decoded. No owner marker came within 10 minutes of any of them, so none is
+  tied to a scene. Two of them (2026-09-13 at 16:17 and 2026-09-27 at 19:19 PDT) came from the
+  same stretch of road, where the same fixed SSIDs show up both times, including the Cradlepoint
+  `OPD 3484` (see the Cradlepoint update above).
+- **The BLE device is the first one on this block that is tied to a scene.** It sent two frames at
+  08:40:47 and 08:40:48 PDT, 10 s before an owner ground-truth marker for law enforcement on scene
+  (08:40:57). The same window holds the `VCSO-Radio` probe and the `VCSO 3425` Cradlepoint (see the
+  Cradlepoint update above). The advert is a single AD structure, type 0x07 (complete list of
+  128-bit service UUIDs), with the UUID `9525af9d-b772-4229-bbe3-41dcc7218167`: no flags, no name,
+  no manufacturer data. That UUID is vendor-defined (it is not on the Bluetooth base UUID) and
+  shows up in no other log. The 2.0.9 board logged it as a Desert row, conf 0, and the phone was
+  not connected at that moment, so the app did not show it.
+- **What 2.1.0 ships.** `WATCHGUARD_VIDEO_OUI` in `bodycam_vendor_signatures.h`, matched by
+  `police_detect.cpp` on BLE and on WiFi management frames (transmitter, then BSSID), the same
+  path as the Motorola blocks. Same gates: the `motorola` sub-toggle (opt-in, default off on every
+  board) and the body-cam category; Desert mode forces it, as it forces every detector. Same
+  confidence, 45, so a hit renders as amber "weak match, verify". Its own detail string,
+  `"WatchGuard Video OUI"`, which both apps resolve to the maker "WatchGuard Video" with their own
+  explainer; an app that predates the string shows the generic body-cam fallback. Host test:
+  `test_police.cpp` section 4b.
+- **What the evidence does not show.** One BLE device, two frames, one scene, and the owner saw
+  law enforcement on scene, not the device. It does not say what the device is: in-car video, a
+  body cam, or other WatchGuard gear, so the type claim stays at the 45 "verify" tier. The 128-bit
+  UUID is not matched. More BLE sightings of it at marked scenes, best of all a bracketed
+  near/left capture, would be the case for a payload rule.
+- **`V300` SSIDs are a decoy.** SSIDs that start with `V300_` or `V300-` appear in 11 of the raw
+  logs, on nine other blocks (`BC:FD:0C`, `34:A6:EF`, `0C:C1:19`, `CC:B8:5E` and others) and never
+  on `00:1D:96`. They share the model name of WatchGuard's V300 body camera, but the name alone is
+  not evidence. Do not match on it.
 
 ### Capture-only SIG vendor identifiers: Axon, Motorola Solutions, PCAM (2.0.8)
 

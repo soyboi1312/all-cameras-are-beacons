@@ -22,7 +22,10 @@ There is also a WiFi path. `axonClassifyWiFi` matches the same `00:25:DF` OUI (a
 Utility BodyWorn OUIs) on WiFi management frames at confidence 65. Axon's WiFi estate is
 broader than body cams (docks, evidence terminals, station gear, and Fleet in-car video),
 so the type claim is weaker there: the OUI says "an Axon device", not necessarily a body
-cam. It is registry-sourced only, not yet field-validated over WiFi.
+cam. It has two field hits so far, and each was one device with WiFi at the base address and
+BLE at the next one. In the 2026-08-03 capture that BLE side carried the `BWCDEVICE` tag, so at
+least one body cam transmits on WiFi. Details are in the body cam section of
+[signatures.md](signatures.md).
 
 > Heads up: the unrelated **"Axon Networks Inc."** OUIs (`00:58:28`, `84:70:03`)
 > belong to a different, legacy company. Don't use them.
@@ -35,9 +38,9 @@ public OUI (not a resolvable random address) in normal holstered operation.
 
 ## Tuning
 
-`lib/acab_core/axon_detect.*` is data-driven via `AxonSignature`. The registry OUI
-loads with `axonUseRegistryCandidate()`; set `usePayload = true` to *require* the
-`BWCDEVICE` tag (strictest match) if OUI-only false positives ever appear. It's
-enabled by default (`gEnabled = true`); either app (iOS or Android) can toggle it with
+`lib/acab_core/axon_detect.*` matches a fixed OUI table (`AXON_OUI`, values in
+`axon_signatures.h`) and the `BWCDEVICE` tag. There is no knob to *require* the tag: if
+OUI-only false positives ever appear, that is a code change in `axonClassifyBLE`. It's
+enabled by default (`gEnabled.on` starts `true`); either app (iOS or Android) can toggle it with
 `{"axon":true}`, and the choice is NVS-persisted, restored on every board at boot via
 `axonRestoreEnabled(true)`.

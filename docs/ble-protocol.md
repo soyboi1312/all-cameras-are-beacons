@@ -67,29 +67,55 @@ See *Firmware update (OTA)* below.
 
 ## Peripheral address, bonding and privacy
 
-**The board advertises from its fixed factory address.** Address privacy (a rotating
-Resolvable Private Address) is implemented in the firmware and is **off by default**;
-`ACAB_BLE_PRIVACY` in `acab_ble_service.h` carries the full bench note. The short version,
-from a controlled A/B on one board on 2026-08-02:
+**The board advertises from its fixed factory address, and no build option changes that.**
+Address privacy (a rotating Resolvable Private Address, build option `ACAB_BLE_PRIVACY`) was
+built and bench-tested, was never on in a committed build, and is now **removed** from the
+source. Defining `ACAB_BLE_PRIVACY` stops the build with an `#error` in `acab_ble_service.h`.
+The result that parked it, from a controlled A/B on one board on 2026-08-02 (same board, same
+firmware, only the flag changed):
 
 - the rotation itself works, confirmed on air by the companion nRF52840 capturing `AdvA`;
 - **Android is fine**, re-pairing and reconnecting across a board reboot in about 4 s;
 - **iOS cannot connect**. The board appears in the picker and the link opens at the
-  controller, but `onConnect` never fires, so the GATT server never sees the peer.
+  controller, but `onConnect` never fires, so the GATT server never sees the peer. With the
+  flag off the same board connected in 7 s. The cause is not found.
 
-A detector that cannot pair with an iPhone is not shippable, so the feature is off. Do not
-re-enable it without reproducing that A/B first.
+A detector that cannot pair with an iPhone is not shippable. Bench note for a new attempt:
+
+- **Restore point.** Commit `5fe6c23` (before the removal) holds the code and the full notes in
+  `acab_ble_service.h`, `acab_ble_service.cpp` and `firmware/platformio.ini`. The option came
+  in with `acc46cc` (v2.0.3).
+- **NimBLE symbol.** The rotation needs `-DCONFIG_BT_NIMBLE_HOST_BASED_PRIVACY=1`. Without it
+  `setOwnAddrType()` compiles its `ble_hs_pvcy_rpa_config()` call away and the board keeps its
+  fixed address while the source reads as private (bench 2026-08-01: two boots, one address).
+  Do not add the symbol to the shared `[env]`: it moves peer-address resolution from the
+  controller to a host-side resolver, and it enables a write to `peer_dev_rec[]` (9 entries)
+  with no bounds check, in reach at the 10th distinct pairing. Use a dedicated env.
+- **Address type.** `BLE_OWN_ADDR_RANDOM`, not `BLE_OWN_ADDR_RPA_PUBLIC_DEFAULT`: with host-based
+  privacy the controller's resolving list is empty, and the second type then falls back to the
+  public address.
+- **Advertising.** Each rotation (`CONFIG_BT_NIMBLE_RPA_TIMEOUT`, 900 s) preempts advertising
+  and restarts nothing; `advCompleteCb`, still in the firmware, re-arms it. A host reset drops
+  the random address, so the supervisor in `acabBleDrainTick` must call
+  `ble_hs_pvcy_rpa_config()` again before it restarts advertising.
+- **IRK.** Every board holds NimBLE's default IRK, a public constant, so a rotating address is
+  still linkable for a listener who has it. A per-unit IRK through `ble_hs_pvcy_set_our_irk`
+  was tried and reverted: it deleted the stored peer records on every boot.
+- **Proof.** The board cannot see its own `AdvA`, and its serial output only proved that an
+  address was generated. Reproduce the A/B first, then put a sniffer on the connection request
+  (`CONNECT_IND`) from the iPhone.
 
 **For app authors this changes nothing about how you should identify a board.** Match on the
 service UUID, never on the address:
 
 - iOS never sees a peripheral MAC at all. CoreBluetooth substitutes a per-host `UUID`, so the
-  same board shows a different identifier on a different phone. That is expected, and it is
-  why the iOS picker labels a board `beacon 6971c790` where Android labels the same board
-  `beacon 4b:ae:b1:20:5b:6f`.
-- Android does see the address. Treat it as a display detail, not an identity: if privacy is
-  ever enabled, an *unbonded* board's rotation mints a second entry in the picker, while a
-  *bonded* board's rotation resolves through the IRK and stays stable.
+  same board shows a different identifier on a different phone. That is expected. The iOS
+  picker draws no identifier for a board; the Android picker draws the board's address under
+  the row title.
+- Android does see the address. Treat it as a display detail, not an identity: released
+  firmware keeps it fixed, but if a later firmware rotates it, an *unbonded* board's rotation
+  mints a second entry in the picker until the stale-row prune drops the old one. Whether
+  Android's scan results resolve a *bonded* board's rotated address was not measured.
 
 **Bond budget.** The board keeps up to 8 bonds. Because the apps subscribe to all three
 NOTIFY characteristics on connect, each fully-subscribed bond costs 3 CCCD records, and the
@@ -119,7 +145,7 @@ sub-threshold hint instead (`meth:3`, `c:45`, `det:"mfg 0x09C8"`).
 
 | Key | Meaning | Values |
 |---|---|---|
-| `t` | device type | `1` Flock camera · `2` Flock Raven · `3` Body camera (Axon, Utility, or the broad Motorola Solutions OUI proxy; read `det` for which) · `4` Drone · `5` BLE item tracker · `7` Nearby device (Desert mode) · `8` Watched device (user watchlist) · `9` Recording glasses · `10` Network camera (branded IP camera on Wi-Fi; opt-in, see `netcam`) |
+| `t` | device type | `1` Flock camera · `2` Flock Raven · `3` Body camera (Axon, Utility, or the broad Motorola Solutions OUI proxy, which since 2.1.0 also covers WatchGuard Video; read `det` for which) · `4` Drone · `5` BLE item tracker · `7` Nearby device (Desert mode) · `8` Watched device (user watchlist) · `9` Recording glasses · `10` Network camera (branded IP camera on Wi-Fi; opt-in, see `netcam`) |
 | `s` | source | `0` BLE · `1` WiFi · `2` Remote ID |
 | `meth` | match method | `1` oui · `2` name · `3` mfg-id · `4` svc-uuid · `5` ssid · `6` probe · `7` remote-id · `8` svc-data tag · `9` mfg-subtype · `10` watchlist (exact-MAC user rule) |
 | `c` | confidence | `0`-`100` |
@@ -127,7 +153,7 @@ sub-threshold hint instead (`meth:3`, `c:45`, `det:"mfg 0x09C8"`).
 | `rssi` | signal strength | dBm |
 | `name` | advertised name | optional. Also the THIRD rung of the replay trim ladder, so an absent `name` on a `hist:true` row can mean the frame was too big rather than that the device advertised none |
 | `id` | RID serial / operator id | optional (drones), and the FINAL last-resort replay trim rung. An absent `id` on `hist:true` can therefore mean transport-bounded, not "the aircraft broadcast none" |
-| `det` | detail (raven fw, ssid, drone op-id…) | optional. On `t:3` it names the source, which is how the app tells the four body-cam signals apart: `"BWC DEVICE"` (Axon service-data payload, conf 90, MAC-independent), `"Axon OUI"` (conf 75 BLE / 65 from the Wi-Fi management-frame path, `s:1`), `"Utility BodyWorn"` (name 85 / OUI 70 on BLE, 65 on Wi-Fi), `"Motorola Solutions OUI"` (broad proxy, conf 45). **Live-notify only**, same limit as `cid`: the offline buffer's fixed 64-byte record stores no detail, so a replay frame never carries `det` - an absent `det` on a `hist:true` row means "not stored", never "no detail existed" |
+| `det` | detail (raven fw, ssid, drone op-id…) | optional. On `t:3` it names the source, which is how the app tells the five body-cam signals apart: `"BWC DEVICE"` (Axon service-data payload, conf 90, MAC-independent), `"Axon OUI"` (conf 75 BLE / 65 from the Wi-Fi management-frame path, `s:1`), `"Utility BodyWorn"` (name 85 / OUI 70 on BLE, 65 on Wi-Fi), `"Motorola Solutions OUI"` (broad proxy, conf 45), `"WatchGuard Video OUI"` (2.1.0+, the same proxy and toggle on WatchGuard Video's block `00:1D:96`, conf 45; an app that predates the string shows the generic body-cam fallback). **Live-notify only**, same limit as `cid`: the offline buffer's fixed 64-byte record stores no detail, so a replay frame never carries `det` - an absent `det` on a `hist:true` row means "not stored", never "no detail existed" |
 | `cid` | BLE manufacturer company ID (Bluetooth SIG assigned #, integer) | optional; BLE only, present when the advert carried manufacturer-specific data. The field the glasses/tracker detectors key on; the app surfaces it in the detail screen + CSV so a miss is diagnosable. **Live-notify only, and first field elided** on a tight-MTU link (it is diagnostics, not alert content, see `detect_elide.h`). Replay frames NEVER carry it: the offline buffer's fixed 64-byte record does not store the company ID, so an elided `cid` is lost, not deferred - do not wait for a drain to recover it |
 | `lat`,`lon` | subject location | **OVERLOADED, read carefully:** drones = the aircraft's own
 broadcast position; everything else = the DETECTOR's GPS. Consumers must branch on the type.
@@ -233,7 +259,7 @@ Write a JSON object with any subset of keys:
 | `drone` | enable/disable the drone Remote ID detector (BLE + Wi-Fi, on by default). Desert mode still reports these even when the toggle is off |
 | `droneoui` | enable/disable the drone **vendor-OUI fallback** (default **off**, opt-in). Layered under Remote ID: matches a device's MAC against known drone-vendor IEEE blocks (DJI/Parrot/...) and flags it at low confidence. It cannot tell a flying drone from a stationary drone-vendor gadget, so it may false-positive - hence off by default. Only meaningful while `drone` is on; Desert mode forces it on |
 | `axon` | enable/disable the body-cam **category** (field-validated, on by default). `bodycam` is the same switch under a clearer name; the board accepts either key, so older app builds keep working. Off means every body-cam signature is off (Axon `BWCDEVICE` tag, Axon OUI, Utility BodyWorn, and the broad Motorola Solutions OUI). It no longer touches the `motorola` sub-toggle, so flipping the category off and back on restores the user's broad-match choice |
-| `motorola` | enable/disable the broad **Motorola Solutions OUI** proxy, a sub-toggle underneath the body-cam category. **Default off on every target.** Flipped from on to off 2026-07-23 on field ground truth: an airport capture returned 30 body-cam rows, and while the 3 Axon BLE hits were confirmed real, all 27 Motorola Wi-Fi OUI hits were confirmed NOT body cams (fixed ceiling / infrastructure gear). 0/27 precision on a detector shipping on by default drowns the true positives beside it, so it joined `netcam` as an opt-in vendor proxy. The signature list itself is correct and stays; this is a default, not a removal. Mesh-detect was always off (a broad OUI match would flood the rate-limited LoRa uplink). NVS-persisted, so the choice survives a reboot - which also means a **fresh** board boots off, while a board that stored "on" before the flip keeps it until the user turns it off in the app. Lets a user quiet the noisy corporate-OUI match (conf 45, reports as a body cam with detail "Motorola Solutions OUI") while keeping the field-validated Axon `BWCDEVICE` tag (conf 90) and Utility BodyWorn running |
+| `motorola` | enable/disable the broad **Motorola Solutions OUI** proxy, a sub-toggle underneath the body-cam category. Since 2.1.0 it also covers WatchGuard Video's block (`00:1D:96`, `det` `"WatchGuard Video OUI"`), since Motorola Solutions owns WatchGuard. **Default off on every target.** Flipped from on to off 2026-07-23 on field ground truth: an airport capture returned 30 body-cam rows, and while the 3 Axon BLE hits were confirmed real, all 27 Motorola Wi-Fi OUI hits were confirmed NOT body cams (fixed ceiling / infrastructure gear). 0/27 precision on a detector shipping on by default drowns the true positives beside it, so it joined `netcam` as an opt-in vendor proxy. The signature list itself is correct and stays; this is a default, not a removal. Mesh-detect was always off (a broad OUI match would flood the rate-limited LoRa uplink). NVS-persisted, so the choice survives a reboot - which also means a **fresh** board boots off, while a board that stored "on" before the flip keeps it until the user turns it off in the app. Lets a user quiet the noisy corporate-OUI match (conf 45, reports as a body cam with detail "Motorola Solutions OUI") while keeping the field-validated Axon `BWCDEVICE` tag (conf 90) and Utility BodyWorn running |
 | `tracker` | enable/disable the BLE item-tracker (Find My, offline form) detector (default off). The detection is delivered to the app on the **first** sighting; what the first **60 s** holds back (`TRACKER_ALERT_DEBOUNCE_MS`) is the wire `new` flag and the offline-buffer write, so a tag you walk past does not spend the board's capture. The board never beeps for a tracker at all, inside the window or after it. See *Tracker delivery and the 60 s capture debounce* below |
 | `glasses` | enable/disable the smart/recording-glasses detector (Ray-Ban/Oakley Meta, Snap Spectacles, Vuzix; on by default). Scores three BLE payload surfaces (manufacturer-data company ID, 16-bit SIG member UUIDs, the HeyCyan service UUID) and keeps the best. See [docs/glasses.md](glasses.md) |
 | `netcam` | enable/disable the **network-camera** detector (default **off**, opt-in). Matches branded IP-camera OUIs (Hikvision/Dahua/Amcrest/Axis/Reolink/Ring/Wyze/eufy/Ezviz/Lorex/Swann/Arlo) on the host Wi-Fi and emits `t:10` at confidence 65 (or 75 for a field-validated block), detail "<Vendor> on wifi". Since 2.0.4 it ALSO matches a base-station SSID prefix ("ARLO_VMB_"/"NTGR_VMB_") on beacon/probe-response frames, emitting `t:10` with method `M_SSID` at confidence **88**, detail "Arlo base station" and the matched SSID in `name` - a self-attested match outranks any OUI inference. Probe REQUESTS are deliberately excluded: they name the network sought, not the transmitter. Turning it on widens Wi-Fi capture to 802.11 **data** frames so a streaming camera's cleartext source MAC can be OUI-matched; off (default) keeps capture management-frame-only for zero added CPU / 2.4GHz load. Honest scope: it matches known camera BRANDS on the network (could be an NVR/doorbell/disclosed camera) and cannot find every camera - never a "hidden camera" claim |
@@ -249,7 +275,7 @@ Write a JSON object with any subset of keys:
 | `buffer` | enable/disable the offline detection buffer (default **off**, opt-in). Every explicit `false` removes the at-rest key from RAM/NVS and durably requests erasure of any retained core dump whose task stacks may contain the key, a decrypted row, or phone coordinates. It does **not** erase the ring records themselves; drain first. See *Offline detection buffer* below |
 | `bufall` | **record everything**: also buffer uncategorized nearby devices, and re-arm capture every 15 min so a revisit writes a second record (default **off**). Deploy-and-leave only, presented as one experimental **Stationary capture** switch that writes `{"buffer":true,"bufall":true,"desert":true,"buzzer":false}` in a single object after pushing the key. `bufall` without `desert` gets revisit resolution but never classifies an uncategorized device. Cleared automatically when `buffer` is set false. External USB-C power required. Widens the undrained-reboot auto-wipe threshold, which weakens the self-clean guarantee, so the client must say so where the user turns it on. **Not implemented in either app today**: the firmware honours the key, but no shipped app writes it or presents the Stationary capture switch. The disclosure requirement here and the disarm ordering below bind whichever app ships it first, as test assertions, not prose. See *Offline detection buffer* |
 | `key` | 64 lowercase hex chars = the 32-byte at-rest encryption key; the app generates + persists it and pushes it on **every authenticated connection**. `sync` is refused until a valid key write has been accepted on that same session; a retained RAM key from another bonded phone never authorizes replay by itself. **The board holds the accepted key in RAM AND persists it to NVS while buffering is enabled** (`det_log.cpp` `detLogSetEnabled`), so a board left deployed keeps encrypting across reboots instead of going keyless. **TRADEOFF, state it plainly: a seized board's flash yields the key, so the at-rest buffer is decryptable and is NOT ciphertext-only.** Turning buffering off erases the key from both RAM and NVS and schedules the retained-core-dump wipe described above. If a different phone key meets a nonempty or untrusted generation, the board preserves the existing rows/key, reports session-only Status `keymis:true`, and refuses sync. Ownership transfer must be explicit: send `clearlog:true`, then re-send the replacement key (they may share one Config object; clear is processed first). A safely accepted different key still schedules the dump wipe even when the ring is empty, because old key bytes can remain in a retained stack. Flash encryption / encrypted NVS is what would restore seized-board protection. See the SECURITY block at the top of `det_log.h`. |
-| `lat`,`lon` | **the phone's own GPS fix, pushed to the board.** Doubles, written as a pair and range-checked (±90 / ±180); an out-of-range pair is discarded silently. This is the only write in the protocol that carries the user's position. It is RAM-only, not NVS, but the encrypted offline ring may store the retained copy described here. The board keeps TWO copies. **The LIVE copy** (`acabBleGetPhoneGps`) belongs only to the current authenticated connection and is zeroed on disconnect. Status `gps`, live non-drone detections, BLE notify, and mesh use only this copy (an onboard/forwarded fix wins when present). **The RETAINED copy** (`acabBleGetLastPhoneGps`) may survive disconnect only when that same session supplied a key accepted for the currently published log generation; a no-key or `keymis` session clears both copies. Every successful authentication also starts by clearing both copies before Config is admitted, so two bonded phones never inherit one another's fix. The retained copy has ONE reader: `handleDetection` may put a fix younger than `DET_LOG_GPS_MAX_AGE_MS` (`0xFFFF` s, about 18h12m) into a `DetLogGpsStamp` only while no app is admitted and the row is actually bound for the encrypted ring. That stamp rides BESIDE `AcabDetection`, is read only by `detLogAppend`, and never becomes live `d.lat`/`d.lon`; a Desert row that is delivered but not buffered does not read it. The asynchronous sink additionally validates each queued row's owner-admission epoch at the final callback boundary, serialized with authentication/disconnect, so an A-era row cannot notify B or escape over mesh after a link handoff. Disconnect is a two-phase boundary: it first blocks admission and publishes the zero scanner token, then clears link-owned GPS/replay/key state, and only afterward publishes the away-session epoch together with a fresh capture generation. A sighting in that teardown window therefore cannot consume the generation intended to record the away session. Thus the retained fix reaches an AES-CTR record as `lat_e7`/`lon_e7` and no live output. It does not survive reboot. **The intended exception:** a stored record is later replayed to a session that supplies the exact accepted generation key. A different-key phone gets `keymis:true` and no replay unless it explicitly clears those rows; a phone that legitimately shares the accepted key can decrypt/replay the prior supplier's stored fix, which is the offline buffer's documented purpose. Mesh-detect separately requires a current fix newer than 60 s for LoRa and re-zeroes non-drone position at its transmission boundary. Both apps push location on connect and refresh it as the phone moves |
+| `lat`,`lon` | **the phone's own GPS fix, pushed to the board.** Doubles, written as a pair and range-checked (±90 / ±180); an out-of-range pair is discarded silently. This is the only write in the protocol that carries the user's position. It is RAM-only, not NVS, but the encrypted offline ring may store the retained copy described here. The board keeps TWO copies. **The LIVE copy** (`acabBleGetPhoneGps`) belongs only to the current authenticated connection and is zeroed on disconnect. Status `gps`, live non-drone detections, BLE notify, and mesh use only this copy. **The RETAINED copy** (`acabBleGetLastPhoneGps`) may survive disconnect only when that same session supplied a key accepted for the currently published log generation; a no-key or `keymis` session clears both copies. Every successful authentication also starts by clearing both copies before Config is admitted, so two bonded phones never inherit one another's fix. The retained copy has ONE reader: `handleDetection` may put a fix younger than `DET_LOG_GPS_MAX_AGE_MS` (`0xFFFF` s, about 18h12m) into a `DetLogGpsStamp` only while no app is admitted and the row is actually bound for the encrypted ring. That stamp rides BESIDE `AcabDetection`, is read only by `detLogAppend`, and never becomes live `d.lat`/`d.lon`; a Desert row that is delivered but not buffered does not read it. The asynchronous sink additionally validates each queued row's owner-admission epoch at the final callback boundary, serialized with authentication/disconnect, so an A-era row cannot notify B or escape over mesh after a link handoff. Disconnect is a two-phase boundary: it first blocks admission and publishes the zero scanner token, then clears link-owned GPS/replay/key state, and only afterward publishes the away-session epoch together with a fresh capture generation. A sighting in that teardown window therefore cannot consume the generation intended to record the away session. Thus the retained fix reaches an AES-CTR record as `lat_e7`/`lon_e7` and no live output. It does not survive reboot. **The intended exception:** a stored record is later replayed to a session that supplies the exact accepted generation key. A different-key phone gets `keymis:true` and no replay unless it explicitly clears those rows; a phone that legitimately shares the accepted key can decrypt/replay the prior supplier's stored fix, which is the offline buffer's documented purpose. Mesh-detect separately requires a current fix newer than 60 s for LoRa and re-zeroes non-drone position at its transmission boundary. Both apps push location on connect and refresh it as the phone moves |
 | `epoch` | unix seconds (the phone's wall clock). The board has no RTC, so this is the only wall clock it ever sees: it stores an *anchor* for the current boot and reconstructs capture times from it later. Persisted, so it dates records from earlier boots too. See *How replay times are derived* below |
 | `sync` | start a replay drain: stream stored records with `seq` greater than this value (`0` = everything). Refused unless this authenticated session has already supplied a valid `key` that the record layer accepted |
 | `clearlog` | `true` logically clears the ring immediately, then performs its real flash-sector erase in chunks (one block per loop pass, so scanning and the GATT link stay live); Status reports `wiping:true` until it finishes. It also persists an independent retained-core-dump erase generation. That intent survives power loss and a ring sweep that was already pending, and is acknowledged only after the dump partition is erased or found empty. It is also the explicit ownership-transfer authorization required before a different `key` may replace a nonempty/unknown generation |
@@ -513,12 +539,20 @@ and a nonce-hash failure refuses append/replay rather than encrypting under a ze
 
 The IDF core-dump partition is a second at-rest surface. A panic can retain live task-stack copies
 of the key, a decrypted record, or phone coordinates outside the encrypted ring. `clearlog`, every
-safely accepted key replacement, and every explicit `buffer:false` therefore advance an independent NVS
-erase generation. `acabCoredumpWipeTick()` clears that generation only after the dump partition is
-erased or found empty. The request survives a power loss and remains distinguishable from the
+safely accepted key replacement, every explicit `buffer:false`, and the first authenticated phone
+link of every boot (`detLogPrepareConfigSession()`, with the buffer on or off) therefore advance an
+independent NVS erase generation. `acabCoredumpWipeTick()` clears that generation only after the
+dump partition is erased or found empty. Empty means the boot probe read every byte of the partition back as erased
+(0xFF, apart from the 16-byte marker `esp_core_dump_image_erase()` writes); no IDF error code counts
+as empty, and a read error counts as possible data. The request survives a power loss and remains distinguishable from the
 ring's shared auto-wipe/resume state; completing an older generation cannot acknowledge a newer
-request. A boot-count auto-wipe without explicit intent deliberately preserves the just-reported
-post-mortem for diagnosis.
+request. The session pre-arm cannot complete on the boot that armed it, so it is still pending at
+the next boot, and a retained dump is erased on the first loop pass that sees a pending generation
+(after any ring sweep in progress, with a bounded wait). On the boot after a panic, that is the
+first pass when a phone had authenticated on the boot that crashed, and otherwise the first pass
+after a phone authenticates. A boot-count auto-wipe does not arm the generation. To decode a panic,
+read the `[coredump]` lines of the serial boot report (printed before any erase), or read the dump
+out of flash before a phone connects.
 
 ### Connect handshake
 

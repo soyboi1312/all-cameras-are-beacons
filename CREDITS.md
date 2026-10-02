@@ -45,10 +45,9 @@ see below), not our code.
 ## A note on licensing
 
 Two third-party *sources* are vendored into this repo. The first is
-opendroneid-core-c, which is cleanly Apache-2.0; its license travels with the main
-vendored copy at `firmware/lib/acab_core/opendroneid/` (the second copy for the
-host-side simulator at `firmware/src/odid-sim/` carries SPDX Apache-2.0 headers in
-each file instead of a separate LICENSE). The second is the compiled **ESP Web
+opendroneid-core-c, which is cleanly Apache-2.0; its license travels with the one
+vendored copy at `firmware/lib/acab_core/opendroneid/` (the bench simulator at
+`firmware/src/odid-sim/` compiles that same source). The second is the compiled **ESP Web
 Tools** flasher bundle at `web/vendor/esp-web-tools/` (Apache-2.0; the bundle also
 compiles in Lit, BSD-3-Clause, plus Material Web, esptool-js, and the Improv WiFi
 SDK, all Apache-2.0). Minification strips its per-file license headers, so the full
