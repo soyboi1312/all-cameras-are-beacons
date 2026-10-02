@@ -169,8 +169,15 @@ def stage_rev_b(
     latest["builds"][REV_B_LABEL] = entry
     latest["updated"] = datetime.date.today().isoformat()
 
+    # The site owns the name its browser flasher shows, so keep it, as build-beacon-flasher.sh does
+    # for rev-A by stamping only the version. The default is the site's name for the battery model.
+    manifest_path = firmware_site / REV_B_MANIFEST
+    flasher_name = "beacon battery (rev-b)"
+    if manifest_path.is_file():
+        site_manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        flasher_name = site_manifest.get("name") or flasher_name
     web_manifest = {
-        "name": "beacon rev-B",
+        "name": flasher_name,
         "version": beacon_version,
         "funding_url": "",
         "new_install_prompt_erase": True,

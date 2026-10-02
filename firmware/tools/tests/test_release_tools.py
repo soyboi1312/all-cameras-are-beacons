@@ -1298,6 +1298,16 @@ class RevBStagingTests(unittest.TestCase):
         self.assertNotIn("nrf", entry)
         web = json.loads((staged / "manifest-beacon-revb.json").read_text())
         self.assertEqual(web["builds"][0]["parts"][-1]["path"], "beacon-revb-app.bin")
+        self.assertEqual(web["name"], "beacon battery (rev-b)")
+
+    def test_restage_keeps_the_site_flasher_name(self) -> None:
+        manifest = self.site / "firmware/manifest-beacon-revb.json"
+        manifest.write_text(json_text({"name": "site-chosen name", "version": "2.0.3"}),
+                            encoding="utf-8")
+        stage_rev_b(self.firmware, self.site, self.boot_app0, None, True)
+        web = json.loads(manifest.read_text())
+        self.assertEqual(web["name"], "site-chosen name")
+        self.assertEqual(web["version"], "2.0.4")
 
     def test_signed_stage_publishes_signature_over_exact_staged_bytes(self) -> None:
         key = Path(self.temp.name) / "key.pem"
