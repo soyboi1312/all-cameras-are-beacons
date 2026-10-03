@@ -8262,10 +8262,10 @@ class AcabBleManager(private val context: Context) {
             // "moto" is present so the tour shows the Motorola sub-toggle. Omitting it would make
             // the demo board look like pre-split firmware and hide the control the tour exists to
             // introduce. "axon":true so the parent category is on and the sub-row is not dimmed.
-            """{"fw":"beacon board 2.0.9","up":4920,"total":6,"ble":true,"wifi":true,"axon":true,"moto":true,"tracker":true,"glasses":true,"ncam":true,"buzzer":true,"vol":70,"gps":true,"bat":82}""").apply {
+            """{"fw":"beacon board 2.1.0","up":4920,"total":6,"ble":true,"wifi":true,"axon":true,"moto":true,"tracker":true,"glasses":true,"ncam":true,"buzzer":true,"vol":70,"gps":true,"bat":82}""").apply {
             when (debugKind) {
-                BoardKind.OUI_SPY -> put("fw", "ACAB-ouispy 2.0.9")
-                BoardKind.MESH_DETECT -> put("fw", "mesh-detect-ACAB 2.0.9")
+                BoardKind.OUI_SPY -> put("fw", "ACAB-ouispy 2.1.0")
+                BoardKind.MESH_DETECT -> put("fw", "mesh-detect-ACAB 2.1.0")
                 BoardKind.BEACON, null -> Unit
             }
         })

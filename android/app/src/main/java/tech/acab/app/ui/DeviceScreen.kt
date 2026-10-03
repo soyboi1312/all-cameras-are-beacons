@@ -994,7 +994,7 @@ private val HeroMarkSize = 56.dp
 
 /** Latest published beacon-board firmware; last-resort offline fallback for an unrecognized
  *  board label (known boards read their per-board version from the manifest). Bump on release. */
-private const val LATEST = "2.0.9"
+private const val LATEST = "2.1.0"
 
 /**
  * One optimistic board control, described once. Three sites derive everything from the list of
