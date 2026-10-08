@@ -60,11 +60,11 @@ static const FalconWifiOui FALCON_WIFI_OUI[] = {
     // D8:F3:BC / C0:35:32 were held-out candidates promoted on 2026-07-24 after a drive recaptured
     // both broadcasting "PROBE-FALCON" / "DATA-FALCON" SSIDs. Neither half happened: git shows both
     // rows shipping unconditionally since the table was written, so there was nothing to promote,
-    // and those two strings are this firmware's OWN diagnostic labels, printed into the ssid= field
-    // of the [wifi] line only AFTER falconOui() had already matched, so they attest to nothing but
-    // this table. The probe label is spelled "fwnote:falcon-oui-probe" in acab_scanner.cpp now, and
-    // the data-frame line is a "FAL-DATA n=..." counter record, precisely so the
-    // round trip cannot be made again. Behaviour of these rows is unchanged, and always was; only
+    // and those two strings were this firmware's OWN diagnostic labels, printed into the ssid= field
+    // of the [wifi] line only AFTER the capture build's own Falcon-OUI match, so they attest to
+    // nothing but this table. Capture builds now write no Falcon label at all: a Falcon-OUI probe
+    // logs as PROBE:<ssid> with the SSID the frame carried, like every other prober, so the round
+    // trip cannot be made again. Behaviour of these rows is unchanged, and always was; only
     // the story above them was wrong. Do not re-split the four on the strength of that story - the
     // evidence behind them is one batch, so grade them together or not at all.
     {{0xD8,0xF3,0xBC}, 0},  // D8:F3:BC:7D:D4:CF               own capture at a DeFlock-confirmed Falcon
@@ -89,9 +89,9 @@ static const size_t FALCON_WIFI_OUI_COUNT = sizeof(FALCON_WIFI_OUI) / sizeof(FAL
 //
 // WHY IT WAS RETIRED. The rule said Falcon cameras stand up per-function networks named
 // "PROBE-FALCON" and "DATA-FALCON", cited to a 2026-07-24 drive. They do not, and it was not.
-// Those two strings are labels THIS FIRMWARE writes into the ssid= field of its own [wifi]
-// diagnostic line, and only after falconOui() has already matched - so a capture containing them
-// is our OUI table talking to itself. Two independent confirmations: a data frame carries no SSID
+// Those two strings were labels THIS FIRMWARE wrote into the ssid= field of its own [wifi]
+// diagnostic line, and only after its capture-build Falcon-OUI match - so a capture containing
+// them is our OUI table talking to itself. Two independent confirmations: a data frame carries no SSID
 // element at all, so "DATA-FALCON" could not have come off the air; and the one capture in the
 // repo that holds the string shows the label immediately followed by a conf=72 "Falcon probe
 // (OUI)" verdict, which is the verdict the classifier gives when the frame's own SSID does NOT

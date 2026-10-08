@@ -1,5 +1,11 @@
 #pragma once
 
+// Model the dual-core S3 the shipping envs build for (alerts.cpp pins to portNUM_PROCESSORS - 1:
+// core 1 there, 0 on the single-core C5).
+#ifndef portNUM_PROCESSORS
+#define portNUM_PROCESSORS 2
+#endif
+
 #include <stdint.h>
 
 typedef int BaseType_t;

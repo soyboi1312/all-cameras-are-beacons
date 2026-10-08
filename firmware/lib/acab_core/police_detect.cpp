@@ -28,7 +28,7 @@ void policeRestoreEnabled(bool defaultEnabled) { gEnabled.restore(defaultEnabled
 // the category (axon) must be on, and this broad-match opt-out must not be set.
 // Turning the category off kills every body-cam signature; turning only this off
 // leaves the conf-90 Axon BWCDEVICE tag and Utility BodyWorn running. Desert mode
-// forces classification regardless, as it does for every other detector.
+// forces it regardless, as for every detector but the netcam and drone OUI opt-ins.
 static inline bool active() {
     if (desertIsEnabled()) return true;
     return gEnabled.on && axonIsEnabled();

@@ -46,6 +46,7 @@ from release_tools import (  # noqa: E402
     require_usb_only_manifest_build,
     read_nrf_dfu_application_version,
     release_profile,
+    restamp_app_desc,
 )
 from stage_beacon_revb import (  # noqa: E402
     REV_B_FILES,
@@ -82,6 +83,21 @@ def make_image(version: str = "2.0.4", project: str = "beacon board rev-B") -> b
     data[ESP_APP_VERSION_OFFSET:ESP_APP_VERSION_OFFSET + len(version)] = version.encode("ascii")
     data[ESP_APP_PROJECT_OFFSET:ESP_APP_PROJECT_OFFSET + len(project)] = project.encode("ascii")
     return bytes(data)
+
+
+def esp_image(segments, hash_appended: bool) -> bytes:
+    """A full ESP32 app image built from scratch: header, segments, checksum, optional digest."""
+    out = bytearray(24)
+    out[0], out[1], out[23] = ESP_IMAGE_MAGIC, len(segments), int(hash_appended)
+    checksum = 0xEF
+    for data in segments:
+        out += struct.pack("<II", 0x3C000020, len(data)) + data
+        for byte in data:
+            checksum ^= byte
+    out += bytes(15 - len(out) % 16) + bytes([checksum])
+    if hash_appended:
+        out += hashlib.sha256(out).digest()
+    return bytes(out)
 
 
 def write_ota_public_key_header(path: Path, der: bytes) -> None:
@@ -435,6 +451,39 @@ class EspAppDescriptorTests(unittest.TestCase):
             path.write_bytes(data)
             with self.assertRaises(ReleaseToolError):
                 read_esp_app_desc(path)
+
+    def test_restamp_equals_an_image_built_with_the_new_fields(self) -> None:
+        def desc(version: str, project: str) -> bytes:
+            data = bytearray(256)
+            struct.pack_into("<I", data, 0, ESP_APP_DESC_MAGIC)
+            for offset, text in ((ESP_APP_VERSION_OFFSET, version),
+                                 (ESP_APP_PROJECT_OFFSET, project)):
+                at = offset - ESP_APP_DESC_OFFSET
+                data[at:at + len(text)] = text.encode("ascii")
+            return bytes(data)
+
+        tail = bytes(range(37))  # a second segment, so the checksum is found by walking past it
+        for hashed in (True, False):
+            with self.subTest(hash_appended=hashed):
+                built = esp_image([desc("v4.4.7-dirty", "arduino-lib-builder"), tail], hashed)
+                self.assertEqual(restamp_app_desc(built, "2.2.0", "beacon board"),
+                                 esp_image([desc("2.2.0", "beacon board"), tail], hashed))
+        with self.assertRaises(ReleaseToolError):  # a trailing byte the segment walk cannot place
+            restamp_app_desc(built + b"\0", "2.2.0", "beacon board")
+        with self.assertRaises(ReleaseToolError):  # no descriptor at IDF's fixed offset
+            restamp_app_desc(esp_image([bytes(256), tail], True), "2.2.0", "beacon board")
+        for hashed in (False, True):  # a corrupt input checksum, under a digest that matches it
+            bad = bytearray(esp_image([desc("v4.4.7", "x"), tail], False))
+            bad[-1] ^= 1
+            if hashed:
+                bad[23] = 1
+                bad += hashlib.sha256(bad).digest()
+            with self.subTest(bad_checksum_hashed=hashed), self.assertRaises(ReleaseToolError):
+                restamp_app_desc(bytes(bad), "2.2.0", "beacon board")
+        bad = bytearray(esp_image([desc("v4.4.7", "x"), tail], True))
+        bad[-1] ^= 1  # only the digest is corrupt
+        with self.assertRaises(ReleaseToolError):
+            restamp_app_desc(bytes(bad), "2.2.0", "beacon board")
 
     def test_artifact_names_map_to_exact_runtime_labels(self) -> None:
         self.assertEqual(expected_project_for_artifact("beacon-app.bin"), "beacon board")

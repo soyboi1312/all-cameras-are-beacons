@@ -1,5 +1,5 @@
 /*
- * ACAB - ESP32-S3 self-update over BLE (implementation). See ota_update.h.
+ * ACAB - ESP32 self-update over BLE (implementation). See ota_update.h.
  */
 #include "ota_update.h"
 #include "acab_version.h"
@@ -16,6 +16,15 @@
 #include <mbedtls/md.h>
 #include <freertos/FreeRTOS.h>
 #include <freertos/semphr.h>
+#include <esp_idf_version.h>
+
+// Running image's descriptor: IDF 5 (env:beacon-c5) renamed IDF 4.4's (S3) getter; same struct.
+#if ESP_IDF_VERSION_MAJOR >= 5
+#include <esp_app_desc.h>
+static inline const esp_app_desc_t* acabRunningAppDesc() { return esp_app_get_description(); }
+#else
+static inline const esp_app_desc_t* acabRunningAppDesc() { return esp_ota_get_app_description(); }
+#endif
 
 // Fail closed: a build with no baked-in OTA public key would skip verification and accept
 // UNSIGNED firmware. Refuse to compile such a build , the signature check in otaFinish is
@@ -97,7 +106,7 @@ const char* otaResultStr(OtaResult r) {
     return "?";
 }
 
-// Standard reflected zlib/PKZIP CRC-32 (poly 0xEDB88420), computed incrementally. Bitwise
+// Standard reflected zlib/PKZIP CRC-32 (poly 0xEDB88320), computed incrementally. Bitwise
 // (table-less) - fine for a one-time ~1MB image, and unambiguous for the app to match.
 static uint32_t crc32_update(uint32_t crc, const uint8_t* d, size_t n) {
     crc = ~crc;
@@ -319,7 +328,7 @@ static OtaResult otaDoFinish() {
     // images share one signing key, so a valid signature alone cannot distinguish rev-A, rev-B,
     // Mesh, or OUI-Spy artifacts. Refuse a cross-product image before Update.end can select it.
     esp_app_desc_t pendingDesc;
-    const esp_app_desc_t* runningPtr = esp_ota_get_app_description();
+    const esp_app_desc_t* runningPtr = acabRunningAppDesc();
     if (!pendingImageDescription(&pendingDesc) || !runningPtr) {
         Update.abort(); gActive = false; return OTA_ERR_IMAGE;
     }
@@ -393,7 +402,7 @@ void otaBootCheck() {
     const esp_partition_t* running = esp_ota_get_running_partition();
     const uint32_t targetAddress = p.getUInt("target", 0);
     const uint32_t targetVersion = p.getUInt("trialver", 0);
-    const esp_app_desc_t* runningDesc = esp_ota_get_app_description();
+    const esp_app_desc_t* runningDesc = acabRunningAppDesc();
     const uint32_t runningVersion = runningDesc
         ? acabOtaVersionPack(runningDesc->version) : 0;
     if (!running || !acabOtaTrialMatches(running->address, targetAddress) ||

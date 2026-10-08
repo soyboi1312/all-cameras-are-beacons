@@ -1,9 +1,8 @@
-// Host regression test for the new-phone pairing window (pair_window.h).
+// Host regression test for the new-phone pairing gate (pair_window.h).
 //
-// The window is a millis() comparison, and millis() ROLLS OVER every ~49.7 days. A naive unsigned
-// `now < until` reads as OPEN for another 49 days after a rollover, so the security property would
-// silently evaporate on a board left powered. That is untestable on hardware in any practical time,
-// which is exactly why the comparison is a pure function and why these boundary cases exist.
+// The window comparison is the security property: a stranger may bond only while it reads open.
+// acab_ble_service.cpp, which calls it, is never host-compiled, so these checks are the only ones
+// that can fail if the window stops closing.
 #include "../../lib/acab_core/pair_window.h"
 #include <cstdio>
 
@@ -20,75 +19,37 @@ static void chkU(const char* name, uint32_t got, uint32_t want) {
 
 int main() {
     printf("\n=== new-phone pairing window ===\n");
-    const uint32_t W = 120000;   // ACAB_PAIR_WINDOW_MS
-
-    // Not armed = closed, whatever the clock says. A board that boots only to decide it should
-    // sleep must never be pairable, and that is enforced by never arming rather than by timing.
-    chk("unarmed is closed even at t=0", acabPairWindowOpenAt(0, W, false, false), false);
-    chk("unarmed is closed mid-window",  acabPairWindowOpenAt(1000, W, false, false), false);
-
-    // Ordinary life.
-    chk("open immediately after arming",       acabPairWindowOpenAt(0, W, true, false), true);
-    chk("open one ms before expiry",           acabPairWindowOpenAt(W - 1, W, true, false), true);
-    chk("CLOSED exactly at expiry",            acabPairWindowOpenAt(W, W, true, false), false);
-    chk("closed one ms after expiry",          acabPairWindowOpenAt(W + 1, W, true, false), false);
-    chk("closed long after expiry",            acabPairWindowOpenAt(W + 86400000UL, W, true, false), false);
-
-    // THE ROLLOVER. Board armed just before millis() wraps: `until` wraps too, so the naive
-    // unsigned test would say "now (huge) < until (tiny)" is false -> closed early, and once now
-    // wraps it would say open again for 49 days. The signed difference gets both right.
-    {
-        const uint32_t armAt = 0xFFFFFF00UL;      // ~256 ms before the wrap
-        const uint32_t until = armAt + W;          // wraps around to a small number
-        chk("armed just before rollover: open right after arming",
-            acabPairWindowOpenAt(armAt, until, true, false), true);
-        chk("armed just before rollover: open ACROSS the wrap",
-            acabPairWindowOpenAt(0x00000100UL, until, true, false), true);
-        chk("armed just before rollover: closed after the wrapped expiry",
-            acabPairWindowOpenAt(until + 1, until, true, false), false);
-        chk("armed just before rollover: still closed much later",
-            acabPairWindowOpenAt(until + 3600000UL, until, true, false), false);
-    }
-
-    // THE 24-DAY HAZARD, and the latch that closes it. This pair is the reason the latch exists:
-    // the first assertion documents that the signed comparison ALONE is wrong past 2^31 ms, and the
-    // second proves the latch makes that unreachable. Written as a passing test of the real
-    // behaviour rather than a disabled one, so nobody "fixes" the comparison and deletes the latch.
-    chk("comparison alone WRONGLY reads open ~24 days past expiry (why the latch exists)",
-        acabPairWindowOpenAt(0x80000000UL + 1000, 1000, true, false), true);
-    chk("latched closed -> stays closed ~24 days past expiry",
-        acabPairWindowOpenAt(0x80000000UL + 1000, 1000, true, true), false);
-    chk("latched closed -> closed even mid-window",
-        acabPairWindowOpenAt(1000, W, true, true), false);
-
-    // Remaining time, including that it is 0 rather than a huge number once closed.
-    chkU("remaining at arming is the full window", acabPairWindowRemainingAt(0, W, true, false), W);
-    chkU("remaining halfway",                      acabPairWindowRemainingAt(W / 2, W, true, false), W / 2);
-    chkU("remaining at expiry is 0",               acabPairWindowRemainingAt(W, W, true, false), 0);
-    chkU("remaining past expiry is 0, not huge",   acabPairWindowRemainingAt(W + 5000, W, true, false), 0);
-    chkU("remaining when unarmed is 0",            acabPairWindowRemainingAt(0, W, false, false), 0);
+    // esp_timer microseconds; T is an arbitrary opening time. `until` is the deadline the service
+    // stores (acabBleOpenPairingWindow), and W is 120 s written out, NOT read from
+    // ACAB_PAIR_WINDOW_MS, so a longer window or a ms/us slip in acabPairWindowUntilUsAt fails here.
+    const uint64_t W = 120000000ULL, T = 5000000ULL;
+    const uint64_t until = acabPairWindowUntilUsAt(T);
+    chkU("never opened (until 0) is closed",          acabPairWindowRemainingMsAt(T, 0), 0);
+    chkU("full 120 s window right after opening",     acabPairWindowRemainingMsAt(T, until), 120000);
+    chkU("1 ms left at 120 s - 1 ms after opening",   acabPairWindowRemainingMsAt(T + W - 1000, until), 1);
+    chkU("closed exactly 120 s after opening",        acabPairWindowRemainingMsAt(T + W, until), 0);
+    // The old uint32 millis() comparison read OPEN again from 2^31 ms (~24.9 days) past expiry,
+    // and any ms-truncated clock reads a boot-time window open again one 2^32 ms wrap later.
+    chkU("closed ~25 days past expiry",
+         acabPairWindowRemainingMsAt(T + W + 2147484ULL * 1000000, until), 0);
+    chkU("closed one 2^32 ms wrap (~49.7 days) after opening",
+         acabPairWindowRemainingMsAt(T + 4294967296ULL * 1000, until), 0);
 
     // ---- admission decision (acabPairAdmit) --------------------------------------------------
     printf("\n  -- connect-gate admission --\n");
     // The ONLY rejection there is. Every other combination admits.
     chk("owned board + stranger + window closed -> REJECT",
-        acabPairAdmit(true, true, false, false), false);
+        acabPairAdmit(true, false, false), false);
     chk("owned board + stranger + window OPEN -> admit",
-        acabPairAdmit(true, true, false, true), true);
+        acabPairAdmit(true, false, true), true);
     // The owner, always. This is the property that means an existing user never has to re-pair.
     chk("owned board + the owner + window closed -> admit",
-        acabPairAdmit(true, true, true, false), true);
+        acabPairAdmit(true, true, false), true);
     // Out of the box: a unit that shipped weeks ago must connect on the first try, no ritual.
     chk("UNOWNED board + new phone + window closed -> admit (out-of-box)",
-        acabPairAdmit(true, false, false, false), true);
+        acabPairAdmit(false, false, false), true);
     chk("UNOWNED board + new phone + window open -> admit",
-        acabPairAdmit(true, false, false, true), true);
-    // A target that never arms a window (mesh-detect) keeps its pre-feature behaviour. Without
-    // this it would inherit the rejection with no way to ever open a window: permanently unpairable.
-    chk("gate disabled (mesh-detect) + stranger + closed -> admit",
-        acabPairAdmit(false, true, false, false), true);
-    chk("gate disabled + unowned + closed -> admit",
-        acabPairAdmit(false, false, false, false), true);
+        acabPairAdmit(false, false, true), true);
 
     // A raw GAP link is not an authenticated app session. A stranger admitted while the physical
     // window is open must finish encrypted bonding before either the window or the auth deadline
@@ -96,17 +57,17 @@ int main() {
     // logging without ever proving possession of a bond.
     printf("\n  -- pre-auth link --\n");
     chk("stranger may authenticate while physical window remains open",
-        acabPairPreAuthMayContinue(true, true, false, true, 1000, 30000), true);
+        acabPairPreAuthMayContinue(true, false, true, 1000, 30000), true);
     chk("stranger is dropped when physical window closes before auth",
-        acabPairPreAuthMayContinue(true, true, false, false, 1000, 30000), false);
+        acabPairPreAuthMayContinue(true, false, false, 1000, 30000), false);
     chk("known owner may authenticate after physical window closes",
-        acabPairPreAuthMayContinue(true, true, true, false, 1000, 30000), true);
+        acabPairPreAuthMayContinue(true, true, false, 1000, 30000), true);
     chk("unowned first pairing is not tied to a physical window",
-        acabPairPreAuthMayContinue(true, false, false, false, 1000, 30000), true);
+        acabPairPreAuthMayContinue(false, false, false, 1000, 30000), true);
     chk("every pre-auth link is dropped at the timeout boundary",
-        acabPairPreAuthMayContinue(false, false, false, false, 30000, 30000), false);
+        acabPairPreAuthMayContinue(false, false, false, 30000, 30000), false);
     chk("elapsed subtraction remains valid across millis rollover",
-        acabPairPreAuthMayContinue(true, true, true, false,
+        acabPairPreAuthMayContinue(true, true, false,
                                    (uint32_t)(0x00000010UL - 0xfffffff0UL), 30000), true);
 
     printf("\n  -- legacy nRF DFU physical/session gate --\n");
@@ -155,18 +116,18 @@ int main() {
     chk("bench build -> physical even on a warm restart",
         acabPhysicalStart(false, false, false, false, false, true), true);
 
-    // ---- warm-boot enforcement (the P1-1 regression) -------------------------------------------
-    printf("\n  -- warm boot: enforced but closed --\n");
-    // The state a warm reboot now produces: gate ENABLED, window CLOSED. Enforcement used to be
-    // switched on only inside the window opener, so this combination was unreachable and every
-    // warm boot admitted any phone indefinitely.
-    chk("warm boot: enabled + owned + stranger + closed -> REJECT",
-        acabPairAdmit(true, true, false, false), false);
-    chk("warm boot: the owner still reconnects",
-        acabPairAdmit(true, true, true, false), true);
-    // And the opt-in property stays load-bearing: a target that enables neither is unaffected.
-    chk("mesh target (gate never enabled) -> admitted regardless of window",
-        acabPairAdmit(false, true, false, false), true);
+    // ---- never-opened window (the P1-1 regression) ---------------------------------------------
+    printf("\n  -- never-opened window: enforced but closed --\n");
+    // A never-opened window (until 0) reads closed and enforcement is unconditional, so a stranger
+    // is refused on an owned board. Enforcement once lived behind an opt-in flag that only the
+    // window opener set, and every OTA restart, panic and watchdog then admitted any phone. That a
+    // warm boot really leaves until at 0 is the mains' part: test_acab_ble_service.cpp pins their
+    // only opener call inside the physical-start branch.
+    const bool unopened = acabPairWindowRemainingMsAt(T, 0) != 0;
+    chk("never opened: owned + stranger -> REJECT",
+        acabPairAdmit(true, false, unopened), false);
+    chk("never opened: the owner still reconnects",
+        acabPairAdmit(true, true, unopened), true);
 
     printf(gFail ? "\n  REGRESSION DETECTED (%d of %d)\n\n" : "\n  all good (0 failures of %d)\n\n",
            gFail ? gFail : gRun, gFail ? gRun : 0);

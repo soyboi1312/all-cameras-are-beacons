@@ -19,8 +19,7 @@
  * two builds (OUI-Spy, Mesh-Detect) differ only in the sink they register.
  */
 // Capture-build guard for the ESP32 side, mirroring the one in nrf-ble-scan/src/main.cpp.
-// This header is pulled in by acab_scanner.cpp, which every ESP32 env compiles, so the guard
-// covers oui-spy, mesh-detect, mesh-detect-ch1 and beacon-board alike.
+// acab_scanner.cpp includes this and every env but odid-sim compiles it, so the guard covers all.
 //
 // ACAB_ACTIVE_SCAN makes the scanner send requests to nearby targets instead of passively hearing
 // their broadcasts. The encrypted phone control link is separate. ACAB_BENCH_NO_SLEEP skips the
@@ -37,6 +36,9 @@
 #define ACAB_SCANNER_H
 
 #include "detection.h"
+#if __has_include("soc/soc_caps.h")
+#include "soc/soc_caps.h"   // SOC_WIFI_SUPPORT_5G gates the 5 GHz API below; host tests have no SoC
+#endif
 
 struct AcabScannerConfig {
     bool        enableBLE;          // scan BLE advertisements
@@ -77,11 +79,9 @@ inline void acabSanitizeAscii(char* dst, const uint8_t* src, size_t n, size_t ca
 // board's own radio; a dual-radio build also calls it for adverts a companion
 // nRF52840 forwards over UART. Counts toward acabScannerBleSeen(). mac is in
 // human order (mac[0] = OUI first byte); payload is the raw advert AD bytes.
-// isReplay=true routes a recovered black-box record to the app WITHOUT beeping or
-// polluting the live dedup table / gTotal / offline buffer (see AcabDetection::replay).
 // addrType: the receiving controller's public/random report. The native NimBLE scan passes the
-// real value; the dual-radio UART forward and black-box replays have none and take the default.
-void acabScannerIngestBLE(const uint8_t mac[6], const uint8_t* payload, size_t plen, int rssi, bool isReplay = false,
+// real value; the dual-radio UART forward has none and takes the default.
+void acabScannerIngestBLE(const uint8_t mac[6], const uint8_t* payload, size_t plen, int rssi,
                           AcabBleAddrType addrType = ACAB_BLE_ADDR_UNKNOWN);
 
 // Finish the two-phase app-disconnect boundary. Call Block below before publishing connection
@@ -100,13 +100,6 @@ bool acabScannerReArmCapture(volatile bool* ownerCaptureBlocked);
 // False means the boundary failed; authentication must reject and disconnect remains fail-closed.
 bool acabScannerBlockCaptureForOwnerSession();
 bool acabScannerAdmitCaptureForOwnerSession();
-
-// Periodic re-arm while "record everything" is on (detLogBufferAll, det_log.h). Call once per
-// main-loop tick; it self-throttles to REBUFFER_AFTER_MS and no-ops when the mode is off or a
-// phone is connected. Without it a week-long deployment writes ONE record per device for the
-// whole week, because the generation counter only advances on an app disconnect and no app is
-// coming - the log would say "this MAC existed" and never "something came by on Thursday".
-void acabScannerBufferAllTick();
 
 // Whitelist: silently drop detections from these MACs (no report/beep/mesh).
 // App-pushed over config; held in RAM + persisted to NVS across boots (the app also
@@ -133,22 +126,13 @@ uint32_t acabScannerTotalDetections();
 // seeing nothing at all."
 uint32_t acabScannerBleSeen();
 uint32_t acabScannerWifiSeen();
-// Sink-queue drop accounting. A nonzero buffered-drop count means the offline ring missed records
-// it was asked to keep (the claim was rolled back, so the device re-arms, but that sighting is
-// gone); a nonzero deliver-only count is benign, since a missed live notify simply re-arrives.
-// Reported as `sdrop` (the total) in periodic status, and individually in the {"diag":true} reply.
-uint32_t acabScannerSinkDropDeliverOnly();
-uint32_t acabScannerSinkDropBuffered();
-uint32_t acabScannerSinkDropReplay();
-uint32_t acabScannerSinkHighWater();
-uint32_t acabScannerSinkDropTotal();
 
 // Co-processor (dual-radio nRF) stats, mirrored up over UART for the two-radio
 // "is it working?" diagnostic. hasCoProc stays false on a single-board build.
-void     acabScannerSetCoProcStats(uint32_t advSeen, uint32_t forwarded, bool scanning, uint32_t bbCount);
+void     acabScannerSetCoProcStats(uint32_t advSeen, uint32_t forwarded, bool scanning);
 bool     acabScannerHasCoProc();
 // Timestamp the last byte-line heard from the co-processor. The dual-radio UART path calls
-// this on EVERY ingested nRF line (adverts, the 5s "D" heartbeat, version/black-box replies)
+// this on EVERY ingested nRF line (adverts, the 5s "D" heartbeat, version replies)
 // so liveness can decay. No-op effect on single-board builds (nothing calls it).
 void     acabScannerNoteCoProcRx();
 // Co-processor liveness: true only if we have heard a line from the nRF within the timeout.
@@ -158,9 +142,8 @@ bool     acabScannerCoProcAlive();
 uint32_t acabScannerCoProcAdvSeen();
 uint32_t acabScannerCoProcForwarded();
 bool     acabScannerCoProcScanning();
-uint32_t acabScannerCoProcBbCount();   // black-box records stored on the nRF's flash
-// Send a command line to the co-processor (e.g. black-box "DUMP" / "BCLR") via the
-// registered cmd sink. No-op if no co-processor link is set.
+// Send a command line to the co-processor (e.g. "V", "DFU") via the registered cmd sink.
+// No-op if no co-processor link is set.
 void     acabScannerSendCoProcCmd(const char* cmd);
 // Re-push the co-processor state that lives only in its RAM: the BLE scan on/off line and the
 // ignore-list mirror. The nRF drops both on ANY reset (power blip, WDT, and most visibly a BLE
@@ -187,6 +170,14 @@ bool acabScannerHealthy();
 void acabScannerSetWifiEco(int sec);
 int  acabScannerWifiEco();
 
+#if SOC_WIFI_SUPPORT_5G
+// 5 GHz hop pass (env:beacon-c5; compiled out without a 5 GHz radio, so no S3 caller exists): true
+// (default) adds WIFI_HOP_SEQ_5G at the cost documented there. Off applies at the next channel.
+// Persisted beside eco.
+void acabScannerSetWifi5(bool on);
+bool acabScannerWifi5();
+#endif
+
 // Recompute + reinstall the 802.11 promiscuous frame filter. Production is MGMT-only, but
 // the network-camera opt-in (netcamIsEnabled) widens it to also deliver DATA frames so their
 // source-MAC can be OUI-matched; turning that toggle off narrows it back so no data-frame
@@ -209,16 +200,6 @@ void acabScannerSetCmdSink(AcabCmdSink sink);
 // an absent signal proves nothing. Reported on the [diag] line.
 uint32_t acabScannerWifiDiagSent();
 uint32_t acabScannerWifiDiagDropped();
-// Every watched DATA frame seen, counted even when the rate limiter printed no line for it.
-uint32_t acabScannerWatchDataSeen();
-// Falcon-OUI mode accounting. Measures whether a data-frame rule for falconWifiOui() could ever
-// be safe, BEFORE one is written: how much Falcon-OUI traffic is data vs management, how many
-// distinct devices carry those OUIs on a normal drive, and whether FALCON_MAX was big enough to
-// believe the answer. falcon_full > 0 invalidates the device count.
-uint32_t acabScannerFalconData();
-uint32_t acabScannerFalconMgmt();
-uint32_t acabScannerFalconMacs();
-uint32_t acabScannerFalconTableFull();
 // Official vendor BLE identifiers (Bluetooth SIG assigned numbers), counted per advert. The three
 // groups are tallied separately because they sit on different tracks: Axon/TASER is the first
 // field-validation target, Motorola Solutions rides along in capture only, and PCAM (company ID

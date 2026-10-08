@@ -47,10 +47,7 @@
  * Status record (fw string is "<label> <version>", e.g. beacon board reports "beacon board"):
  *   {"fw":"ACAB-ouispy 2.0.0","up":12345,"total":42,"ble":true,"wifi":true,
  *    "axon":false,"buzzer":true,"gps":false, ...}
- *   bat appears only on battery-sense boards; co/chg/nbb only on the dual-radio beacon
- *   board. The radio ingest counters (wseen/bseen) and the sink-drop total (sdrop) ride
- *   the one-shot {"diag":true} reply, NOT the periodic status - moved 2026-08-26 to keep
- *   the periodic frame's worst case under STATUS_JSON_MAX.
+ *   bat appears only on battery-sense boards; co/chg only on the dual-radio beacon board.
  *
  * The full, current key list for all three characteristics lives in docs/ble-protocol.md;
  * treat that doc as the source of truth and this header as a quick orientation.
@@ -78,15 +75,13 @@
 #define ACAB_BLE_STAT_UUID   "acab0103-6f75-6973-7079-000000000000"
 #define ACAB_BLE_OTA_UUID    "acab0104-6f75-6973-7079-000000000000"
 
-// The companion nRF's app version for the status doc (dual-radio boards). Weakly defined as -1
-// here; the beacon-board app provides the real one (the last "V<n>" it heard from the nRF).
+// Dual-radio hooks: called only under ACAB_DUAL_RADIO, defined only in beacon-board/main.cpp.
+// The companion nRF's app version for the status doc (the last "V<n>" heard, -1 before that).
 int acabNrfVersion();
 // Carrier revision, fixed at build time (true = rev-B: momentary power button + real VBUS sense).
-// Defined in the beacon-board build; weakly defaulted false elsewhere so the shared core links.
-bool acabBoardIsRevB() __attribute__((weak));
-
-// True while the companion nRF is mid BLE DFU (dual-radio boards; weakly false elsewhere). Drives
-// the status "nrfup" flag so the app mutes the co-proc fault banner during a legitimate update.
+bool acabBoardIsRevB();
+// True while the companion nRF is mid BLE DFU. Drives the status "nrfup" flag so the app mutes the
+// co-proc fault banner during a legitimate update.
 bool acabNrfDfuActive();
 
 // Execute a deferred physical action on the loop task while retaining the authenticated link that
@@ -105,16 +100,12 @@ bool acabBleRunPowerOffRequest(AcabBleDeferredLinkAction action, void* context =
 // only when it is really about to deep-sleep; a no-op with no subscriber and on non-dual builds.
 void acabBleNotifyPoweringOff();
 
-// Init NimBLE, build the service, and start advertising as `deviceName`. `fwLabel`
-// is this build's name in the status "fw" string (e.g. "mesh-detect-ACAB").
-// `startAdvertising = false` brings the GATT service up WITHOUT going on air, so a target can
-// finish deciding whether it is even staying powered, and configure the pairing gate, before any
-// phone can reach it. Call acabBleStartAdvertising() once those decisions are made. Default true
-// preserves every existing call site.
-void acabBleBegin(const char* deviceName, const char* fwLabel = "ACAB-ouispy",
-                  bool startAdvertising = true);
+// Init NimBLE and build the service named `deviceName`, WITHOUT going on air, so a target can
+// finish its power and pairing-window decisions before any phone can reach it. `fwLabel` is this
+// build's name in the status "fw" string (e.g. "mesh-detect-ACAB"); the pointer is kept, not copied.
+void acabBleBegin(const char* deviceName, const char* fwLabel);
 
-// Go on air. Idempotent, and safe to call even if acabBleBegin already started advertising.
+// Go on air. Call once those decisions are made. Idempotent.
 void acabBleStartAdvertising();
 
 // Push one detection to subscribed clients (call from the scanner sink).
@@ -148,25 +139,15 @@ void acabBleNotifyDetection(const AcabDetection& d, bool isNew);
 // this version can DELETE an existing bond while servicing a repeat pairing. Rejecting at connect,
 // before any SMP traffic, is therefore the only placement that cannot cost the legitimate owner
 // their bond. See ServerCb::onConnect.
-#define ACAB_PAIR_WINDOW_MS 120000UL
+//
+// The window length (ACAB_PAIR_WINDOW_MS) and the deadline arithmetic live in pair_window.h, where
+// they are host-tested.
 
-// Open the window. Call ONCE, only after the soft-power gate has committed the board ON, so a
-// board that boots merely to decide it should be off never becomes pairable. Touches no NVS: the
-// window is RAM-only and a power cycle is exactly how a user reopens it.
-// Turn ON enforcement without opening a window: strangers refused, already-bonded phones still
-// reconnect. Call unconditionally on every boot of a target that wants the gate. Separate from
-// acabBleOpenPairingWindow because enforcement and "a person just turned this on" are different
-// questions, and folding them together left every warm reboot (OTA, panic, watchdog, brownout)
-// running with enforcement OFF, admitting any phone indefinitely.
-void acabBlePairGateEnable();
-
-// Calling this ALSO opts the target into enforcement. A target that never calls it keeps the
-// pre-feature behaviour (any phone may pair, any time). Every GATT-serving production target now
-// opts in: beacon-board arms the window from its power-gate signals, mesh-detect from the reset
-// reason with cellAbsent=true (USB power is its only "switch"), so unplug/replug is the recovery
-// on both. The old worry, inheriting the rejection without ever arming a window and becoming
-// permanently unpairable, is exactly why enabling the gate without a window-arming signal is
-// wrong; do not copy the enable call without the acabPhysicalStart call beside it.
+// Enforcement is unconditional: on every boot strangers are refused on an owned board and bonded
+// phones reconnect. Open the window ONCE, only when acabPhysicalStart says a person just started
+// the board, and before acabBleStartAdvertising. A warm restart (OTA, panic, watchdog) opens
+// nothing. Touches no NVS: the window is RAM-only and a power cycle is how a user reopens it.
+// A target that never calls this refuses every new phone once the board has a bond.
 void acabBleOpenPairingWindow();
 // True while a new phone may bond. False before the window opens and after it expires.
 bool acabBlePairWindowOpen();
@@ -178,15 +159,6 @@ uint32_t acabBlePairWindowRemainingMs();
 int acabBleBondCount();
 
 void acabBleUpdateStatus();
-// One-shot expanded diagnostic pushed through the STATUS characteristic, in response to a
-// {"diag":true} write on Config. Config is WRITE-only, so this is the only shape a
-// request/response can take on this profile. See the implementation for what it carries.
-void acabBleSendDiag();
-// Live-notify MTU accounting, surfaced in the {"diag":true} reply. Elided = the alert still went
-// out with optional RID enrichment trimmed (see detect_elide.h); over-cap = the record could not
-// be made to fit at all, i.e. a genuinely lost live sighting.
-uint32_t acabBleNotifyElidedCount();
-uint32_t acabBleNotifyOverCapCount();
 
 // Report battery percentage (0-100) in the status JSON. Boards with no sense divider
 // never call this, so "bat" stays out of the JSON (pass -1 for unknown).

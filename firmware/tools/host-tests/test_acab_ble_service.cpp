@@ -25,8 +25,8 @@
  *      EVERY build, every counter at the top of its domain - is publishable. That is the floor:
  *      if it stopped fitting, the Status characteristic would be dead from the first build.
  *   4. the HEALTHY-REACHABLE document is publishable: pairing window open, LED switched off,
- *      buffer-all armed, a saturated ring, a wipe sweeping, an nRF DFU running and a charger
- *      attached, all at once, on a board with nothing wrong.
+ *      a wipe sweeping, an nRF DFU running and a charger attached, all at once, on a board with
+ *      nothing wrong.
  *   5. the WORST CASE - the latched-flash-fault key and the flood-limit flag on top of all of
  *      that - is publishable too. The flood flag (bufrl) is the builder's else-if arm of wiping,
  *      so the two never share a frame; the documents count the wider of that pair, and only after
@@ -34,20 +34,23 @@
  *      This is the HARD CEILING: every document the builder can produce, at the top of every
  *      declared domain, serializes strictly under STATUS_JSON_MAX, so the runtime overflow guard
  *      is defense in depth against a width this table missed, never an expected path.
+ *   3 to 5 hold per build: a key compiled into one build only (KeyBudget::onlyIf: the dual-radio
+ *   block, the C5's "wifi5") counts there alone once main() proves its guards.
  *
  * 4 and 5 were OVERAGE RATCHETS until 2026-08-26, because the healthy and worst-case documents
  * were then 21 and 53 bytes past the guard and a ceiling would only have hidden that debt. The
  * debt was paid the cross-platform way the old banner asked for: wseen, bseen and sdrop left the
- * periodic status for the {"diag":true} reply (verified first: NEITHER app parses any of the
- * three, and docs/ble-protocol.md's receipts contract reads them as start/end diagnostic deltas,
- * i.e. off that reply), "fw" was bounded by sizing fwbuf to its provable content, and "nrfv" was
+ * periodic status (verified first: NEITHER app parses any of the three), "fw" was bounded by
+ * sizing fwbuf to its provable content, and "nrfv" was
  * clamped at the untrusted UART boundary. With every reachable document now fitting, a ceiling is
  * the honest assertion, and the moment ANY tier reaches the guard this build fails - the gap can
  * not silently reopen as a ratchet would have allowed.
  */
+#include <algorithm>
 #include <cstdio>
 #include <cstring>
 #include <cstdlib>
+#include <filesystem>
 #include <string>
 #include <vector>
 
@@ -59,7 +62,7 @@
 // ---------------------------------------------------------------------------
 // WHICH DOCUMENT A KEY BELONGS TO. This used to be one bit, `steady`, and one bit cannot say the
 // thing that matters: ordinary states - an open pairing window, the LED switched off,
-// buffer-all armed, a saturated ring, a wipe sweeping, an nRF DFU, a charger - were filed under
+// a wipe sweeping, an nRF DFU, a charger - were filed under
 // the same "not steady" heading as a latched flash fault, which let the fitting assertion read as
 // "a behaving board always publishes" while this very table said it might not. Three tiers, so
 // each document the firmware can actually build gets measured as itself.
@@ -80,6 +83,10 @@ struct KeyBudget {
     // that exact else-if in the source and fails if it is gone, so deleting the else would fail
     // this test rather than quietly overflow the ceiling.
     const char* exclusiveWith = nullptr;
+    // Macro of the `#if M` / `#ifdef M` block that alone emits this key (null = every build).
+    // Until main() proves that block and acabBleUpdateStatus's both-macros #error, the key counts
+    // in every build, so a lost guard fails the ceiling instead of hiding from it.
+    const char* onlyIf = nullptr;
 };
 
 static const KeyBudget BUDGET[] = {
@@ -97,6 +104,7 @@ static const KeyBudget BUDGET[] = {
     { "ble",       5, ALWAYS,  "bool" },
     { "wifi",      5, ALWAYS,  "bool" },
     { "wifiEco",   2, ALWAYS,  "0/3/7/15 s sweep sleep" },
+    { "wifi5",     5, ALWAYS,  "bool; beacon-c5 only", nullptr, "SOC_WIFI_SUPPORT_5G" },
     { "axon",      5, ALWAYS,  "bool" },
     { "moto",      5, ALWAYS,  "bool" },
     { "tracker",   5, ALWAYS,  "bool" },
@@ -112,8 +120,6 @@ static const KeyBudget BUDGET[] = {
     { "buf",       5, ALWAYS,  "detLogCount() <= gSlots; the shipped 1.5 MB ring is 24576 slots" },
     { "bufon",     5, ALWAYS,  "bool" },
     { "keymis",    4, HEALTHY, "emitted only as true for this authenticated session; absent=false" },
-    { "bufall",    4, HEALTHY, "emitted only as true; a user opt-in" },
-    { "bufsat",    4, HEALTHY, "emitted only as true; the expected end state of a long deploy" },
     { "buferr",    3, FAULT,   "DET_LOG_FAULT_* bitmask, 5 bits defined, so 31 max" },
     { "wiping",    4, HEALTHY, "emitted only as true; a wipe still sweeping - one the user asked"
                                " for, or the boot-count auto-wipe" },
@@ -124,24 +130,22 @@ static const KeyBudget BUDGET[] = {
     { "desert",    5, ALWAYS,  "bool" },
     { "ign",       3, ALWAYS,  "ignore list caps at 256" },
     { "wat",       3, ALWAYS,  "watchlist caps at 256" },
-    // wseen / bseen / sdrop are NOT here because they are no longer in this document: they moved
-    // to the {"diag":true} reply on 2026-08-26 (neither app parses them; the receipts contract
-    // consumes them as start/end diagnostic deltas). Assertion 1 makes re-adding one a build
-    // failure until its width is re-declared - and re-declaring it must find its bytes elsewhere,
-    // because assertion 5 is now a hard ceiling.
-    { "nbb",       5, ALWAYS,  "the nRF's ring caps at BB_SLOTS = 32768, but that bound lives on"
-                               " the far side of the UART, so parseAdvLine saturates the D line's"
-                               " value at 65535 to keep this width provable on THIS side" },
+    // wseen / bseen are NOT here: they left this document on 2026-08-26 for the {"diag":true}
+    // reply, which 2.2.0 removed (neither app parses them); the counts now print only on the
+    // dual-radio [diag] line and mesh-detect's alive line. Assertion 1 makes re-adding one a build
+    // failure until its width is re-declared, and assertion 5 then holds it under the hard ceiling.
     { "bat",       3, ALWAYS,  "0..100, emitted only when >= 0" },
-    { "co",        5, ALWAYS,  "bool" },
+    { "co",        5, ALWAYS,  "bool", nullptr, "ACAB_DUAL_RADIO" },
     { "nrfv",      4, ALWAYS,  "atoi of the nRF's V-line, an int off an untrusted UART - so it is"
                                " clamped to -1..9999 where it is parsed (parseAdvLine, beacon-board"
                                " main.cpp) AND re-capped at 9999 at the emit site in"
                                " acabBleUpdateStatus, which only emits >= 0; real domain is"
-                               " NRF_APP_VERSION, currently 2" },
-    { "rev",       3, ALWAYS,  "quoted \"A\" or \"B\"" },
-    { "nrfup",     4, HEALTHY, "emitted only as true; a normal nRF OTA, not a fault" },
-    { "chg",       4, HEALTHY, "emitted only as true; the board is on a charger" },
+                               " NRF_APP_VERSION, currently 2", nullptr, "ACAB_DUAL_RADIO" },
+    { "rev",       3, ALWAYS,  "quoted \"A\" or \"B\"", nullptr, "ACAB_DUAL_RADIO" },
+    { "nrfup",     4, HEALTHY, "emitted only as true; a normal nRF OTA, not a fault", nullptr,
+                               "ACAB_DUAL_RADIO" },
+    { "chg",       4, HEALTHY, "emitted only as true; the board is on a charger", nullptr,
+                               "ACAB_DUAL_RADIO" },
 };
 static const size_t BUDGET_N = sizeof(BUDGET) / sizeof(BUDGET[0]);
 
@@ -166,6 +170,44 @@ static std::string slurp(const char* path) {
     while ((n = fread(b, 1, sizeof(b), f)) > 0) s.append(b, n);
     fclose(f);
     return s;
+}
+
+// The code alone, comments dropped and every whitespace run collapsed to one space, so a pin
+// matches neither a commented-out statement nor one that merely moved to another line. String and
+// char literals are copied whole, so a "//" inside one is not read as a comment.
+static std::string codeFlat(const std::string& s) {
+    std::string out;
+    auto put = [&](char c) {
+        if (c != ' ' && c != '\n' && c != '\t' && c != '\r') out += c;
+        else if (!out.empty() && out.back() != ' ') out += ' ';
+    };
+    for (size_t i = 0; i < s.size(); i++) {
+        if (s.compare(i, 2, "//") == 0) {
+            while (i < s.size() && s[i] != '\n') i++;
+            put('\n');
+        } else if (s.compare(i, 2, "/*") == 0) {
+            size_t e = s.find("*/", i + 2);
+            i = e == std::string::npos ? s.size() : e + 1;
+            put(' ');
+        } else if (s[i] == '"' || s[i] == '\'') {
+            const char q = s[i];
+            put(s[i]);
+            for (i++; i < s.size() && s[i] != q; i++) {
+                if (s[i] == '\\' && i + 1 < s.size()) out += s[i++];
+                out += s[i];
+            }
+            if (i < s.size()) out += q;
+        } else {
+            put(s[i]);
+        }
+    }
+    return out;
+}
+
+static int countOf(const std::string& hay, const char* needle) {
+    int n = 0;
+    for (size_t at = hay.find(needle); at != std::string::npos; at = hay.find(needle, at + 1)) n++;
+    return n;
 }
 
 static int keyCost(const KeyBudget* k) { return (int)strlen(k->key) + 3 + k->width; }
@@ -326,8 +368,8 @@ int main() {
            src.find("? doc[\"syncgen\"].as<uint32_t>() : 0") != std::string::npos &&
            src.find("doc[\"gen\"]  = detLogGeneration();") != std::string::npos);
         ok("disconnect invalidates the complete replay transport session",
-           src.find("stopReplaySession();", src.find("void onDisconnect")) != std::string::npos);
-        const size_t disconnect = src.find("void onDisconnect");
+           src.find("stopReplaySession();", src.find("void disconnectBody")) != std::string::npos);
+        const size_t disconnect = src.find("void disconnectBody");
         const size_t disconnectStop = disconnect == std::string::npos ? disconnect :
             src.find("stopReplaySession();", disconnect);
         const size_t disconnectKeyCleanup = disconnectStop == std::string::npos ? disconnectStop :
@@ -336,8 +378,8 @@ int main() {
            disconnect != std::string::npos && disconnectStop != std::string::npos &&
            disconnectKeyCleanup != std::string::npos && disconnectStop < disconnectKeyCleanup &&
            src.find("if (scrubReplayKey)", disconnect) == std::string::npos);
-        const size_t auth = src.find("void onAuthenticationComplete");
-        const size_t connectLifecycle = src.find("void onConnect");
+        const size_t auth = src.find("void authBody");
+        const size_t connectLifecycle = src.find("void connectBody");
         const size_t connectOwnerGateClear = connectLifecycle == std::string::npos ?
             connectLifecycle : src.find("gOwnerCaptureBlocked = false;", connectLifecycle);
         ok("a failed away publication stays fail-closed across the next raw link",
@@ -406,6 +448,45 @@ int main() {
            authenticatedGpsClear != std::string::npos &&
            src.find("if (!gPeerKnownAtConnect) clearPhoneGpsShadow(true);") == std::string::npos &&
            authenticatedGpsClear < privacyArm && privacyArm < configAdmit);
+        // The checks above anchor on *Body functions reached only through the NimBLE overrides, so
+        // an emptied override (onConnect runs the pairing gate) would pass them all. Every adapter
+        // must forward on both versions; the 2.x connect refuses a missing descriptor first.
+        const size_t c5Connect = src.find("void onConnect(NimBLEServer* srv, NimBLEConnInfo& ci) override {");
+        const size_t c5Refuse = src.find("if (ble_gap_conn_find(ci.getConnHandle(), &d) != 0) {", c5Connect);
+        const size_t c5Body = src.find("connectBody(srv, &d);", c5Connect);
+        size_t writeForwards = 0;
+        for (size_t at = src.find("override { writeBody(c); }"); at != std::string::npos;
+             at = src.find("override { writeBody(c); }", at + 1)) writeForwards++;
+        ok("NimBLE callback adapters forward to their bodies on both NimBLE versions",
+           src.find("void onConnect(NimBLEServer* srv, ble_gap_conn_desc* d) override { connectBody(srv, d); }") != std::string::npos &&
+           src.find("void onAuthenticationComplete(ble_gap_conn_desc* desc) override { authBody(desc); }") != std::string::npos &&
+           src.find("void onMTUChange(uint16_t mtu, ble_gap_conn_desc*) override { mtuBody(mtu); }") != std::string::npos &&
+           src.find("void onDisconnect(NimBLEServer*) override { disconnectBody(); }") != std::string::npos &&
+           c5Connect != std::string::npos && c5Refuse != std::string::npos && c5Body != std::string::npos &&
+           c5Refuse < c5Body &&
+           src.find("authBody(ble_gap_conn_find(ci.getConnHandle(), &d) == 0 ? &d : nullptr);") != std::string::npos &&
+           src.find("void onMTUChange(uint16_t mtu, NimBLEConnInfo&) override { mtuBody(mtu); }") != std::string::npos &&
+           src.find("gDetSubVal = 0; gStatSubVal = 0; gOtaSubVal = 0;\n        disconnectBody();") != std::string::npos &&
+           writeForwards == 4);
+        // Why: see linkNotify (0xffff notifies every peer; that form checks no encryption).
+        const size_t ln = src.find("static void linkNotify(");
+        const size_t lnEnd = ln == std::string::npos ? ln : src.find("\n}", ln);
+        const std::string lnBody = ln == std::string::npos ? std::string() : src.substr(ln, lnEnd - ln);
+        size_t handleReads = 0;
+        for (size_t at = lnBody.find("gConnHandle"); at != std::string::npos;
+             at = lnBody.find("gConnHandle", at + 1)) handleReads++;
+        ok("2.x linkNotify reads the handle once and sends only on an encrypted link",
+           handleReads == 1 &&
+           lnBody.find("ble_gap_conn_find(h, &d) == 0 && d.sec_state.encrypted") != std::string::npos &&
+           lnBody.find("c->notify(v, n, h);") != std::string::npos);
+        // Why: see StoreCb. The hook must also be installed before init.
+        const size_t storeCb = src.find("if (e->event_code == BLE_STORE_EVENT_OVERFLOW) NimBLEDevice::getScan()->stop();");
+        const size_t storeRr = storeCb == std::string::npos ? storeCb : src.find("return ble_store_util_status_rr(e, arg);", storeCb);
+        const size_t storeSet = src.find("NimBLEDevice::setDeviceCallbacks(&gStoreCb);");
+        const size_t bleInit = src.find("NimBLEDevice::init(deviceName");
+        ok("2.x bond overflow stops the scan so the oldest bond is evicted",
+           storeCb != std::string::npos && storeRr != std::string::npos &&
+           storeSet != std::string::npos && bleInit != std::string::npos && storeSet < bleInit);
         ok("disconnect blocks claims before state teardown and publishes away capture last",
            disconnectGateRaise != std::string::npos && disconnectBlock != std::string::npos &&
            disconnectPublish != std::string::npos && disconnectGpsClear != std::string::npos &&
@@ -414,6 +495,31 @@ int main() {
            disconnectGateRaise < disconnectBlock && disconnectBlock < disconnectPublish &&
            disconnectPublish < disconnectGpsClear && disconnectGpsClear < disconnectStop &&
            disconnectStop < disconnectKeyCleanup && disconnectKeyCleanup < disconnectRearm);
+        // NimBLE calls onDisconnect for a stranger refused at the pairing gate too. A link that
+        // never passed the encrypted-bond check must return before the session teardown, which
+        // wipes the retained away-row fix and re-arms capture.
+        const size_t secureCheck = auth == std::string::npos ? auth :
+            src.find("if (!secure || !stillAdmitted)", auth);
+        const size_t securedMark = auth == std::string::npos ? auth :
+            src.find("gLinkSecured = true;", auth);
+        const size_t teardownStart = disconnect == std::string::npos ? disconnect :
+            src.find("const bool retainGpsForAwayRows", disconnect);
+        const size_t unsecuredGuard = disconnect == std::string::npos ? disconnect :
+            src.find("if (!gLinkSecured) {", disconnect);
+        const size_t unsecuredReturn = unsecuredGuard == std::string::npos ? unsecuredGuard :
+            src.find("return;", unsecuredGuard);
+        const std::string unsecuredBranch = unsecuredReturn == std::string::npos ? "" :
+            src.substr(unsecuredGuard, unsecuredReturn - unsecuredGuard);
+        ok("an unauthenticated link's disconnect leaves session state alone",
+           secureCheck != std::string::npos && securedMark != std::string::npos &&
+           authGateRaise != std::string::npos && secureCheck < securedMark &&
+           securedMark < authGateRaise &&
+           unsecuredGuard != std::string::npos && unsecuredReturn != std::string::npos &&
+           teardownStart != std::string::npos && unsecuredReturn < teardownStart &&
+           unsecuredBranch.find("clearPhoneGpsShadow") == std::string::npos &&
+           unsecuredBranch.find("acabScannerReArmCapture") == std::string::npos &&
+           unsecuredBranch.find("gOwnerCaptureBlocked") == std::string::npos &&
+           src.find("gLinkSecured = false;", unsecuredReturn) < teardownStart);
         const size_t scannerDisconnectFinish = scannerSrc.find(
             "bool acabScannerReArmCapture(volatile bool* ownerCaptureBlocked)");
         const size_t disconnectPendingAdmit = scannerDisconnectFinish == std::string::npos ?
@@ -478,12 +584,8 @@ int main() {
         const size_t guardedDelivery = scannerSrc.find(
             "detLogDeliverIfCaptureEpochCurrent(it.claim.admissionEpoch");
         const size_t directDelivery = scannerSrc.find("if (it.deliver && gSink) gSink(");
-        const size_t replayBranch = scannerSrc.find("if (isReplay)");
-        const size_t replayEpochStamp = replayBranch == std::string::npos ? replayBranch :
-            scannerSrc.find("it.claim.admissionEpoch = gAdmissionEpoch;", replayBranch);
-        ok("every queued sink delivery, including nRF replay, is owner-epoch guarded",
-           guardedDelivery != std::string::npos && directDelivery == std::string::npos &&
-           replayEpochStamp != std::string::npos);
+        ok("every queued sink delivery is owner-epoch guarded",
+           guardedDelivery != std::string::npos && directDelivery == std::string::npos);
         const size_t deliveryGuard = detLogSrc.find(
             "bool detLogDeliverIfCaptureEpochCurrent");
         const size_t deliveryOwnerLock = deliveryGuard == std::string::npos ? deliveryGuard :
@@ -499,16 +601,6 @@ int main() {
            deliveryCallback != std::string::npos && deliveryOwnerUnlock != std::string::npos &&
            deliveryOwnerLock < deliveryIoUnlock && deliveryIoUnlock < deliveryCallback &&
            deliveryCallback < deliveryOwnerUnlock);
-        const size_t cadenceHelper = scannerSrc.find("static void rearmCaptureCadenceOnly()");
-        const size_t bufferAllTick = scannerSrc.find("void acabScannerBufferAllTick()");
-        const size_t cadenceCall = bufferAllTick == std::string::npos ? bufferAllTick :
-            scannerSrc.find("rearmCaptureCadenceOnly();", bufferAllTick);
-        const size_t cadenceEpochAdvance = cadenceHelper == std::string::npos ? cadenceHelper :
-            scannerSrc.find("detLogAdvanceCaptureEpoch();", cadenceHelper);
-        ok("periodic capture rearm leaves owner admission epoch unchanged",
-           cadenceHelper != std::string::npos && bufferAllTick != std::string::npos &&
-           cadenceCall != std::string::npos &&
-           (cadenceEpochAdvance == std::string::npos || cadenceEpochAdvance > bufferAllTick));
         const size_t cfgWrite = src.find("class CfgCb");
         const size_t cfgGuard = cfgWrite == std::string::npos ? cfgWrite :
             src.find("if (!gConnected || !gConfigPrivacyReady || !c) return;", cfgWrite);
@@ -558,7 +650,7 @@ int main() {
             src.find("if (doc[\"key\"].is<const char*>())", cfgWrite);
         const size_t replacementConsume = keyResult == std::string::npos ? keyResult :
             src.find("if (keyResult == DET_LOG_KEY_ACCEPTED)", keyResult);
-        const size_t connect = src.find("void onConnect");
+        const size_t connect = src.find("void connectBody");
         const size_t replacementResetOnConnect = connect == std::string::npos ? connect :
             src.find("gSessionKeyReplacementApproved = false;", connect);
         const size_t replacementResetOnDisconnect = disconnect == std::string::npos ? disconnect :
@@ -620,6 +712,127 @@ int main() {
            boardPowerLease != std::string::npos &&
            boardPowerCallback < boardPowerAction && boardPowerAction < boardPowerLease &&
            src.find("acabBleTakePowerOffRequest") == std::string::npos);
+        // The window arithmetic is host-tested in test_pair_window.cpp, but this file is not
+        // compiled on the host. Pin that the service writes and reads the window only through
+        // those helpers on the 64-bit clock, and that every admission point consults it.
+        const std::string flat = codeFlat(src);
+        ok("pairing window is read only through the host-tested 64-bit helper",
+           flat.find("bool acabBlePairWindowOpen() { return acabBlePairWindowRemainingMs() != 0; }") !=
+               std::string::npos &&
+           flat.find("uint32_t acabBlePairWindowRemainingMs() { return acabPairWindowRemainingMsAt("
+                     "(uint64_t)esp_timer_get_time(), gPairWindowUntilUs); }") != std::string::npos);
+        // Three uses (declaration, opener, reader): any other write, or any other opener call
+        // (one that reopens the window from a tick), fails here.
+        ok("pairing window deadline is written only by the opener, through the tested helper",
+           flat.find("void acabBleOpenPairingWindow() { gPairWindowUntilUs = "
+                     "acabPairWindowUntilUsAt((uint64_t)esp_timer_get_time());") !=
+               std::string::npos &&
+           countOf(flat, "gPairWindowUntilUs") == 3 &&
+           countOf(flat, "acabBleOpenPairingWindow(") == 1);
+        ok("legacy nRF DFU arms and runs only inside the physical window",
+           flat.find("static bool nrfDfuMayArmNow() { return acabLegacyDfuMayArm(gConnected, "
+                     "acabBlePairWindowOpen()); }") != std::string::npos &&
+           flat.find("if (nrfDfuMayArmNow() && gLinkActions.arm(AcabLinkActionSlot::nrfDfu))") !=
+               std::string::npos &&
+           flat.find("static bool nrfDfuStillAuthorized(void*) { return nrfDfuMayArmNow(); }") !=
+               std::string::npos &&
+           flat.find("AcabLinkActionSlot::nrfDfu, nrfDfuStillAuthorized, action, context);") !=
+               std::string::npos);
+        // A warm reboot (OTA, panic, watchdog) must leave the window closed, so each main opens it
+        // exactly once and only in its physical-start branch, decided by acabPhysicalStart.
+        const std::string boardFlat = codeFlat(boardMain), meshFlat = codeFlat(meshMain);
+        ok("beacon-board opens the window once, only on a physical start",
+           boardFlat.find("const esp_reset_reason_t rr2 = esp_reset_reason(); const bool "
+                          "physicalStart = acabPhysicalStart(rr2 == ESP_RST_POWERON, rr2 == "
+                          "ESP_RST_DEEPSLEEP, pwrCellAbsent, pwrButtonHeld, pwrSwitchLow, "
+                          "pwrBenchBuild);") != std::string::npos &&
+           boardFlat.find("if (physicalStart) { acabBleOpenPairingWindow(); } else {") !=
+               std::string::npos &&
+           countOf(boardFlat, "acabBleOpenPairingWindow(") == 1);
+        ok("mesh-detect opens the window once, only on a physical start",
+           meshFlat.find("const esp_reset_reason_t meshRr = esp_reset_reason(); if "
+                         "(acabPhysicalStart(meshRr == ESP_RST_POWERON, meshRr == "
+                         "ESP_RST_DEEPSLEEP, true, false, false, false)) { "
+                         "acabBleOpenPairingWindow(); } else {") != std::string::npos &&
+           countOf(meshFlat, "acabBleOpenPairingWindow(") == 1);
+        // acabCoredumpWipeTick() no-ops until acabCoredumpProbe() has run (gProbed), so a main that
+        // drops the probe silently loses the {"clearlog"} / key-change dump erase.
+        auto probeArmsWipe = [](const std::string& f) {
+            return countOf(f, "acabCoredumpProbe();") == 1 &&
+                   countOf(f, "acabCoredumpWipeTick();") == 1 &&
+                   f.find("acabCoredumpProbe();") < f.find("acabCoredumpWipeTick();");
+        };
+        ok("beacon-board probes the coredump once, before its wipe tick", probeArmsWipe(boardFlat));
+        ok("mesh-detect probes the coredump once, before its wipe tick", probeArmsWipe(meshFlat));
+        ok("connect, authentication and pre-auth gates all consult the window",
+           flat.find("!acabPairAdmit(boardHadBond, known, acabBlePairWindowOpen())") != std::string::npos &&
+           flat.find("acabPairAdmit(gBoardHadBondAtConnect, gPeerKnownAtConnect, "
+                     "acabBlePairWindowOpen());") != std::string::npos &&
+           flat.find("!acabPairPreAuthMayContinue(gBoardHadBondAtConnect, gPeerKnownAtConnect, "
+                     "acabBlePairWindowOpen(), elapsed, AUTH_TIMEOUT_MS)") != std::string::npos);
+        // The pins above match only the CALL text, so a gate wrapped in an opt-in #ifdef (the old
+        // P1-1 shape), short-circuited, left without its disconnect/return, or fed a bond count or
+        // "known" that admits everyone would still pass. Pin each enforcement block whole.
+        const size_t cbStart = flat.find("void connectBody(NimBLEServer* srv, ble_gap_conn_desc* d) {");
+        const size_t cbGate = flat.find("bool known = false; const bool boardHadBond", cbStart);
+        const std::string cbPre = cbStart == std::string::npos || cbGate == std::string::npos ? "#if return"
+            : flat.substr(cbStart, cbGate - cbStart);
+        ok("connect gate is enforced whole: owned + stranger + closed window disconnects and returns",
+           cbPre.find("return") == std::string::npos && cbPre.find("#if") == std::string::npos &&
+           flat.find("bool known = false; const bool boardHadBond = acabBleBondCount() > 0; if (d) { "
+                     "known = NimBLEDevice::isBonded(NimBLEAddress(d->peer_id_addr)) || "
+                     "NimBLEDevice::isBonded(NimBLEAddress(d->peer_ota_addr)); if (!acabPairAdmit("
+                     "boardHadBond, known, acabBlePairWindowOpen())) { Serial.println(\"[pair] window "
+                     "CLOSED and peer is not bonded -> rejecting. \" \"Power-cycle the board to open a "
+                     "fresh 2-minute window.\"); if (srv) srv->disconnect(d->conn_handle); return; } } "
+                     "gLinkConnected = true; gConnected = false; gConnHandle = d ? d->conn_handle : "
+                     "0xffff; gAuthStartedMs = millis(); gPeerKnownAtConnect = known; "
+                     "gBoardHadBondAtConnect = boardHadBond;") != std::string::npos &&
+           flat.find("int acabBleBondCount() { return NimBLEDevice::getNumBonds(); }") != std::string::npos);
+        ok("auth re-check and pre-auth tick disconnect a stranger whose window closed",
+           flat.find("if (!secure || !stillAdmitted) { Serial.println(!secure ? \"[ACAB] pairing failed to "
+                     "establish an encrypted bond; disconnecting\" : \"[ACAB] pairing window closed before "
+                     "stranger authenticated; disconnecting\"); if (gServer && gConnHandle != 0xffff) "
+                     "gServer->disconnect(gConnHandle); return; } gLinkSecured = true;") != std::string::npos &&
+           flat.find("if (gLinkConnected && !gConnected) { const uint32_t elapsed = (uint32_t)(millis() - "
+                     "gAuthStartedMs); if (!acabPairPreAuthMayContinue(gBoardHadBondAtConnect, "
+                     "gPeerKnownAtConnect, acabBlePairWindowOpen(), elapsed, AUTH_TIMEOUT_MS)) { "
+                     "Serial.println(elapsed >= AUTH_TIMEOUT_MS ? \"[ACAB] BLE authentication timed out; "
+                     "disconnecting\" : \"[ACAB] pairing window closed before authentication; "
+                     "disconnecting\"); if (gServer && gConnHandle != 0xffff) "
+                     "gServer->disconnect(gConnHandle); } }") != std::string::npos);
+        ok("status pairw and the [diag] pairw read the same 64-bit helper",
+           flat.find("if (uint32_t rem = acabBlePairWindowRemainingMs()) doc[\"pairw\"] = rem / 1000;") !=
+               std::string::npos &&
+           boardFlat.find("acabBleBondCount(), (unsigned long)(acabBlePairWindowRemainingMs() / 1000));") !=
+               std::string::npos);
+        // A production build that claims to be a bench build opens the window on every warm boot.
+        ok("beacon-board is a bench build only under ACAB_BENCH_NO_SLEEP",
+           boardFlat.find("#ifdef ACAB_BENCH_NO_SLEEP const bool pwrBenchBuild = true; #else const bool "
+                          "pwrBenchBuild = false; #endif") != std::string::npos &&
+           countOf(boardFlat, "pwrBenchBuild") == 3);
+        // The per-file counts above cannot see a call added in another translation unit (an OTA boot
+        // check, the scanner): walk every firmware source for the opener.
+        {
+            int defs = 0, calls = 0; std::string where;
+            for (const char* root : {"../../lib", "../../src"}) {
+                for (const auto& e : std::filesystem::recursive_directory_iterator(root)) {
+                    const std::string ext = e.path().extension().string();
+                    if (!e.is_regular_file() || (ext != ".cpp" && ext != ".h" && ext != ".c")) continue;
+                    const int n = countOf(codeFlat(slurp(e.path().string().c_str())), "acabBleOpenPairingWindow(");
+                    if (!n) continue;
+                    const std::string f = e.path().generic_string();
+                    if (f.size() >= 18 && f.compare(f.size() - 18, 18, "acab_ble_service.h") == 0 && n == 1) defs++;
+                    else if (f.size() >= 20 && f.compare(f.size() - 20, 20, "acab_ble_service.cpp") == 0 && n == 1) defs++;
+                    else if ((f.find("beacon-board/main.cpp") != std::string::npos ||
+                              f.find("mesh-detect/main.cpp") != std::string::npos) && n == 1) calls++;
+                    else where += " " + f;
+                }
+            }
+            char extra[160]; snprintf(extra, sizeof(extra), "%s", where.c_str());
+            ok("acabBleOpenPairingWindow is called only from the two mains' physical-start branches",
+               defs == 2 && calls == 2 && where.empty(), extra);
+        }
         ok("legacy loose replay envelope globals are gone",
            src.find("gHistSent") == std::string::npos &&
            src.find("gHistBeginSent") == std::string::npos &&
@@ -683,12 +896,6 @@ int main() {
 
     // 3 + 4 + 5. Build the three documents from the DECLARED order-independent key set. Order does
     // not change a compact JSON length, so the sums below hold whatever order the builder emits in.
-    std::vector<const KeyBudget*> all, always, healthy;
-    for (size_t i = 0; i < BUDGET_N; i++) {
-        all.push_back(&BUDGET[i]);
-        if (BUDGET[i].tier == ALWAYS)  { always.push_back(&BUDGET[i]); healthy.push_back(&BUDGET[i]); }
-        if (BUDGET[i].tier == HEALTHY) { healthy.push_back(&BUDGET[i]); }
-    }
     // Exclusive pairs: prove each one from the builder source BEFORE counting it as one slot.
     // The emit of `exclusiveWith` must be followed, as the very next statement, by
     // `else if (...) doc["<key>"]`. Anything else (the else deleted, the arms reordered, the key
@@ -721,9 +928,68 @@ int main() {
         if (proven) provenExclusions.push_back(BUDGET[i].key);
     }
 
-    const int alwaysLen  = docLen(applyExclusions(always, provenExclusions));
-    const int healthyLen = docLen(applyExclusions(healthy, provenExclusions));
-    const int worstLen   = docLen(applyExclusions(all, provenExclusions));
+    // Build-only keys (KeyBudget::onlyIf). The builder's one emit must sit directly in `#if M` /
+    // `#ifdef M`: the nearest opener above names exactly M, no #else / #elif / #endif between. An
+    // onlyIf outside kBuilds fails and counts everywhere: a new macro needs an entry here and its
+    // own #error against each other entry.
+    static const char* const kBuilds[] = { "ACAB_DUAL_RADIO", "SOC_WIFI_SUPPORT_5G" };
+    const size_t fn = src.find("void acabBleUpdateStatus()");
+    const size_t end = fn == std::string::npos ? fn : src.find("len = serializeJson(", fn);
+    const size_t both = src.find("#if SOC_WIFI_SUPPORT_5G && defined(ACAB_DUAL_RADIO)\n#error", fn);
+    const bool buildsApart = both != std::string::npos && end != std::string::npos && both < end;
+    ok("the status builder #errors on a build with both ACAB_DUAL_RADIO and 5 GHz", buildsApart);
+    std::vector<std::string> provenGuards;
+    for (size_t i = 0; i < BUDGET_N; i++) {
+        const KeyBudget& k = BUDGET[i];
+        if (!k.onlyIf) continue;
+        const std::string emit = std::string("doc[\"") + k.key + "\"]";
+        const size_t at = fn == std::string::npos ? fn : src.find(emit, fn);
+        bool proven = false;
+        if (at != std::string::npos && end != std::string::npos && at < end) {
+            const size_t again = src.find(emit, at + 1);
+            const size_t open = src.rfind("\n#if", at);
+            const size_t close = src.rfind("\n#endif", at);
+            const size_t alt = src.rfind("\n#el", at);
+            std::string line = open == std::string::npos ? "" :
+                src.substr(open + 1, src.find('\n', open + 1) - open - 1);
+            line = line.substr(0, line.find("//"));
+            while (!line.empty() && line.back() == ' ') line.pop_back();
+            proven = (again == std::string::npos || again > end) &&
+                     open != std::string::npos && open > fn &&
+                     (close == std::string::npos || close < open) &&
+                     (alt == std::string::npos || alt < open) &&
+                     (line == std::string("#if ") + k.onlyIf ||
+                      line == std::string("#ifdef ") + k.onlyIf);
+        }
+        char msg[200];
+        snprintf(msg, sizeof(msg), "\"%s\" is emitted only inside the %s block", k.key, k.onlyIf);
+        ok(msg, proven);
+        const bool known = std::any_of(std::begin(kBuilds), std::end(kBuilds),
+                                       [&](const char* b) { return strcmp(b, k.onlyIf) == 0; });
+        snprintf(msg, sizeof(msg), "\"%s\" onlyIf %s is a kBuilds entry", k.key, k.onlyIf);
+        ok(msg, known);
+        if (proven && known && buildsApart) provenGuards.push_back(k.key);
+    }
+
+    // Each build's three documents; each tier reports the largest build's length.
+    int alwaysLen = 0, healthyLen = 0, worstLen = 0;
+    for (const char* build : kBuilds) {
+        std::vector<const KeyBudget*> all, always, healthy;
+        for (size_t i = 0; i < BUDGET_N; i++) {
+            const KeyBudget* k = &BUDGET[i];
+            if (k->onlyIf && strcmp(k->onlyIf, build) != 0 &&
+                std::find(provenGuards.begin(), provenGuards.end(), k->key) != provenGuards.end())
+                continue;   // compiled out of this build
+            all.push_back(k);
+            if (k->tier == ALWAYS)  { always.push_back(k); healthy.push_back(k); }
+            if (k->tier == HEALTHY) { healthy.push_back(k); }
+        }
+        const int w = docLen(applyExclusions(all, provenExclusions));
+        alwaysLen  = std::max(alwaysLen,  docLen(applyExclusions(always, provenExclusions)));
+        healthyLen = std::max(healthyLen, docLen(applyExclusions(healthy, provenExclusions)));
+        worstLen   = std::max(worstLen, w);
+        printf("  worst case on the %s build: %d B\n", build, w);
+    }
 
     // The largest frame that can actually be PUBLISHED. The guard rejects `len >= STATUS_JSON_MAX`
     // rather than `> `, because the scratch is declared one byte larger so truncation is
@@ -761,8 +1027,7 @@ int main() {
     printf("    worst case %4d B  %s\n", worstLen,
            worstLen <= maxPublishable
                      ? "fits - every reachable document publishes and the guard is belt and braces"
-                     : "OVER - the hard ceiling is breached; shrink a domain or move a key to the"
-                       " diag reply");
+                     : "OVER - the hard ceiling is breached; shrink a domain or drop a key");
 
     printf("\n  %s\n", gFail ? "FAILURES" : "all good (0 failures)");
     return gFail ? 1 : 0;

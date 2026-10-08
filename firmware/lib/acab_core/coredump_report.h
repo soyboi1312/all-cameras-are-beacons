@@ -6,7 +6,7 @@
  * compiled into the image. Nothing in ACAB has ever read it. So every panic this product has had
  * in the field wrote a full post-mortem to flash and then sat there, invisible, until the next
  * flash erase took it. This header is the smallest thing that changes that: one line on the serial
- * console at boot, and the same fields in the {"diag":true} reply.
+ * console at boot.
  *
  * DELIBERATELY NOT TOUCHING THE PARTITION TABLE. A resize would invalidate every board in the
  * field (the table is flashed once, and a mismatched table bricks the OTA layout), and truncation
@@ -75,7 +75,8 @@
 #include <stdbool.h>
 
 /// Cached, printable view of the retained dump. Read once at boot (the flash read is not free and
-/// the contents cannot change while we run) and reused by the diag reply.
+/// the contents cannot change while we run), then reused by acabCoredumpPrint and
+/// acabCoredumpWipeTick.
 struct AcabCoredumpInfo {
     bool     present;        ///< a dump was found AND passed esp_core_dump_image_check()
     bool     corrupt;        ///< not positively empty, but unreadable/invalid; erase is required
@@ -95,7 +96,8 @@ struct AcabCoredumpInfo {
 /// report is visible.
 void acabCoredumpProbe();
 
-/// The cached result. Zeroed until acabCoredumpProbe() runs.
+/// The cached result. Zeroed until acabCoredumpProbe() runs. No firmware path calls this; it is the
+/// host suite's view of the probe/erase state (test_coredump_report.cpp).
 const AcabCoredumpInfo& acabCoredumpInfo();
 
 /// Print the one-line `[coredump]` report (or nothing when there is no dump and no corruption).

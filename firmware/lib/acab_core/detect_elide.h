@@ -13,21 +13,18 @@
  * detail nobody reads in the moment. The live notify's job is the ALERT: something is here, what it
  * is, how sure we are, and where. Sending a shorter honest record beats sending nothing.
  *
- * AN ELIDED FIELD IS LOST, NOT DEFERRED. The offline buffer's fixed 64-byte StoredDet slot
- * (det_log.h) persists none of the elidable fields - not cid, not the drone telemetry - so a
- * replayed record cannot restore what the live notify gave up. An earlier version of this comment
- * claimed the complete record reaches the buffer; it does not, and the doc row for `cid` in
- * ble-protocol.md states the real contract. The trade still holds: what elision drops is
- * enrichment, and the fields the alert and the evidence log depend on are never elidable.
+ * AN ELIDED FIELD IS LOST, NOT DEFERRED. The offline buffer's 64-byte StoredDet slot (det_log.h)
+ * persists none of the elidable fields (cid, ch, drone telemetry): unpackToDetection starts from
+ * acabInit's zeroed struct, so a replayed companyId and channel are 0 and a hist row never emits
+ * "cid" or "ch" (ble-protocol.md, rows `cid` and `ch`). Fine, since elision drops only enrichment.
  *
- * THE ORDER IS THE CONTRACT. Fields are dropped least-meaningful first: the BLE company ID goes
- * first (it exists for after-the-fact diagnosability, not for the in-the-moment alert), and
- * operator position is
- * dropped LAST of the optional set because on a drone record it is the single most useful field to
- * a person deciding what to do. Anything a user or a parser depends on is never elidable at all:
- * type, source, method, confidence, MAC, RSSI, name, detail, the UAS id, the subject lat/lon, the
- * sighting count, and the new flag. If you change this order, change the test that pins it in the
- * same commit, and say why here.
+ * THE ORDER IS THE CONTRACT. Least-meaningful first: the BLE company ID, then the WiFi channel
+ * (both after-the-fact diagnostics; cid is BLE-only and ch WiFi-only, so on a WiFi row ch goes
+ * first), and operator position LAST, since on a drone record it is the most useful field to a
+ * person deciding what to do. Never elidable, because users and parsers depend on them: type,
+ * source, method, confidence, MAC, RSSI, name, detail, the UAS id, the subject lat/lon, the
+ * sighting count, and the new flag. Change this order only with the test that pins it, in the same
+ * commit, saying why here.
  */
 #ifndef ACAB_DETECT_ELIDE_H
 #define ACAB_DETECT_ELIDE_H
@@ -41,6 +38,7 @@
 enum AcabElideLevel : uint8_t {
     ACAB_ELIDE_NONE = 0,  ///< full record
     ACAB_ELIDE_CID,       ///< BLE company ID: pure diagnostics, FIRST to go
+    ACAB_ELIDE_CH,        ///< WiFi channel: diagnostics, never on the same record as cid
     ACAB_ELIDE_PALT,      ///< operator altitude: least actionable number in the set
     ACAB_ELIDE_HGT,       ///< height above ground
     ACAB_ELIDE_VSPD,      ///< vertical speed
@@ -54,6 +52,7 @@ enum AcabElideLevel : uint8_t {
 /// The elidable fields, named for tests and for the serial warning.
 enum AcabElidableField : uint8_t {
     ACAB_FIELD_CID = 0,
+    ACAB_FIELD_CH,
     ACAB_FIELD_PALT,
     ACAB_FIELD_HGT,
     ACAB_FIELD_VSPD,
@@ -72,6 +71,7 @@ enum AcabElidableField : uint8_t {
 inline bool acabElideKeeps(AcabElidableField field, uint8_t level) {
     switch (field) {
         case ACAB_FIELD_CID:   return level < ACAB_ELIDE_CID;
+        case ACAB_FIELD_CH:    return level < ACAB_ELIDE_CH;
         case ACAB_FIELD_PALT:  return level < ACAB_ELIDE_PALT;
         case ACAB_FIELD_HGT:   return level < ACAB_ELIDE_HGT;
         case ACAB_FIELD_VSPD:  return level < ACAB_ELIDE_VSPD;
@@ -88,6 +88,7 @@ inline bool acabElideKeeps(AcabElidableField field, uint8_t level) {
 inline const char* acabElideKey(AcabElidableField field) {
     switch (field) {
         case ACAB_FIELD_CID:   return "cid";
+        case ACAB_FIELD_CH:    return "ch";
         case ACAB_FIELD_PALT:  return "palt";
         case ACAB_FIELD_HGT:   return "hgt";
         case ACAB_FIELD_VSPD:  return "vspd";

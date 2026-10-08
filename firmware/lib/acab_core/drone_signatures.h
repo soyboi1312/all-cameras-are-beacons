@@ -59,15 +59,21 @@ static const DroneOui DRONE_VENDOR_OUI[] = {
 
     // DJI Baiwang Technology, DJI's wholly owned UAV manufacturing subsidiary. These are
     // separate IEEE registrations, so a lookup restricted to the exact SZ DJI registrant misses
-    // them even though the registrant is part of the same drone manufacturer.
+    // them even though the registrant is part of the same drone manufacturer. The DJI blocks also
+    // cover DJI's Osmo cameras (field counts: droneClassifyBLE).
     DRONE_MAL(0x9c, 0x5a, 0x8a, "DJI"),
     DRONE_MAL(0xec, 0x72, 0xf7, "DJI"),
     DRONE_MAL(0x34, 0x91, 0xf0, "DJI"),
+    DRONE_MAL(0xc8, 0xa1, 0x62, "DJI"),   // listed 2026-10-02 (api.maclookup.app); on 2026-10-03 it
+                                       //   was not yet in Wireshark's IEEE-derived manuf, so a
+                                       //   check against that file reports it unassigned.
 
     // Parrot SA (ANAFI line, incl. the ANAFI USA carried by US agencies). NOTE: 90:3A:E6 is
-    //   also the OUI the OpenDroneID WiFi beacon vendor IE rides (see droneRidWiFi); that is
-    //   an IE match, not a transmitter-MAC match, and RID is decoded FIRST, so this fallback
-    //   only fires on non-RID Parrot gear. src: IEEE ("Parrot SA / Parrot Drones").
+    //   also the OUI the French DRI beacon vendor IE borrows (see droneRidWiFi); that is an IE
+    //   match, not a transmitter-MAC match, and RID is decoded FIRST, so this fallback only fires
+    //   on non-RID Parrot gear. src: IEEE, exact registrant "PARROT SA" (no Parrot Drones entry).
+    //   Corporate blanket: four of the five predate the ANAFI, and they also cover car head
+    //   units and consumer gear, hence the access-point-only WiFi rule in droneClassifyWiFi.
     DRONE_MAL(0x00, 0x12, 0x1c, "Parrot"),
     DRONE_MAL(0x00, 0x26, 0x7e, "Parrot"),
     DRONE_MAL(0x90, 0x03, 0xb7, "Parrot"),

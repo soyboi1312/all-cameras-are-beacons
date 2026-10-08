@@ -49,19 +49,6 @@ static const uint8_t  RING_FORMAT = 2;
 // ever connecting to drain it, erase it (a board out of its owner's hands self-cleans).
 // This is a no-RTC proxy for the "N hours" decision; an epoch-time refinement is a TODO.
 static const uint32_t WIPE_AFTER_BOOTS = 6;
-// ...and the threshold used while "record everything" is on (see detLogSetBufferAll in det_log.h).
-// 6 reboots is the right proxy for "seized" when the board rides in a pocket and reconnects to a
-// phone daily. It is the WRONG proxy once the owner has explicitly said they are leaving it
-// unattended for days: a discharging battery brownout-looping six times would erase the entire
-// deployment, which is precisely the data the mode exists to collect, and the owner would never
-// know it happened. Still finite, so a genuinely abandoned board self-cleans eventually.
-//
-// DO NOT read this as "wide enough to survive a week of resets". A boot counter cannot bound a
-// brownout loop: gBoot increments unconditionally below, so a cell sitting at the brownout knee
-// at ~2 s per cycle burns 64 counts in about two minutes. 64 is a real and monotonic improvement
-// over 6 - there is no input where the wider threshold loses records the narrower one keeps - and
-// that is the whole claim. A time or epoch gate would be the honest fix and is future work.
-static const uint32_t WIPE_AFTER_BOOTS_DEPLOY = 64;
 
 // ---- state ----
 static const esp_partition_t* gPart = nullptr;
@@ -178,32 +165,20 @@ static bool     gPendingEnabled = false;
 // transient first-token failure keeps the old complete config intact but remembers the action for
 // this boot; power loss safely drops the RAM-only request and restores that intact config.
 static bool     gDisableAwaitingEraseToken = false;
-static bool     gClearKeyAwaitingEraseToken = false;
 // Once a disable has begun, later enable intent may not cancel its residual-key/privacy cleanup.
 // The off transaction completes first; gPendingEnabled can then request a separate re-enable.
 static bool     gDisableCleanupPending = false;
 static bool     gKeyPersistencePending = false;
 static bool     gKeyRemovalPending = false;
-static bool     gBufferAllTransitionPending = false;
-static bool     gPendingBufferAll = false;
-// volatile: read LOCK-FREE by detLogBufferAll() on the radio hot paths; writes stay under gIoMutex.
-static volatile bool gBufferAll = false;   // "record everything" deploy mode; see det_log.h
-// Stationary-mode capacity marker. gSaturated is PERSISTED ("bufsat") as soon as a bufall ring
-// reaches capacity. It means later nearby rows MAY have been omitted, not that one definitely was;
-// gSatDrops is the this-boot count of actual full-ring refusals for the [diag] line.
-static bool              gSaturated = false;
-static bool              gSaturationPersistencePending = false;
-static volatile uint32_t gSatDrops  = 0;
 // Signature-row flood limit (see DET_LOG_RATE_* in det_log.h). The bucket is RAM-only and starts
 // full at every boot; gRateLastMs is the millis() the last whole token was credited at, so partial
 // progress toward the next token survives across appends. All three are gIoMutex-owned.
 static uint32_t          gRateTokens = DET_LOG_RATE_BURST;
 static uint32_t          gRateLastMs = 0;
 static bool              gRateClockStarted = false;
-// The flood marker, persisted as "bufrl" and reset at exactly the points that reset bufsat.
+// The flood marker, persisted as "bufrl" and reset by every wipe of the log.
 static bool              gRateLimited = false;
 static bool              gRateLimitPersistencePending = false;
-static volatile uint32_t gRateDrops = 0;
 // The ingest gate's "closed until" stamps. Written only under gIoMutex at a refusal, read
 // LOCK-FREE by detLogRateGate() on the radio path; each is one aligned 32-bit word, so a read
 // cannot tear, and a one-advert-stale read only defers or admits one claim.
@@ -504,7 +479,7 @@ static bool destructivePrivacyPendingLocked() {
     // These actions must establish their own durable recovery boundary before a ring clear can
     // publish a fresh boot/log/crypto generation. Otherwise a power loss between the two commits
     // can reload the obsolete retained key or on=true into the already-rebased empty generation.
-    return gDisableAwaitingEraseToken || gClearKeyAwaitingEraseToken ||
+    return gDisableAwaitingEraseToken ||
            gDisableCleanupPending || gKeyRemovalPending ||
            (gWipePendingKeyValid && gKeyChangeEraseArmed);
 }
@@ -513,8 +488,6 @@ static bool clearLocked(bool requestSensitiveErase);
 static void beginDisableLocked();
 static bool keyFingerprint(const uint8_t key[32], uint8_t out[8]);
 static bool retryConfigPersistenceLocked();
-static void markSaturatedLocked();
-static bool persistSaturationLocked();
 static bool persistRateLimitedLocked();
 
 // Restore the durable coredump-wipe token without ever interpreting an NVS-open failure as the
@@ -794,7 +767,6 @@ static bool restoreRingWipeLocked(bool* pending) {
 // key can also turn
 // ciphertext into a plausible-looking replay. Both paths therefore remain unavailable together.
 static bool restoreStartupConfigLocked() {
-    const bool runtimeKeyRemovalPending = gKeyRemovalPending;
     Preferences p;
     if (!p.begin(NVS_NS, false)) {
         gStartupConfigPending = true;
@@ -804,9 +776,6 @@ static bool restoreStartupConfigLocked() {
 
     const bool enabled = p.getBool("on", false);
     const bool keyRemovalCommitted = p.getBool("keydrop", false);
-    bool bufferAll = p.getBool("bufall", false);
-    bool saturated = p.getBool("bufsat", false);
-    bool saturationRepairPending = false;
     const bool rateLimited = p.getBool("bufrl", false);
     const uint32_t storedFaults = p.getUInt("fault", DET_LOG_FAULT_NONE);
     uint8_t keyFp[sizeof(gKeyFp)] = {};
@@ -971,27 +940,10 @@ static bool restoreStartupConfigLocked() {
     // Missing is not "connected this boot". Defaulting to the freshly incremented counter would
     // refresh the seizure timer on every reboot and let an undrained ring live forever. Zero is a
     // conservative monotonic baseline; auto-wipe still requires an actually nonempty ring.
-    // In Stationary mode, exact-fill is itself the documented capacity/censoring-risk boundary.
-    // Recover a marker whose first write failed immediately before power loss from the persisted
-    // mode plus raw geometry. A normally full FIFO ring is not evidence Stationary capture ran.
-    if (!saturated && bufferAll && gSlots != 0 && gRingScanReady && !gWipePending &&
-        !generationRecoveryWipe &&
-        countLocked() >= gSlots) {
-        saturated = true;
-        saturationRepairPending =
-            p.putBool("bufsat", true) != sizeof(bool);
-    }
-    // `on=false` is the durable disable marker and `keydrop=true` is the equivalent marker for a
-    // standalone detLogClearKey(). If power died between either commit and the key removal,
-    // finish forgetting the residual key before this boot becomes ready.
+    // `on=false` is the durable disable marker and `keydrop=true` is the equivalent marker for an
+    // enabled key rotation (persistKeyRemovalLocked). If power died between either commit and the
+    // key removal, finish forgetting the residual key before this boot becomes ready.
     if (!enabled || keyRemovalCommitted) {
-        if (!enabled && bufferAll && p.putBool("bufall", false) != sizeof(bool)) {
-            p.end();
-            gStartupConfigPending = true;
-            latchFaultLocked(DET_LOG_FAULT_NVS);
-            return false;
-        }
-        if (!enabled) bufferAll = false;
         if (p.isKey("key") && !p.remove("key")) {
             p.end();
             gStartupConfigPending = true;
@@ -1010,11 +962,7 @@ static bool restoreStartupConfigLocked() {
                    p.getBytesLength("key") == sizeof(key) &&
                    p.getBytes("key", key, sizeof(key)) == sizeof(key);
     bool keyPairUnverified = false;
-    if (runtimeKeyRemovalPending) {
-        // A clear-key request made while startup was retrying owns the newer intent. Do not let
-        // this retained read republish the key before persistKeyRemovalLocked gets its retry.
-        haveKey = false;
-    } else if (haveKey) {
+    if (haveKey) {
         uint8_t derivedFp[sizeof(gKeyFp)] = {};
         if (!keyFingerprint(key, derivedFp)) {
             // This is not an "absent key" result: the retained blob exists but its identity could
@@ -1054,9 +1002,6 @@ static bool restoreStartupConfigLocked() {
     p.end();
 
     gEnabled = enabled;
-    gBufferAll = bufferAll;
-    gSaturated = saturated;
-    gSaturationPersistencePending = saturationRepairPending;
     // OR, never overwrite: appends stay RETRY until this transaction publishes, so no refusal can
     // precede it today, but a RAM marker must never be lowered by a stale read if that changes.
     gRateLimited = gRateLimited || rateLimited;
@@ -1104,8 +1049,8 @@ static bool persistKeyStateLocked() {
     // The decrypting key lands before its fingerprint. If power fails between them, startup sees
     // the NEW key with the OLD fingerprint; the next app key therefore forces a conservative
     // wipe. The reverse order could expose OLD-key rows under a NEW fingerprint and suppress the
-    // only mixed-key guard. `keydrop=false` is last so a partially replaced clear-key request
-    // remains fail-closed across reboot.
+    // only mixed-key guard. `keydrop=false` is last so a rotation whose old-key removal is still
+    // marked pending remains fail-closed across reboot.
     bool stored = true;
     if (gEnabled && gHaveKey)
         stored = p.putBytes("key", gKey, sizeof(gKey)) == sizeof(gKey);
@@ -1141,9 +1086,6 @@ static bool persistKeyRemovalLocked() {
 
 static bool persistEnableTransitionLocked() {
     if (!gEnableTransitionPending && !gDisableCleanupPending) return true;
-    // `on=false`/`bufall=false` remove the raw-geometry fallback that can reconstruct an exact-fill
-    // Stationary capacity warning after power loss. Land an already-observed warning first.
-    if (gSaturationPersistencePending && !persistSaturationLocked()) return false;
     Preferences p;
     if (!p.begin(NVS_NS, false)) {
         latchFaultLocked(DET_LOG_FAULT_NVS);
@@ -1156,7 +1098,6 @@ static bool persistEnableTransitionLocked() {
         // first, remove any residual key, then leave the newer enable transition staged for a
         // separate transaction below/on the next coordinator iteration.
         stored = p.putBool("on", false) == sizeof(bool);
-        if (stored) stored = p.putBool("bufall", false) == sizeof(bool);
         if (stored && p.isKey("key")) stored = p.remove("key");
         if (stored) stored = p.putBool("keydrop", false) == sizeof(bool);
     } else if (gPendingEnabled) {
@@ -1175,7 +1116,6 @@ static bool persistEnableTransitionLocked() {
         // `on=false` is the durable recovery marker. Startup finishes the key removal if power
         // fails after this first commit but before the following cleanup commits.
         stored = p.putBool("on", false) == sizeof(bool);
-        if (stored) stored = p.putBool("bufall", false) == sizeof(bool);
         if (stored && p.isKey("key")) stored = p.remove("key");
         if (stored) stored = p.putBool("keydrop", false) == sizeof(bool);
     }
@@ -1188,13 +1128,6 @@ static bool persistEnableTransitionLocked() {
     if (gDisableCleanupPending) {
         gDisableCleanupPending = false;
         gEnabled = false;
-        gBufferAll = false;
-        // A newer buffer:true + bufall intent is applied only after mandatory off/key cleanup.
-        // Preserve it across this intermediate transaction; a final/off target still forces false.
-        if (!gPendingEnabled) {
-            gBufferAllTransitionPending = false;
-            gPendingBufferAll = false;
-        }
         memset(gKey, 0, sizeof(gKey));
         gHaveKey = false;
         gKeyPersistencePending = false;
@@ -1211,59 +1144,9 @@ static bool persistEnableTransitionLocked() {
     return true;
 }
 
-static bool persistBufferAllLocked() {
-    if (!gBufferAllTransitionPending) return true;
-    // Turning Stationary mode off must not outrun a failed bufsat=true write. Otherwise a reboot
-    // sees bufall=false and cannot infer the warning from an exactly full ring.
-    if (!gPendingBufferAll && gSaturationPersistencePending &&
-        !persistSaturationLocked()) return false;
-    Preferences p;
-    if (!p.begin(NVS_NS, false)) {
-        latchFaultLocked(DET_LOG_FAULT_NVS);
-        return false;
-    }
-    const bool stored = p.putBool("bufall", gPendingBufferAll) == sizeof(bool);
-    p.end();
-    if (!stored) {
-        latchFaultLocked(DET_LOG_FAULT_NVS);
-        return false;
-    }
-    gBufferAll = gPendingBufferAll;
-    gBufferAllTransitionPending = false;
-    // Turning Stationary capture on over an already-full ring crosses the same capacity-risk
-    // boundary as writing the exact-fill row while the mode is active.
-    if (gBufferAll && gSlots != 0 && countLocked() >= gSlots) markSaturatedLocked();
-    return true;
-}
-
-static bool persistSaturationLocked() {
-    if (!gSaturationPersistencePending) return true;
-    Preferences p;
-    if (!p.begin(NVS_NS, false)) {
-        latchFaultLocked(DET_LOG_FAULT_NVS);
-        return false;
-    }
-    const bool stored = p.putBool("bufsat", true) == sizeof(bool);
-    p.end();
-    if (!stored) {
-        latchFaultLocked(DET_LOG_FAULT_NVS);
-        return false;
-    }
-    gSaturationPersistencePending = false;
-    return true;
-}
-
-static void markSaturatedLocked() {
-    if (gSaturated) return;
-    gSaturated = true;
-    gSaturationPersistencePending = true;
-    persistSaturationLocked();
-}
-
-// The flood marker's NVS write. Unlike bufsat it gates nothing: bufsat must land before
-// on=false/bufall=false because startup can otherwise rebuild it from raw geometry, and no such
-// fallback exists (or is needed) here. A failure latches the NVS fault bit and detLogEraseTick
-// retries it; appends carry on, because blocking them would turn an NVS hiccup into lost evidence.
+// The flood marker's NVS write. It gates nothing: a failure latches the NVS fault bit and
+// detLogEraseTick retries it; appends carry on, because blocking them would turn an NVS hiccup
+// into lost evidence.
 static bool persistRateLimitedLocked() {
     if (!gRateLimitPersistencePending) return true;
     Preferences p;
@@ -1429,17 +1312,15 @@ static bool persistRingWipeArmLocked() {
                    sizeof(gWipeTargetCryptoDomain)) == sizeof(gWipeTargetCryptoDomain);
     const bool lastConnStored = cryptoStored &&
                                 p.putUInt("lastconn", gWipeArmBoot) == sizeof(uint32_t);
-    const bool saturationStored = lastConnStored &&
-                                  p.putBool("bufsat", false) == sizeof(bool);
-    // The flood marker describes the generation this arm condemns, exactly like bufsat above.
-    const bool rateLimitStored = saturationStored &&
+    // The flood marker describes the generation this arm condemns.
+    const bool rateLimitStored = lastConnStored &&
                                  p.putBool("bufrl", false) == sizeof(bool);
     const bool generationResolved = rateLimitStored &&
                                     p.putBool("wipeneed", false) == sizeof(bool);
     p.end();
     if (!generationIntentStored || !cryptoIntentStored || !wipeStored || !bootStored ||
         !generationStored || !cryptoStored ||
-        !lastConnStored || !saturationStored || !rateLimitStored || !generationResolved) {
+        !lastConnStored || !rateLimitStored || !generationResolved) {
         latchFaultLocked(DET_LOG_FAULT_NVS);
         return false;
     }
@@ -1468,12 +1349,8 @@ static void publishRingWipeArmLocked() {
     gOldest = 1;
     gMaxScannedBoot = 0;
     gDrain = 0;
-    gSaturated = false;
-    gSaturationPersistencePending = false;
-    gSatDrops = 0;
     gRateLimited = false;
     gRateLimitPersistencePending = false;
-    gRateDrops = 0;
     // A clear starts a clean log, so it also starts a full bucket. Without this, a drained bucket
     // from the last deployment would refuse the re-armed dedup entries at the next disconnect and
     // raise bufrl on a log nothing has flooded yet. The owner triggers a clear, never an attacker.
@@ -1504,8 +1381,9 @@ static void publishRingWipeArmLocked() {
 static bool armRingWipeLocked() {
     if (destructivePrivacyPendingLocked()) {
         // Keep only a RAM-deferred clear here. Persisting even a targetless wipe tombstone would
-        // let reboot complete the generation transition before an as-yet-uncommitted clear-key or
-        // buffer:false action. The privacy coordinator is retried first from detLogEraseTick().
+        // let reboot complete the generation transition before an as-yet-uncommitted old-key
+        // removal or buffer:false action. The privacy coordinator is retried first from
+        // detLogEraseTick().
         gRingClearDeferred = true;
         gWipePending = true;
         return false;
@@ -1613,12 +1491,13 @@ static bool keyFingerprint(const uint8_t key[32], uint8_t out[8]) {
 // under a DIFFERENT key passes validation and only turns to noise after cryptPayload. The
 // fingerprint wipe in detLogSetKey should have erased those already; if anything ever slips
 // through, noise must not reach the app, which files and maps whatever it is handed (random
-// MACs, +/-214 degrees). So drop records whose decrypted fields cannot be real. Free on a good
-// record, and it catches garbage with probability ~1 - 1e-6.
+// MACs, +/-214 degrees). So reject records whose decrypted fields cannot be real; the drain
+// latches CORRUPT on one. Free on a good record, and a random record passes about 0.6% of the
+// time (type, conf, lat and lon). src and method are deliberately NOT range-checked: a bound
+// hard-coded to today's last enum value would turn the first record of a newly added source or
+// method into a CORRUPT latch that halts capture and trims every older record from the window.
 static bool plausibleRecord(const StoredDet* s) {
     if (s->type >= ACAB_TYPE_COUNT) return false;
-    if (s->src > SRC_REMOTEID) return false;
-    if (s->method > M_WATCHLIST) return false;
     if (s->conf > 100) return false;
     if (s->lat_e7 < -900000000  || s->lat_e7 > 900000000)  return false;
     if (s->lon_e7 < -1800000000 || s->lon_e7 > 1800000000) return false;
@@ -1749,9 +1628,7 @@ static uint32_t scanRingLocked() {
 }
 
 static void maybeAutoWipeLocked(uint32_t maxSeq) {
-    const uint32_t wipeAfter = (gEnabled && gBufferAll) ? WIPE_AFTER_BOOTS_DEPLOY
-                                                        : WIPE_AFTER_BOOTS;
-    if (maxSeq > 0 && (gBoot - gLastConnBoot) >= wipeAfter) {
+    if (maxSeq > 0 && (gBoot - gLastConnBoot) >= WIPE_AFTER_BOOTS) {
         // This self-clean is not a new user erase request. Preserve a just-reported crash dump for
         // diagnosis; only explicit clear/key-change/disable actions arm its durable erase token.
         clearLocked(false);
@@ -1884,85 +1761,17 @@ void detLogBegin() {
     // from that conservative RAM block before the retry has positively read the durable latch.
     if (anchorsLoadLocked() && !gWipeLoadPending) restoreStartupConfigLocked();
 
-    // Auto-wipe: undrained across too many reboots -> erase. The threshold widens while
-    // "record everything" is on, because the owner has declared the board is deliberately
-    // unattended and boot count stops meaning "seized" (see WIPE_AFTER_BOOTS_DEPLOY).
-    //
-    // gEnabled is in the test ON PURPOSE. The three switches (buffer / bufall / desert) persist
-    // INDEPENDENTLY, so "buffering off, bufall still true" is reachable, and in that state a
-    // board that is not recording anything would otherwise keep the weakened self-clean posture
-    // indefinitely. Weakened seizure protection must never outlive the feature that asked for it.
-    // detLogSetEnabled below also clears bufall, so this is belt-and-braces against an NVS write
-    // that failed to land; the read is free and the failure it covers is silent.
+    // Auto-wipe: undrained across WIPE_AFTER_BOOTS reboots -> erase.
     if (ioLock()) {
         runAutoWipeCheckLocked();
         ioUnlock();
     }
 }
 
-// See the long note in det_log.h. Persisted so a deployed board keeps recording across the
-// brownout resets that a week in the field guarantees; without persistence this switch would
-// silently revert on the first reset and the deployment would quietly collect nothing.
-void detLogSetBufferAll(bool on) {
-    if (!ioLock()) { gFaults |= DET_LOG_FAULT_LOCK; return; }
-    if (on) {
-        // Config objects are processed in field order, so {"buffer":false,"bufall":true} reaches
-        // this API after the off transition. Never persist the weakened Stationary posture while
-        // capture is effectively disabled. A staged/failing buffer:true transition may still own a
-        // newer bufall:true intent and is explicitly allowed.
-        const bool targetEnabled = !gDisableAwaitingEraseToken &&
-            (gEnableTransitionPending ? gPendingEnabled : gEnabled);
-        if (!targetEnabled) { ioUnlock(); return; }
-    }
-    if (on == gBufferAll && !gBufferAllTransitionPending) { ioUnlock(); return; }
-    gBufferAll = on;
-    gPendingBufferAll = on;
-    gBufferAllTransitionPending = true;
-    // During startup the retained `on=false` cleanup deliberately clears bufall. Persist only
-    // after that state is published and any staged enable has committed, or this user write can
-    // be silently undone by the restore transaction in the same callback window.
-    if (!gStartupConfigPending && !gDisableCleanupPending && !gEnableTransitionPending)
-        persistBufferAllLocked();
-    ioUnlock();
-}
-bool detLogBufferAll() {
-    // Deliberately LOCK-FREE. Callers include the radio hot paths (handleDetection runs inside
-    // the promiscuous RX callback and the BLE ingest path), and gIoMutex is held across multi-ms
-    // flash erases (a 4 KB sector every 64 appends, 64 KB blocks during a wipe), so taking it
-    // here stalled frame RX for the duration of every erase. An aligned bool read is atomic on
-    // this core, the value only changes on an app config write, and the old lock-timeout
-    // fallback already returned the unlocked read - one-advert staleness is harmless.
-    return gBufferAll;
-}
-
-// True once Stationary capture has reached ring capacity. Later nearby rows MAY have been omitted;
-// the flag is deliberately raised on exact fill, so it is not proof of an actual refusal. PERSISTED
-// across deployment reboots and cleared only by detLogClear; detLogSatDrops is the actual-refusal
-// counter for this boot.
-bool detLogSaturated() {
-    if (!ioLock()) return gSaturated;
-    const bool value = gSaturated;
-    ioUnlock();
-    return value;
-}
-uint32_t detLogSatDrops() {
-    if (!ioLock()) return gSatDrops;
-    const uint32_t value = gSatDrops;
-    ioUnlock();
-    return value;
-}
-
-// Flood marker (persisted "bufrl") and this boot's refused-append count. Same locking idiom as the
-// saturation pair above: the status builder calls these once per build, never per advert.
+// Flood marker (persisted "bufrl"). The status builder calls this once per build, never per advert.
 bool detLogRateLimited() {
     if (!ioLock()) return gRateLimited;
     const bool value = gRateLimited;
-    ioUnlock();
-    return value;
-}
-uint32_t detLogRateDrops() {
-    if (!ioLock()) return gRateDrops;
-    const uint32_t value = gRateDrops;
     ioUnlock();
     return value;
 }
@@ -1986,22 +1795,6 @@ DetLogRateGate detLogRateGate(uint32_t nowMs) {
     return gate;
 }
 
-static void clearKeyLocked() {
-    gDraining = false;
-    gDrainStartPending = false;
-    gLastConnWritePending = false;
-    invalidateDrainLocked();
-    discardPendingKeysLocked();
-    memset(gKey, 0, 32);
-    gHaveKey = false;
-    gKeyPersistencePending = false;
-    gKeyRemovalPending = true;
-    // gKeyFp deliberately SURVIVES this, in RAM and in NVS. Dropping the key does not drop the
-    // records it encrypted, so the fingerprint is the only thing left that can recognise a
-    // different phone's key arriving for them (see gKeyFp).
-    persistKeyRemovalLocked();
-}
-
 static void beginDisableLocked() {
     gDisableAwaitingEraseToken = false;
     // Stop admission and forget the RAM copy immediately. NVS writes `on=false` first, so a power
@@ -2012,9 +1805,6 @@ static void beginDisableLocked() {
     invalidateDrainLocked();
     discardPendingKeysLocked();
     gEnabled = false;
-    gBufferAll = false;
-    gBufferAllTransitionPending = false;
-    gPendingBufferAll = false;
     memset(gKey, 0, sizeof(gKey));
     gHaveKey = false;
     gKeyPersistencePending = false;
@@ -2042,14 +1832,6 @@ void detLogSetEnabled(bool on) {
             // The privacy command owns a strict age boundary: keys staged before it are part of
             // the state being forgotten. Only a key received after this flag is published may be
             // preserved across the deferred cleanup as a newer app intent.
-            discardPendingKeysLocked();
-            gDisableAwaitingEraseToken = true;
-            ioUnlock();
-            return;
-        }
-        if (gSaturationPersistencePending && !persistSaturationLocked()) {
-            // The durable privacy token exists, but the evidence-capacity warning must precede
-            // on=false/bufall=false. Keep admission blocked and finish both from the loop tick.
             discardPendingKeysLocked();
             gDisableAwaitingEraseToken = true;
             ioUnlock();
@@ -2211,9 +1993,7 @@ DetLogKeyResult detLogSetKey(const uint8_t key[32], bool allowDestructiveReplace
         ioUnlock();
         return DET_LOG_KEY_MISMATCH;
     }
-    if (gDisableCleanupPending ||
-        gClearKeyAwaitingEraseToken || gDisableAwaitingEraseToken ||
-        gEnableTransitionPending) {
+    if (gDisableCleanupPending || gDisableAwaitingEraseToken || gEnableTransitionPending) {
         // Privacy/config coordinators own ordering over an unrelated pending ring clear. Their
         // cleanup helpers discard older wipe keys, then preserve/apply this newer staged intent.
         stageIncomingKeyLocked(key, fp, allowDestructiveReplacement);
@@ -2265,22 +2045,6 @@ DetLogKeyResult detLogSetKey(const uint8_t key[32], bool allowDestructiveReplace
         stageIncomingKeyLocked(key, fp, allowDestructiveReplacement);
     ioUnlock();
     return result;
-}
-void detLogClearKey() {
-    if (!ioLock()) { gFaults |= DET_LOG_FAULT_LOCK; return; }
-    if (!ensureDisabledKeyEraseLocked()) {
-        // Same fail-closed boundary as buffer:false: do not publish a keyless state until a retained
-        // dump-erasure token is durable across an immediate panic/reboot.
-        // Do not let a key staged before the clear survive merely because the dump-erasure token
-        // needed a retry. detLogSetKey stages any genuinely newer key after this flag is visible.
-        discardPendingKeysLocked();
-        gClearKeyAwaitingEraseToken = true;
-        ioUnlock();
-        return;
-    }
-    gClearKeyAwaitingEraseToken = false;
-    clearKeyLocked();
-    ioUnlock();
 }
 bool detLogHaveKey() {
     if (!ioLock()) return gHaveKey;
@@ -2433,8 +2197,7 @@ static DetLogAppendResult appendLocked(const AcabDetection& d, const DetLogGpsSt
     if (__atomic_load_n(&gCaptureAdmissionInvalid, __ATOMIC_ACQUIRE) ||
         gCaptureAdmissionBlocked || acabBleClientConnected() ||
         (enforceCaptureEpoch && captureEpoch != gCaptureAdmissionEpoch) ||
-        gSlots == 0 || appendBlockedLocked() ||
-        gDisableAwaitingEraseToken || gClearKeyAwaitingEraseToken ||
+        gSlots == 0 || appendBlockedLocked() || gDisableAwaitingEraseToken ||
         (gEnableTransitionPending && !gPendingEnabled)) {
         ioUnlock();
         return DET_LOG_APPEND_NOT_ARMED;
@@ -2444,7 +2207,6 @@ static DetLogAppendResult appendLocked(const AcabDetection& d, const DetLogGpsSt
     if (gStartupConfigPending || gStartupPendingKeyValid ||
         gEnableTransitionPending || gKeyPersistencePending || gKeyRemovalPending ||
         gDisableCleanupPending ||
-        gBufferAllTransitionPending || gSaturationPersistencePending ||
         gDrainStartPending || gLastConnWritePending || !gRingScanReady ||
         gExplicitClearPending || gRingClearDeferred || gWipeArmPending) {
         ioUnlock();
@@ -2467,75 +2229,36 @@ static DetLogAppendResult appendLocked(const AcabDetection& d, const DetLogGpsSt
         ioUnlock();
         return DET_LOG_APPEND_RETRY;
     }
-    // ONCE THE RING IS FULL, UNCATEGORIZED ROWS STOP APPENDING. Signature hits still append and
-    // still evict oldest-first; only ACAB_NEARBY_DEVICE is capped here. (Signature rows have their
-    // own guard, the flood limit just below, which bounds their RATE rather than their count.)
+    // FLOOD LIMIT (DET_LOG_RATE_* in det_log.h for the attack, the numbers and their evidence).
+    // Checked HERE, after every arming check, so only a row that would otherwise have been written
+    // spends or is refused a token; the token itself is spent only once the flash write succeeds,
+    // below.
     //
-    // The ring is strictly FIFO and type-blind (see the gOldest advance below), unlike the dedup
-    // table, which deliberately evicts the oldest NEARBY_DEVICE first. acab_scanner.cpp says both
-    // halves are what make Desert safe: "the eviction priority in dedupFind() plus the type gate
-    // on buffering, NOT the size". detLogBufferAll relaxes the type gate, which leaves the ring
-    // with no type protection at all.
-    //
-    // The failure that closes: the owner collects a deployed board and drives home with it still
-    // powered and still armed. The app is disconnected - that is the mode's own premise - so the
-    // guard above never fires, and both bufall and desert now survive the reboot. The 2026-07-24
-    // drive logged 9,795 unique BLE + 10,296 unique WiFi devices in ~104 minutes against 24,576
-    // slots. That is ~82% of the ring on first sightings, and dedup thrash re-buffering the same
-    // devices (see the REBUFFER note in acab_scanner.cpp) carries it the rest of the way, so one
-    // drive home wraps it and silently overwrites the
-    // week the board was left there to record.
-    //
-    // TRADEOFF, deliberate: on a genuinely saturated deployment this drops the TAIL of nearby
-    // devices instead of the head. For "did anything come by while I was gone" that is the right
-    // end to lose, and it is strictly better than losing the whole deployment on the way home.
-    //
-    // AND IT MUST NOT BE SILENT. A dropped tail with no marker hands the owner a full-looking log
-    // whose last hours or days are censored, with nothing to distinguish "nothing came by after
-    // Tuesday" from "we stopped writing on Tuesday". That is the same class of unfalsifiable
-    // absence this project has already been bitten by twice. gSatDrops counts this boot; the
-    // persisted flag survives the reboots a week in the field guarantees, and is what the app
-    // must surface beside the log.
-    if (d.type == ACAB_NEARBY_DEVICE && countLocked() >= gSlots) {
-        gSatDrops++;
-        markSaturatedLocked();      // normally already set by the exact-fill transition
+    // A refusal is never silent: it raises the persisted "bufrl" marker (status) and closes the
+    // scanner's ingest gate for this row's tier until the bucket is due back over that tier's
+    // floor, which is what keeps the released claim from becoming a hot retry loop on the
+    // per-advert path.
+    const uint32_t now = millis();
+    rateRefillLocked(now);
+    const bool persistent =
+        detLogRatePersistent(d.count, (uint32_t)(d.lastSeen - d.firstSeen));
+    const uint32_t tokenFloor = persistent ? 0 : DET_LOG_RATE_RESERVE;
+    if (gRateTokens <= tokenFloor) {
+        markRateLimitedLocked();
+        // Reopen each tier when the bucket will next be over that tier's floor. The bucket is
+        // below full here, so rateRefillLocked has left gRateLastMs at the last whole credit
+        // (never in the future) and token k lands at gRateLastMs + k * REFILL. Every refusal
+        // has gRateTokens <= RESERVE (a fresh one by its floor, a persistent one at zero), so
+        // the fresh tier needs RESERVE + 1 - tokens more, at most RESERVE + 1 refills away,
+        // and a persistent refusal needs exactly one. A persistent refusal therefore shuts
+        // BOTH tiers. If persistent rows spend reserve tokens after a fresh closure was
+        // stamped, that closure reopens early; the cost is one more refused row, which
+        // re-stamps it.
+        gRateFreshClosedUntil =
+            gRateLastMs + (DET_LOG_RATE_RESERVE + 1 - gRateTokens) * DET_LOG_RATE_REFILL_MS;
+        if (persistent) gRatePersistentClosedUntil = gRateLastMs + DET_LOG_RATE_REFILL_MS;
         ioUnlock();
-        return DET_LOG_APPEND_CAPACITY_DROP;
-    }
-    // FLOOD LIMIT on signature rows (DET_LOG_RATE_* in det_log.h for the attack, the numbers and
-    // their evidence). Checked HERE, after every arming check, so only a row that would otherwise
-    // have been written spends or is refused a token; the token itself is spent only once the
-    // flash write succeeds, below. NEARBY rows are exempt: the full-ring guard above is theirs.
-    //
-    // A refusal is never silent: it counts toward gRateDrops (the [diag] line), raises the
-    // persisted "bufrl" marker (status), and closes the scanner's ingest gate for this row's tier
-    // until the bucket is due back over that tier's floor, which is what keeps the released claim
-    // from becoming a hot retry loop on the per-advert path.
-    const bool rateBound = d.type != ACAB_NEARBY_DEVICE;
-    if (rateBound) {
-        const uint32_t now = millis();
-        rateRefillLocked(now);
-        const bool persistent =
-            detLogRatePersistent(d.count, (uint32_t)(d.lastSeen - d.firstSeen));
-        const uint32_t tokenFloor = persistent ? 0 : DET_LOG_RATE_RESERVE;
-        if (gRateTokens <= tokenFloor) {
-            gRateDrops++;
-            markRateLimitedLocked();
-            // Reopen each tier when the bucket will next be over that tier's floor. The bucket is
-            // below full here, so rateRefillLocked has left gRateLastMs at the last whole credit
-            // (never in the future) and token k lands at gRateLastMs + k * REFILL. Every refusal
-            // has gRateTokens <= RESERVE (a fresh one by its floor, a persistent one at zero), so
-            // the fresh tier needs RESERVE + 1 - tokens more, at most RESERVE + 1 refills away,
-            // and a persistent refusal needs exactly one. A persistent refusal therefore shuts
-            // BOTH tiers. If persistent rows spend reserve tokens after a fresh closure was
-            // stamped, that closure reopens early; the cost is one more refused row, which
-            // re-stamps it.
-            gRateFreshClosedUntil =
-                gRateLastMs + (DET_LOG_RATE_RESERVE + 1 - gRateTokens) * DET_LOG_RATE_REFILL_MS;
-            if (persistent) gRatePersistentClosedUntil = gRateLastMs + DET_LOG_RATE_REFILL_MS;
-            ioUnlock();
-            return DET_LOG_APPEND_RATE_LIMITED;
-        }
+        return DET_LOG_APPEND_RATE_LIMITED;
     }
     // gHead is only a candidate until every flash operation succeeds. Advancing it first makes
     // a failed write look like a stored record in count/status and creates a hole in replay.
@@ -2589,8 +2312,7 @@ static DetLogAppendResult appendLocked(const AcabDetection& d, const DetLogGpsSt
     if (stored) {
         gHead = seq + 1;
         if (gHead - gOldest > gSlots) gOldest = gHead - gSlots;
-        if (gBufferAll && countLocked() >= gSlots) markSaturatedLocked();
-        if (rateBound && gRateTokens > 0) gRateTokens--;   // > 0 always holds: checked above
+        if (gRateTokens > 0) gRateTokens--;   // > 0 always holds: checked above
     }
     ioUnlock();
     // prepare/write failures latch a raw blocking fault. Releasing the scanner claim would only
@@ -2641,7 +2363,7 @@ DetLogDrainStartResult detLogStartDrain(uint32_t lastSeq, uint32_t clientLogGene
     }
     const bool transientReadiness = gStartupConfigPending || gStartupPendingKeyValid ||
         gEnableTransitionPending || gKeyPersistencePending || gKeyRemovalPending ||
-        gDisableAwaitingEraseToken || gClearKeyAwaitingEraseToken ||
+        gDisableAwaitingEraseToken ||
         gRingClearDeferred || gExplicitClearPending || !gRingScanReady ||
         !gAnchorsReady || gAnchorsLoadPending ||
         gAnchorsSavePending || gWipePending || gWipeArmPending || gWipeLoadPending ||
@@ -2704,8 +2426,7 @@ bool detLogPeekForDrain(DetLogReplay* out) {
     if (!out || !gDraining || gSlots == 0 || !gHaveKey || !gAnchorsReady ||
         gAnchorsLoadPending || gAnchorsSavePending || gStartupConfigPending ||
         gEnableTransitionPending || gKeyPersistencePending || gKeyRemovalPending ||
-        gDisableAwaitingEraseToken || gClearKeyAwaitingEraseToken ||
-        gExplicitClearPending ||
+        gDisableAwaitingEraseToken || gExplicitClearPending ||
         gWipePending || gWipeArmPending || gWipeLoadPending) {
         gDraining = false;
         ioUnlock();
@@ -2838,7 +2559,7 @@ static bool clearLocked(bool requestSensitiveErase) {
     }
     gExplicitClearPending = false;
     if (destructivePrivacyPendingLocked()) {
-        // A disable/clear-key command that has not reached its own durable recovery marker owns
+        // A disable or old-key removal that has not reached its own durable recovery marker owns
         // ordering over this clear. Do not write wipegen/wipe yet: after a sudden reboot that
         // partial arm could otherwise publish a fresh generation with the obsolete retained key.
         gRingClearDeferred = true;
@@ -2905,8 +2626,9 @@ static bool applyStartupKeyLocked() {
 }
 
 static bool retryConfigPersistenceLocked() {
-    // A clear-key request is the newer privacy intent. Complete it before an enable transition is
-    // allowed to clear keydrop=false; otherwise a residual old blob can survive and reload.
+    // A pending old-key removal (key rotation) is the newer privacy intent. Complete it before an
+    // enable transition is allowed to clear keydrop=false; otherwise a residual old blob can
+    // survive and reload.
     if (gKeyRemovalPending && !persistKeyRemovalLocked()) return false;
     while (gDisableCleanupPending) {
         if (!persistEnableTransitionLocked()) return false;
@@ -2923,8 +2645,6 @@ static bool retryConfigPersistenceLocked() {
         if (!persistEnableTransitionLocked()) return false;
     }
     if (gKeyPersistencePending && !persistKeyStateLocked()) return false;
-    if (gBufferAllTransitionPending && !persistBufferAllLocked()) return false;
-    if (gSaturationPersistencePending && !persistSaturationLocked()) return false;
     return true;
 }
 
@@ -2969,34 +2689,21 @@ void detLogEraseTick() {
         ioUnlock();
         return;
     }
-    // Privacy/config transitions can durably clear `on`/`bufall`, after which startup can no
-    // longer reconstruct a lost exact-fill warning from geometry. Flush the marker before any of
-    // those staged actions is allowed to publish.
-    if (gSaturationPersistencePending && !persistSaturationLocked()) {
-        ioUnlock();
-        return;
-    }
-    // Complete RAM-staged privacy actions only after startup has published the retained config and
+    // Complete a RAM-staged buffer:false only after startup has published the retained config and
     // the retry above has established a power-loss-safe coredump token. A newer key can arrive in
-    // the same config handshake while either action waits. Both cleanup helpers deliberately scrub
-    // staged keys, so carry that exact newer key across the old-key cleanup and let the normal
+    // the same config handshake while it waits. The disable helper deliberately scrubs staged
+    // keys, so carry that exact newer key across the old-key cleanup and let the normal
     // coordinator install it afterward (RAM-only when the completed target is off).
     uint8_t deferredKey[sizeof(gStartupPendingKey)] = {};
     uint8_t deferredFp[sizeof(gStartupPendingKeyFp)] = {};
     bool deferredKeyMayReplace = false;
-    const bool preserveDeferredKey =
-        (gDisableAwaitingEraseToken || gClearKeyAwaitingEraseToken) &&
-        gStartupPendingKeyValid;
+    const bool preserveDeferredKey = gDisableAwaitingEraseToken && gStartupPendingKeyValid;
     if (preserveDeferredKey) {
         memcpy(deferredKey, gStartupPendingKey, sizeof(deferredKey));
         memcpy(deferredFp, gStartupPendingKeyFp, sizeof(deferredFp));
         deferredKeyMayReplace = gStartupPendingKeyMayReplace;
     }
     if (gDisableAwaitingEraseToken && sensitiveEraseDurableLocked()) beginDisableLocked();
-    if (gClearKeyAwaitingEraseToken && sensitiveEraseDurableLocked()) {
-        gClearKeyAwaitingEraseToken = false;
-        clearKeyLocked();
-    }
     if (preserveDeferredKey && !gStartupPendingKeyValid) {
         memcpy(gStartupPendingKey, deferredKey, sizeof(gStartupPendingKey));
         memcpy(gStartupPendingKeyFp, deferredFp, sizeof(gStartupPendingKeyFp));
@@ -3011,11 +2718,11 @@ void detLogEraseTick() {
         gExplicitClearPending = false;
         clearLocked(false);
     }
-    // Standalone clear-key and buffer:false actions own the privacy boundary even when no
+    // buffer:false and a rotation's old-key removal own the privacy boundary even when no
     // replacement key is staged. Complete their durable recovery marker before any pending clear
     // can publish a new boot/log/crypto generation. New enable/key intents remain staged until
     // after the arm, so this does not let later configuration bypass mandatory old-key cleanup.
-    if (gDisableAwaitingEraseToken || gClearKeyAwaitingEraseToken) {
+    if (gDisableAwaitingEraseToken) {
         ioUnlock();
         return;
     }
@@ -3165,10 +2872,7 @@ void detLogEraseTick() {
         // Clear stale raw-ring faults while the durable wipe tombstone still blocks appends and
         // boot scans. Retirement is last: once wipe=false lands, every prerequisite for admitting
         // the fresh generation is already durable.
-        const bool saturationCleared =
-            p.putBool("bufsat", false) == sizeof(bool);
-        const bool rateLimitCleared = saturationCleared &&
-            p.putBool("bufrl", false) == sizeof(bool);
+        const bool rateLimitCleared = p.putBool("bufrl", false) == sizeof(bool);
         const bool faultCleared = rateLimitCleared &&
             p.putUInt("fault", DET_LOG_FAULT_NONE) == sizeof(uint32_t);
         // Retire the pending generation marker while wipe=true still blocks scans/appends. If the
@@ -3181,7 +2885,7 @@ void detLogEraseTick() {
         const bool retired = generationRetired &&
                              p.putBool("wipe", false) == sizeof(bool);
         p.end();
-        if (!saturationCleared || !rateLimitCleared || !faultCleared || !cryptoTargetRetired ||
+        if (!rateLimitCleared || !faultCleared || !cryptoTargetRetired ||
             !generationRetired || !retired) {
             latchFaultLocked(DET_LOG_FAULT_NVS);
             ioUnlock();
@@ -3193,12 +2897,8 @@ void detLogEraseTick() {
         gWipeStalled = false;
         gRingScanReady = true;
         gAutoWipeCheckPending = false;
-        gSaturated = false;
-        gSaturationPersistencePending = false;
-        gSatDrops = 0;
         gRateLimited = false;
         gRateLimitPersistencePending = false;
-        gRateDrops = 0;
         gFaults = DET_LOG_FAULT_NONE;
         gFaultPersistencePending = false;
     }
@@ -3348,22 +3048,14 @@ void detLogHostResetRuntime() {
     gEnableTransitionPending = false;
     gPendingEnabled = false;
     gDisableAwaitingEraseToken = false;
-    gClearKeyAwaitingEraseToken = false;
     gDisableCleanupPending = false;
     gKeyPersistencePending = false;
     gKeyRemovalPending = false;
-    gBufferAllTransitionPending = false;
-    gPendingBufferAll = false;
-    gBufferAll = false;
-    gSaturated = false;
-    gSaturationPersistencePending = false;
-    gSatDrops = 0;
     gRateTokens = DET_LOG_RATE_BURST;
     gRateLastMs = 0;
     gRateClockStarted = false;
     gRateLimited = false;
     gRateLimitPersistencePending = false;
-    gRateDrops = 0;
     gRateFreshClosedUntil = 0;
     gRatePersistentClosedUntil = 0;
     gFaults = DET_LOG_FAULT_NONE;

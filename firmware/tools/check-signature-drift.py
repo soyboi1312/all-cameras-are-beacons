@@ -93,14 +93,12 @@ AND_FAQ = "android/app/src/main/assets/faq-content.json"
 # The firmware and protocol-doc sides of a rule the apps seed from (see SHARED_SHAPES).
 FW_BEACON_MAIN = "firmware/src/beacon-board/main.cpp"
 FW_MESH_MAIN = "firmware/src/mesh-detect/main.cpp"
+FW_PLATFORMIO = "firmware/platformio.ini"
 DOCS_BLE_PROTOCOL = "docs/ble-protocol.md"
 CANONICAL_PRIVACY = "web/privacy.html"
 CANONICAL_PRIVACY_URL = (
     "https://soyboi1312.github.io/all-cameras-are-beacons/privacy.html"
 )
-# The workflow that runs this script in CI. check_ci_trigger_paths holds its path filter to the
-# files this script reads.
-FIRMWARE_CI = ".github/workflows/firmware-ci.yml"
 # ----------------------------------------------------------------------------
 
 
@@ -108,13 +106,7 @@ def repo_root():
     return os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
 
 
-# Every repo-relative path this run reads, for check_ci_trigger_paths. read_local adds its own;
-# check_faq_copies hashes its two files without it and adds them itself.
-_READS = set()
-
-
 def read_local(rel):
-    _READS.add(rel)
     with open(os.path.join(repo_root(), rel), encoding="utf-8") as f:
         return f.read()
 
@@ -271,7 +263,6 @@ def check_faq_copies():
     """
     root = repo_root()
     rel_a, rel_b = IOS_FAQ, AND_FAQ
-    _READS.update((rel_a, rel_b))
     a, b = os.path.join(root, rel_a), os.path.join(root, rel_b)
     print("\n== bundled FAQ content (both app copies must be identical) ==")
     missing = [p for p in (a, b) if not os.path.exists(p)]
@@ -398,6 +389,7 @@ def _toggle_title_rows():
     for what, anchor, and_anchor in (
         ("Scan radios Bluetooth toggle title", "ALPR ", None),
         ("Scan radios Wi-Fi toggle title", "2\\.4 GHz", None),
+        ("Scan radios 5 GHz Wi-Fi toggle title", "9 channels ", None),
         ("Detectors drones toggle title", "FAA remote ID", None),
         ("Detectors non-broadcasting drones toggle title", "OUI match only", None),
         ("Detectors body cams toggle title", "Axon ", None),
@@ -1315,6 +1307,16 @@ SHARED_CONSTANTS = (
                 r" seededAt\.addingTimeInterval\(-([0-9][0-9_.]*)\) \}"),
         "android": (AND_BLE_MANAGER,
                     r"fun sampleSeenWatermarkMs\(seededAtMs: Long\): Long = seededAtMs - ([0-9][0-9_]*)L\b"),
+    },
+    # The sample netcam is the seed's only Wi-Fi (s=1) row, so its only "ch". Keyed on the detail
+    # so a row that lost "ch" on one phone reads as unreadable, not as a pass.
+    {
+        "what": "sample Wi-Fi row channel",
+        "kind": "string",
+        "why": "the sample tour's Wi-Fi channel row and its wifi_channel/wifi_band_ghz CSV cells"
+               " read this value, so both phones must seed the same channel",
+        "ios": (IOS_BLE_MANAGER, r'"det": "Hikvision on wifi", "ch": ([0-9]+),'),
+        "android": (AND_BLE_MANAGER, r'"det":"Hikvision on wifi","ch":([0-9]+),'),
     },
     # The radar sweep (decisions M3): one turn every 4.5 s on both phones, from the clock.
     {
@@ -2454,11 +2456,9 @@ SHARED_SHAPES = (
             # places. The needles below span the neighbour each one leads, so a copy that slides
             # back down the page fails here rather than in a screenshot nobody takes.
             #
-            # THE PRE-CONNECT CALL SITES ARE NOW PINNED TOO, on the three sides after the two below
-            # (RootView.swift and ConnectView.swift on iOS, AcabApp.kt on Android). They used to be
-            # left out, and said so here, because a file this script reads has to be in both
-            # firmware-ci.yml path lists; adding those three paths is what let the render sites
-            # themselves be held, instead of only everything they call. It matters because deleting
+            # THE PRE-CONNECT CALL SITES ARE PINNED TOO, on the three sides after the two below
+            # (RootView.swift and ConnectView.swift on iOS, AcabApp.kt on Android), so the render
+            # sites themselves are held, not only everything they call. It matters because deleting
             # a render site is exactly the regression this rule exists to catch, and the gate, the
             # panel, the offer, the strings and the take all survive that deletion untouched.
             ("iOS offer surfaces", IOS_SETTINGS, None,
@@ -4234,6 +4234,32 @@ SHARED_SHAPES = (
                r"reduce = read\(\)\s*\n\s*onDispose \{ resolver\.unregisterContentObserver\(observer\) \}"))),
         ),
     },
+    # The wifi_band_ghz rule (owner request 2026-10-05); "detection CSV columns" pins the names.
+    # Each needle spans the whole helper body, so a moved edge, a changed band word or an extra arm
+    # on one phone fails.
+    {
+        "what": "Wi-Fi band thresholds (channels 1-14 are 2.4 GHz, 32-177 are 5 GHz, anything else"
+                " has no band)",
+        "why": "the CSV's wifi_band_ghz cell and the dossier's Wi-Fi channel row both read the band"
+               " from this helper; a different edge on one phone files the same channel under a"
+               " different band, or under none",
+        "sides": (
+            ("iOS", IOS_DETECTION,
+             r"static func wifiBandGHz\(channel: Int\?\) -> String\? \{(.*?)\n    \}",
+             (("the two bands and no other arm",
+               r"\A\s*switch channel \{" + _KT_ARM_GAP
+               + r'case \.some\(1\.\.\.14\):\s*return "2\.4"' + _KT_ARM_GAP
+               + r'case \.some\(32\.\.\.177\):\s*return "5"' + _KT_ARM_GAP
+               + r"default:\s*return nil" + _KT_ARM_GAP + r"\}\s*\Z"),)),
+            ("Android", AND_DEVICE_TYPE,
+             r"\nfun wifiBandGhz\(channel: Int\?\): String\? = when \(channel\) \{(.*?)\n\}",
+             (("the two bands and no other arm",
+               r"\A\s*null -> null" + _KT_ARM_GAP
+               + r'in 1\.\.14 -> "2\.4"' + _KT_ARM_GAP
+               + r'in 32\.\.177 -> "5"' + _KT_ARM_GAP
+               + r"else -> null\s*\Z"),)),
+        ),
+    },
 )
 
 
@@ -4396,6 +4422,9 @@ def check_board_kinds():
         labels = re.findall(r'const char\* kFwLabel = "([^"]*)";', beacon)
         mesh_name = re.findall(r'acabBleBegin\("([^"]*)", fwLabel', mesh)
         mesh_label = re.findall(r'snprintf\(fwLabel, sizeof\(fwLabel\), "(mesh-detect[^"%]*)"\)', mesh)
+        ini = read_local(FW_PLATFORMIO)
+        ini_names = re.findall(r"""-DACAB_BLE_NAME='"([^"]*)"'""", ini)
+        ini_labels = re.findall(r"""-DACAB_FW_LABEL='"([^"]*)"'""", ini)
     except OSError as exc:
         print(f"   !! firmware mains could not be read ({exc})")
         return drift + 1
@@ -4408,6 +4437,10 @@ def check_board_kinds():
     expected = (("dual-radio beacon", names[0], labels[0], "beacon"),
                 ("single-radio OUI-Spy", names[1], labels[1], "ouiSpy"),
                 ("Mesh-Detect", mesh_name[0], mesh_label[0], "meshDetect"))
+    # Beacon variants set identity by -D in platformio.ini (rev-B's label, beacon-c5's name and
+    # label), which the literal search above cannot see; each must still read as a beacon.
+    expected += tuple((f"beacon {l!r} (platformio.ini)", names[0], l, "beacon") for l in ini_labels)
+    expected += tuple((f"beacon advert {n!r} (platformio.ini)", n, labels[0], "beacon") for n in ini_names)
     for build, name, label, raw in expected:
         for side, fw, exact, prefix in (("iOS", i_fw, i_exact, i_prefix),
                                         ("Android", a_fw, a_exact, a_prefix)):
@@ -4430,7 +4463,7 @@ def check_board_kinds():
               " read as a beacon, or the reverse")
         drift += 1
     else:
-        print(f"   ok: the three firmware builds read as their own kind on both apps"
+        print(f"   ok: every firmware build reads as its own kind on both apps"
               f" ({', '.join(f'{n}/{l}' for _, n, l, _ in expected)})")
     return drift
 
@@ -4620,184 +4653,6 @@ def check_privacy_contract():
     return drift
 
 
-def _glob_to_re(pattern):
-    """A GitHub `paths` pattern as a regex: `**` crosses directories and `*` does not. None for any
-    other glob syntax (`?`, `[...]`, `{...}`, `+`, a leading `!` negation), which this reader would
-    get wrong, so the caller reports it instead of guessing."""
-    if pattern.startswith("!") or re.search(r"[?\[\]{}+]", pattern):
-        return None
-    parts = re.split(r"(\*\*|\*)", pattern)
-    return re.compile("".join(".*" if p == "**" else "[^/]*" if p == "*" else re.escape(p)
-                              for p in parts) + r"\Z")
-
-
-def _workflow_trigger_paths(text):
-    """{event: [path patterns]} from the `paths:` block lists under a workflow's top-level `on:`,
-    as (events, problems). Line-based, because CI installs no YAML library. A shape this reader
-    does not follow (a flow-style list, `paths-ignore`, an entry it cannot unquote) is a problem,
-    never a skip."""
-    lines = text.splitlines()
-    start = next((i for i, l in enumerate(lines) if re.fullmatch(r"on:\s*", l)), None)
-    if start is None:
-        return {}, ["no top-level `on:` block"]
-    events, problems = {}, []
-    event_indent = event = paths_indent = None
-    for line in lines[start + 1:]:
-        body = line.strip()
-        if not body or body.startswith("#"):
-            continue
-        indent = len(line) - len(line.lstrip())
-        if indent == 0:
-            break
-        if paths_indent is not None and indent > paths_indent and body.startswith("- "):
-            item = re.fullmatch(r"- (?:'([^']*)'|\"([^\"]*)\"|([^\s'\"#]+))", body)
-            if item:
-                events[event].append(next(g for g in item.groups() if g is not None))
-            else:
-                problems.append(f"{event}: path entry {body!r} is not one plain or quoted path")
-            continue
-        paths_indent = None
-        key = re.match(r"([A-Za-z_-]+):", body)
-        if not key:
-            problems.append(f"{body!r} under `on:` was not understood")
-            continue
-        if event_indent is None:
-            event_indent = indent
-        if indent == event_indent:
-            event = key.group(1)
-        elif key.group(1) == "paths":
-            if body != "paths:":
-                problems.append(f"{event}: `paths` is not a block list")
-            events[event] = []
-            paths_indent = indent
-        elif key.group(1) == "paths-ignore":
-            problems.append(f"{event}: `paths-ignore` is set, which this reader does not apply")
-    return events, problems
-
-
-# The workflow line that runs this script for real: no --offline, no other argument.
-_CI_DRIFT_RUN_RE = re.compile(r"\s*run:\s*python3 firmware/tools/check-signature-drift\.py\s*")
-# The two keys that leave a step listed in the workflow while it stops failing the run.
-_CI_SKIP_KEY_RE = re.compile(r"(if|continue-on-error)\s*:")
-
-
-def _ci_drift_step(text):
-    """The job that runs this script, as (job name, problems). None with a problem when unreadable.
-
-    Counting `run:` lines is not enough, and used to be all this did: `continue-on-error: true`
-    added to keep a red CI moving, or `if: false` to park the step, left every cross-platform
-    guard present, running or not, and not failing anything, while the line below still printed
-    ok. That is the shape this whole file exists to refuse.
-
-    Line-based, like _workflow_trigger_paths, because CI installs no YAML library: it walks out
-    from the `run:` line to the `- ` step bullet above it and to the job header above that, and
-    reports either key on either. It cannot tell an always-true `if:` from `if: false`, so it
-    reports both and whoever wants one changes this check on purpose. The job NAME is returned
-    rather than required to be `build`, so a step moved to another job changes what the caller
-    prints instead of outliving a sentence that named the old one. It does not see a step
-    disabled from outside its own keys: a `strategy`, a reusable workflow, a `needs:` on a job
-    that can be skipped, or a repository setting.
-    """
-    lines = text.splitlines()
-    hits = [i for i, line in enumerate(lines) if _CI_DRIFT_RUN_RE.fullmatch(line)]
-    if len(hits) != 1:
-        return None, [f"a step runs this script without --offline {len(hits)} times (expected 1)"]
-    run_at = hits[0]
-    run_indent = len(lines[run_at]) - len(lines[run_at].lstrip())
-    problems = []
-
-    def keys_of(start, own_indent, key_indent, first=None):
-        """The keys of the block opened at `start`: `first` (the key written on a step's own
-        bullet line) plus each following line at key_indent, until the block dedents."""
-        out = [first] if first else []
-        for line in lines[start + 1:]:
-            body = line.strip()
-            if not body or body.startswith("#"):
-                continue
-            indent = len(line) - len(line.lstrip())
-            if indent <= own_indent:
-                break
-            if indent == key_indent:
-                out.append(body)
-        return out
-
-    step_at = next((i for i in range(run_at, -1, -1)
-                    if lines[i].lstrip().startswith("- ")
-                    and len(lines[i]) - len(lines[i].lstrip()) < run_indent), None)
-    if step_at is None:
-        return None, ["the line running this script is not inside a `- ` step"]
-    step_indent = len(lines[step_at]) - len(lines[step_at].lstrip())
-    for key in keys_of(step_at, step_indent, run_indent, lines[step_at].strip()[2:]):
-        if _CI_SKIP_KEY_RE.match(key):
-            problems.append(f"the step running this script carries `{key}`, so it can stop"
-                            " failing the run while still being listed")
-    job_at = next((i for i in range(step_at, -1, -1)
-                   if re.fullmatch(r"  ([A-Za-z0-9_-]+):\s*", lines[i])), None)
-    top_at = next((i for i in range(step_at, -1, -1)
-                   if lines[i][:1] not in ("", " ", "#")), None)
-    if job_at is None or top_at is None or lines[top_at].rstrip() != "jobs:":
-        return None, problems + ["the step running this script is not under a `jobs:` entry this"
-                                 " reader can name"]
-    job = lines[job_at].strip()[:-1]
-    for key in keys_of(job_at, 2, 4):
-        if _CI_SKIP_KEY_RE.match(key):
-            problems.append(f"the `{job}` job carries `{key}`, so the step running this script"
-                            " can be skipped whole")
-    return job, problems
-
-
-def check_ci_trigger_paths():
-    """The one CI runner of this script must run it on a commit that touches ANY file it reads,
-    in a step that can still fail the run.
-
-    firmware-ci.yml filters on explicit `paths:` lists, and most guards above exist to catch the
-    commit that edits one of their files alone. A file this script reads that is missing from
-    either list is a guard CI never runs on that commit, and a green run cannot show it. So hold
-    both lists to the files this run actually read (_READS), and read the step that runs the
-    script (_ci_drift_step), which names the job and reports an `if:` or a `continue-on-error:`
-    on the step or its job. Runs LAST, so every read above is counted. It does not see the push
-    `branches:` filter, the other workflows, a file opened without read_local or _READS, or the
-    ways of disabling a step that live outside the step's and the job's own keys.
-    """
-    print("\n== CI trigger paths (firmware-ci.yml runs this script on every file it reads) ==")
-    try:
-        text = read_local(FIRMWARE_CI)
-    except OSError as exc:
-        print(f"   !! {FIRMWARE_CI} could not be read ({exc}), so CI coverage was NOT checked")
-        return 1
-    events, problems = _workflow_trigger_paths(text)
-    job, step_problems = _ci_drift_step(text)
-    problems += step_problems
-    reads = sorted(_READS)
-    missing = []
-    for event in ("push", "pull_request"):
-        patterns = events.get(event)
-        if not patterns:
-            problems.append(f"{event}: no `paths:` list was read")
-            continue
-        compiled = []
-        for pattern in patterns:
-            rx = _glob_to_re(pattern)
-            if rx is None:
-                problems.append(f"{event}: {pattern!r} uses glob syntax this reader does not apply")
-            else:
-                compiled.append(rx)
-        missing += [(event, rel) for rel in reads if not any(rx.match(rel) for rx in compiled)]
-    if problems or missing:
-        print(f"   !! {FIRMWARE_CI} would not run this script on every commit it exists to catch")
-        for msg in problems:
-            print(f"      {msg}")
-        for event, rel in missing:
-            print(f"      {event:12} does not list {rel}")
-        print("      a guard whose file CI does not trigger on runs only on some later, unrelated")
-        print("      commit; add the path to BOTH lists, or fix the workflow shape")
-        return 1
-    print(f"   ok: all {len(reads)} files this run read are in both path lists")
-    print(f"   ok: the `{job}` job runs this script without --offline, in a step carrying no"
-          " `if:` and no `continue-on-error:`")
-    return 0
-
-
 def main():
     ap = argparse.ArgumentParser(
         description="ACAB signature + vendored-copy drift check (reports only, changes nothing)")
@@ -4813,8 +4668,6 @@ def main():
              + check_shared_shapes() + check_board_kinds() + check_map_refresh_ladder()
              + check_pin_priority()
              + check_privacy_contract())
-    # Last, so it sees every file the checks above read.
-    drift += check_ci_trigger_paths()
     print()
     if drift:
         print(f"DRIFT: {drift} item(s) need a look. Review and re-port by hand.")

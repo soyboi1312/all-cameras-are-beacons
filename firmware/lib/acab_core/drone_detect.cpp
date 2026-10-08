@@ -272,10 +272,11 @@ bool droneClassifyBLE(const uint8_t mac[6], const uint8_t* payload, size_t len,
                       int rssi, AcabDetection* out) {
     if (!gEnabled.on && !desertIsEnabled()) return false;
     if (droneRidBLE(mac, payload, len, rssi, out)) return true;
-    // OUI fallback is opt-in (default OFF): it cannot distinguish a flying drone from
-    // a stationary drone-vendor gadget, so it false-positives. Only run it when the
-    // user opted in, or in Desert mode which deliberately surfaces everything.
-    if (!droneOuiIsEnabled() && !desertIsEnabled()) return false;
+    // OUI fallback: opt-in (default OFF), under the drone master toggle (both apps grey the
+    // sub-toggle while drones are off): it cannot tell a flying drone from a drone-vendor gadget,
+    // and in the owner's logs labelled 12 DJI Osmo cameras and a Hasselblad as drones vs 1 named
+    // drone. Desert does NOT force it (or the netcam opt-in) but lists such gear as nearby devices.
+    if (!gEnabled.on || !droneOuiIsEnabled()) return false;
     if (const char* v = droneVendorOui(mac)) return emitVendorOui(mac, rssi, SRC_BLE, v, out);
     return false;
 }
@@ -285,14 +286,14 @@ bool droneClassifyBLE(const uint8_t mac[6], const uint8_t* payload, size_t len,
 // ---------------------------------------------------------------------------
 // Remote ID comes in two public ASTM F3411 frame types: a NAN action frame (fixed
 // multicast destination 51:6f:9a:01:00:00) and a beacon carrying an ODID vendor
-// IE (Wi-Fi Alliance OUI 90:3a:e6 or ASTM OUI fa:0b:bc). Both hand their ODID
-// payload to the Apache-licensed decoder.
+// IE (90:3a:e6, Parrot SA's OUI borrowed by the French DRI scheme, or fa:0b:bc, CEN's
+// CID). Both hand their ODID payload to the Apache-licensed decoder.
+static const uint8_t kNanDest[6] = {0x51, 0x6f, 0x9a, 0x01, 0x00, 0x00};
 static bool droneRidWiFi(const uint8_t* frame, size_t len, int rssi,
                          AcabDetection* out) {
     if (!frame || len < 24) return false;
 
     // NAN action frame: recognised solely by its multicast destination (bytes 4-9).
-    static const uint8_t kNanDest[6] = {0x51, 0x6f, 0x9a, 0x01, 0x00, 0x00};
     if (memcmp(frame + 4, kNanDest, 6) == 0) {
         ODID_UAS_Data uas;
         memset(&uas, 0, sizeof(uas));
@@ -330,10 +331,15 @@ bool droneClassifyWiFi(const uint8_t* frame, size_t len, int rssi,
                        AcabDetection* out) {
     if (!gEnabled.on && !desertIsEnabled()) return false;
     if (droneRidWiFi(frame, len, rssi, out)) return true;
-    // OUI fallback is opt-in (default OFF) - see droneClassifyBLE for the why. Desert
-    // mode still forces it on, matching how the master guard above treats desert.
-    if (!droneOuiIsEnabled() && !desertIsEnabled()) return false;
-    if (frame && len >= 16)
+    // Gated as in droneClassifyBLE. Desert still lists the device from its beacons and probes
+    // (desertClassifyWiFi), but not a vendor-block NAN frame that fails the RID decode.
+    if (!gEnabled.on || !droneOuiIsEnabled()) return false;
+    // AP frames only (beacon 0x80, probe response 0x50) or a NAN frame the RID decoder rejected:
+    // a Wi-Fi drone runs as the AP, and a MAC that only probes or associates is a client. Every
+    // Parrot hit in the field logs was a probing client (90:3a:e6:15:b9:e3 at the owner's home,
+    // three 90:03:b7 MACs); a captured ANAFI Thermal beacons from 90:3a:e6.
+    if (frame && len >= 16 &&
+        (frame[0] == 0x80 || frame[0] == 0x50 || memcmp(frame + 4, kNanDest, 6) == 0))
         if (const char* v = droneVendorOui(frame + 10))
             return emitVendorOui(frame + 10, rssi, SRC_WIFI, v, out);
     return false;

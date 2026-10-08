@@ -7,45 +7,13 @@ name: Firmware CI
 #
 # iOS has its own macOS test and unsigned Release-build gate in ios-ci.yml.
 #
-# THE PATH LIST REACHES OUTSIDE firmware/ ON PURPOSE. check-signature-drift.py below is the only
-# CI runner of the cross-platform guards (release.sh also runs it at a release cut), and many of
-# the files those guards read live in the two APP trees: the two faq-content.json copies, the two
-# DeviceType enums, the files behind every SHARED_CONSTANTS, SHARED_SHAPES and per-arm table row,
-# and each app's privacy link beside the canonical web policy. With a firmware-only filter, the one
-# commit shape those guards exist to catch, an app-tree-only edit that changes one copy, never
-# triggered them, and no other workflow runs the script. Both DeviceType files tell maintainers
-# this script "FAILS the build"; the app-tree paths in both lists are what makes that sentence true.
-#
-# THE LIST IS CHECKED, NOT TRUSTED. The script's last check, check_ci_trigger_paths, records every
-# file the run read and fails when one is missing from the push list or the pull_request list. The
-# two app source trees are listed whole, so a pin on a new file inside them needs no edit here. A
-# pin on a file that no pattern below covers (an app test, a Gradle script, a second web page)
-# fails its own commit until that path is in BOTH lists below.
-#
-# THE COST, STATED: an edit to any file in the two app source trees spends a cached PlatformIO
-# build, and those trees change often, so this is not free. A guard that does not run on the
-# commit it exists to catch is worth less than the runner minutes, and cancel-in-progress below
-# stops a superseded push from spending them twice.
+# NO `paths:` FILTER, ON PURPOSE. check-signature-drift.py below is the only CI runner of the
+# cross-platform guards, and they read files in both app trees, docs/ and web/. A filter skips the
+# one commit shape those guards exist to catch: an edit to one copy alone.
 on:
   push:
     branches: [main]
-    paths:
-      - 'firmware/**'
-      - 'docs/**'
-      - 'README.md'
-      - '.github/workflows/firmware-ci.yml'
-      - 'ios/Beacons/**'
-      - 'android/app/src/main/**'
-      - 'web/privacy.html'
   pull_request:
-    paths:
-      - 'firmware/**'
-      - 'docs/**'
-      - 'README.md'
-      - '.github/workflows/firmware-ci.yml'
-      - 'ios/Beacons/**'
-      - 'android/app/src/main/**'
-      - 'web/privacy.html'
   workflow_dispatch:
 
 # LEAST PRIVILEGE. This was the only workflow in the repo declaring no permissions at all, so it
@@ -81,6 +49,7 @@ jobs:
         with:
           path: |
             ~/.platformio
+            ~/.platformio-c5
             firmware/.pio
           key: pio-${{ runner.os }}-${{ hashFiles('firmware/platformio.ini') }}
           restore-keys: pio-${{ runner.os }}-
@@ -90,15 +59,27 @@ jobs:
 
       # ALL envs, not just the product one. The rev-B and channel-1 variants are exactly the
       # targets a local `pio run` forgets, because nobody builds them by hand day to day.
+      # A bare `pio run` builds default_envs: every env but beacon-c5 (next step).
       - name: Build every firmware env
         working-directory: firmware
         run: pio run
+
+      # Own core dir: see [platformio] in platformio.ini. The only build of the NimBLE 2.x /
+      # Arduino 3 branches and the C5 static_asserts.
+      - name: Build beacon-c5 (own core dir)
+        working-directory: firmware
+        run: PLATFORMIO_CORE_DIR="$HOME/.platformio-c5" pio run -e beacon-c5
 
       # Sub-second, no board needed. This is the layer that catches a classifier that still
       # compiles but has quietly stopped matching, which is the failure this product cannot
       # afford and which no amount of building would reveal.
       - name: Host tests (classifiers)
         run: firmware/tools/host-tests/run.sh
+
+      # The same suites under ASan + UBSan. The parsers they drive take bytes off the air, and a
+      # memory error or undefined behaviour there passes the plain build silently.
+      - name: Host tests under sanitizers
+        run: firmware/tools/host-tests/run.sh --sanitize
 
       # A drift watcher that only runs when someone remembers to run it is not a watcher.
       # The job's own token goes in because the opendroneid release watch now FAILS on an

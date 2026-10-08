@@ -24,7 +24,7 @@ static bool hostBleConnected = false;
 static void countCaptureDelivery(void* raw) {
     int* count = static_cast<int*>(raw);
     (*count)++;
-    // Ordinary sink callbacks may build BLE status/diagnostic JSON that snapshots det_log. This
+    // Ordinary sink callbacks may build BLE status JSON that snapshots det_log. This
     // would deadlock immediately if the delivery guard held gIoMutex through the callback.
     (void)detLogCount();
 }
@@ -310,6 +310,22 @@ int main() {
     detLogStopDrain();
     check("a stopped drain rejects a formerly peeked seq",
           !detLogCommitDrain(2, replay.drainGeneration));
+
+    // StoredDet has no byte for "cid" or "ch", so a replay must return both as 0; that keeps
+    // serializeDetection (acab_ble_service.cpp) from emitting either key on a hist row
+    // (ble-protocol.md, rows cid / ch).
+    fresh();
+    {
+        AcabDetection w = detection(1, ACAB_FLOCK_CAMERA);
+        w.src = SRC_WIFI; w.channel = 149; w.companyId = 0x004C;
+        detLogAppend(w);
+        detLogStartDrain(0);
+        DetLogReplay wr;
+        check("a replayed WiFi record carries channel 0 and companyId 0 (no ch/cid)",
+              detLogPeekForDrain(&wr) && wr.seq == 1 && wr.d.src == SRC_WIFI &&
+              wr.d.channel == 0 && wr.d.companyId == 0);
+        detLogStopDrain();
+    }
 
     // Exact ABA regression: stopping and restarting from the same app cursor can put a NEW drain
     // on the same seq. The old accepted-notify callback must not advance that replacement drain.
@@ -665,14 +681,6 @@ int main() {
     check("disabled-state append refusal is non-retryable within this capture generation",
           detLogAppend(detection(1)) == DET_LOG_APPEND_NOT_ARMED);
 
-    // Stationary mode periodically advances only the scanner's dedup capture generation. It does
-    // not represent an owner/link handoff, so a legitimate already-queued row keeps the same
-    // det_log admission epoch and remains appendable.
-    fresh();
-    check("periodic dedup rearm does not invalidate a queued owner-era row",
-          detLogAppendClaimed(detection(1), nullptr, 1) == DET_LOG_APPEND_STORED &&
-          detLogCount() == 1);
-
     // Successful authentication has a pre-ready window: GPS is cleared and a durable privacy
     // token may touch NVS before gConnected can become true. Reserve + block at that boundary and
     // publish no scanner token until the explicit admit step succeeds.
@@ -772,7 +780,8 @@ int main() {
               DET_LOG_APPEND_STORED && detLogCount() == 1);
 
     fresh();
-    detLogClearKey();
+    detLogSetEnabled(false);           // buffer:false forgets the key; buffer:true with no key push
+    detLogSetEnabled(true);
     check("ready-but-keyless append and sync are explicitly rejected",
           detLogAppend(detection(1)) == DET_LOG_APPEND_NOT_ARMED &&
           detLogStartDrain(0, detLogGeneration()) == DET_LOG_DRAIN_REJECTED);
@@ -839,9 +848,8 @@ int main() {
           detLogCount() == 1 && savedBlob("key") == startupOldKeyBlob &&
           !detLogWipePending());
 
-    // Fresh-board setup is the complementary case: key + enable + Stationary-capture writes all
-    // arrive while startup is pending and must commit in dependency order rather than having the
-    // retained on=false cleanup silently erase bufall.
+    // Fresh-board setup is the complementary case: key + enable writes both arrive while startup
+    // is pending and must commit in dependency order.
     Preferences::wipeAll();
     acabHostPartitionReset(8192);
     detLogHostResetRuntime();
@@ -851,24 +859,22 @@ int main() {
     detLogBegin();
     const DetLogKeyResult freshStartupKeyResult = detLogSetKey(startupSameKey);
     detLogSetEnabled(true);
-    detLogSetBufferAll(true);
     check("fresh startup leaves an unconfirmed key unstaged while config waits",
           freshStartupKeyResult == DET_LOG_KEY_PENDING && !savedBool("on") &&
-          !savedKeyExists("key") && !savedBool("bufall"));
+          !savedKeyExists("key"));
     detLogEraseTick();
     check("startup can publish requested settings without fabricating key acceptance",
-          detLogEnabled() && !detLogHaveKey() && detLogBufferAll() && savedBool("on") &&
-          savedBool("bufall") && !savedKeyExists("key"));
+          detLogEnabled() && !detLogHaveKey() && savedBool("on") && !savedKeyExists("key"));
     check("fresh-board key retry is accepted after metadata publication",
           detLogSetKey(startupSameKey) == DET_LOG_KEY_ACCEPTED);
     detLogAppend(detection(1));
-    check("confirmed key retry completes Stationary capture before append",
-          detLogEnabled() && detLogHaveKey() && detLogBufferAll() && savedBool("on") &&
-          savedBool("bufall") && savedKeyExists("key") && detLogCount() == 1);
+    check("confirmed key retry completes the enable before append",
+          detLogEnabled() && detLogHaveKey() && savedBool("on") && savedKeyExists("key") &&
+          detLogCount() == 1);
     detLogHostResetRuntime();
     detLogBegin();
-    check("confirmed fresh-board Stationary capture survives reboot",
-          detLogEnabled() && detLogHaveKey() && detLogBufferAll() && detLogCount() == 1);
+    check("confirmed fresh-board enable survives reboot",
+          detLogEnabled() && detLogHaveKey() && detLogCount() == 1);
 
     // clearlog must not derive a new encryption generation from reset-value gBoot=0. Defer the
     // ring arm until startup reads and increments the retained high counter.
@@ -885,21 +891,6 @@ int main() {
     check("deferred clear uses a generation newer than the retained counter",
           savedUInt("boot") > 41 && detLogCount() == 0 && !detLogWipePending() &&
           acabHostPartitionAllErased());
-
-    // A failed clear-key begin is also a newer runtime intent than the retained config read. The
-    // restore may not republish the old blob and clear its retry flag.
-    fresh();
-    detLogAppend(detection(1));
-    detLogHostResetRuntime();
-    Preferences::failNthBegin(5);
-    detLogBegin();
-    Preferences::failNextBegin();
-    detLogClearKey();
-    check("startup-pending clear-key remains keyless after its first NVS failure",
-          !detLogHaveKey() && savedKeyExists("key"));
-    detLogEraseTick();
-    check("startup restore preserves and completes the explicit clear-key retry",
-          !detLogHaveKey() && !savedKeyExists("key"));
 
     // Epoch belongs to the durable boot selected by startup, not boot 0. Preserve its original
     // receipt uptime across the retry so the first row after recovery remains exact.
@@ -924,7 +915,8 @@ int main() {
     // cryptPayload would be a no-op; pushing the key later replays the untouched first row.
     fresh();
     detLogAppend(detection(1));
-    detLogClearKey();
+    detLogSetEnabled(false);
+    detLogSetEnabled(true);
     detLogStartDrain(0);
     DetLogReplay keylessReplay;
     check("keyless sync exposes no replay and advances nothing",
@@ -1120,18 +1112,19 @@ int main() {
     check("loop retry removes the residual key before startup becomes ready",
           !detLogHaveKey() && !savedKeyExists("key") && !savedBool("on", true));
 
-    // Standalone clear-key keeps the master switch but needs its own durable recovery marker.
-    // Once keydrop=true lands, a power loss between it and remove() may not reload the old key.
+    // An enabled key rotation keeps the master switch but first removes the old key behind its
+    // own durable recovery marker. Once keydrop=true lands, a power loss between it and remove()
+    // may not reload the old key.
     fresh();
     detLogAppend(detection(1));
     Preferences::failNextRemove("acab-buf", "key");
-    detLogClearKey();
-    check("failed standalone key removal leaves a durable boot cleanup marker",
-          !detLogHaveKey() && savedBool("keydrop") && savedKeyExists("key"));
+    check("failed rotation key removal leaves a durable boot cleanup marker",
+          detLogSetKey(otherKey, true) == DET_LOG_KEY_PENDING &&
+          savedBool("keydrop") && savedKeyExists("key"));
     detLogHostResetRuntime();
     detLogBegin();
     check("reboot honors keydrop before loading the retained key",
-          !detLogHaveKey() && !savedKeyExists("key") && !savedBool("keydrop"));
+          detLogEnabled() && !detLogHaveKey() && !savedKeyExists("key") && !savedBool("keydrop"));
 
     // A key update writes the decrypting key before its fingerprint. If the first write fails,
     // neither half of the retained pair changes and appends remain blocked until the retry; this
@@ -1323,7 +1316,7 @@ int main() {
     check("repeated-clear replacement failure cannot reload the obsolete key",
           detLogEnabled() && !detLogHaveKey() && !savedKeyExists("key"));
 
-    // Disable/clear-key coordinators take precedence over a pending ordinary wipe. A handshake key
+    // The disable coordinator takes precedence over a pending ordinary wipe. A handshake key
     // arriving after buffer:false remains a replay-only RAM intent; the wipe publication must not
     // persist it before mandatory off/key cleanup, and reboot remains durably off and keyless.
     fresh();
@@ -1342,26 +1335,29 @@ int main() {
     check("power loss after deferred-clear/disable/key ordering stays off and keyless",
           !detLogEnabled() && !detLogHaveKey() && !savedKeyExists("key"));
 
-    // A standalone privacy cleanup has the same priority even when no replacement key is waiting.
-    // Hold a clear arm at its loggen publication boundary, fail the first two cleanup commits, and
-    // prove the arm cannot advance until a later tick establishes the clear-key recovery boundary.
+    // A rotation's old-key removal has the same priority. Hold a clear arm at its loggen
+    // publication boundary, fail the first two keydrop commits, and prove the arm cannot advance
+    // until a later tick establishes the rotation's recovery boundary.
     fresh();
     detLogAppend(detection(1));
-    const uint32_t generationBeforePendingClearKey = detLogGeneration();
+    const std::vector<uint8_t> keyBeforePendingRotation = savedBlob("key");
+    const uint32_t generationBeforePendingRotation = detLogGeneration();
     Preferences::failNextPutUInt("acab-buf", "loggen");
     detLogClear();
     Preferences::failNextPutBool("acab-buf", "keydrop", 2);
-    detLogClearKey();
+    detLogSetKey(otherKey, true);
     detLogEraseTick();
-    check("pending clear cannot publish ahead of standalone clear-key cleanup",
-          savedUInt("loggen") == generationBeforePendingClearKey && savedKeyExists("key"));
+    check("pending clear cannot publish ahead of rotation old-key cleanup",
+          savedUInt("loggen") == generationBeforePendingRotation &&
+          savedBlob("key") == keyBeforePendingRotation);
     detLogEraseTick();
-    check("clear-key recovery commits before the pending generation can publish",
-          savedUInt("loggen") != generationBeforePendingClearKey && !savedKeyExists("key"));
+    check("rotation old-key removal commits before the pending generation can publish",
+          savedUInt("loggen") != generationBeforePendingRotation &&
+          savedBlob("key") != keyBeforePendingRotation);
     detLogHostResetRuntime();
     detLogBegin();
-    check("power loss after ordered clear-key/arm commit reboots keyless",
-          detLogEnabled() && !detLogHaveKey() && !savedKeyExists("key"));
+    check("power loss after ordered rotation/arm commit reboots under the new key only",
+          detLogEnabled() && detLogHaveKey() && savedBlob("key") != keyBeforePendingRotation);
 
     fresh();
     detLogAppend(detection(1));
@@ -1382,7 +1378,7 @@ int main() {
     check("power loss after ordered disable/arm commit stays off and keyless",
           !detLogEnabled() && !detLogHaveKey() && !savedKeyExists("key"));
 
-    // The reverse production ordering is synchronous: buffer:false/ClearKey can fail, then a
+    // The reverse production ordering is synchronous: buffer:false can fail, then a
     // clearlog field arrives in the same config object. clearLocked must remain RAM-deferred and
     // write no wipe target until the older privacy transaction reaches its durable marker.
     fresh();
@@ -1403,23 +1399,26 @@ int main() {
           !detLogEnabled() && !detLogHaveKey() && !savedKeyExists("key") &&
           detLogGeneration() != generationBeforeDisableThenClear);
 
+    // A rotation whose keydrop=true commit fails stays the older privacy transaction: a clearlog
+    // in the same config object must stay RAM-deferred until the old key is reboot-safely gone.
     fresh();
     detLogAppend(detection(1));
-    const uint32_t generationBeforeClearKeyThenClear = detLogGeneration();
+    const std::vector<uint8_t> keyBeforeRotationThenClear = savedBlob("key");
+    const uint32_t generationBeforeRotationThenClear = detLogGeneration();
     Preferences::failNextPutBool("acab-buf", "keydrop", 2);
-    detLogClearKey();
+    detLogSetKey(otherKey, true);
     detLogClear();
-    check("clear-key-first clear writes no ring arm before key cleanup",
-          !savedBool("wipe") && savedUInt("loggen") == generationBeforeClearKeyThenClear);
+    check("rotation-first clear writes no ring arm before old-key cleanup",
+          !savedBool("wipe") && savedUInt("loggen") == generationBeforeRotationThenClear);
     detLogEraseTick();
-    check("failed clear-key retry continues to hold the deferred clear in RAM",
-          !savedBool("wipe") && savedUInt("loggen") == generationBeforeClearKeyThenClear);
+    check("failed rotation retry continues to hold the deferred clear in RAM",
+          !savedBool("wipe") && savedUInt("loggen") == generationBeforeRotationThenClear);
     detLogEraseTick();
     detLogHostResetRuntime();
     detLogBegin();
-    check("clear-key-first clear publishes only after reboot-safe key removal",
-          detLogEnabled() && !detLogHaveKey() && !savedKeyExists("key") &&
-          detLogGeneration() != generationBeforeClearKeyThenClear);
+    check("rotation-first clear publishes only after reboot-safe old-key removal",
+          detLogEnabled() && detLogGeneration() != generationBeforeRotationThenClear &&
+          savedBlob("key") != keyBeforeRotationThenClear);
 
     // The exact state a gKey-conditioned guard would MISS: records outlived their key, so nothing
     // but the persisted fingerprint can recognise the new phone.
@@ -1554,29 +1553,9 @@ int main() {
           !detLogEnabled() && detLogHaveKey() && !savedKeyExists("key") &&
           savedBlob("keyfp") != savedBlob("key"));
 
-    fresh();
-    Preferences::failNextPutUInt("acab-buf", "cdwipe");
-    detLogClearKey();
-    detLogSetKey(otherKey);            // replacement must apply after old-key removal
-    detLogEraseTick();
-    check("deferred clear-key cleanup installs the newer enabled key afterward",
-          detLogEnabled() && detLogHaveKey() && savedKeyExists("key") &&
-          savedBlob("key") != std::vector<uint8_t>(sameKey, sameKey + sizeof(sameKey)));
-
-    // The inverse ordering is a privacy boundary: a key staged before ClearKey/buffer:false is
-    // part of the state being forgotten. A failed coredump-token write may preserve only keys that
-    // arrive after the action was queued, never resurrect an older staged key on retry.
-    fresh();
-    detLogHostResetRuntime();
-    Preferences::failNthBegin(5);                  // keep retained startup publication pending
-    detLogBegin();
-    detLogSetKey(otherKey);                         // staged before the privacy action
-    Preferences::failNextPutUInt("acab-buf", "cdwipe");
-    detLogClearKey();
-    detLogEraseTick();
-    check("failed-token clear discards a key staged before the clear",
-          detLogEnabled() && !detLogHaveKey() && !savedKeyExists("key"));
-
+    // The inverse ordering is a privacy boundary: a key staged before buffer:false is part of the
+    // state being forgotten. A failed coredump-token write may preserve only keys that arrive
+    // after the action was queued, never resurrect an older staged key on retry.
     fresh();
     detLogHostResetRuntime();
     Preferences::failNthBegin(5);
@@ -1599,19 +1578,6 @@ int main() {
     check("failed disable pre-arm plus immediate reboot restores the intact protected config",
           savedUInt("cdwipe") == 0 && detLogEnabled() && detLogHaveKey() &&
           savedBool("on") && savedKeyExists("key"));
-
-    // Standalone clear-key uses the same fail-closed privacy boundary. A failed first token cannot
-    // erase either RAM or NVS identity and then leave a panic dump uncondemned across power loss.
-    fresh();
-    Preferences::failNextPutUInt("acab-buf", "cdwipe");
-    detLogClearKey();
-    check("failed clear-key pre-arm keeps the live and retained key intact",
-          detLogHaveKey() && savedKeyExists("key") && !savedBool("keydrop") &&
-          savedUInt("cdwipe") == 0);
-    detLogHostResetRuntime();
-    detLogBegin();
-    check("clear-key token failure cannot become a keyless unprotected reboot state",
-          detLogEnabled() && detLogHaveKey() && savedKeyExists("key"));
 
     // If generation N was already durable when N+1 failed to persist, completion of N must leave
     // its token in place. That old durable token is the reboot backstop for the newer RAM-only
@@ -1839,69 +1805,6 @@ int main() {
     check("reboot safely resumes and retires a partial generation finalization",
           !detLogWipePending() && savedUInt("wipegen") == 0);
 
-    // bufsat is a Stationary-mode capacity/censoring-risk flag, not proof a refusal happened. Raise
-    // it on exact fill, recover a failed marker from persisted bufall + geometry after power loss,
-    // and keep the actual-refusal counter separate.
-    fresh();
-    detLogSetBufferAll(true);
-    Preferences::failNextPutBool("acab-buf", "bufsat");
-    appendRange(1, 128);
-    check("exact fill raises capacity risk without claiming an actual refusal",
-          detLogSaturated() && detLogSatDrops() == 0 && !savedBool("bufsat"));
-    const uint32_t writesBeforeUnmarkedWrap = acabHostWriteCalls;
-    const DetLogAppendResult unmarkedWrap = detLogAppend(detection(129, ACAB_TRACKER));
-    check("failed capacity-marker persistence blocks signature wrap until durable",
-          unmarkedWrap == DET_LOG_APPEND_RETRY && detLogCount() == 128 &&
-          acabHostWriteCalls == writesBeforeUnmarkedWrap);
-    detLogHostResetRuntime();
-    detLogBegin();
-    check("Stationary full-ring reboot recovers and persists a lost capacity warning",
-          detLogBufferAll() && detLogSaturated() && detLogSatDrops() == 0 &&
-          savedBool("bufsat") && detLogCount() == 128);
-    detLogAppend(detection(129, ACAB_NEARBY_DEVICE));
-    check("bufdrops separately counts a real post-capacity refusal",
-          detLogSaturated() && detLogSatDrops() == 1 && detLogCount() == 128);
-
-    fresh();
-    detLogSetBufferAll(true);
-    Preferences::failNextPutBool("acab-buf", "bufsat", 2); // exact-fill + transition flush
-    appendRange(1, 128);
-    detLogSetBufferAll(false);
-    check("bufall=false cannot outrun a failed exact-fill warning",
-          !savedBool("bufsat") && savedBool("bufall"));
-    detLogHostResetRuntime();
-    detLogBegin();
-    check("power loss during bufall-off preserves recoverable capacity warning",
-          detLogBufferAll() && detLogSaturated() && savedBool("bufsat"));
-
-    fresh();
-    detLogSetBufferAll(true);
-    Preferences::failNextPutBool("acab-buf", "bufsat", 2); // exact-fill + disable flush
-    appendRange(1, 128);
-    detLogSetEnabled(false);
-    check("buffer:false cannot commit before the lost capacity warning",
-          !savedBool("bufsat") && savedBool("on") && savedBool("bufall"));
-    detLogHostResetRuntime();
-    detLogBegin();
-    check("power loss during disable still reconstructs the Stationary warning",
-          detLogEnabled() && detLogBufferAll() && detLogSaturated() && savedBool("bufsat"));
-
-    fresh();
-    appendRange(1, 128);
-    detLogHostResetRuntime();
-    detLogBegin();
-    check("an ordinary full FIFO ring does not fabricate Stationary saturation",
-          !detLogBufferAll() && !detLogSaturated() && detLogSatDrops() == 0);
-    detLogSetBufferAll(true);
-    check("enabling Stationary capture on an already-full ring marks capacity",
-          detLogSaturated() && savedBool("bufsat"));
-
-    fresh();
-    detLogSetEnabled(false);
-    detLogSetBufferAll(true);          // contradictory {buffer:false,bufall:true} field ordering
-    check("disabled config cannot persist a contradictory Stationary-capture posture",
-          !detLogEnabled() && !detLogBufferAll() && !savedBool("bufall"));
-
     // ---- signature-row FLOOD LIMIT (DET_LOG_RATE_* in det_log.h) ----
     // A 1024-slot ring so the bucket, not ring capacity, is what these cases hit.
     {
@@ -1928,7 +1831,7 @@ int main() {
             if (detLogAppend(oneShot(n)) == DET_LOG_APPEND_STORED) stored++;
         check("flood: the burst admits every one-shot row down to the reserve",
               stored == freshBudget && detLogCount() == freshBudget && !detLogRateLimited() &&
-              detLogRateDrops() == 0 && !savedBool("bufrl"));
+              !savedBool("bufrl"));
         const DetLogRateGate openBefore = detLogRateGate(millis());
         check("flood: the ingest gate is open before any refusal",
               openBefore.freshOpen && openBefore.persistentOpen);
@@ -1937,19 +1840,16 @@ int main() {
         check("flood: the next one-shot row is refused with a claim-releasing result",
               refused == DET_LOG_APPEND_RATE_LIMITED && detLogAppendReleasesClaim(refused) &&
               detLogCount() == freshBudget && acabHostWriteCalls == writesBeforeRefusal);
-        check("flood: a refusal is never silent (marker, NVS key, this-boot counter)",
-              detLogRateLimited() && savedBool("bufrl") && detLogRateDrops() == 1);
+        check("flood: a refusal is never silent (marker and NVS key)",
+              detLogRateLimited() && savedBool("bufrl"));
         const DetLogRateGate afterFresh = detLogRateGate(millis());
         check("flood: a fresh refusal shuts the fresh tier only",
               !afterFresh.freshOpen && afterFresh.persistentOpen);
-        check("flood: NEARBY rows are exempt (their full-ring cap is unchanged)",
-              detLogAppend(detection(9000, ACAB_NEARBY_DEVICE)) == DET_LOG_APPEND_STORED);
         check("flood: a real device that kept transmitting still gets the reserve",
               detLogAppend(persistentRow(1)) == DET_LOG_APPEND_STORED);
         for (uint32_t n = 2; n <= DET_LOG_RATE_RESERVE; n++) detLogAppend(persistentRow(n));
         check("flood: persistent rows drain the reserve to zero, then are refused",
-              detLogAppend(persistentRow(1000)) == DET_LOG_APPEND_RATE_LIMITED &&
-              detLogRateDrops() == 2);
+              detLogAppend(persistentRow(1000)) == DET_LOG_APPEND_RATE_LIMITED);
         const DetLogRateGate afterPersistent = detLogRateGate(millis());
         check("flood: an empty bucket shuts both tiers",
               !afterPersistent.freshOpen && !afterPersistent.persistentOpen);
@@ -1990,18 +1890,17 @@ int main() {
                       (unsigned)(detLogCount() - afterBurst));
         check(floodNote, afterBurst == freshBudget && detLogCount() - afterBurst == 60);
 
-        // Persistence: the marker survives a reboot; the counter and the bucket are per boot.
+        // Persistence: the marker survives a reboot; the bucket is per boot.
         detLogHostResetRuntime();
         detLogBegin();
-        check("marker: bufrl survives a reboot; the refusal counter restarts",
-              detLogRateLimited() && detLogRateDrops() == 0);
+        check("marker: bufrl survives a reboot", detLogRateLimited());
         check("marker: the bucket starts full after a reboot",
               detLogAppend(oneShot(1)) == DET_LOG_APPEND_STORED);
 
         // Reset: clearlog drops it at the wipe arm, in RAM and NVS, and it stays down at retirement.
         detLogClear();
         check("marker: clearlog clears bufrl at the wipe arm",
-              !detLogRateLimited() && !savedBool("bufrl") && detLogRateDrops() == 0);
+              !detLogRateLimited() && !savedBool("bufrl"));
         for (int i = 0; i < 64 && detLogWipePending(); i++) detLogEraseTick();
         check("marker: stays clear once the wipe retires", !detLogWipePending() &&
               !detLogRateLimited() && !savedBool("bufrl"));
@@ -2265,19 +2164,17 @@ int main() {
     check("pending-enable key ordering survives reboot without resurrecting an old key",
           detLogEnabled() && detLogHaveKey());
 
-    // Mandatory disable cleanup cannot be canceled by a newer enable/bufall/key handshake. Preserve
-    // the later intents, finish residual-key removal first, then commit key -> enable -> bufall.
+    // Mandatory disable cleanup cannot be canceled by a newer enable/key handshake. Preserve the
+    // later intents, finish residual-key removal first, then commit key -> enable.
     fresh();
     Preferences::failNextRemove("acab-buf", "key", 2);
     detLogSetEnabled(false);                       // first cleanup removal fails
     detLogSetEnabled(true);                        // second coordinator removal fails
     detLogSetKey(sameKey);                         // staged behind mandatory cleanup
-    detLogSetBufferAll(true);                      // staged behind cleanup/enable
     detLogEndConfigSession();                      // must preserve enable-owned staged state
     detLogEraseTick();
-    check("disable cleanup orders newer key/enable/bufall intents without losing them",
-          detLogEnabled() && detLogHaveKey() && detLogBufferAll() &&
-          savedBool("on") && savedBool("bufall") && savedKeyExists("key"));
+    check("disable cleanup orders newer key/enable intents without losing them",
+          detLogEnabled() && detLogHaveKey() && savedBool("on") && savedKeyExists("key"));
 
     // Conversely, power loss before a queued re-enable completes may lose that newer RAM intent,
     // but the committed off cleanup must never let the residual old key resurrect.

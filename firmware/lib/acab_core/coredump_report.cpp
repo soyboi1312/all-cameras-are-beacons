@@ -68,7 +68,7 @@ void acabCoredumpProbe() {
     }
 
     // Fail closed until the complete valid-image path below proves otherwise. `corrupt` is also
-    // the public "erase required / dump unreadable" state used by diagnostics and WipeTick; it
+    // the public "erase required / dump unreadable" state used by the boot report and WipeTick; it
     // includes a failed image_get and an impossible zero-size result, not just a bad checksum.
     gInfo.corrupt = true;
     size_t addr = 0, size = 0;
@@ -108,9 +108,9 @@ bool acabCoredumpErase() {
     if (!gInfo.present && !gInfo.corrupt) return true;
 #ifdef ACAB_HAVE_COREDUMP
     if (esp_core_dump_image_erase() != ESP_OK) return false;
-    // Drop the cached summary too. It is what the {"diag":true} reply serves, and a board that
-    // kept reporting task/pc/elf for a dump it has just erased would be advertising the exact
-    // thing the caller asked it to forget.
+    // Drop the cached summary too. WipeTick reads it as "nothing retained", so a later erase
+    // generation completes without another block erase, and nothing keeps the task/pc/elf of a
+    // dump the caller asked this board to forget.
     memset(&gInfo, 0, sizeof(gInfo));
     return true;
 #else

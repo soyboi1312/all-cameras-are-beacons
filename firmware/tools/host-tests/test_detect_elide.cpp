@@ -19,11 +19,10 @@ static void chk(const char* name, bool ok) {
 int main() {
     printf("\n=== live-notify field elision ===\n");
 
-    // THE DOCUMENTED ORDER, asserted as a sequence rather than field by field. Company ID is first
-    // on purpose (diagnostics, not alert content); operator position is
-    // last on purpose: on a drone record it is the most useful thing a person can act on.
+    // THE DOCUMENTED ORDER (detect_elide.h), asserted as a sequence rather than field by field:
+    // diagnostics first (cid, then ch), operator position last.
     static const AcabElidableField kOrder[] = {
-        ACAB_FIELD_CID,  ACAB_FIELD_PALT, ACAB_FIELD_HGT, ACAB_FIELD_VSPD,
+        ACAB_FIELD_CID,  ACAB_FIELD_CH,   ACAB_FIELD_PALT, ACAB_FIELD_HGT, ACAB_FIELD_VSPD,
         ACAB_FIELD_SPD,  ACAB_FIELD_HDG,  ACAB_FIELD_STA, ACAB_FIELD_PILOT
     };
     const int n = (int)(sizeof(kOrder) / sizeof(kOrder[0]));
@@ -46,12 +45,19 @@ int main() {
 
     // Spot-checks that read as English, so a failure names the product decision it broke.
     chk("full record keeps the company ID", acabElideKeeps(ACAB_FIELD_CID, ACAB_ELIDE_NONE));
+    chk("full record keeps the WiFi channel", acabElideKeeps(ACAB_FIELD_CH, ACAB_ELIDE_NONE));
     chk("full record keeps operator altitude", acabElideKeeps(ACAB_FIELD_PALT, ACAB_ELIDE_NONE));
     chk("first squeeze gives up the COMPANY ID, nothing else",
         !acabElideKeeps(ACAB_FIELD_CID,  ACAB_ELIDE_CID) &&
+         acabElideKeeps(ACAB_FIELD_CH,   ACAB_ELIDE_CID) &&
          acabElideKeeps(ACAB_FIELD_PALT, ACAB_ELIDE_CID) &&
          acabElideKeeps(ACAB_FIELD_PILOT, ACAB_ELIDE_CID));
-    chk("second squeeze gives up operator ALTITUDE, keeping the rest",
+    chk("second squeeze gives up the WiFi CHANNEL, keeping the RID fields",
+        !acabElideKeeps(ACAB_FIELD_CH,   ACAB_ELIDE_CH) &&
+         acabElideKeeps(ACAB_FIELD_PALT, ACAB_ELIDE_CH) &&
+         acabElideKeeps(ACAB_FIELD_PILOT, ACAB_ELIDE_CH));
+    chk("the wire key for the channel is \"ch\"", strcmp(acabElideKey(ACAB_FIELD_CH), "ch") == 0);
+    chk("third squeeze gives up operator ALTITUDE, keeping the rest",
         !acabElideKeeps(ACAB_FIELD_PALT, ACAB_ELIDE_PALT) &&
          acabElideKeeps(ACAB_FIELD_HGT,  ACAB_ELIDE_PALT) &&
          acabElideKeeps(ACAB_FIELD_PILOT, ACAB_ELIDE_PALT));

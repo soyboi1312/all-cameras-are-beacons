@@ -1,7 +1,7 @@
 /*
- * ACAB - ESP32-S3 self-update over BLE.
+ * ACAB - ESP32 self-update over BLE (every product build, env:beacon-c5 included).
  *
- * The app streams a new S3 app image (the standard esp-idf OTA .bin) to the OTA
+ * The app streams a new app image (the standard esp-idf OTA .bin) to the OTA
  * characteristic; this module writes it into the inactive app slot, validates it, and
  * (on otaFinish) points the bootloader at it. The caller reboots.
  *

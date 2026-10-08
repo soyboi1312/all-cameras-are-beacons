@@ -1,6 +1,6 @@
 /*
  * ACAB - All Cameras Are Beacons
- * OUI-Spy build (Colonel Panic OUI-Spy / XIAO ESP32-S3).
+ * OUI-Spy build (Colonel Panic OUI-Spy / XIAO ESP32-S3); every beacon env builds it too.
  *
  * App-controlled counter-surveillance scanner. Runs Flock (BLE + WiFi), drone
  * Remote ID, and Axon detection at once; streams every hit to the
@@ -10,10 +10,12 @@
  * jamming, no spoofing.
  */
 #include <Arduino.h>
+#include "esp_idf_version.h"
 #include "esp_task_wdt.h"   // task watchdog: catch a wedged loop() (both single- and dual-radio)
 #include "acab_scanner.h"
 #include "coredump_report.h"
 #include "pair_window.h"   // acabPhysicalStart: the host-tested rule production must CALL, not restate
+#include "nrf_line.h"      // nrfParseAdvLine: the host-tested nRF advert-line parser
 #include "axon_detect.h"
 #include "police_detect.h"
 #include "tracker_detect.h"
@@ -25,7 +27,7 @@
 #include "acab_ble_service.h"
 #include "alerts.h"
 #include "det_log.h"
-#include "ota_update.h"   // S3 self-update over BLE + boot-attempt rollback
+#include "ota_update.h"   // ESP32 self-update over BLE + boot-attempt rollback
 #include "acab_banner.h"
 #ifdef ACAB_DUAL_RADIO
 #include <Preferences.h>   // NVS: committed power state (pwrCommittedOn)
@@ -87,16 +89,16 @@ static bool alertTypeEnabled(AcabDeviceType t) {
 
 static void onDetection(const AcabDetection& d, bool isNew) {
     acabBleNotifyDetection(d, isNew);
-    // Replayed black-box records reach the app but must NOT beep (a silent evidence pull
-    // shouldn't fire the piezo for every stored hit) - see AcabDetection::replay.
-    if (!d.replay && alertTypeEnabled(d.type)) alertsSignal(d.type, isNew);
+    if (alertTypeEnabled(d.type)) alertsSignal(d.type, isNew);
 
     if (isNew) {
         char mac[18];
         acabFormatMac(d.mac, mac);
-        Serial.printf("[ACAB] %-16s %-4s %s rssi=%d conf=%d %s%s\n",
+        char ch[8] = "";   // WiFi rows only: " ch=6", or " ch=149" on 5 GHz (C5 only)
+        if (d.channel) snprintf(ch, sizeof(ch), " ch=%u", (unsigned)d.channel);
+        Serial.printf("[ACAB] %-16s %-4s %s rssi=%d conf=%d%s %s%s\n",
                       acabTypeLabel(d.type), acabSourceLabel(d.src), mac,
-                      d.rssi, d.confidence,
+                      d.rssi, d.confidence, ch,
                       d.name[0] ? d.name : "", d.detail[0] ? d.detail : "");
     }
 
@@ -122,20 +124,17 @@ static void onDetection(const AcabDetection& d, bool isNew) {
 // normal BLE classifier chain on each one, so all detection logic stays on this
 // ESP32-S3, which keeps WiFi + the app GATT. Wiring (v2 board, straightened): nRF
 // D6/TX -> our D6 (RX, GPIO43), our D7 (TX, GPIO44) -> nRF D7/RX (the command
-// channel: radio toggle, ignore list, black box, and the soft power-off), GND <-> GND.
-static int hexNib(char c) {
-    if (c >= '0' && c <= '9') return c - '0';
-    if (c >= 'A' && c <= 'F') return c - 'A' + 10;
-    if (c >= 'a' && c <= 'f') return c - 'a' + 10;
-    return -1;
-}
-
+// channel: radio toggle, ignore list, and the soft power-off), GND <-> GND.
 // The nRF's app version, learned from its "V<n>" line (-1 = not heard yet). Reported to the app
 // (status "nrfv") so it can tell whether the co-processor has a BLE DFU update available.
 static volatile int gNrfVersion = -1;
 
 // Read the nRF's last-reported app version (-1 until it first announces "V<n>").
 int acabNrfVersion() { return gNrfVersion; }
+
+// "A" lines dropped as malformed since boot (see nrf_line.h), shown as rej= on the [diag] line.
+// Only the loop task touches it: uartIngestPoll and the [diag] print both run there.
+static uint32_t gNrfLinesRejected = 0;
 
 // millis() when a BLE DFU was last triggered (0 = never). During the window after a trigger the
 // nRF is rebooting into its bootloader and stops speaking the UART protocol, so co-proc liveness
@@ -171,76 +170,37 @@ static void parseAdvLine(const char* s) {
         acabScannerResyncCoProc();
         return;
     }
-    if (s[0] == 'D' && s[1] == ' ') {          // co-processor stats: "D <adv> <fwd> <scan> <bb>"
+    // Co-processor stats: "D <adv> <fwd> <scan> ...". Fields past the third are read by nothing
+    // here, so the nRF's retired black-box count (field 4, always 0 from current images) and
+    // anything after it are ignored.
+    if (s[0] == 'D' && s[1] == ' ') {
         char* p = (char*)(s + 2);
         uint32_t adv = strtoul(p, &p, 10);
         uint32_t fwd = strtoul(p, &p, 10);
         int scn = (int)strtol(p, &p, 10);
-        // Clamp at the UART boundary, exactly like the "V" line's version above: BB_SLOTS is
-        // enforced on the FAR side of this link (nrf-ble-scan's own ring), so the S3 cannot
-        // treat it as a bound on what it just read. A garbled or hostile D line would otherwise
-        // emit up to 10 digits for "nbb" against the 5-digit width the status budget declares
-        // (test_acab_ble_service.cpp), spending spare bytes the budget proves it does not need.
-        // 65535 saturates: it is above any real BB_SLOTS value and stays inside 5 digits.
-        uint32_t bb = strtoul(p, &p, 10);
-        if (bb > 65535) bb = 65535;
-        acabScannerSetCoProcStats(adv, fwd, scn != 0, bb);
+        acabScannerSetCoProcStats(adv, fwd, scn != 0);
         return;
     }
-    if (s[0] == 'B' && s[1] == ' ') {          // a black-box record the nRF replayed: "B <seq> <ts> <mac> <rssi> <payload>"
-        char* p = (char*)(s + 2);
-        strtoul(p, &p, 10);                    // skip seq
-        strtoul(p, &p, 10);                    // skip ts
-        while (*p == ' ') p++;
-        uint8_t mac[6];
-        for (int i = 0; i < 6; i++) {
-            if (!p[0] || !p[1]) return;   // stop at the line's NUL before reading the 2nd nibble (OOB guard: p can reach the terminator here after the seq/ts skips)
-            int hi = hexNib(p[0]), lo = hexNib(p[1]);
-            if (hi < 0 || lo < 0) return;
-            mac[i] = (uint8_t)((hi << 4) | lo); p += 2;
-        }
-        int rssi = (int)strtol(p, &p, 10);
-        while (*p == ' ') p++;
-        static uint8_t bpl[64];
-        size_t blen = 0;
-        while (p[0] && p[1] && blen < sizeof(bpl)) {
-            int hi = hexNib(p[0]), lo = hexNib(p[1]);
-            if (hi < 0 || lo < 0) break;
-            bpl[blen++] = (uint8_t)((hi << 4) | lo); p += 2;
-        }
-        acabScannerIngestBLE(mac, bpl, blen, rssi, /*isReplay=*/true);   // recover to the app: no beep, no live-table pollution
-        return;
-    }
-    if (s[0] != 'A' || s[1] != ' ') return;   // ignore the nRF's heartbeats / boot noise
-    const char* p = s + 2;
-    uint8_t mac[6];
-    for (int i = 0; i < 6; i++) {
-        int hi = hexNib(p[0]), lo = hexNib(p[1]);
-        if (hi < 0 || lo < 0) return;
-        mac[i] = (uint8_t)((hi << 4) | lo);
-        p += 2;
-    }
-    if (*p++ != ' ') return;
-    int rssi = atoi(p);
-    while (*p && *p != ' ') p++;
-    if (*p++ != ' ') return;
-    // 256-byte payload so a BLE 5 extended/coded advert (bucket B1, up to 255 bytes when the
-    // nRF is built with ACAB_BLE5_EXT) fits. Harmless when the flag is off - short legacy
-    // adverts (<=31 bytes) still land in the same buffer.
+    // Anything else but an advert line (heartbeats, boot noise, an old bench image's "B" records)
+    // is ignored.
+    if (s[0] != 'A' || s[1] != ' ') return;
+    // The nRF forwards legacy adverts, 31 B at most; 256 B is headroom, not a protocol bound.
+    // nrfParseAdvLine rejects a payload over the cap rather than truncating it.
     static uint8_t payload[256];
-    size_t plen = 0;
-    while (p[0] && p[1] && plen < sizeof(payload)) {
-        int hi = hexNib(p[0]), lo = hexNib(p[1]);
-        if (hi < 0 || lo < 0) break;
-        payload[plen++] = (uint8_t)((hi << 4) | lo);
-        p += 2;
+    uint8_t mac[6];
+    int rssi;
+    size_t plen;
+    // A malformed line is dropped whole, never repaired: nrf_line.h says why.
+    if (!nrfParseAdvLine(s, mac, &rssi, payload, sizeof(payload), &plen)) {
+        gNrfLinesRejected++;
+        return;
     }
     acabScannerIngestBLE(mac, payload, plen, rssi);
 }
 
 static void uartIngestPoll() {
-    // >=600 so a full 255-byte extended advert ("A <mac> <rssi> <510 hex>") fits without an
-    // overrun-resync dropping it. Wide enough for legacy lines too, so it costs nothing off.
+    // Fits the longest line parseAdvLine's 256 B payload buffer accepts (532 chars). The nRF's
+    // legacy forward is under 90; an overrun drops the line.
     static char line[600];
     static int  pos = 0;
     while (Serial1.available()) {
@@ -613,13 +573,25 @@ static bool otaRuntimeHealthy() {
 }
 
 void setup() {
+#if ESP_ARDUINO_VERSION_MAJOR >= 3
+    // Arduino 3's HWCDC (env:beacon-c5) waits its TX timeout on EVERY write while an enumerated USB
+    // host is not reading (no monitor open, a data-capable car port), stalling the sink and NimBLE
+    // host tasks ~2 s per print. Zero wait drops output instead; the 4 KB ring keeps a reading
+    // monitor's boot report whole. Must precede begin().
+    // ponytail: zero wait also drops a line while another task is mid-print or the ring is full, so
+    // C5 serial capture is lossy; setTxTimeoutMs(1) buys whole lines for ~20 ms per unread print.
+    Serial.setTxBufferSize(4096);
+    Serial.setTxTimeoutMs(0);
+#endif
     Serial.begin(115200);
     delay(200);
     Serial.print(acabBanner());
     // Read the retained core dump BEFORE anything else can panic, and report it. The board has
     // been capturing these to flash all along (the partition and IDF's espcoredump are already in
     // the shipped image); nothing ever read them, so every field panic wrote a full post-mortem
-    // and then sat invisible until the next erase. Prints nothing on a clean boot.
+    // and then sat invisible until the next erase. Prints nothing on a clean boot. The probe also
+    // arms acabCoredumpWipeTick() in loop(), which no-ops until gProbed is set, so removing this
+    // call silently disables the {"clearlog"} / key-change dump erase.
     acabCoredumpProbe();
     acabCoredumpPrint();
 #ifdef ACAB_BENCH_COREDUMP_PANIC
@@ -638,7 +610,7 @@ void setup() {
     // NOTE this is the HUMAN-READABLE banner only. The fw LABEL below ("beacon board" /
     // "ACAB-ouispy") is a WIRE CONTRACT: the apps and firmware-latest.json resolve a manifest
     // entry from it, so it must not be "fixed" to match this string.
-#ifdef ACAB_DUAL_RADIO
+#if defined(ACAB_DUAL_RADIO) || defined(ACAB_BLE_NAME)
     Serial.println("=== All Cameras Are Beacons " ACAB_FW_VERSION " ===");
 #else
     Serial.println("=== ACAB OUI-Spy " ACAB_FW_VERSION " ===");
@@ -840,17 +812,20 @@ void setup() {
 #else
     const char* kFwLabel = "beacon board";
 #endif
+#elif defined(ACAB_BLE_NAME)
+    // Single-chip product (env:beacon-c5): name + label come from platformio.ini.
+    static_assert(sizeof(ACAB_FW_LABEL) <= 24, "ACAB_FW_LABEL longer than 23 chars - resize fwbuf "
+                  "and the host-test fw width (test_acab_ble_service.cpp) together");
+    const char* kBleName = ACAB_BLE_NAME;
+    const char* kFwLabel = ACAB_FW_LABEL;
 #else
     const char* kBleName = "ACAB";
     const char* kFwLabel = "ACAB-ouispy";
 #endif
-    // BLE service inits NimBLE + starts advertising for the app.
-    // Advertising DEFERRED: the pairing gate is configured after this call, so going on air here
-    // would let a phone connect before it settles, with enforcement still off. acabBleStartAdvertising()
-    // runs once the pairing decision below is made. (The soft-power gate already ran ABOVE this since
-    // the 2026-08-14 reorder, so a parking boot never reaches here at all - this defer is now purely
-    // about the pairing gate, not the power decision.)
-    acabBleBegin(kBleName, kFwLabel, /*startAdvertising=*/false);
+    // Inits NimBLE and the GATT service but does not go on air: acabBleStartAdvertising() runs
+    // below, after the pairing-window decision. (The soft-power gate already ran above, so a
+    // parking boot never reaches here.)
+    acabBleBegin(kBleName, kFwLabel);
 
     // Offline detection buffer: mount the flash ring + bump the boot counter. Stays
     // inert (no capture) until the app enables it and pushes an at-rest key.
@@ -970,7 +945,8 @@ void setup() {
     // board that boots merely to conclude it should sleep must never advertise itself as pairable.
     // Already-bonded phones are unaffected and reconnect whenever they like; this governs FIRST
     // contact only. RAM-only, so a power cycle is exactly how a user reopens it, which is also the
-    // entire recovery instruction. See ACAB_PAIR_WINDOW_MS in acab_ble_service.h.
+    // entire recovery instruction. See ACAB_PAIR_WINDOW_MS in pair_window.h and the pairing-window
+    // notes in acab_ble_service.h.
     //
     // ONLY ON A REAL POWER-ON. The user-facing promise is "turn it off and on", i.e. PHYSICAL
     // presence. A warm reboot is not that: pwrCommittedOn() keeps the board up through an OTA
@@ -993,25 +969,24 @@ void setup() {
     // the switch reads on, the cell is absent (USB-only SKU), or this is a bench build. Neither
     // half decides alone, and a warm cause stays closed whatever the switch reads. acabPhysicalStart
     // owns that combination and is host-tested; the branches above only collect the inputs.
-    // ENFORCEMENT IS UNCONDITIONAL. It used to be switched on only inside the window opener, and
-    // the opener only ran on a physical start, so every OTA restart, panic, watchdog and brownout
-    // came back with the gate OFF and admitted any phone indefinitely. Enforcement and "a person
-    // just turned this on" are separate questions and are now separate calls.
+    // ENFORCEMENT IS UNCONDITIONAL and lives in the BLE service, not here. It used to be switched
+    // on only inside the window opener, and the opener only ran on a physical start, so every OTA
+    // restart, panic, watchdog and brownout came back with the gate OFF and admitted any phone
+    // indefinitely. This block decides only the window.
     // ONE call, ONE decision. The branches above only record what happened; the rule for turning
     // that into "did a person start this board" lives in acabPhysicalStart and is host-tested.
     // The reset reason is one INPUT here, not the whole answer. See acabPhysicalStart for the two
     // wrong versions this replaced and why each failed.
     // `physicalStart` was calculated before the boot cue so this gate and the sound cannot drift
     // into two different definitions of a deliberate power-on.
-    acabBlePairGateEnable();
     if (physicalStart) {
         acabBleOpenPairingWindow();
     } else {
         Serial.println("[pair] warm continuation (not a physical start) - window NOT opened; "
                        "enforcement is ON, bonded phones still reconnect");
     }
-    // The board may go on air now that it has committed to staying powered and the pairing gate is
-    // configured; the dual-radio path first performs its loaded battery prime immediately below.
+    // The board may go on air now that it has committed to staying powered and the pairing window
+    // is decided; the dual-radio path first performs its loaded battery prime immediately below.
 #ifdef ACAB_DUAL_RADIO
     // Start the real operating load BEFORE seeding readBatteryPct's voltage EMA and percent slew
     // state. The first 2.0.6 implementation sampled up near the BLE identity block, while WiFi was
@@ -1036,7 +1011,24 @@ void setup() {
     // Task watchdog on the loop task. 30s timeout with panic=true so a genuine wedge reboots into
     // a clean image. loop() never blocks for long - the companion nRF self-updates over BLE DFU,
     // off the S3 - so the loop always feeds the WDT well inside the window.
+#if ESP_IDF_VERSION_MAJOR >= 5
+    // IDF 5 (env:beacon-c5) starts the TWDT itself: retime to 30 s + panic, keep its idle mask.
+    const esp_task_wdt_config_t wdtCfg = {
+        .timeout_ms = 30000,
+        .idle_core_mask =
+#if CONFIG_ESP_TASK_WDT_CHECK_IDLE_TASK_CPU0
+            (1u << 0) |
+#endif
+#if CONFIG_ESP_TASK_WDT_CHECK_IDLE_TASK_CPU1
+            (1u << 1) |
+#endif
+            0u,
+        .trigger_panic = true,
+    };
+    if (esp_task_wdt_reconfigure(&wdtCfg) != ESP_OK) esp_task_wdt_init(&wdtCfg);
+#else
     esp_task_wdt_init(30, true);
+#endif
     esp_task_wdt_add(NULL);
 
     Serial.println("[ACAB] scanning: Flock BLE/WiFi + drone RID + Axon (OUI 00:25:DF)");
@@ -1258,10 +1250,6 @@ static void runRequestedPowerOff(void*) {
 
 void loop() {
     esp_task_wdt_reset();   // pet the task WDT each pass
-    // Re-arm offline capture on a timer while "record everything" is on, so a board left
-    // unattended records a REVISIT instead of collapsing a week into one row per device.
-    // Self-throttling and a no-op when the mode is off or a phone is connected.
-    acabScannerBufferAllTick();
 
     // "App linked" chirp on the rising edge of a client connection (and arm the
     // first-catch reveal for the session). Polled here because the core BLE service
@@ -1321,11 +1309,11 @@ void loop() {
         // bonds + pairw make the pairing window observable from a USB console: bonds is how many
         // phones the BOARD still has stored (a phone forgetting its side does NOT remove ours), and
         // pairw is seconds left in the new-phone window, 0 once closed.
-        Serial.printf("[diag] wifi_seen=%lu ble_seen=%lu | nRF adv=%lu fwd=%lu scan=%d bb=%lu bat_mv=%d"
-                      " | bonds=%d pairw=%lus\n",
+        Serial.printf("[diag] wifi_seen=%lu ble_seen=%lu | nRF adv=%lu fwd=%lu rej=%lu scan=%d"
+                      " bat_mv=%d | bonds=%d pairw=%lus\n",
                       (unsigned long)acabScannerWifiSeen(), (unsigned long)acabScannerBleSeen(),
                       (unsigned long)acabScannerCoProcAdvSeen(), (unsigned long)acabScannerCoProcForwarded(),
-                      (int)acabScannerCoProcScanning(), (unsigned long)acabScannerCoProcBbCount(), gBatMv,
+                      (unsigned long)gNrfLinesRejected, (int)acabScannerCoProcScanning(), gBatMv,
                       acabBleBondCount(),
                       (unsigned long)(acabBlePairWindowRemainingMs() / 1000));
 #ifdef ACAB_CAPTURE_BUILD
@@ -1336,15 +1324,7 @@ void loop() {
         // firmware never detected it" and "the firmware detected it and the app never saw it".
         // bufen/buf say whether the offline buffer would have caught it while the app was away.
         // The 2026-08-08 drive could not tell those apart: bonds=2 only proves bonds exist.
-        // falcon_data / falcon_mgmt / falcon_macs are the Falcon-OUI mode accounting (see
-        // FalconRec in acab_scanner.cpp). They answer, on any drive, the question the app's
-        // exported history raised: every WiFi ALPR hit this project ever recorded matched on a
-        // wildcard PROBE, and a unit that associates to its backhaul stops probing. A drive that
-        // returns falcon_mgmt=0 with falcon_data>0 says the hardware is present and associated,
-        // which no shipping rule can currently see. falcon_full>0 means FALCON_MAX overflowed and
-        // falcon_macs is a floor, not a count.
         Serial.printf("[diag] wifi_diag sent=%lu dropped=%lu app=%d bufen=%d buf=%lu"
-                      " watch_data=%lu falcon_data=%lu falcon_mgmt=%lu falcon_macs=%lu falcon_full=%lu"
                       " axon_ble=%lu moto_ble=%lu pcam_ble=%lu vendor_macs=%lu vendor_full=%lu"
                       " alpr_ble=%lu alpr_wifi=%lu alpr_macs=%lu alpr_full=%lu"
                       "\n",
@@ -1353,11 +1333,6 @@ void loop() {
                       acabBleClientConnected() ? 1 : 0,
                       detLogEnabled() ? 1 : 0,
                       (unsigned long)detLogCount()
-                      , (unsigned long)acabScannerWatchDataSeen()
-                      , (unsigned long)acabScannerFalconData()
-                      , (unsigned long)acabScannerFalconMgmt()
-                      , (unsigned long)acabScannerFalconMacs()
-                      , (unsigned long)acabScannerFalconTableFull()
                       , (unsigned long)acabScannerVendorAxon()
                       , (unsigned long)acabScannerVendorMoto()
                       , (unsigned long)acabScannerVendorPcam()

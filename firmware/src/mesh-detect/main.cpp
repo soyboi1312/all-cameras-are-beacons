@@ -37,7 +37,7 @@
 
 // LED master switch (mirrors oui-spy's alerts.cpp). On (default) = detection blinks + idle
 // heartbeat; "lights out" = fully dark. Persisted to NVS, pushed from the app via the shared
-// {"led":bool} config key. These strong symbols override the BLE service's weak stubs.
+// {"led":bool} config key. The BLE service calls these; beacon-board defines its pair in alerts.cpp.
 static bool gLedEnabled = true;
 bool alertsLedEnabled() { return gLedEnabled; }
 void alertsSetLedEnabled(bool on) {
@@ -104,10 +104,12 @@ void setup() {
     Serial.println("=== ACAB Mesh-Detect " ACAB_FW_VERSION " ===");
 
     // Read the retained core dump BEFORE the heavy init that could panic, and report it. Same
-    // reason as beacon-board: the coredump partition is in this build's partition table too, the
-    // shared {"diag":true} reply already carries the cd* fields, and without this probe they are
-    // permanently absent - a mesh board that has been panicking looks clean. Prints nothing on a
-    // clean boot. See coredump_report.h.
+    // reason as beacon-board: the coredump partition is in this build's partition table too, and
+    // this serial boot report is the dependable read-out of it, so without it a mesh board that has
+    // been panicking looks clean. Prints nothing on a clean boot. The probe is also what arms
+    // acabCoredumpWipeTick() in loop(): the tick no-ops until gProbed is set, so removing this call
+    // silently disables the {"clearlog"} / key-change dump erase on this build, and the dump can
+    // hold key bytes and phone coordinates. See coredump_report.h.
     acabCoredumpProbe();
     acabCoredumpPrint();
 
@@ -137,20 +139,18 @@ void setup() {
         snprintf(fwLabel, sizeof(fwLabel), "mesh-detect-ACAB");
     else
         snprintf(fwLabel, sizeof(fwLabel), "mesh-detect-ACAB-ch%d", ACAB_MESH_CHANNEL);
-    // startAdvertising=false: configure the pairing gate BEFORE going on air, so no phone can
-    // reach a board that has not decided (same ordering as beacon-board).
-    acabBleBegin("ACAB-mesh", fwLabel, false);
+    // Stays off air until the pairing window is decided below (same ordering as beacon-board).
+    acabBleBegin("ACAB-mesh", fwLabel);
 
-    // Pairing gate. Without it acabPairAdmit admits any stranger in radio range, and a bonded
-    // stranger reaches the whole config surface: {"clearlog":true} erases the offline buffer,
-    // a new {"key":...} triggers the mismatch wipe, and every detector toggle can be switched
-    // off. Enforcement is unconditional on every boot; the window only opens on a PHYSICAL
-    // start. This build has no slide switch, button, or battery cell (XIAO on USB power), so
-    // the inputs mirror the slim SKU: cellAbsent=true makes plugging in the only "switch",
-    // and unplug/replug is the documented recovery ("turn it off and on, then connect within
-    // two minutes"). A warm restart (OTA, panic, watchdog) opens no window; bonded phones
-    // still reconnect.
-    acabBlePairGateEnable();
+    // Pairing window. Once the board holds a bond, the BLE service refuses any new phone unless
+    // this window is open (acabPairAdmit), because a bonded stranger reaches the whole config
+    // surface: {"clearlog":true} erases
+    // the offline buffer, a new {"key":...} triggers the mismatch wipe, and every detector toggle
+    // can be switched off. The window only opens on a PHYSICAL start. This build has no slide
+    // switch, button, or battery cell (XIAO on USB power), so the inputs mirror the slim SKU:
+    // cellAbsent=true makes plugging in the only "switch", and unplug/replug is the documented
+    // recovery ("turn it off and on, then connect within two minutes"). A warm restart (OTA,
+    // panic, watchdog) opens no window; bonded phones still reconnect.
     const esp_reset_reason_t meshRr = esp_reset_reason();
     if (acabPhysicalStart(meshRr == ESP_RST_POWERON, meshRr == ESP_RST_DEEPSLEEP,
                           /*cellAbsent=*/true, /*buttonHeld=*/false,
@@ -233,10 +233,6 @@ void setup() {
 
 void loop() {
     esp_task_wdt_reset();   // pet the task WDT each pass; loop() never blocks long on this build
-    // Re-arm offline capture on a timer while "record everything" is on, so a board left
-    // unattended records a REVISIT instead of collapsing a week into one row per device.
-    // Self-throttling and a no-op when the mode is off or a phone is connected.
-    acabScannerBufferAllTick();
 
     static uint32_t lastBeat = 0;
     static bool bootPinged = false;

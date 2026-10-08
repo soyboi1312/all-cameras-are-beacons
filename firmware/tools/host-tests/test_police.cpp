@@ -239,7 +239,8 @@ int main() {
       bool got = runBle(m);
       chk("WatchGuard, other tail -> still matches", got, true, d.confidence, 45, d.detail,
           "WatchGuard Video OUI"); }
-    // The same two switches gate it. Desert forces it, like every other detector.
+    // The same two switches gate it. Desert forces it, as for all but the netcam and drone OUI
+    // opt-ins.
     setGates(false, true, false);
     chk("WatchGuard: sub-toggle OFF -> no hit", runBle(MAC_WG), false);
     setGates(true, false, false);

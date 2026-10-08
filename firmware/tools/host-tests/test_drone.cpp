@@ -44,9 +44,8 @@ extern "C" {
 // The definitions drone_detect.cpp needs from translation units the harness does not compile.
 // ---------------------------------------------------------------------------
 
-// Desert mode forces classification even when a detector is toggled off, so it has to be
-// controllable here: several assertions below exist only to prove the desert override still
-// reaches both the master gate and the OUI opt-in.
+// Desert forces classification past a toggled-off detector, so tests control it: several
+// assertions prove it reaches the master gate but NOT the OUI opt-in.
 static bool gDesert = false;
 bool desertIsEnabled(void) { return gDesert; }
 
@@ -261,6 +260,7 @@ int main() {
     const uint8_t macDjiBaiwang1[6] = {0x9c, 0x5a, 0x8a, 0x01, 0x02, 0x03};
     const uint8_t macDjiBaiwang2[6] = {0xec, 0x72, 0xf7, 0x01, 0x02, 0x03};
     const uint8_t macDjiBaiwang3[6] = {0x34, 0x91, 0xf0, 0x01, 0x02, 0x03};
+    const uint8_t macDjiBaiwang4[6] = {0xc8, 0xa1, 0x62, 0x01, 0x02, 0x03};  // listed 2026-10-02
     const uint8_t macAutelMam[6] = {0xec, 0x5b, 0xcd, 0xe1, 0x02, 0x03};
     const uint8_t macAutelNeighbor[6] = {0xec, 0x5b, 0xcd, 0xd1, 0x02, 0x03};
     const uint8_t macAutelAutomotive[6] = {0x18, 0xd7, 0x93, 0x61, 0x02, 0x03};
@@ -530,7 +530,7 @@ int main() {
       chk("additional Parrot MA-L block", hit, true, d.confidence, 60, d.detail,
           "Parrot gear, no Remote ID"); }
     { std::vector<uint8_t> a; addFlags(a);
-      const uint8_t* baiwang[] = {macDjiBaiwang1, macDjiBaiwang2, macDjiBaiwang3};
+      const uint8_t* baiwang[] = {macDjiBaiwang1, macDjiBaiwang2, macDjiBaiwang3, macDjiBaiwang4};
       for (const uint8_t* mac : baiwang) {
           hit = runBLE(mac, a, &d);
           chk("DJI Baiwang MA-L block", hit, true, d.confidence, 60, d.detail,
@@ -607,8 +607,17 @@ int main() {
     droneOuiSetEnabled(false);
     { std::vector<uint8_t> a; addFlags(a);
       hit = runBLE(macSkydio, a, &d);
-      chk("Desert mode also forces the opt-in OUI fallback", hit, true, d.confidence, 60, d.detail,
-          "Skydio gear, no Remote ID"); }
+      chk("Desert mode does NOT force the opt-in OUI fallback", hit, false); }
+    droneSetEnabled(false);                          // drones off: the greyed-out sub-toggle stays off
+    droneOuiSetEnabled(true);
+    { std::vector<uint8_t> a; addFlags(a);
+      hit = runBLE(macSkydio, a, &d);
+      chk("drones off + OUI opt-in on + Desert -> no OUI fallback", hit, false); }
+    { std::vector<uint8_t> a; mkBasicID(msg, "DESERTDRONE000000002"); addOdid(a, msg, sizeof(msg));
+      hit = runBLE(macDesert, a, &d);
+      chk("  ... while Remote ID still reaches through Desert", hit, true, d.confidence, 99, d.detail); }
+    droneSetEnabled(true);
+    droneOuiSetEnabled(false);
     gDesert = false;
     { std::vector<uint8_t> a; addFlags(a);
       hit = runBLE(macSkydio, a, &d);
@@ -630,7 +639,11 @@ int main() {
       chk("NAN action frame (multicast 51:6f:9a:01:00:00)", hit, true, d.confidence, 99, d.detail);
       ok("  ... reached the ODID parser exactly once", gNanCalls == 1);
       ok("  ... MAC taken from addr2, source SRC_REMOTEID",
-         memcmp(d.mac, addr2, 6) == 0 && d.src == SRC_REMOTEID); }
+         memcmp(d.mac, addr2, 6) == 0 && d.src == SRC_REMOTEID);
+      droneSetEnabled(false); gDesert = true; gNanRc = 0;
+      hit = runWiFi(f, &d);
+      chk("Desert overrides the master toggle on WiFi too", hit, true, d.confidence, 99, d.detail);
+      droneSetEnabled(true); gDesert = false; }
 
     { const uint8_t nearDest[6] = {0x51, 0x6f, 0x9a, 0x01, 0x00, 0x01};   // one off the multicast
       const uint8_t addr2[6]    = {0x34, 0xd2, 0x62, 0x55, 0x66, 0x02};
@@ -664,7 +677,7 @@ int main() {
       const uint8_t addr2[6]  = {0xe4, 0x7a, 0x2c, 0x55, 0x66, 0x04};
       std::vector<uint8_t> f = mkBeacon(addr2, wfaOui, pack, n);
       hit = runWiFi(f, &d);
-      chk("beacon + Wi-Fi Alliance ODID IE 90:3a:e6", hit, true, d.confidence, 99, d.detail);
+      chk("beacon + ODID IE under 90:3a:e6 (Parrot SA OUI, French DRI scheme)", hit, true, d.confidence, 99, d.detail);
       ok("  ... ID and position out of the beacon",
          strcmp(d.id, "WIFIBEACON0000000001") == 0 && nearly(d.lat, 32.9) && nearly(d.lon, -117.05)); }
 
@@ -725,6 +738,35 @@ int main() {
       chk("master toggle OFF gates the WiFi path too", hit, false); }
     droneSetEnabled(true);
     droneOuiSetEnabled(false);
+
+    // A Parrot-block WiFi CLIENT is not an aircraft (the owner's 90:3a:e6:15:b9:e3 only probed,
+    // 911.log/913.log). As an AP (the ANAFI Thermal shape) it is Parrot gear, but only with the
+    // opt-in on: Desert alone does not force the fallback.
+    { const uint8_t parrot[6] = {0x90, 0x3a, 0xe6, 0x15, 0xb9, 0xe3};
+      for (int desert = 0; desert < 2; desert++) for (int oui = 0; oui < 2; oui++) {
+        if (!desert && !oui) continue;
+        gDesert = desert; droneOuiSetEnabled(oui);
+        std::vector<uint8_t> f(24, 0);
+        memcpy(&f[4], "\xff\xff\xff\xff\xff\xff", 6); memcpy(&f[10], parrot, 6); memcpy(&f[16], f.data() + 4, 6);
+        f.push_back(0x00); f.push_back(0x00);          // wildcard SSID IE
+        char nm[96];
+        f[0] = 0x40;                                   // probe request
+        snprintf(nm, sizeof nm, "Parrot-block probe request is not a drone (desert=%d oui=%d)", desert, oui);
+        hit = runWiFi(f, &d); chk(nm, hit, false);
+        f[0] = 0xB0;                                   // authentication: client role too
+        snprintf(nm, sizeof nm, "Parrot-block auth frame is not a drone (desert=%d oui=%d)", desert, oui);
+        hit = runWiFi(f, &d); chk(nm, hit, false);
+        for (uint8_t fc : {(uint8_t)0x80, (uint8_t)0x50}) {   // beacon, probe response: AP role
+          f[0] = fc;
+          snprintf(nm, sizeof nm, "Parrot-block %s is %s (desert=%d oui=%d)",
+                   fc == 0x80 ? "beacon" : "probe response", oui ? "Parrot gear" : "not a drone",
+                   desert, oui);
+          hit = runWiFi(f, &d);
+          if (oui) chk(nm, hit, true, d.confidence, 60, d.detail, "Parrot gear, no Remote ID");
+          else     chk(nm, hit, false);
+        }
+      }
+      gDesert = false; droneOuiSetEnabled(false); }
 
     printf("\n  %s (%d failure%s)\n\n", failures ? "REGRESSION DETECTED" : "all good",
            failures, failures == 1 ? "" : "s");

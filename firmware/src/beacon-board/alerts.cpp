@@ -35,7 +35,8 @@ static volatile bool    gLedEnabled = true;
 #define ACAB_LED_HEARTBEAT_MS 2000
 
 // Queue sentinels: not detection patterns, but "device voice" sounds that ride the
-// same non-blocking queue. Values sit well above any real AcabDeviceType (1..9).
+// same non-blocking queue. Values sit well above any real AcabDeviceType (all below
+// ACAB_TYPE_COUNT).
 static const AcabDeviceType ACAB_ALERT_TEST    = (AcabDeviceType)0xFE;   // volume preview
 static const AcabDeviceType ACAB_ALERT_CONNECT = (AcabDeviceType)0xFD;   // app linked
 static const AcabDeviceType ACAB_ALERT_REVEAL  = (AcabDeviceType)0xFC;   // first catch of a session
@@ -100,7 +101,16 @@ void alertsSetLedEnabled(bool on) {
 }
 bool alertsLedEnabled() { return gLedEnabled; }
 
-static void buzzerOff() { ledcWrite(BUZZER_LEDC_CHANNEL, 0); }
+// Arduino 3 (env:beacon-c5) drives LEDC by pin, Arduino 2 by channel; same timer, resolution, duty.
+#if ESP_ARDUINO_VERSION_MAJOR >= 3
+static void buzzerDuty(uint32_t duty) { ledcWrite(ACAB_BUZZER_PIN, duty); }
+static void buzzerFreq(int freq) { ledcChangeFrequency(ACAB_BUZZER_PIN, freq, BUZZER_LEDC_RES); }
+#else
+static void buzzerDuty(uint32_t duty) { ledcWrite(BUZZER_LEDC_CHANNEL, duty); }
+static void buzzerFreq(int freq) { ledcSetup(BUZZER_LEDC_CHANNEL, freq, BUZZER_LEDC_RES); }
+#endif
+
+static void buzzerOff() { buzzerDuty(0); }
 
 // Start a tone at `freq`, scaled to the current volume, then by an optional per-call scale
 // (0-100%, default full). Power-state cues bypass the detection-alert mute so a battery unit can
@@ -120,9 +130,9 @@ static void buzzerTone(int freq, int scalePct = 100,
     // (0x1FF) that we then have to overwrite. ledcSetup programs the same timer frequency at OUR
     // resolution and writes no duty, and costs the same - both are one ledc_timer_config call, so
     // nothing new lands on the per-note path (caw() re-enters here every 8 ms).
-    ledcSetup(BUZZER_LEDC_CHANNEL, freq, BUZZER_LEDC_RES);
+    buzzerFreq(freq);
     uint32_t duty = (uint32_t)gVolume * scalePct / 100 * BUZZER_DUTY_MAX / 100;
-    ledcWrite(BUZZER_LEDC_CHANNEL, duty);
+    buzzerDuty(duty);
 }
 
 static void beep(int freq, int durMs, int scalePct = 100,
@@ -267,14 +277,19 @@ void alertsInit() {
     pinMode(ACAB_LED_PIN, OUTPUT);
     ledOff();
 
+#if ESP_ARDUINO_VERSION_MAJOR >= 3
+    ledcAttachChannel(ACAB_BUZZER_PIN, 2000, BUZZER_LEDC_RES, BUZZER_LEDC_CHANNEL);
+#else
     ledcSetup(BUZZER_LEDC_CHANNEL, 2000, BUZZER_LEDC_RES);
     ledcAttachPin(ACAB_BUZZER_PIN, BUZZER_LEDC_CHANNEL);
+#endif
     buzzerOff();
 
     loadAudio();
 
     gAlertQ = xQueueCreate(16, sizeof(AcabDeviceType));
-    xTaskCreatePinnedToCore(alertTask, "acabAlert", 4096, nullptr, 1, &gAlertTask, 1);
+    // Last core: 1 on the dual-core S3, 0 on the single-core C5.
+    xTaskCreatePinnedToCore(alertTask, "acabAlert", 4096, nullptr, 1, &gAlertTask, portNUM_PROCESSORS - 1);
     gArmReveal = true;   // a standalone (no-app) board still reveals its first catch
 }
 

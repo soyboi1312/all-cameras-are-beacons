@@ -2,11 +2,12 @@
  * ACAB - All Cameras Are Beacons
  * Single source of truth for the firmware version.
  *
- * This default value is what oui-spy and mesh-detect report; bump it here for those
- * builds. The beacon board carries its OWN -DACAB_FW_VERSION in platformio.ini (that is
+ * This default value is what oui-spy, mesh-detect and beacon-c5 report; bump it here for
+ * those builds. The beacon board carries its OWN -DACAB_FW_VERSION in platformio.ini (that is
  * the line to bump for a beacon-board release), so it does not read this default.
  *   oui-spy     banner, advertised version, status JSON ("fw")
  *   mesh-detect serial banner
+ *   beacon-c5   default (no platformio.ini override)
  *   beacon-board overrides via -DACAB_FW_VERSION (platformio.ini)
  *
  * It's a string literal so it can be glued onto adjacent literals (e.g.
@@ -17,8 +18,8 @@
 #define ACAB_VERSION_H
 
 // Default single source of truth. A build env may override it (the beacon-board carries
-// its own version via -DACAB_FW_VERSION so OTA's version-guard can compare builds); oui-spy
-// and mesh-detect leave it at the default. Keep it "a.b[.c]" so OTA can parse and compare.
+// its own version via -DACAB_FW_VERSION so OTA's version-guard can compare builds); oui-spy,
+// mesh-detect and beacon-c5 leave it at the default. Keep it "a.b[.c]" so OTA can parse and compare.
 //
 // KEEP EVERY DOTTED FIELD UNDER 1024. acabOtaVersionPack (ota_policy.h) packs the version into
 // three 10-BIT FIELDS and REFUSES a field past 1023 as malformed (packs to 0, which every OTA
@@ -26,6 +27,60 @@
 // field above 1023 is therefore un-shippable over the air: the apps compare unclamped, would keep offering
 // the update, and the board would refuse it forever. Bump the MINOR when the patch field runs out.
 //
+// 2.2.0: NEW BOARD env:beacon-c5: one Seeed XIAO ESP32-C5 (Bluetooth plus 2.4 and 5 GHz Wi-Fi on
+//        one radio, no nRF) on pioarduino (Arduino 3.3.12 / ESP-IDF 5.5.5, NimBLE-Arduino 2.5.1);
+//        S3 envs stay on Arduino 2.0.17 / NimBLE 1.4.3 and the shared core carries version guards.
+//        Label "beacon c5", 4 bonds (resolving list holds 5). Unreleased: no stager profile,
+//        flasher entry or OTA manifest entry yet. A new board is a minor bump for fw and both apps.
+//        PRODUCTION, EVERY BUILD: (1) live Wi-Fi detections carry their frame's channel, wire key
+//        "ch" (elided second, after cid; never on replayed rows), shown in the apps and exported as
+//        CSV columns; oui-spy, beacon and beacon-c5 serial lines print " ch=N" (mesh-detect's does
+//        not). (2) The Wi-Fi drone vendor-OUI fallback fires only on access-point frames (beacon,
+//        probe response, NAN Remote ID): every Parrot "drone" in the field logs was a probing
+//        client. (3) Desert no longer forces that fallback on BLE or Wi-Fi, and the fallback obeys
+//        the drone master toggle (in the owner's logs it labelled 12 DJI Osmo cameras and a
+//        Hasselblad as drone gear vs 1 named drone). (4) The advertising start and its supervisor
+//        log the outcome ("restart refused (normal while a link opens)" on a reconnect race). (5)
+//        New rows: DJI C8:A1:62 (drone fallback); SkyBell 68:F0:D0 and 9C:54:DA, Canary D8:42:E2,
+//        Canary MA-M 7C:70:BC:5 (network camera). (6) A link that never passed the encrypted-bond
+//        check skips the disconnect teardown (which wiped the retained away-row fix and re-armed
+//        capture per refused stranger). (7) The offline buffer's record check no longer
+//        range-checks src and method, so a new source or method is not read as corrupt.
+//        SECURITY FIX, EVERY BUILD: the new-phone pairing window could reopen. Since 2.0.5 it was a
+//        32-bit millis() deadline read through a signed compare, and the latch that held it shut
+//        tripped only on a connect, pre-auth or nRF DFU attempt. A board with a bonded owner and
+//        no connection attempt for about 25 days after its window closed read the window as open
+//        again for about the next 25 days, so a stranger in range could pair with it. The window
+//        is now a 64-bit esp_timer deadline with no latch (acabPairWindowRemainingMsAt in
+//        pair_window.h, host-tested at expiry, 25 days past it and one 2^32 ms wrap after
+//        opening). Enforcement is hard-wired: the acabBlePairGateEnable() opt-in is gone (every
+//        target already called it), and acabBleBegin() no longer starts advertising.
+//        REMOVED (an older app keeps working: every removed Status key was optional, and the
+//        board ignores a removed Config key):
+//        - Stationary capture: Config {"bufall"}, Status "bufall" and "bufsat", the 15-minute
+//          re-arm tick and the 64-boot undrained-wipe threshold (6 boots now applies to every
+//          board). NVS acab-buf "bufall" and "bufsat" are no longer read. Also detLogClearKey(),
+//          which had no production caller. UPGRADE: sync a board that ran Stationary capture with
+//          the app (an app OTA connects, and the app syncs on connect) before a USB flash to
+//          2.2.0, or the 6-boot auto-wipe can erase its undrained log on its first 2.2.0 boot.
+//        - The {"diag":true} reply (wseen, bseen, sdrop and the sd*, sqHigh, nElide, nOver, hTrim,
+//          hOver and cd* fields), its serial lines, and the sink-drop and high-water counters only
+//          it read. The live elide and over-cap counts and the replay over-cap count stay on their
+//          rate-limited serial warnings.
+//        - The bench nRF black box: Status "nbb", capture-build {"bbdump"} and {"bbclear"}, and
+//          the beacon S3's "B" replay parser. The beacon [diag] line lost bb=. The nRF source
+//          drops its ring and the never-run ACAB_BLE5_EXT scan; its shipped image is unchanged,
+//          still sends 0 as the D line's fourth field, and keeps the first-boot wipe.
+//        - Capture builds only: the Falcon-OUI FAL-DATA, FAL-MGMT and fwnote labels and the
+//          08:3A:88 WATCH rows (a Falcon-OUI probe logs as PROBE:<ssid>); the capture [diag] line
+//          lost watch_data and falcon_*.
+//        Tooling: firmware CI has no paths filter, so the drift check's trigger-path guard is gone;
+//        tools/stamp_app_desc.py restamps through release_tools.restamp_app_desc (stdlib only),
+//        not esptool plus a build-time pip install.
+//        beacon-board only: nRF advert lines go through the strict host-tested parser (nrf_line.h);
+//        a malformed "A" line is dropped whole and counted as rej= on [diag].
+//        beacon-c5 only: the 5 GHz pass and its "wifi5" Status/config key.
+//        beacon-board: RAM 78364 bytes (-96 vs 2.1.0), flash 1030157 bytes (-6324).
 // 2.1.0: adds WatchGuard Video's block, 00:1D:96, to the opt-in Motorola sub-toggle
 //        ({"motorola":bool}, default OFF on every board). A match reports body cam at conf 45,
 //        like the Motorola rows, but with its OWN detail string "WatchGuard Video OUI", so the
@@ -205,7 +260,7 @@
 // 2.0.0: the Colonel Panic builds pick up the full v2 detection set the beacon board ships
 // with (offline buffer, watchlist/custom category, ignore list, refreshed OUIs, glasses).
 #ifndef ACAB_FW_VERSION
-#define ACAB_FW_VERSION "2.1.0"
+#define ACAB_FW_VERSION "2.2.0"
 #endif
 
 #endif // ACAB_VERSION_H

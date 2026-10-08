@@ -21,7 +21,8 @@
  * the consumer brands on 2026-07-31, and the Hikvision/Dahua expansion plus six new vendors on
  * 2026-08-07 (a direct standards-oui.ieee.org/oui/oui.csv pull). The 2026-09-01 additions
  * were checked against the same MA-L registry and standards-oui.ieee.org/oui28/mam.csv.
- * No commodity-module silicon, so it passes the no-shared-silicon rule the rest of the
+ * The 2026-10-03 additions were checked against Wireshark's IEEE-derived manuf file (see
+ * VENDOR NOTES). No commodity-module silicon, so it passes the no-shared-silicon rule the rest of the
  * OUI tables follow.
  *
  * Two precisions, because the wording here used to overstate two things. "The vendor's OWN"
@@ -120,7 +121,8 @@ struct NetcamPrefix {
 // VMB3000/VMB4000 hubs - rides NETGEAR's 76 blocks and fails the narrowness test the same way
 // TP-Link does. Those are reachable ONLY by the NTGR_VMB_ SSID form, never by OUI. (2) BAND:
 // Ultra-class cameras on a VMB5000 hub, and dual-band Pro 5S/6 direct to a router, can sit on
-// 5GHz where this radio cannot hear them. (3) LINK: Arlo Go 1st gen is LTE-only, never
+// 5GHz, where no S3 build hears them (env:beacon-c5 can, on channels 36-48 or
+// 149-165: see WIFI_HOP_SEQ_5G in acab_scanner.cpp). (3) LINK: Arlo Go 1st gen is LTE-only, never
 // detectable. (4) The discontinued Arlo Security Light talks BLE to a bridge - KEEP THIS
 // MATCH WIFI-ONLY (netcamClassifyWiFi already is) or a porch light gets labelled a camera.
 // src: IEEE MA-L + our own captures.
@@ -179,6 +181,18 @@ struct NetcamPrefix {
 // Representative names include BLINK-5AJB, NVR542b5707c2a1, SkybellHD_2151974911 and
 // NVR083a2f4cc78b. These support the vendor attribution without changing the OUI tier or
 // adding an SSID rule. Exact assignments, source links and capture counts: docs/signatures.md.
+//
+// 2026-10-03 COMPLETED VENDOR SETS. SkyBell's other two MA-L blocks and both Canary blocks, so
+// each vendor is listed in full (the Ezviz and Blink rule). Checked against Wireshark's
+// IEEE-derived manuf file, because standards-oui.ieee.org refused scripted downloads that day:
+//   68F0D0, 9C54DA  SkyBell Technologies Inc.
+//   D842E2          Canary Connect, Inc.  (MA-L)
+//   7C70BC5         Canary Connect, Inc.  (MA-M; fourth-byte high nibble stays 5)
+// "SkyBell Technologies Inc." is the same doorbell company as "SKYBELL, INC": both of its
+// blocks broadcast SkyBell-named SSIDs in our captures (Skybell_A1BC331571 from 68:F0:D0,
+// Skybell_938524580 from 9C:54:DA). Canary sells three cameras (Pro, View, Flex); the Pro adds
+// a siren and air sensors but is still a camera. One Canary address (D8:42:E2) appears in our
+// captures, as a probe request. No visual confirmation, so every new row has validated=0.
 // ---------------------------------------------------------------------------------------
 
 // Registry-confirmed camera-brand OUIs (IEEE MA-L). The original 19 were verified 2026-07-17
@@ -337,6 +351,8 @@ static constexpr NetcamOui CAMERA_VENDOR_OUI[] = {
     { { 0x64, 0xfd, 0x29 }, "Dahua", 0 },
     // Hikvision
     { { 0x68, 0x6d, 0xbc }, "Hikvision", 0 },
+    // SkyBell
+    { { 0x68, 0xf0, 0xd0 }, "SkyBell", 0 },
     // Dahua
     { { 0x6c, 0x1c, 0x71 }, "Dahua", 0 },
     // Uniview
@@ -391,6 +407,8 @@ static constexpr NetcamOui CAMERA_VENDOR_OUI[] = {
     // Dahua
     { { 0x98, 0xf9, 0xcc }, "Dahua", 0 },
     { { 0x9c, 0x14, 0x63 }, "Dahua", 0 },
+    // SkyBell
+    { { 0x9c, 0x54, 0xda }, "SkyBell", 0 },
     // Ring
     { { 0x9c, 0x76, 0x13 }, "Ring", 0 },
     // Amcrest
@@ -478,6 +496,9 @@ static constexpr NetcamOui CAMERA_VENDOR_OUI[] = {
     { { 0xd4, 0x43, 0x0e }, "Dahua", 0 },
     // Hikvision
     { { 0xd4, 0xe8, 0x53 }, "Hikvision", 0 },
+    // Canary
+    { { 0xd8, 0x42, 0xe2 }, "Canary", 0 },
+    // Hikvision
     { { 0xdc, 0x07, 0xf8 }, "Hikvision", 0 },
     { { 0xdc, 0xd2, 0x6a }, "Hikvision", 0 },
     // Dahua
@@ -551,6 +572,7 @@ static constexpr NetcamPrefix CAMERA_VENDOR_PREFIX[] = {
     { ACAB_OUI_MAM(0xa4, 0xda, 0x22, 0x2), "Wyze", 0 },
     { ACAB_OUI_MAM(0x0c, 0x0e, 0xc1, 0x4), "Swann", 0 },
     { ACAB_OUI_MAM(0xb0, 0xb3, 0x53, 0x7), "WUUK", 0 },
+    { ACAB_OUI_MAM(0x7c, 0x70, 0xbc, 0x5), "Canary", 0 },
 };
 static constexpr size_t CAMERA_VENDOR_PREFIX_COUNT =
     sizeof(CAMERA_VENDOR_PREFIX) / sizeof(CAMERA_VENDOR_PREFIX[0]);

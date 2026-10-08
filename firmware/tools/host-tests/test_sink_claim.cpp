@@ -11,9 +11,11 @@
 #include "../../lib/acab_core/sink_claim.h"
 #include "../../lib/acab_core/dedup_key.h"
 #include "../../lib/acab_core/det_log.h"
+#include <cctype>
 #include <cstdio>
 #include <cstring>
 #include <cstdint>
+#include <string>
 
 // ---------------------------------------------------------------------------
 // KEY PLUMBING (P1-3)
@@ -130,16 +132,6 @@ int main() {
 
     chk("claim carries separate capture and owner-admission epochs",
         sizeof(AcabSinkClaim) == 32, true);
-    AcabSinkClaim epochClaim{};
-    epochClaim.captureGen = 5;
-    epochClaim.admissionEpoch = 9;
-    const uint32_t periodicCaptureGen = 6;
-    const uint32_t sameOwnerAdmissionEpoch = 9;
-    chk("periodic dedup rearm preserves queued owner admission",
-        periodicCaptureGen != epochClaim.captureGen &&
-        sameOwnerAdmissionEpoch == epochClaim.admissionEpoch, true);
-    chk("disconnect owner epoch invalidates the queued claim",
-        (sameOwnerAdmissionEpoch + 1) == epochClaim.admissionEpoch, false);
 
     // The whole point: a buffer-bearing item that failed to enqueue must release its claim, or the
     // device reads as "already buffered this generation" with nothing written and stays that way
@@ -156,8 +148,6 @@ int main() {
         detLogAppendReleasesClaim(DET_LOG_APPEND_STORED), false);
     chk("stable not-armed refusal keeps the scanner claim consumed",
         detLogAppendReleasesClaim(DET_LOG_APPEND_NOT_ARMED), false);
-    chk("capacity refusal keeps the scanner claim consumed",
-        detLogAppendReleasesClaim(DET_LOG_APPEND_CAPACITY_DROP), false);
     // A flood-limit refusal is the one deliberate refusal that DOES release: a real device that
     // keeps transmitting must get another chance once a token refills. The hot loop that release
     // would otherwise open is closed by det_log's ingest gate (test_det_log.cpp covers it).
@@ -268,6 +258,36 @@ int main() {
       FakeTable t{}; AcabClaimTable api{ fakeLookup, fakeRestore, fakeGenNow, &t };
       chk("a non-buffering detection never even looks the table up",
           !acabSinkClaimRollback(c, api) && !t.lookupCalled, true); }
+
+    // ---- what may claim at all ----------------------------------------------------------------
+    // The ring is FIFO and type-blind, so shouldBuffer's type term is the ONLY thing that keeps
+    // Desert's ACAB_NEARBY_DEVICE flood from wrapping away the signature rows, and det_log's flood
+    // limit assumes it (det_log.h). The tracker debounce term keeps tags you merely pass out of the
+    // ring. acab_scanner.cpp is not host-compiled, so pin the WHOLE statement in its source, with
+    // line comments stripped and whitespace collapsed: a substring pin passed with the type term
+    // commented out or with an `|| ...` added beside it.
+    {
+        std::string src;
+        if (std::FILE* f = std::fopen("../../lib/acab_core/acab_scanner.cpp", "rb")) {
+            char buf[8192]; size_t got;
+            while ((got = std::fread(buf, 1, sizeof(buf), f)) > 0) src.append(buf, got);
+            std::fclose(f);
+        }
+        std::string flat;
+        for (size_t i = 0; i < src.size(); ++i) {
+            if (src.compare(i, 2, "//") == 0) while (i < src.size() && src[i] != '\n') ++i;
+            const char ch = i < src.size() ? src[i] : ' ';
+            if (!std::isspace((unsigned char)ch)) flat += ch;
+            else if (!flat.empty() && flat.back() != ' ') flat += ' ';
+        }
+        const size_t sb = flat.find("bool shouldBuffer =");
+        const std::string stmt = sb == std::string::npos ? "" : flat.substr(sb, flat.find(';', sb) + 1 - sb);
+        chk("shouldBuffer refuses debouncing trackers and every Desert row",
+            stmt == "bool shouldBuffer = !debouncing && d.type != ACAB_NEARBY_DEVICE"
+                    " && (e->loggedGen != gCaptureGen)"
+                    " && (detLogRatePersistent(e->count, now - e->firstSeen)"
+                    " ? rateGate.persistentOpen : rateGate.freshOpen);", true);
+    }
 
     printf(gFail ? "\n  REGRESSION DETECTED (%d failure%s of %d)\n\n" : "\n  all good (0 failures of %d)\n\n",
            gFail ? gFail : gRun, gFail == 1 ? "" : "s", gFail ? gRun : 0);

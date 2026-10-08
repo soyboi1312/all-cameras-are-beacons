@@ -9,11 +9,20 @@
 # Added 2026-07-31 after glassesClassifyBLE was restructured from return-on-first-match to
 # score-and-keep. That change was invisible to the compiler and to five rounds of code review.
 #
-#   ./run.sh          # build + run every test
+#   ./run.sh             # build + run every test
+#   ./run.sh --sanitize  # the same suites under AddressSanitizer + UndefinedBehaviorSanitizer
 set -euo pipefail
 cd "$(dirname "$0")"
 CORE="../../lib/acab_core"
 fail=0
+san=""
+if [ "${1:-}" = "--sanitize" ]; then
+    # The classifiers and line parsers these suites drive take bytes straight off the air, and a
+    # memory error or undefined behaviour there passes the plain build silently. Leaks are not the
+    # target, and Linux ASan reports them by default while macOS does not, so leak checks stay off.
+    san="-fsanitize=address,undefined -fno-sanitize-recover=undefined -fno-omit-frame-pointer -g -O1"
+    export ASAN_OPTIONS=detect_leaks=0
+fi
 for t in test_*.cpp; do
     stem="${t#test_}"; stem="${stem%.cpp}"
     src="${CORE}/${stem}_detect.cpp"
@@ -60,7 +69,7 @@ for t in test_*.cpp; do
     # where a truncated log reads as "the suite
     # is smaller than I thought" rather than "it died early". A failing test RUN already used
     # `|| fail=1` and continued, so this only makes the two paths behave the same way.
-    g++ -std=c++17 -Wall ${extra_flags:+$extra_flags} -I"$CORE" -Istubs -o "/tmp/$(basename "$t" .cpp)" "$t" ${src:+"$src"} \
+    g++ -std=c++17 -Wall ${san:+$san} ${extra_flags:+$extra_flags} -I"$CORE" -Istubs -o "/tmp/$(basename "$t" .cpp)" "$t" ${src:+"$src"} \
         || { echo "!! COMPILE FAILED: $t"; fail=1; continue; }
     "/tmp/$(basename "$t" .cpp)" || fail=1
 done

@@ -68,7 +68,7 @@ static void addName(std::vector<uint8_t>& a, uint8_t adType, const char* s) {
     a.push_back((uint8_t)(1 + n)); a.push_back(adType);
     for (size_t i = 0; i < n; i++) a.push_back((uint8_t)s[i]);
 }
-// Default = ACAB_BLE_ADDR_UNKNOWN, which is what the dual-radio UART path and replays deliver.
+// Default = ACAB_BLE_ADDR_UNKNOWN, which is what the dual-radio UART path delivers.
 static bool runBle(const uint8_t mac[6], std::vector<uint8_t>& a, AcabDetection* out,
                    AcabBleAddrType t = ACAB_BLE_ADDR_UNKNOWN) {
     memset(out, 0, sizeof(*out));

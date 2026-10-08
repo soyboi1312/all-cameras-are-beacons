@@ -16,8 +16,7 @@
  * decoded into the detection for display. OFF by default; toggled via the app
  * {desert} config key. Reuses the scanner's existing dedup + "new device" + alert
  * pipeline, so show/log/alert-on-new all come for free. NOT the offline buffer:
- * shouldBuffer in acab_scanner.cpp refuses ACAB_NEARBY_DEVICE unless "record
- * everything" (bufferAll) is on, see docs/ble-protocol.md.
+ * shouldBuffer in acab_scanner.cpp refuses ACAB_NEARBY_DEVICE.
  */
 #ifndef ACAB_DESERT_DETECT_H
 #define ACAB_DESERT_DETECT_H
@@ -36,7 +35,7 @@ void desertRestoreEnabled(bool defaultEnabled);
 // Catch-all: returns true for ANY device when Desert mode is on (emits
 // ACAB_NEARBY_DEVICE). MUST be tried LAST, after every specific classifier.
 // addrType is what the receiving radio reported (ACAB_BLE_ADDR_UNKNOWN on the dual-radio
-// UART path and on black-box replays); it selects the detail label, see the header note.
+// UART path); it selects the detail label, see the header note.
 // No default on purpose: the one production caller (acabScannerIngestBLE) always knows.
 bool desertClassifyBLE(const uint8_t mac[6], const uint8_t* adv, size_t advLen,
                        int rssi, AcabDetection* out, AcabBleAddrType addrType);

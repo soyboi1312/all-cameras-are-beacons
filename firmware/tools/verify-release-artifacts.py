@@ -69,6 +69,10 @@ CANARIES = {
     # police_detect.cpp, linked into every production image, and absent from every earlier one.
     # Confirmed in all five local 2.1.0 builds (one occurrence each) on 2026-10-01.
     "2.1.0": ["WatchGuard Video OUI"],
+    # 2.2.0: the advertising supervisor's refused-restart report, new in acab_ble_service.cpp (in
+    # every production image). Once in each of the five local 2.2.0 builds, absent from the
+    # published 2.1.0 DIY images (2026-10-05).
+    "2.2.0": ["restart refused (normal while a link opens)"],
 }
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -145,7 +149,8 @@ def newest_source_mtime():
     newest, where = 0.0, ""
     for root in (os.path.join(FW, "lib"), os.path.join(FW, "src"),
                  os.path.join(FW, "platformio.ini"),
-                 os.path.join(FW, "tools/stamp_app_desc.py")):
+                 os.path.join(FW, "tools/stamp_app_desc.py"),
+                 os.path.join(FW, "tools/release_tools.py")):  # stamp_app_desc.py imports it
         if os.path.isfile(root):
             if os.path.getmtime(root) > newest:
                 newest, where = os.path.getmtime(root), root

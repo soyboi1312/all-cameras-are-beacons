@@ -118,8 +118,8 @@ struct DetLogReplay {
 // Latched storage faults. These are a bitmask so one status value can report every
 // failure observed since the last fully successful clear. Faults survive reboot and
 // raw-ring integrity faults stop new appends. The NVS bit reports an offline-buffer metadata
-// load/save failure (generation, anchors, connection/privacy lifecycle, saturation, or diagnostic
-// state), but does not by itself condemn otherwise sound ring geometry. A complete physical wipe
+// load/save failure (generation, anchors, connection/privacy lifecycle, or diagnostic state), but
+// does not by itself condemn otherwise sound ring geometry. A complete physical wipe
 // clears the mask; merely starting a clear does not claim the storage is healthy again.
 enum DetLogFault : uint32_t {
     DET_LOG_FAULT_NONE    = 0,
@@ -138,121 +138,6 @@ void     detLogBegin();             // mount ring, scan for head (generation win
 void     detLogSetEnabled(bool on); // opt-in master switch (persisted); false also durably requests
                                     // retained-coredump erasure, even when already disabled
 bool     detLogEnabled();
-
-// --- RECORD EVERYTHING (deploy-and-leave). Persisted to NVS, default OFF. ---
-// Normally the ring REFUSES ACAB_NEARBY_DEVICE (shouldBuffer in acab_scanner.cpp): it is
-// append-only with no type filter of its own, so in a dense area a flood of re-admitted phone
-// records wraps it and evicts the real ALPR / body-cam hits the owner synced to get.
-//
-// That reasoning INVERTS for the case this switch exists for: a board left unattended for days
-// in a low-RF area, where the question is whether anything came by at all and an uncategorized
-// device IS the finding. There is nothing to crowd out, because almost nothing transmits there.
-//
-// Turning it on also changes two things that are otherwise wrong for a week-long deployment:
-//      1. Re-arm becomes TIME-based (REBUFFER_AFTER_MS in acab_scanner.cpp) instead of firing
-//      once per capture generation. Without it a vehicle that passes Monday and again Thursday
-//      writes ONE record, because gCaptureGen only advances on an app disconnect and no app is
-//      coming. The log would say "this MAC existed" and never "something came by twice".
-//      TWO LIMITS ON THAT, both real, and neither may be papered over in user-facing copy:
-//        - The interval is BEST EFFORT. Dedup eviction resets loggedGen, so a busy site
-//          re-buffers the same device far more often than the interval implies. It governs at a
-//          quiet, stationary site, which is the only place this mode belongs.
-//        - "Monday and Thursday" needs a CLOCK. The board has no RTC. Times are millis() plus an
-//          app-pushed epoch anchor, so a boot that follows an unattended power loss is never
-//          anchored and its records replay as approx, bracketed between neighbouring anchored
-//          boots (see DetLogReplay.approx). Exact wall-clock is only guaranteed while the board
-//          stays powered or that boot received an anchor. Ordering within a boot is always sound.
-//   2. The undrained-reboot auto-wipe threshold rises (WIPE_AFTER_BOOTS_DEPLOY). Boot count is a
-//      poor proxy for "seized" once the owner has explicitly said they are leaving it unattended,
-//      and a discharging battery browning out six times would otherwise erase the whole week.
-//      SECURITY TRADEOFF, STATED PLAINLY: this weakens the self-clean guarantee. It does not
-//      remove it (the threshold stays finite), but a board recovered inside that window yields
-//      more than it would with the switch off. Say so where the user turns it on.
-//
-// THIS SWITCH ALONE DOES NOT GIVE YOU "DID ANYTHING COME BY". DESERT MODE MUST ALSO BE ON.
-// ACAB_NEARBY_DEVICE has exactly two producers, both in desert_detect.cpp and both behind that
-// mode's own enable. With Desert off, bufall still buys the revisit/dwell half (the tick re-arms
-// EVERY type, so a Flock or body-cam hit gets a record per window instead of one for the whole
-// deployment) and the wider wipe threshold, but nothing uncategorized is ever classified, so the
-// uncategorized half of the feature produces nothing. The app must turn both on together, and
-// firmware deliberately does NOT auto-enable Desert here: the iOS client forces Silent when
-// Desert goes on, and bypassing that would arm the buzzer into a firehose.
-//
-// Once the ring is full, detLogAppend stops accepting ACAB_NEARBY_DEVICE rather than letting
-// them evict signature hits. See the guard there for why (a drive home with the board still
-// armed will otherwise overwrite the deployment it just collected).
-void     detLogSetBufferAll(bool on);
-bool     detLogBufferAll();
-
-// --- Stationary-mode capacity / censoring risk ---
-// Once Stationary capture reaches ring capacity, detLogAppend refuses further
-// ACAB_NEARBY_DEVICE records rather than let them evict signature hits. `bufsat` is raised on the
-// exact transition to full (and when bufall is enabled on an already-full ring), so it means later
-// nearby rows MAY have been omitted; it is not proof a refusal already occurred. The flag is
-// PERSISTED across deployment reboots and cleared only by detLogClear. detLogSatDrops() counts
-// actual refusals THIS BOOT for the diag line. Surface the capacity warning beside the log.
-bool     detLogSaturated();
-uint32_t detLogSatDrops();
-
-// --- CLIENT CONTRACT for this mode. Not yet implemented in either app, ON PURPOSE. ---
-// Firmware-only until the UI below exists: nothing in ios/ or android/ writes "bufall", so the
-// mode is currently unreachable and cannot be armed by accident.
-//
-// Present it as ONE experimental switch called "Stationary capture". Do NOT call it "record
-// everything": that names the mechanism, invites use as a general logging mode, and buries the
-// one thing the user has to understand, which is that this is for a board that STAYS PUT.
-//
-// Arming it pushes the at-rest key first, then a SINGLE config object:
-//     {"buffer":true, "bufall":true, "desert":true, "buzzer":false}
-// All four together, in one write. buffer alone records nothing new; bufall without desert gets
-// revisit resolution but never classifies an uncategorized device, which is the half the user
-// actually wants; and buzzer:false because Desert on a live board is a firehose.
-//
-// The screen must state, in the user's own terms:
-//   1. EXTERNAL USB-C POWER IS REQUIRED. The battery SKU runs ~7h15m quiet against 168h in a
-//      week. Without this the deployment simply stops, and the log looks identical to "nothing
-//      came by".
-//   2. It records nearby radios, INCLUDING BYSTANDERS' PHONES. Say it plainly; this is the
-//      disclosure that distinguishes the mode from the rest of the product.
-//   3. Storage used, and whether it REACHED CAPACITY (status "bufsat"). Later nearby rows may have
-//      been omitted, so the user must not assume a full log is complete. Show this next to the log;
-//      `bufdrops` is the separate current-boot count proving actual refusals.
-//   4. Whether capture times are EXACT or APPROXIMATE. Any boot after an unattended power loss
-//      is unanchored and replays as approx (DetLogReplay.approx). "Monday and Thursday" is only
-//      guaranteed while the board stays powered or that boot received an epoch anchor.
-//   5. The weakened auto-wipe, in one sentence, at the switch itself and not in a help page.
-//
-// DISARMING IS AN ORDERED SEQUENCE, and the order is load-bearing. Setting "buffer":false calls
-// detLogClearKey(), which drops the at-rest key from RAM and NVS. Do that before the replay has
-// finished and the remaining records become undecryptable while still occupying the ring: the
-// deployment is destroyed by the act of collecting it. So, on collection:
-//   1. Connect and let the replay run to completion.
-//   2. Confirm it ended CLEANLY - the {"hist":"end","n":N} sentinel, with N matching the record
-//      count received. A gap means re-sync, not proceed.
-//   3. Only then write {"bufall":false, "desert":false, "buffer":false}.
-//   4. Restore the user's prior alert mode through the existing Desert reconciliation path
-//      (reconcileDesert on both platforms). Do NOT blindly re-enable the buzzer: the mode forced
-//      Silent, and a mode the user hand-picked while Desert ran has to survive.
-//   5. Let the user ERASE the stored log explicitly ({"clearlog":true}). Never automatic. They
-//      just collected a week of bystander movements; deleting it is their call and their timing.
-//
-// STATUS SEMANTICS THE CLIENT MUST IMPLEMENT: "bufall" and "bufsat" are sent ONLY when true, so
-// ABSENT MEANS FALSE, and it means false in EVERY fresh status frame, not just the first. Latch
-// them per frame, never cumulatively. Get this wrong and a stale saturation warning survives a
-// clearlog forever, telling the user their complete log is truncated when it is not.
-//
-// HARDWARE ACCEPTANCE PASS, required before the switch is exposed in either app. The host suite
-// covers the persistence LOGIC; none of it proves the flash ring, the NVS writes and the drain
-// behave on a real board across a real power cycle, which is the entire premise of the mode:
-//   1. Arm Stationary capture, then disconnect.
-//   2. Confirm UNCATEGORIZED and TRACKER records are actually stored (both are new admissions
-//      under this mode; the tracker one only works because the debounce term is relaxed).
-//   3. Power-cycle the board. Confirm desert, buffer and bufall all come back ARMED.
-//   4. Drain, and verify exact vs approximate timestamps behave as documented above: records from
-//      an anchored boot exact, records from a boot that followed an unattended power loss approx.
-//   5. Force saturation with a TEST BUILD using a tiny slot count, and confirm bufsat persists
-//      through a reboot. Do not wait for a real 24576-record ring to fill.
-//   6. clearlog, and confirm bufsat disappears from the status frame.
 
 // --- at-rest key: app-pushed on connect. Held in RAM, and persisted to NVS while buffering
 // is enabled so a deploy-and-leave board survives a reboot (the TRADEOFF above). A truncated
@@ -273,8 +158,6 @@ enum DetLogKeyResult : uint8_t {
 };
 DetLogKeyResult detLogSetKey(const uint8_t key[32],
                              bool allowDestructiveReplacement = false);
-void     detLogClearKey();          // forget the key; keeps the fingerprint. Normal disable callers
-                                    // use detLogSetEnabled(false), which also requests dump erasure
 bool     detLogHaveKey();
 // Called after BLE authentication but before config writes are admitted. Durably pins one
 // retained-coredump erase generation for the whole physical boot before keys/config can enter
@@ -324,8 +207,7 @@ bool     detLogDeliverIfCaptureEpochCurrent(uint32_t epoch,
 // --- capture: called from acab_scanner.cpp's sinkTask, off both radio paths.
 // No-op unless buffering is enabled AND a key is present AND the ring mounted AND no app is
 // connected. WHICH detections get here at all is the caller's decision (shouldBuffer in
-// handleDetection): once per device per capture generation, no Desert rows unless the owner
-// turned on "record everything".
+// handleDetection): once per device per capture generation, never a Desert ACAB_NEARBY_DEVICE row.
 //
 // `gps`, when non-null and valid, supplies the position for THIS record only - see DetLogGpsStamp
 // for why the retained phone fix arrives beside the detection rather than on it. A detection that
@@ -334,7 +216,6 @@ enum DetLogAppendResult : uint8_t {
     DET_LOG_APPEND_STORED,          // row is durably present in the raw ring
     DET_LOG_APPEND_RETRY,           // transient refusal; caller should release its capture claim
     DET_LOG_APPEND_NOT_ARMED,       // stable off/link/key/storage refusal; claim stays consumed
-    DET_LOG_APPEND_CAPACITY_DROP,   // intentional full-ring nearby refusal; claim stays consumed
     DET_LOG_APPEND_RATE_LIMITED,    // signature-row flood limit refused it; claim is RELEASED so a
                                     // device that keeps transmitting gets another chance once a
                                     // token refills (see the flood limit below)
@@ -347,7 +228,7 @@ inline bool detLogAppendReleasesClaim(DetLogAppendResult result) {
     return result == DET_LOG_APPEND_RETRY || result == DET_LOG_APPEND_RATE_LIMITED;
 }
 
-// --- FLOOD LIMIT on signature rows (every type except ACAB_NEARBY_DEVICE) ---
+// --- FLOOD LIMIT on signature rows (the only rows the ring stores) ---
 // THE ATTACK. The ring is strictly FIFO and type-blind, and the scanner writes each fresh dedup
 // key once per capture generation. A nearby transmitter that mints fresh identities (beacon frames
 // SSID "Flock-..." from random BSSIDs, Flock-named BLE adverts from random addresses, Remote ID
@@ -357,15 +238,15 @@ inline bool detLogAppendReleasesClaim(DetLogAppendResult result) {
 // away.
 //
 // THE LIMIT. A token bucket inside appendLocked, under gIoMutex, which is the one place a row
-// reaches storage. Each stored signature row spends one token. NEARBY rows never touch it: their
-// existing full-ring cap (bufsat) already keeps them from evicting anything.
+// reaches storage. Each stored row spends one token. shouldBuffer never admits an
+// ACAB_NEARBY_DEVICE row, so every row that reaches this bucket is a signature row.
 //
 // THE NUMBERS, from the densest real signature scenes committed to the repo:
 //   - docs/captures/lvt-2026-08-03-summary.txt, netcam ON, residential streets (Ring, Swann, Wyze,
 //     Reolink, eufy OUIs). Unique signature first sightings, which is what the ring stores: 83 in
 //     one 47-minute segment, at most 34 in any 10 minutes, 10 in any 60 s, 4 in any 1 s.
 //   - docs/radio-coverage.md, the c5-lvt capture: 67 camera-vendor MACs in ~27 minutes, 48 of them
-//     on 2.4 GHz (the only band the board hears).
+//     heard only on 2.4 GHz (the only band an S3 build hears).
 //   - docs/captures/drive-to-camarillo-2026-09-07.txt: 45 detections in 2h28m, netcam off.
 //   - docs/captures/911-2026-09-11.txt (3h53m): its strongest results are two Remote ID drones
 //     and one FS Ext Battery row, beside a handful of low-confidence alerts.
@@ -382,15 +263,6 @@ inline bool detLogAppendReleasesClaim(DetLogAppendResult result) {
 // WORST CASE, STATED: a sustained flood gets the full burst, then one row per 10 s. Overwriting all
 // 24,576 slots takes 256 + (24,576 - 256) x 10 s = 243,200 s, about 67.6 hours (2 days 19.6 h),
 // instead of about four minutes. The flood is not silent either: see detLogRateLimited() below.
-//
-// WHERE THE LIMIT CAN BITE A REAL SCENE, stated rather than hidden. Stationary capture (bufall)
-// re-arms every device each REBUFFER_AFTER_MS (15 min in acab_scanner.cpp), so N signature devices
-// permanently in range cost N rows per window against 90 refills per window. Up to N = 90 the
-// bucket never drains. Above it the bucket drains by (N - 90) per window and, once empty, some
-// devices miss a window's re-arm row (they are released, not lost, and the next window re-arms
-// them) and the marker is raised. Nothing captured so far comes near 90 concurrently audible
-// 2.4 GHz netcams (see the density above). If a real deployment does, the fix is a separate bucket
-// per type (netcam being the only type with that volume), not a larger shared one.
 //
 // FAIRNESS: one-shot random identities must not starve a real device. The last
 // DET_LOG_RATE_RESERVE tokens are spendable only by a PERSISTENT row (detLogRatePersistent: seen
@@ -435,14 +307,12 @@ struct DetLogRateGate {
 DetLogRateGate detLogRateGate(uint32_t nowMs);
 
 // FLOOD MARKER. Raised on the first rate refusal, PERSISTED to NVS ("bufrl") so it survives the
-// reboots a deployment sees, and cleared only where bufsat is cleared (the clearlog/key-rotation/
-// auto-wipe arm and the wipe's retirement). Status sends "bufrl":true only while it is set.
-// detLogRateDrops() is the this-boot count of refused appends for the [diag] line. It counts rows
-// refused AT THE RING; adverts the ingest gate deferred while closed are not rows and are not
-// counted. The marker does NOT block further appends: a failed NVS write is retried from the loop
-// tick (and latches DET_LOG_FAULT_NVS) instead of stopping evidence capture.
+// reboots a deployment sees, and cleared only by a wipe of the log (the clearlog/key-rotation/
+// auto-wipe arm and the wipe's retirement). Status sends "bufrl":true only while it is set. Only a
+// row refused AT THE RING raises it; adverts the ingest gate deferred while closed are not rows.
+// The marker does NOT block further appends: a failed NVS write is retried from the loop tick (and
+// latches DET_LOG_FAULT_NVS) instead of stopping evidence capture.
 bool     detLogRateLimited();
-uint32_t detLogRateDrops();
 DetLogAppendResult detLogAppend(const AcabDetection& d,
                                 const DetLogGpsStamp* gps = nullptr);
 DetLogAppendResult detLogAppendClaimed(const AcabDetection& d,

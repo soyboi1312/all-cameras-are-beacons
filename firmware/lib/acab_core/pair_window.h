@@ -11,21 +11,12 @@
  * closes the actual threat, which is someone in radio range pairing to an unattended board and
  * reading the log.
  *
- * WHY THE DECISION LIVES HERE. The runtime check is a millis() comparison, and millis() ROLLS OVER
- * every ~49.7 days. A naive `millis() < until` reads as OPEN for another 49 days after a rollover,
- * i.e. the security property silently evaporates on a board left running. That is not reproducible
- * on hardware in any practical time, so the comparison is a pure function tested at the boundary
- * instead (test_pair_window.cpp).
- *
- * THE LATCH, AND WHY THE SIGNED COMPARISON IS NOT ENOUGH ON ITS OWN. A signed difference is only
- * correct while the two timestamps are within 2^31 ms (~24.8 days) of each other. A board left
- * powered longer than that would see the difference flip sign and read the window as OPEN AGAIN,
- * silently reopening pairing on exactly the long-running unattended board this feature protects.
- * The host test caught this. So closure is LATCHED: once the window has been observed closed it
- * stays closed until the latch is cleared, and the only thing that clears it is a power cycle,
- * which is already the documented way to reopen the window. The latch makes the arithmetic hazard
- * unreachable, because the accessor runs on every connect and every ~5 s status build, so the latch
- * trips within seconds of expiry rather than 24 days later.
+ * WHY THE CLOCK IS 64-BIT. The window used to be a uint32 millis() deadline with a signed
+ * comparison plus a closure latch, and the latch tripped only on the connect, pre-auth and DFU
+ * paths. A board that saw no connect attempt for ~24.9 days after its window closed therefore read
+ * the window OPEN again for the next ~24.8 days. esp_timer microseconds do not wrap in the life of
+ * a board, so the comparison below needs no latch. Keep it here, pure and host-tested
+ * (test_pair_window.cpp): the service code that calls it is never host-compiled.
  */
 #ifndef ACAB_PAIR_WINDOW_H
 #define ACAB_PAIR_WINDOW_H
@@ -33,33 +24,27 @@
 #include <stdint.h>
 #include <stdbool.h>
 
-/// True while a new phone may bond.
-///
-/// `armed` is false until the board has committed itself ON (a board that boots only to decide it
-/// should sleep must never be pairable). The comparison is deliberately SIGNED: casting the
-/// difference to int32_t makes "now is past until" correct across the millis() rollover, where an
-/// unsigned `now < until` would report the window as open for another ~49 days.
-inline bool acabPairWindowOpenAt(uint32_t nowMs, uint32_t untilMs, bool armed, bool latchedClosed) {
-    if (!armed || latchedClosed) return false;
-    return (int32_t)(nowMs - untilMs) < 0;
+/// The new-phone window length. The only definition in the tree; why the gate sits at connect is
+/// in the pairing-window notes in acab_ble_service.h.
+#define ACAB_PAIR_WINDOW_MS 120000UL
+
+/// The deadline acabBleOpenPairingWindow stores for a window opened at nowUs (esp_timer
+/// microseconds). It lives here, not in the service, so test_pair_window.cpp checks the ms-to-us
+/// step: the service source is never host-compiled.
+inline uint64_t acabPairWindowUntilUsAt(uint64_t nowUs) {
+    return nowUs + (uint64_t)ACAB_PAIR_WINDOW_MS * 1000;
 }
 
-/// Milliseconds remaining, 0 when closed. Same signed-difference reasoning as above.
-inline uint32_t acabPairWindowRemainingAt(uint32_t nowMs, uint32_t untilMs, bool armed,
-                                          bool latchedClosed) {
-    if (!acabPairWindowOpenAt(nowMs, untilMs, armed, latchedClosed)) return 0;
-    return untilMs - nowMs;
+/// Milliseconds left in the window, 0 when closed. untilUs == 0 means never opened, so closed.
+/// Both times are esp_timer microseconds since boot.
+inline uint32_t acabPairWindowRemainingMsAt(uint64_t nowUs, uint64_t untilUs) {
+    return nowUs < untilUs ? (uint32_t)((untilUs - nowUs) / 1000) : 0;
 }
 
-/// Should this peer be allowed past the connect gate?
+/// Should this peer be allowed past the connect gate? Enforcement is unconditional on every target.
 ///
-/// Four inputs, and each rejection reason is a distinct product decision:
+/// Three inputs, and each rejection reason is a distinct product decision:
 ///
-///   gateEnabled  - does this TARGET enforce at all. Every GATT-serving production target now
-///                  enables it (beacon-board from its power-gate signals, mesh-detect from the
-///                  reset reason with cellAbsent=true); false remains the pre-feature behaviour
-///                  for any build that never arms a window, which must not inherit a rejection
-///                  it can never open a window to satisfy.
 ///   boardHasBond - does the board already have an owner. A board with ZERO bonds pairs freely,
 ///                  which is the whole out-of-box experience: a unit that shipped weeks ago, or sat
 ///                  in a drawer, must connect on the customer's first try with no ritual. There is
@@ -71,8 +56,7 @@ inline uint32_t acabPairWindowRemainingAt(uint32_t nowMs, uint32_t untilMs, bool
 /// So the ONLY rejection is: an owned board, a stranger, outside the window. That is exactly the
 /// threat (someone in radio range pairing to an unattended board that already has a log on it) and
 /// nothing else.
-inline bool acabPairAdmit(bool gateEnabled, bool boardHasBond, bool known, bool windowOpen) {
-    if (!gateEnabled)  return true;   // target does not enforce
+inline bool acabPairAdmit(bool boardHasBond, bool known, bool windowOpen) {
     if (!boardHasBond) return true;   // unowned board: first pairing always works
     if (known)         return true;   // the owner, reconnecting
     return windowOpen;                // a stranger: only during the window
@@ -83,11 +67,11 @@ inline bool acabPairAdmit(bool gateEnabled, bool boardHasBond, bool known, bool 
 /// Admission is re-evaluated because a stranger can connect during the physical pairing window
 /// and then deliberately stall SMP until after it closes. The elapsed-time check is deliberately
 /// subtraction based, so it remains correct when millis() rolls over.
-inline bool acabPairPreAuthMayContinue(bool gateEnabled, bool boardHadBondAtConnect,
+inline bool acabPairPreAuthMayContinue(bool boardHadBondAtConnect,
                                        bool knownAtConnect, bool windowOpen,
                                        uint32_t elapsedMs, uint32_t timeoutMs) {
     if (elapsedMs >= timeoutMs) return false;
-    return acabPairAdmit(gateEnabled, boardHadBondAtConnect, knownAtConnect, windowOpen);
+    return acabPairAdmit(boardHadBondAtConnect, knownAtConnect, windowOpen);
 }
 
 /// May this session arm the legacy nRF bootloader?

@@ -156,7 +156,7 @@ static const char* const KNOWN_VENDORS[] = {
     "Hikvision", "Dahua", "Amcrest", "Axis", "Reolink", "Ring", "Wyze", "Anker/eufy",
     "Ezviz", "Lorex", "Swann", "Arlo",
     "Verkada", "i-PRO", "Vivotek", "Uniview", "Hanwha", "Samsung Techwin",
-    "Blink", "Night Owl", "SkyBell", "Juan OEM", "WUUK"
+    "Blink", "Night Owl", "SkyBell", "Juan OEM", "WUUK", "Canary"
 };
 
 int main() {
@@ -254,6 +254,9 @@ int main() {
         { "Juan OEM",  {0x9c,0xa3,0xa9,0x12,0x34,0x56} },
         { "Juan OEM",  {0x84,0xd0,0xdb,0x12,0x34,0x56} },
         { "Juan OEM",  {0xa4,0x86,0xdb,0x12,0x34,0x56} },
+        { "SkyBell",   {0x68,0xf0,0xd0,0x12,0x34,0x56} },
+        { "SkyBell",   {0x9c,0x54,0xda,0x12,0x34,0x56} },
+        { "Canary",    {0xd8,0x42,0xe2,0x12,0x34,0x56} },
     };
     for (const VendorCase& v : additionalOuis) {
         std::vector<uint8_t> f = uplink(v.mac);
@@ -294,6 +297,9 @@ int main() {
         { "WUUK",
           {0xb0,0xb3,0x53,0x70,0x00,0x00}, {0xb0,0xb3,0x53,0x7f,0xff,0xff},
           {0xb0,0xb3,0x53,0x6f,0xff,0xff}, {0xb0,0xb3,0x53,0x80,0x00,0x00} },
+        { "Canary",
+          {0x7c,0x70,0xbc,0x50,0x00,0x00}, {0x7c,0x70,0xbc,0x5f,0xff,0xff},
+          {0x7c,0x70,0xbc,0x4f,0xff,0xff}, {0x7c,0x70,0xbc,0x60,0x00,0x00} },
     };
     for (const PrefixCase& p : prefixes) {
         char label[96], detail[64];
@@ -356,10 +362,12 @@ int main() {
     // Uniview x4, Amcrest x2, Hanwha x2 and Samsung Techwin. All re-confirmed against a fresh
     // standards-oui.ieee.org pull. The 2026-09-01 refresh adds Ezviz and Uniview MA-Ls plus
     // three separate MA-M blocks. The capture review then adds twelve MA-L blocks across
-    // Blink, Night Owl, SkyBell and Juan OEM, plus WUUK's MA-M. If this failed, read the DELIBERATELY
-    // ABSENT block at the bottom of netcam_signatures.h before you bump the number.
-    chkBool("table holds exactly 194 MA-L OUIs", CAMERA_VENDOR_OUI_COUNT == 194);
-    chkBool("fallback holds exactly 4 narrower prefixes", CAMERA_VENDOR_PREFIX_COUNT == 4);
+    // Blink, Night Owl, SkyBell and Juan OEM, plus WUUK's MA-M. 2026-10-03 completes two vendors:
+    // SkyBell's other two MA-L blocks, Canary's MA-L, and Canary's MA-M (194 -> 197, 4 -> 5).
+    // If this failed, read the DELIBERATELY ABSENT block at the bottom of netcam_signatures.h
+    // before you bump the number.
+    chkBool("table holds exactly 197 MA-L OUIs", CAMERA_VENDOR_OUI_COUNT == 197);
+    chkBool("fallback holds exactly 5 narrower prefixes", CAMERA_VENDOR_PREFIX_COUNT == 5);
     { note[0] = 0;
       for (size_t i = 0; i < CAMERA_VENDOR_OUI_COUNT; i++) {
           bool known = false;
@@ -375,7 +383,7 @@ int main() {
           if (!known && !note[0]) snprintf(note, sizeof(note), "prefix idx %zu unknown label \"%s\"", i,
                                            CAMERA_VENDOR_PREFIX[i].vendor);
       }
-      chkBool("every label is one of the 23 exact known vendor strings", note[0] == 0, note); }
+      chkBool("every label is one of the 24 exact known vendor strings", note[0] == 0, note); }
     // A table OUI with the locally-administered bit set could never match, because netcamEntry()
     // rejects LA addresses before it looks at the table. Such an entry would be dead weight and a
     // sign the block was transcribed wrong, so assert none exists.

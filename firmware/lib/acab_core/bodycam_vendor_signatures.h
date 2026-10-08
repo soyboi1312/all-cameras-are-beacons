@@ -5,8 +5,8 @@
  * Solutions is the dominant US public-safety comms vendor, but the same corporate
  * block also covers the MOTOTRBO two-way radios, docks, and infrastructure carried by
  * retail, school, and venue staff, so a hit is "Motorola Solutions gear", not proof of
- * a camera. It is NOT ALPR-specific, and NOT their LMR radios (700/800 MHz, off this
- * 2.4 GHz board). Broad by nature, so it sits behind its OWN sub-toggle underneath the
+ * a camera. It is NOT ALPR-specific, and NOT their LMR radios (700/800 MHz, below every
+ * band this board hears). Broad by nature, so it sits behind its OWN sub-toggle underneath the
  * body-cam category ({"motorola":bool}, OPT-IN: default OFF on EVERY board, per the
  * 2026-07-23 ground truth recorded below) and emits below the apps' weak-match
  * threshold (<50) so it always renders as "verify this".

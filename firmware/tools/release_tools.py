@@ -189,6 +189,52 @@ def read_esp_app_desc(path: Union[os.PathLike, str]) -> Tuple[str, str]:
     return parse_esp_app_desc(prefix, os.fspath(image))
 
 
+def restamp_app_desc(image: bytes, version: str, project: str) -> bytes:
+    """Return an ESP32 app image with esp_app_desc's version and project_name replaced.
+
+    Standard library only, because stamp_app_desc.py runs this inside the SCons build. IDF's layout
+    (esp_image_format.h): a 24-byte header whose byte 1 counts the segments and byte 23 flags an
+    appended SHA-256, then each segment as an 8-byte header (load address, length) and its data.
+    The checksum byte, 0xEF XOR every segment data byte, ends the 16-byte-aligned block after the
+    last segment, and the digest covers everything up to and including it. Both fields sit inside
+    segment data, so XORing each old and new byte into the checksum keeps it exact. The incoming
+    checksum and digest are checked first, so a corrupt input fails here instead of being re-signed.
+    """
+    out = bytearray(image)
+    end, checksum = 24, 0xEF
+    for _ in range(out[1]):
+        size = struct.unpack_from("<I", out, end + 4)[0]
+        for byte in out[end + 8:end + 8 + size]:
+            checksum ^= byte
+        end += 8 + size
+    checksum_at = end | 15
+    expected = checksum_at + 1 + (32 if out[23] else 0)
+    if len(out) != expected:
+        raise ReleaseToolError(f"ESP image is {len(out)} B, but its segments, checksum and digest "
+                               f"add up to {expected} B")
+    if out[checksum_at] != checksum:
+        raise ReleaseToolError(f"ESP image checksum is 0x{out[checksum_at]:02x}, but its segment "
+                               f"data gives 0x{checksum:02x}")
+    if out[23] and out[checksum_at + 1:] != hashlib.sha256(out[:checksum_at + 1]).digest():
+        raise ReleaseToolError("ESP image SHA-256 digest does not match its contents")
+    fields = b""
+    for value, name in ((version, "version"), (project, "project_name")):
+        raw = value.encode("ascii")
+        if len(raw) >= ESP_APP_TEXT_FIELD_SIZE:
+            raise ReleaseToolError(f"esp_app_desc {name} {value!r} does not fit its "
+                                   f"{ESP_APP_TEXT_FIELD_SIZE}-byte field")
+        fields += raw.ljust(ESP_APP_TEXT_FIELD_SIZE, b"\0")
+    span = slice(ESP_APP_VERSION_OFFSET, ESP_APP_PROJECT_OFFSET + ESP_APP_TEXT_FIELD_SIZE)
+    for old, new in zip(out[span], fields):
+        out[checksum_at] ^= old ^ new
+    out[span] = fields
+    if out[23]:
+        out[checksum_at + 1:] = hashlib.sha256(out[:checksum_at + 1]).digest()
+    # Both magics: refuses an image whose descriptor is not at IDF's fixed offset.
+    parse_esp_app_desc(bytes(out), "stamped ESP image")
+    return bytes(out)
+
+
 def require_manifest_image_identity(
     path: Union[os.PathLike, str], manifest_label: str, manifest_version: str
 ) -> Tuple[str, str]:
@@ -505,7 +551,7 @@ def _platformio_define_value(raw: str) -> str:
 
 
 def declared_versions(firmware_dir: Union[os.PathLike, str]) -> Tuple[str, str]:
-    """Return the shared S3 version and the beacon-board override."""
+    """Return the shared version (the S3 Colonel Panic builds and beacon-c5) and the beacon-board override."""
     root = Path(firmware_dir)
     shared = _version_from_header(root)
     ini = (root / "platformio.ini").read_text(encoding="utf-8", errors="replace")

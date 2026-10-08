@@ -9,6 +9,9 @@ For a beacon release, rev-A and rev-B are separate products at the artifact boun
 - Each image must carry its declared version and exact runtime label in raw `esp_app_desc` bytes.
 - The app manifest must contain both exact keys. A rev-B entry never reuses a rev-A URL.
 
+`beacon-c5`, the single-radio ESP32-C5 build, is not part of a release: `release.sh` has no
+profile for it, no stager builds it, and it has no browser flasher and no app manifest entry.
+
 The firmware repository owns `stage_beacon_revb.py`, but the sibling `soyboi.tech` repository owns
 the browser page. That sibling must provide `flash-revb.html` with an install button that references
 `./firmware/manifest-beacon-revb.json`. The sibling provides that page today; if it is ever absent

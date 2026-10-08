@@ -76,7 +76,7 @@ enum AcabMethod : uint8_t {
 // SinkItem in acab_scanner.cpp and is pinned there by its own static_assert - do not restate it
 // here, because a second copy of a derived number is what went stale last time. The same 224 bytes is also
 // the stack frame this struct occupies inside the IRAM_ATTR WiFi promiscuous callback, which
-// runs on the WiFi driver task's stack. Anyone deepening the queue to cut gSinkDropBuffered
+// runs on the WiFi driver task's stack. Anyone deepening the queue to cut sink-queue drops
 // during a Desert firehose is budgeting against this number, so the static_assert below is
 // here to surface a future field addition at COMPILE time instead of letting it silently
 // grow both.
@@ -109,6 +109,10 @@ struct AcabDetection {
     float          heightAGL;            // height above takeoff (m)
     int32_t        pilotAlt;             // operator altitude (m MSL)
     uint8_t        ridStatus;            // ODID op status: 1 ground, 2 airborne, 3 emergency, 4 fault
+    uint8_t        channel;              // WiFi channel the radio was TUNED to (1-14 = 2.4 GHz,
+                                         // 36+ = 5 GHz on beacon-c5); 0 = not WiFi. Band exact;
+                                         // 2.4 GHz overlap can put the number a few off. Notify
+                                         // "ch" (ACAB_ELIDE_CH) + serial; unstored, so 0 on replay.
 
     uint32_t       firstSeen;      // millis() we first saw it
     uint32_t       lastSeen;       // millis() we last saw it
@@ -148,11 +152,6 @@ struct AcabDetection {
     // Closing that needs "rnd" on the wire (11 bytes against the iPhone notify budget) plus the
     // Android decode, deliberately not part of the 2.0.7 change.
     bool           randomAddr;
-
-    // Transient routing flag: true when this is a REPLAY of a stored record (nRF
-    // black-box dump). The app-notify still fires, but the buzzer + the live dedup
-    // table / gTotal / offline buffer are all skipped. Never serialized; defaults false.
-    bool           replay;
 };
 
 // Self-checking version of the size stated above, so it can never go stale the way "~160 bytes"
@@ -192,8 +191,8 @@ static inline const char* acabSourceLabel(AcabSource s) {
 // BLE address type as reported by the controller that heard the advert. BLE signals a random
 // address in the advertising PDU's TxAdd flag, not in the address bytes, so only the radio that
 // received the packet can say. Public/random here is that flag; UNKNOWN is the honest value on
-// every path that never saw it (the dual-radio nRF forward line carries no type, and a replayed
-// black-box record stores none). Readers must treat UNKNOWN as "cannot tell", never as public.
+// every path that never saw it (the dual-radio nRF forward line carries no type). Readers must
+// treat UNKNOWN as "cannot tell", never as public.
 typedef enum {
     ACAB_BLE_ADDR_UNKNOWN = 0,
     ACAB_BLE_ADDR_PUBLIC  = 1,
@@ -248,7 +247,7 @@ static inline void acabApplyDurability(AcabDetection* d) {
 
 // THE ONE OWNER of "what the controller's address type does to randomAddr". OR, never assign: a
 // RANDOM report sets it; a PUBLIC report does not clear a set 0x02 bit (a locally-administered
-// public address still owns no IEEE OUI); UNKNOWN (dual-radio UART, replays) leaves the
+// public address still owns no IEEE OUI); UNKNOWN (the dual-radio UART forward) leaves the
 // byte-derived value alone. Called from acabScannerIngestBLE after the classifier chain (so it
 // covers every classified row) and from desertClassifyBLE for its own row (so a caller that reads
 // the record straight from the classifier, as test_desert.cpp does, sees label and flag agree).
