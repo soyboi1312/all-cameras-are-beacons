@@ -490,6 +490,13 @@ class EspAppDescriptorTests(unittest.TestCase):
         self.assertEqual(
             expected_project_for_artifact("beacon-revb-app.bin"), "beacon board rev-B"
         )
+        self.assertEqual(expected_project_for_artifact("acab-beacon-c5-app.bin"), "beacon c5")
+        self.assertEqual(
+            expected_project_for_artifact("acab-beacon-c5-devkitc-app.bin"), "beacon c5 devkitc"
+        )
+        self.assertEqual(release_profile("acab-beacon-c5-devkitc-app.bin"), "colonel-panic")
+        self.assertEqual(release_profile("beacon c5"), "colonel-panic")
+        self.assertEqual(release_profile("beacon c5 devkitc"), "colonel-panic")
         self.assertEqual(
             expected_project_for_artifact("acab-mesh-detect-ch1-app.bin"),
             "mesh-detect-ACAB-ch1",
@@ -722,7 +729,7 @@ class ReleaseManifestContractTests(unittest.TestCase):
             with self.assertRaisesRegex(ReleaseToolError, "NRF_APP_VERSION"):
                 verifier.require_current_nrf_package(package, 8, root)
 
-    def test_web_manifest_inventory_requires_all_three_and_no_substitutes(self) -> None:
+    def test_web_manifest_inventory_requires_every_env_and_no_substitutes(self) -> None:
         verifier = load_verifier()
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -758,21 +765,35 @@ class UsbManifestGateTests(unittest.TestCase):
             os.utime(path, (self.src_mtime + 10, self.src_mtime + 10))
         self.parts = self.verifier.beacon_usb_parts(self.verifier.REV_A_FILES)
 
-    def failures(self, parts, version: str = "2.0.6"):
+    def failures(self, parts, version: str = "2.0.6", chip: str = "ESP32-S3",
+                 expected_chip: str = "ESP32-S3", parts_expected=None):
         """The gate's FAIL messages for a manifest naming `parts`, output swallowed."""
         module = self.verifier
         manifest = self.dir / module.REV_A_MANIFEST
         manifest.write_text(json.dumps({
             "version": version,
-            "builds": [{"chipFamily": "ESP32-S3",
+            "builds": [{"chipFamily": chip,
                         "parts": [{"path": p, "offset": o} for p, o in parts]}],
         }), encoding="utf-8")
         module.OK.clear()
         module.FAIL.clear()
         with contextlib.redirect_stdout(io.StringIO()):
             module.check_usb_manifest(module.REV_A_MANIFEST, os.fspath(manifest), "2.0.6",
-                                      self.parts, self.src_mtime)
+                                      parts_expected or self.parts, self.src_mtime,
+                                      expected_chip=expected_chip)
         return list(module.FAIL)
+
+    def test_a_c5_manifest_marked_s3_fails(self) -> None:
+        # The C5 images share the page with the S3 ones: chipFamily is what esp-web-tools matches
+        # against the connected chip, so it is part of the manifest's identity, like the offsets.
+        module = self.verifier
+        parts = list(zip((p for p, _ in self.parts), module.web_part_offsets("beacon-c5")))
+        self.assertEqual(parts[0][1], 0x2000)
+        self.assertTrue(self.failures(parts, chip="ESP32-S3", expected_chip="ESP32-C5",
+                                      parts_expected=parts))
+        self.assertEqual(self.failures(parts, chip="ESP32-C5", expected_chip="ESP32-C5",
+                                       parts_expected=parts), [])
+        self.assertTrue(self.failures(self.parts, chip="ESP32-C5"))
 
     def test_a_correct_fresh_manifest_passes(self) -> None:
         self.assertEqual(self.failures(self.parts), [])
@@ -1063,7 +1084,7 @@ class ReleaseOrchestratorContractTests(unittest.TestCase):
 class WebStagerFailureTests(unittest.TestCase):
     """The Colonel-Panic stager changes two served repos, so failure must change neither."""
 
-    envs = ("oui-spy", "mesh-detect", "mesh-detect-ch1")
+    envs = ("oui-spy", "mesh-detect", "mesh-detect-ch1", "beacon-c5", "beacon-c5-devkitc")
 
     def setUp(self) -> None:
         self.temp = tempfile.TemporaryDirectory()
@@ -1147,6 +1168,9 @@ class WebStagerFailureTests(unittest.TestCase):
                      "tools/partitions/boot_app0.bin")
         boot_app0.parent.mkdir(parents=True)
         boot_app0.write_bytes(b"new-boot-app0")
+        # The stager refuses to run without the ESP32-C5 core dir; the fake pio ignores its args,
+        # so an empty directory stands in for it.
+        (self.fake_home / ".platformio-c5").mkdir()
         self.pio_marker = root / "pio-ran"
         pio = self.fake_bin / "pio"
         pio.write_text(
@@ -1273,6 +1297,17 @@ class WebStagerFailureTests(unittest.TestCase):
             self.assertTrue(entry["ota"])
             self.assertEqual(entry["app"]["size"], len(expected))
             self.assertEqual(entry["app"]["sig"], b"fake-signature".hex())
+        # The ESP32-C5 images are staged on the web side only: fresh parts, no sibling copy and
+        # no firmware-latest.json entry (USB-only, see build-flasher.sh).
+        for env in ("beacon-c5", "beacon-c5-devkitc"):
+            expected = (self.firmware / f".pio/build/{env}/firmware.bin").read_bytes()
+            self.assertEqual((self.web / "firmware" / f"acab-{env}-app.bin").read_bytes(), expected)
+            self.assertEqual((self.web / "firmware" / f"acab-{env}-boot_app0.bin").read_bytes(),
+                             b"new-boot-app0")
+            self.assertFalse((self.site_firmware / f"acab-{env}-app.bin").exists())
+            self.assertNotIn(env, json.dumps(latest))
+            self.assertIn('"version": "2.0.6"',
+                          (self.web / f"manifest-{env}.json").read_text())
         self.assertIn("All Cameras Are Beacons v2.0.6",
                       (self.web / "index.html").read_text())
 
@@ -1285,6 +1320,16 @@ class WebStagerFailureTests(unittest.TestCase):
         for label in ("ACAB-ouispy", "mesh-detect-ACAB", "mesh-detect-ACAB-ch1"):
             self.assertIs(latest["builds"][label]["ota"], False)
             self.assertEqual(latest["builds"][label]["app"]["sig"], "")
+
+    def test_missing_c5_core_dir_aborts_before_any_served_mutation(self) -> None:
+        self.install_key()
+        self.install_working_openssl()
+        before = self.snapshot()
+        proc = self.run_stager(PLATFORMIO_C5_CORE_DIR=os.fspath(self.fake_home / "no-such-core"))
+        self.assertNotEqual(proc.returncode, 0, proc.stdout)
+        self.assertIn("ESP32-C5 core dir not found", proc.stdout)
+        self.assertEqual(self.snapshot(), before, proc.stdout)
+        self.assertFalse(self.pio_marker.exists(), proc.stdout)
 
     def test_one_deleted_tracked_vendor_chunk_is_rejected(self) -> None:
         (self.web / "vendor/esp-web-tools/chunk.js").unlink()

@@ -1,11 +1,15 @@
 #!/usr/bin/env bash
 # Regenerate ACAB firmware parts for the web flasher (ESP Web Tools).
-# Builds the three PlatformIO envs, then stages bootloader + partitions + boot_app0 +
-# app as SEPARATE parts, each flashed at its own offset. Keeping them separate (rather
+# Builds the five DIY PlatformIO envs (three XIAO ESP32-S3 Colonel Panic builds in the shared
+# core dir, two ESP32-C5 builds in their own), then stages bootloader + partitions + boot_app0 +
+# app as SEPARATE parts, each flashed at its own offset (the C5 bootloader sits at 0x2000). Keeping them separate (rather
 # than one merged blob from 0x0) leaves the NVS partition (0x9000) untouched, so a
 # no-erase web-flash PRESERVES the BLE bond + ignore list (no re-pair on a firmware update).
 #
-# NOTE: this script handles oui-spy + mesh-detect only. The v2 beacon-board build +
+# The two ESP32-C5 images are USB-only: they get no firmware-latest.json entry and no OTA
+# signature, so the apps never offer them an image (they read as NOT IN CATALOG).
+#
+# NOTE: this script handles the DIY builds only. The v2 beacon-board build +
 # manifest + OTA stamping lives in the sibling site repo, at
 # soyboi.tech/firmware/build-beacon-flasher.sh (the OTA-deploy tooling is split across the
 # two repos). Run that one to refresh the beacon-board flasher and firmware-latest.json entry.
@@ -144,8 +148,43 @@ cleanup_stage() {
 }
 trap cleanup_stage EXIT
 
-echo ">> building firmware (oui-spy, mesh-detect, mesh-detect-ch1)"
+S3_ENVS="oui-spy mesh-detect mesh-detect-ch1"
+C5_ENVS="beacon-c5 beacon-c5-devkitc"
+WEB_ENVS="$S3_ENVS $C5_ENVS"
+# The ESP32-C5 envs build in their own core dir (platformio.ini [platformio]): pioarduino deletes
+# the framework versions the S3 envs need from whichever core dir it runs in.
+C5_CORE="${PLATFORMIO_C5_CORE_DIR:-$HOME/.platformio-c5}"
+if [ ! -d "$C5_CORE" ]; then
+  echo "!! ESP32-C5 core dir not found at $C5_CORE (set PLATFORMIO_C5_CORE_DIR or install it:"
+  echo "!! PLATFORMIO_CORE_DIR=\"$C5_CORE\" pio pkg install -e beacon-c5, from firmware/)."
+  exit 1
+fi
+
+# Freeze every build output once, straight after its build. Signatures, hashes and both served
+# copies consume these bytes, so a concurrent/retried PlatformIO build cannot create a
+# check-then-copy generation split. The C5 parts are frozen BEFORE the S3 build: the core dir is
+# in PlatformIO's project checksum, so switching core dirs wipes .pio/build.
+PAYLOAD_DIR="$STAGE_TMP/payloads"
+mkdir -p "$PAYLOAD_DIR"
+cp "$BOOT_APP0" "$PAYLOAD_DIR/boot_app0.bin"
+freeze_env() {
+  local ENV="$1" B="$FW/.pio/build/$1" PART
+  for PART in bootloader partitions firmware; do
+    [ -f "$B/$PART.bin" ] || { echo "!! missing $B/$PART.bin after build"; exit 1; }
+  done
+  cp "$B/bootloader.bin" "$PAYLOAD_DIR/acab-$ENV-bootloader.bin"
+  cp "$B/partitions.bin" "$PAYLOAD_DIR/acab-$ENV-partitions.bin"
+  cp "$PAYLOAD_DIR/boot_app0.bin" "$PAYLOAD_DIR/acab-$ENV-boot_app0.bin"
+  cp "$B/firmware.bin" "$PAYLOAD_DIR/acab-$ENV-app.bin"
+}
+
+echo ">> building firmware ($C5_ENVS) in $C5_CORE"
+( cd "$FW" && PLATFORMIO_CORE_DIR="$C5_CORE" pio run -e beacon-c5 -e beacon-c5-devkitc )
+for ENV in $C5_ENVS; do freeze_env "$ENV"; done
+
+echo ">> building firmware ($S3_ENVS)"
 ( cd "$FW" && pio run -e oui-spy -e mesh-detect -e mesh-detect-ch1 )
+for ENV in $S3_ENVS; do freeze_env "$ENV"; done
 
 # Stamp the firmware version (single source of truth: acab_version.h) into the web
 # manifests + page footer, so the flasher's displayed version can never drift from
@@ -172,22 +211,6 @@ PY
   echo "!! still advertise the previous version, and a plain push to Pages runs no verifier."
   exit 1
 fi
-
-# Freeze every build output once. Signatures, hashes and both served copies consume these bytes,
-# so a concurrent/retried PlatformIO build cannot create a check-then-copy generation split.
-PAYLOAD_DIR="$STAGE_TMP/payloads"
-mkdir -p "$PAYLOAD_DIR"
-cp "$BOOT_APP0" "$PAYLOAD_DIR/boot_app0.bin"
-for ENV in oui-spy mesh-detect mesh-detect-ch1; do
-  B="$FW/.pio/build/$ENV"
-  for PART in bootloader partitions firmware; do
-    [ -f "$B/$PART.bin" ] || { echo "!! missing $B/$PART.bin after build"; exit 1; }
-  done
-  cp "$B/bootloader.bin" "$PAYLOAD_DIR/acab-$ENV-bootloader.bin"
-  cp "$B/partitions.bin" "$PAYLOAD_DIR/acab-$ENV-partitions.bin"
-  cp "$PAYLOAD_DIR/boot_app0.bin" "$PAYLOAD_DIR/acab-$ENV-boot_app0.bin"
-  cp "$B/firmware.bin" "$PAYLOAD_DIR/acab-$ENV-app.bin"
-done
 
 # Locate and validate the app-facing sibling manifest before replacing a single served byte. The
 # sibling is optional for the standalone public-USB builder, but when present its schema, keys and
@@ -252,17 +275,13 @@ SIG_MESH_CH1="$(sig_hex "$PAYLOAD_DIR/acab-mesh-detect-ch1-app.bin")" || exit 1
 # From here on, every path the command may replace is covered by one cross-repository rollback.
 # The manifests are included along with their payloads; a late stamp/copy failure therefore cannot
 # leave either hosting tree in a publishable old-metadata/new-bytes mixture.
-for ENV in oui-spy mesh-detect mesh-detect-ch1; do
+for ENV in $WEB_ENVS; do
   for PART in bootloader partitions boot_app0 app; do
     TRANSACTION_FILES+=("$ROOT/web/firmware/acab-$ENV-$PART.bin")
   done
+  TRANSACTION_FILES+=("$ROOT/web/manifest-$ENV.json")
 done
-TRANSACTION_FILES+=(
-  "$ROOT/web/manifest-oui-spy.json"
-  "$ROOT/web/manifest-mesh-detect.json"
-  "$ROOT/web/manifest-mesh-detect-ch1.json"
-  "$ROOT/web/index.html"
-)
+TRANSACTION_FILES+=("$ROOT/web/index.html")
 if [ "$SIBLING_ACTIVE" = "1" ]; then
   TRANSACTION_FILES+=(
     "$SIBLING/acab-oui-spy-app.bin"
@@ -287,15 +306,14 @@ ver, root = sys.argv[1], sys.argv[2]
 # Exactly one hit per file is the rule: each manifest carries a single "version", and index.html
 # has one footer span. Dying here matches the version-parse abort above rather than carrying on.
 expected = {
-    os.path.join(root, "web", "manifest-oui-spy.json"),
-    os.path.join(root, "web", "manifest-mesh-detect.json"),
-    os.path.join(root, "web", "manifest-mesh-detect-ch1.json"),
+    os.path.join(root, "web", "manifest-%s.json" % env)
+    for env in ("oui-spy", "mesh-detect", "mesh-detect-ch1", "beacon-c5", "beacon-c5-devkitc")
 }
 found = set(glob.glob(os.path.join(root, "web", "manifest-*.json")))
 if found != expected:
     missing = sorted(os.path.basename(path) for path in expected - found)
     extra = sorted(os.path.basename(path) for path in found - expected)
-    sys.exit("!! web USB manifests must be exactly the three shipping profiles; missing=%s, "
+    sys.exit("!! web USB manifests must be exactly the five DIY builds; missing=%s, "
              "unexpected=%s" % (missing or "-", extra or "-"))
 for m in sorted(found):
     s = open(m).read()
@@ -318,7 +336,7 @@ mkdir -p "$ROOT/web/firmware"
 # Stage the four flash parts SEPARATELY (not one merged blob). esp-web-tools writes
 # each at its own offset, so the NVS partition (0x9000, the gap between partitions and
 # boot_app0) is never overwritten and a no-erase web-flash keeps the BLE bond + whitelist.
-for ENV in oui-spy mesh-detect mesh-detect-ch1; do
+for ENV in $WEB_ENVS; do
   echo ">> staging parts for $ENV"
   for PART in bootloader partitions boot_app0 app; do
     cp "$PAYLOAD_DIR/acab-$ENV-$PART.bin" "$ROOT/web/firmware/acab-$ENV-$PART.bin"

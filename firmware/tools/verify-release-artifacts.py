@@ -80,14 +80,23 @@ FW = os.path.normpath(os.path.join(HERE, ".."))
 REPO = os.path.normpath(os.path.join(FW, ".."))
 SITE = os.path.normpath(os.path.join(REPO, "..", "soyboi.tech"))
 
-# ONE flash layout, SHARED BY EVERY USB MANIFEST THIS FILE OPENS - the web envs it globs plus the
-# two beacon revisions. esp-web-tools writes each part at its own offset, so an offset is not
-# decoration: moving `partitions` off 0x8000 writes the table over NVS (0x9000 in default_8MB.csv),
-# which is the BLE bond + ignore list the separate-parts layout exists to preserve. The manifests
-# differ only in which filenames they name at these offsets. The web profile has an explicit
-# manifest inventory below: adding an environment must update both the builder and verifier rather
-# than silently leaving an install button or release gate behind.
+# ONE flash layout per chip, SHARED BY EVERY USB MANIFEST THIS FILE OPENS - the web envs it globs
+# plus the two beacon revisions. esp-web-tools writes each part at its own offset, so an offset is
+# not decoration: moving `partitions` off 0x8000 writes the table over NVS (0x9000 in
+# default_8MB.csv), which is the BLE bond + ignore list the separate-parts layout exists to
+# preserve. The manifests differ only in which filenames they name at these offsets. The ESP32-S3
+# bootloader sits at 0x0; the ESP32-C5 ROM loads its bootloader from 0x2000 (pioarduino's
+# upload.bootloader_offset for esp32c5), and the other three parts keep their offsets. The web
+# profile has an explicit manifest inventory below: adding an environment must update both the
+# builder and verifier rather than silently leaving an install button or release gate behind.
 USB_PART_OFFSETS = (0, 32768, 57344, 65536)
+C5_USB_PART_OFFSETS = (8192, 32768, 57344, 65536)
+C5_WEB_ENVS = ("beacon-c5", "beacon-c5-devkitc")
+
+
+def web_part_offsets(env):
+    """The four part offsets a web env's manifest must name, by chip."""
+    return C5_USB_PART_OFFSETS if env in C5_WEB_ENVS else USB_PART_OFFSETS
 WEB_PART_NAMES = ("bootloader", "partitions", "boot_app0", "app")
 # REV_B_FILES keys the app image as "firmware"; its rev-A twin below uses the same keys.
 BEACON_PART_KEYS = ("bootloader", "partitions", "boot_app0", "firmware")
@@ -116,7 +125,9 @@ BEACON_OTA_FILES = {
     REV_B_LABEL: REV_B_FILES["firmware"],
 }
 OTA_APP_FILES = {**COLONEL_OTA_FILES, **BEACON_OTA_FILES}
-WEB_MANIFEST_ENVS = ("oui-spy", "mesh-detect", "mesh-detect-ch1")
+# The two ESP32-C5 envs are USB-only DIY images: staged and verified here, absent from
+# COLONEL_OTA_FILES on purpose (no OTA manifest entry, no signature, the apps offer them nothing).
+WEB_MANIFEST_ENVS = ("oui-spy", "mesh-detect", "mesh-detect-ch1") + C5_WEB_ENVS
 NRF_PACKAGE_FILE = "beacon-nrf-dfu.zip"
 
 # The OTA trust root this release is EXPECTED to bake: SHA-256 of the SubjectPublicKeyInfo DER in
@@ -145,10 +156,11 @@ def check(cond, msg):
 
 
 def newest_source_mtime():
-    """Newest mtime across everything that ends up compiled into an ESP32-S3 app image."""
+    """Newest mtime across everything that ends up compiled into an app image (S3 or C5)."""
     newest, where = 0.0, ""
     for root in (os.path.join(FW, "lib"), os.path.join(FW, "src"),
                  os.path.join(FW, "platformio.ini"),
+                 os.path.join(FW, "c5_sdkconfig_overrides.h"),   # force-included by the C5 envs
                  os.path.join(FW, "tools/stamp_app_desc.py"),
                  os.path.join(FW, "tools/release_tools.py")):  # stamp_app_desc.py imports it
         if os.path.isfile(root):
@@ -377,7 +389,8 @@ def flasher_page_names(page_path, manifest_name):
         html, re.IGNORECASE | re.DOTALL))
 
 
-def check_usb_manifest(label, manifest_path, expected_version, expected_parts, src_mtime):
+def check_usb_manifest(label, manifest_path, expected_version, expected_parts, src_mtime,
+                       expected_chip="ESP32-S3"):
     """One standard for every USB flash path: version, exact parts, staged, and NOT stale.
 
     WHAT "check the manifest" HAS TO MEAN. Counting to four and naming the parts in the check's own
@@ -400,15 +413,22 @@ def check_usb_manifest(label, manifest_path, expected_version, expected_parts, s
         return
     check(manifest.get("version") == expected_version,
           f"{label} version {manifest.get('version')!r} == {expected_version!r}")
+    # With two chip families on one page the chip is part of the identity: esp-web-tools matches
+    # chipFamily against the connected chip, so a C5 manifest marked ESP32-S3 flashes a C5 image
+    # onto an S3 (and is refused on the C5 it was built for) while every offset row still passes.
+    builds = manifest.get("builds") or []
+    check(len(builds) == 1 and isinstance(builds[0], dict)
+          and builds[0].get("chipFamily") == expected_chip,
+          f"{label} targets exactly one build, for {expected_chip}")
     # Materialize FIRST: callers pass a generator, and consuming it in the comparison would leave
     # the diagnostic print below reporting an empty expectation.
     expected = list(expected_parts)
-    builds = manifest.get("builds") or []
     parts = builds[0].get("parts", []) if len(builds) == 1 and isinstance(builds[0], dict) else []
     actual = [(part.get("path"), part.get("offset")) for part in parts
               if isinstance(part, dict)]
     matches = actual == expected
-    check(matches, f"{label} names only its own parts, in order, at 0x0/0x8000/0xe000/0x10000")
+    offsets = "/".join(hex(offset) for _, offset in expected)
+    check(matches, f"{label} names only its own parts, in order, at {offsets}")
     if not matches:
         print(f"        expected {expected}")
         print(f"        actual   {actual}")
@@ -708,7 +728,7 @@ def main():
         expected_web_manifests, actual_web_manifests = web_manifest_inventory(REPO)
         expected_paths = set(expected_web_manifests)
         check(actual_web_manifests == expected_paths,
-              "web carries exactly the three profile-required USB manifests")
+              f"web carries exactly the {len(WEB_MANIFEST_ENVS)} profile-required USB manifests")
         if actual_web_manifests != expected_paths:
             missing = sorted(os.path.basename(path) for path in expected_paths - actual_web_manifests)
             extra = sorted(os.path.basename(path) for path in actual_web_manifests - expected_paths)
@@ -721,8 +741,9 @@ def main():
             check_usb_manifest(
                 os.path.relpath(mp, REPO), mp, shared_ver,
                 zip((f"firmware/acab-{env}-{name}.bin" for name in WEB_PART_NAMES),
-                    USB_PART_OFFSETS),
-                src_mtime)
+                    web_part_offsets(env)),
+                src_mtime,
+                expected_chip="ESP32-C5" if env in C5_WEB_ENVS else "ESP32-S3")
         # THE SAME SCRIPT STAMPS THE PAGE, AND NEVER CHECKS THAT IT MATCHED. build-flasher.sh
         # rewrites web/index.html with a bare `re.sub(r'(All Cameras Are Beacons v)[0-9...]', ...)`,
         # anchored to nothing but that sentence. Reword the sentence and the stamp becomes a silent
@@ -785,7 +806,9 @@ def main():
                 print(f"  --    {label}: {sha} (working tree: {digest})")
             except Exception as e:
                 print(f"  --    {label}: provenance unavailable ({e})")
-        print("  --    toolchain: espressif32@6.13.0, NimBLE-Arduino@1.4.3")
+        print("  --    toolchain (S3 envs): espressif32@6.13.0, NimBLE-Arduino@1.4.3")
+        print("  --    toolchain (beacon-c5, beacon-c5-devkitc): pioarduino platform-espressif32@55.03.312-1,"
+              " NimBLE-Arduino@2.5.1")
 
     print(f"\n{len(OK)} passed, {len(FAIL)} failed\n")
     if FAIL:

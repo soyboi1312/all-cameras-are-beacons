@@ -643,6 +643,10 @@ def expected_project_for_artifact(path: Union[os.PathLike, str]) -> Optional[str
         "acab-oui-spy-app.bin": "ACAB-ouispy",
         "acab-mesh-detect-app.bin": "mesh-detect-ACAB",
         "acab-mesh-detect-ch1-app.bin": "mesh-detect-ACAB-ch1",
+        # USB-only DIY images on the web flasher (no OTA manifest entry); the label is the
+        # -DACAB_FW_LABEL of the env of the same name in platformio.ini.
+        "acab-beacon-c5-app.bin": "beacon c5",
+        "acab-beacon-c5-devkitc-app.bin": "beacon c5 devkitc",
         "beacon-app.bin": "beacon board",
         "beacon-revb-app.bin": "beacon board rev-B",
     }.get(Path(path).name)
@@ -654,8 +658,10 @@ def release_profile(value: Union[os.PathLike, str]) -> Optional[str]:
     name = Path(text).name
     if name.startswith("beacon-") or text in {"beacon board", "beacon board rev-B"}:
         return "beacon"
+    # "acab-" covers the three Colonel Panic images and the two ESP32-C5 DIY images: one web
+    # flasher, one stager (web/build-flasher.sh), one release family.
     if name.startswith("acab-") or text in {
-        "ACAB-ouispy", "mesh-detect-ACAB", "mesh-detect-ACAB-ch1"
+        "ACAB-ouispy", "mesh-detect-ACAB", "mesh-detect-ACAB-ch1", "beacon c5", "beacon c5 devkitc"
     }:
         return "colonel-panic"
     return None

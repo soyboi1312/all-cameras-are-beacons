@@ -30,8 +30,11 @@
 // 2.2.0: NEW BOARD env:beacon-c5: one Seeed XIAO ESP32-C5 (Bluetooth plus 2.4 and 5 GHz Wi-Fi on
 //        one radio, no nRF) on pioarduino (Arduino 3.3.12 / ESP-IDF 5.5.5, NimBLE-Arduino 2.5.1);
 //        S3 envs stay on Arduino 2.0.17 / NimBLE 1.4.3 and the shared core carries version guards.
-//        Label "beacon c5", 4 bonds (resolving list holds 5). Unreleased: no stager profile,
-//        flasher entry or OTA manifest entry yet. A new board is a minor bump for fw and both apps.
+//        Label "beacon c5", 4 bonds (resolving list holds 5). On the DIY flasher page as a USB
+//        image since 2026-10-08 (web/build-flasher.sh), with no OTA manifest entry: updates are
+//        USB reflashes. env:beacon-c5-devkitc is the same build for Espressif's ESP32-C5-DevKitC-1
+//        (issue #2; label "beacon c5 devkitc", buzzer GPIO23, RGB LED GPIO27 via ACAB_LED_RGB),
+//        untested on hardware here. A new board is a minor bump for fw and both apps.
 //        PRODUCTION, EVERY BUILD: (1) live Wi-Fi detections carry their frame's channel, wire key
 //        "ch" (elided second, after cid; never on replayed rows), shown in the apps and exported as
 //        CSV columns; oui-spy, beacon and beacon-c5 serial lines print " ch=N" (mesh-detect's does

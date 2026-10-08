@@ -59,16 +59,16 @@ jobs:
 
       # ALL envs, not just the product one. The rev-B and channel-1 variants are exactly the
       # targets a local `pio run` forgets, because nobody builds them by hand day to day.
-      # A bare `pio run` builds default_envs: every env but beacon-c5 (next step).
+      # A bare `pio run` builds default_envs: every env but the two ESP32-C5 envs (next step).
       - name: Build every firmware env
         working-directory: firmware
         run: pio run
 
       # Own core dir: see [platformio] in platformio.ini. The only build of the NimBLE 2.x /
       # Arduino 3 branches and the C5 static_asserts.
-      - name: Build beacon-c5 (own core dir)
+      - name: Build beacon-c5 and beacon-c5-devkitc (own core dir)
         working-directory: firmware
-        run: PLATFORMIO_CORE_DIR="$HOME/.platformio-c5" pio run -e beacon-c5
+        run: PLATFORMIO_CORE_DIR="$HOME/.platformio-c5" pio run -e beacon-c5 -e beacon-c5-devkitc
 
       # Sub-second, no board needed. This is the layer that catches a classifier that still
       # compiles but has quietly stopped matching, which is the failure this product cannot

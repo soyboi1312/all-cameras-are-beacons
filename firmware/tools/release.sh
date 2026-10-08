@@ -98,6 +98,12 @@ KEY="$REPO/firmware/tools/ota_signing/beacon_ota_key.pem"
 if [ ! -f "$KEY" ] && [ "$UNSIGNED_USB_ONLY" -eq 0 ]; then
     die "OTA signing key not found at ${KEY#$REPO/}. Re-run with --unsigned-usb-only for a flasher-only build."
 fi
+# The colonel-panic profile stages the two ESP32-C5 images, which web/build-flasher.sh builds in
+# their own core dir. Fail here, before the test step, rather than in step 3.
+if [ "$PROFILE" = "colonel-panic" ] || [ "$PROFILE" = "all" ]; then
+    C5_CORE="${PLATFORMIO_C5_CORE_DIR:-$HOME/.platformio-c5}"
+    [ -d "$C5_CORE" ] || die "ESP32-C5 core dir not found at $C5_CORE (web/build-flasher.sh builds beacon-c5 and beacon-c5-devkitc there; set PLATFORMIO_C5_CORE_DIR, or run PLATFORMIO_CORE_DIR=\"$C5_CORE\" pio pkg install -e beacon-c5 from firmware/)"
+fi
 if [ "$UNSIGNED_USB_ONLY" -eq 1 ]; then
     SIGNED_LABEL="NO (explicit USB-only cut)"
 elif [ -f "$KEY" ]; then

@@ -574,14 +574,21 @@ static bool otaRuntimeHealthy() {
 
 void setup() {
 #if ESP_ARDUINO_VERSION_MAJOR >= 3
-    // Arduino 3's HWCDC (env:beacon-c5) waits its TX timeout on EVERY write while an enumerated USB
-    // host is not reading (no monitor open, a data-capable car port), stalling the sink and NimBLE
-    // host tasks ~2 s per print. Zero wait drops output instead; the 4 KB ring keeps a reading
-    // monitor's boot report whole. Must precede begin().
+    // 4 KB TX ring on every Arduino 3 build. XIAO (HWCDC): keeps a reading monitor's boot report
+    // whole. DevKitC-1 (Serial = UART0, a HardwareSerial): the core's default TX ring is 0, and
+    // with no ring uart_write_bytes blocks the caller until every byte is in the 128-byte FIFO, so
+    // any burst past the FIFO (the boot report, clustered [ACAB] lines) would stall sinkTask and
+    // the NimBLE host task at 115200 baud. Must precede begin().
+    Serial.setTxBufferSize(4096);
+#if ARDUINO_USB_CDC_ON_BOOT
+    // HWCDC only (the XIAO boards set ARDUINO_USB_CDC_ON_BOOT; a HardwareSerial has no TX timeout
+    // and never waits on an absent reader): HWCDC waits its TX timeout on EVERY write while an
+    // enumerated USB host is not reading (no monitor open, a data-capable car port), stalling the
+    // sink and NimBLE host tasks ~2 s per print. Zero wait drops output instead.
     // ponytail: zero wait also drops a line while another task is mid-print or the ring is full, so
     // C5 serial capture is lossy; setTxTimeoutMs(1) buys whole lines for ~20 ms per unread print.
-    Serial.setTxBufferSize(4096);
     Serial.setTxTimeoutMs(0);
+#endif
 #endif
     Serial.begin(115200);
     delay(200);

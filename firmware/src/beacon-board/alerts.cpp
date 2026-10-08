@@ -91,8 +91,18 @@ uint8_t alertsVolume() { return gVolume; }
 // --- low-level output ---
 // ledOn honors the master flag, so "lights out" silences every LED path (heartbeat, alert
 // patterns, boot sweep) without touching each call site.
+#ifdef ACAB_LED_RGB
+// An addressable RGB LED (WS2812 class) on ACAB_LED_PIN, the ESP32-C5-DevKitC-1's only LED. The
+// Arduino 3 core's rgbLedWrite drives it over RMT; the active-low digitalWrite path below would
+// never light it. Dim crimson on, dark off: a status glow, not a torch. The 300 us pause after
+// each frame is the WS2812 latch gap (idle-low reset, 50 to 280 us by part): without it two
+// back-to-back writes, as in the drone motif's off-then-on, merge and the second never shows.
+static inline void ledOn()  { rgbLedWrite(ACAB_LED_PIN, gLedEnabled ? 16 : 0, 0, 0); delayMicroseconds(300); }
+static inline void ledOff() { rgbLedWrite(ACAB_LED_PIN, 0, 0, 0); delayMicroseconds(300); }
+#else
 static inline void ledOn()  { digitalWrite(ACAB_LED_PIN, gLedEnabled ? LOW : HIGH); }
 static inline void ledOff() { digitalWrite(ACAB_LED_PIN, HIGH); }
+#endif
 
 void alertsSetLedEnabled(bool on) {
     gLedEnabled = on;
@@ -274,7 +284,9 @@ static void alertTask(void*) {
 
 // Set up the LED pin, the LEDC PWM for the buzzer, and the alert task.
 void alertsInit() {
-    pinMode(ACAB_LED_PIN, OUTPUT);
+#ifndef ACAB_LED_RGB
+    pinMode(ACAB_LED_PIN, OUTPUT);   // rgbLedWrite claims its pin itself (RMT)
+#endif
     ledOff();
 
 #if ESP_ARDUINO_VERSION_MAJOR >= 3

@@ -5,16 +5,19 @@ browser, with nothing to install. It uses
 [ESP Web Tools](https://esphome.github.io/esp-web-tools/), which talks to the
 board over USB right from Chrome.
 
-This page hosts the public XIAO builds only, OUI-Spy and Mesh-Detect, so anyone
-building that hardware themselves has a no-toolchain way to flash it.
+This page hosts the DIY builds only: OUI-Spy and Mesh-Detect (XIAO ESP32-S3) and the two
+ESP32-C5 images (Seeed XIAO ESP32-C5, Espressif ESP32-C5-DevKitC-1), so anyone building that
+hardware themselves has a no-toolchain way to flash it.
 
 **The beacon you buy is not flashed from here.** It ships pre-flashed and takes its
 updates over Bluetooth from the app, and its USB recovery images are board-revision
 specific and live on their own pages:
 [rev-A](https://soyboi.tech/flash.html) and [rev-B](https://soyboi.tech/flash-revb.html).
-Both beacon products are chipFamily ESP32-S3, exactly like the XIAO builds here, so ESP
+Both beacon products are chipFamily ESP32-S3, exactly like the S3 builds here, so ESP
 Web Tools cannot refuse a wrong image for us. Routing people in copy is the only guard
-there is, which is why `index.html` opens with a caution box that names both pages.
+there is, which is why `index.html` opens with a caution box that names both pages. The two
+ESP32-C5 manifests say chipFamily ESP32-C5, so ESP Web Tools does refuse those on an S3 and the
+S3 images on a C5.
 
 ```
 web/
@@ -23,14 +26,23 @@ web/
 ├── manifest-oui-spy.json         # tells the flasher about the app-controlled OUI-Spy firmware
 ├── manifest-mesh-detect.json     # ...and the public Mesh-Detect firmware
 ├── manifest-mesh-detect-ch1.json # ...and the private-channel Mesh-Detect build
+├── manifest-beacon-c5.json       # ...and the Seeed XIAO ESP32-C5 build (USB-only, 5 GHz)
+├── manifest-beacon-c5-devkitc.json # ...and the ESP32-C5-DevKitC-1 build (untested here)
 ├── build-flasher.sh              # rebuilds the flashable firmware files
 ├── vendor/
 │   └── esp-web-tools/            # self-hosted ESP Web Tools 10.2.1 (see below)
 └── firmware/                     # per-part images, one set of four per build
     ├── acab-oui-spy-{bootloader,partitions,boot_app0,app}.bin
     ├── acab-mesh-detect-{bootloader,partitions,boot_app0,app}.bin
-    └── acab-mesh-detect-ch1-{bootloader,partitions,boot_app0,app}.bin
+    ├── acab-mesh-detect-ch1-{bootloader,partitions,boot_app0,app}.bin
+    ├── acab-beacon-c5-{bootloader,partitions,boot_app0,app}.bin
+    └── acab-beacon-c5-devkitc-{bootloader,partitions,boot_app0,app}.bin
 ```
+
+The two ESP32-C5 builds are USB-only: they have no entry in `firmware-latest.json`, so the apps
+never offer them an over-the-air image and an update means flashing again from this page. Their
+bootloader part goes to 0x2000, where the ESP32-C5 ROM looks for it; the other parts keep the S3
+offsets. The DevKitC-1 image is built for GitHub issue #2 on a board nobody here owns.
 
 ## One canonical privacy policy
 
@@ -104,6 +116,9 @@ It aborts rather than publish something it cannot stand behind:
 
 - **No OTA signing key.** An empty signature ships a manifest every board rejects in the
   field. Pass `--unsigned-usb-only` to build an explicitly unsigned, USB-only cut instead.
+- **No ESP32-C5 core dir.** The two C5 envs build with pioarduino in `~/.platformio-c5` (or
+  `PLATFORMIO_C5_CORE_DIR`), never in the shared core dir; without it the script refuses to stage
+  three of five images as if they were the whole set.
 - **The key is there but cannot sign it, or it is the wrong valid key.** A passphrase-protected or
   corrupt PEM, an unreadable file, an openssl that rejects the arguments, or a key whose derived
   public DER differs from `firmware/lib/acab_core/ota_pubkey.h`: the run prints the failure and
@@ -131,7 +146,8 @@ It aborts rather than publish something it cannot stand behind:
   success, which is the same silently-stale advertisement as the bullet above, so the stamper
   now dies at the file it could not write.
 
-That rebuilds all three firmware variants (oui-spy, mesh-detect, mesh-detect-ch1)
+That rebuilds all five DIY firmware variants (oui-spy, mesh-detect and mesh-detect-ch1 in the
+shared core dir; beacon-c5 and beacon-c5-devkitc in the ESP32-C5 core dir)
 and stages each as four separate part files flashed at their own offsets, kept
 apart so a web flash preserves your pairing. Build outputs are frozen and signed before the first
 served file changes. The GitHub Pages files plus the sibling site's app binaries and manifest are

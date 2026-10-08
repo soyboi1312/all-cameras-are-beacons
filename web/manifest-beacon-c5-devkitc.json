@@ -1,0 +1,17 @@
+{
+  "name": "ACAB beacon c5 devkitc (All Cameras Are Beacons), ESP32-C5-DevKitC-1",
+  "version": "2.2.0",
+  "funding_url": "",
+  "new_install_prompt_erase": true,
+  "builds": [
+    {
+      "chipFamily": "ESP32-C5",
+      "parts": [
+        { "path": "firmware/acab-beacon-c5-devkitc-bootloader.bin", "offset": 8192 },
+        { "path": "firmware/acab-beacon-c5-devkitc-partitions.bin", "offset": 32768 },
+        { "path": "firmware/acab-beacon-c5-devkitc-boot_app0.bin", "offset": 57344 },
+        { "path": "firmware/acab-beacon-c5-devkitc-app.bin", "offset": 65536 }
+      ]
+    }
+  ]
+}

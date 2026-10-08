@@ -9,8 +9,13 @@ For a beacon release, rev-A and rev-B are separate products at the artifact boun
 - Each image must carry its declared version and exact runtime label in raw `esp_app_desc` bytes.
 - The app manifest must contain both exact keys. A rev-B entry never reuses a rev-A URL.
 
-`beacon-c5`, the single-radio ESP32-C5 build, is not part of a release: `release.sh` has no
-profile for it, no stager builds it, and it has no browser flasher and no app manifest entry.
+The two ESP32-C5 builds, `beacon-c5` (Seeed XIAO ESP32-C5) and `beacon-c5-devkitc`
+(ESP32-C5-DevKitC-1), ride the `colonel-panic` profile as USB-only DIY images: `web/build-flasher.sh`
+builds them in their own core dir, stages their four parts and manifests next to the Colonel Panic
+ones, and the verifier checks them (C5 bootloader at 0x2000). They have NO app manifest entry and
+no OTA signature on purpose, so the apps never offer them an image; an update is a USB reflash
+from the DIY page. Adding them to `firmware-latest.json` is a separate decision that needs the C5
+OTA path bench-tested first.
 
 The firmware repository owns `stage_beacon_revb.py`, but the sibling `soyboi.tech` repository owns
 the browser page. That sibling must provide `flash-revb.html` with an install button that references
@@ -73,7 +78,8 @@ update it must reject.
   entries and app artifacts in the sibling repository's working tree with the next release's
   bytes, at the same published paths. `build-beacon-flasher.sh`, which runs
   `stage_beacon_revb.py` for rev-B, covers both beacon revisions and the nRF package;
-  `web/build-flasher.sh` covers the three Colonel Panic images and also writes them, with their
+  `web/build-flasher.sh` covers the three Colonel Panic images and the two ESP32-C5 images and
+  also writes them, with their
   other USB flash parts, to this repository's `web/firmware/`. A run that stops before a stager
   commits leaves that stager's files as they were, because staging follows preflight and tests
   and each stager restores every file it replaced when it fails. After a `--profile all` run
@@ -88,7 +94,8 @@ update it must reject.
   overwrites those bytes at the same URL and the manifest has no second entry to fall back to.
   Once a product's next version has been staged, its transition signature survives only in the
   sibling's `firmware-latest.json` history, and its transition image only in git history (the
-  sibling's, plus this repository's `web/firmware/` for the three Colonel Panic images) and at the
+  sibling's, plus this repository's `web/firmware/` for the three Colonel Panic images and the
+  two ESP32-C5 images) and at the
   still-served URLs, so retain a copy outside the publish path before staging if it must be
   retrievable afterwards.
 - A board that misses the window needs a USB flash. The revision-specific browser flashers are the
