@@ -57,7 +57,7 @@ tap a detection to see how it was matched, its confidence, and the evidence. **c
 
 ### what it can hear
 
-the board only listens on 2.4 GHz; there is no 5 GHz radio. it cannot see equipment that never makes a supported broadcast, such as wired-only or purely optical gear. Wi-Fi is scanned one channel at a time, so short transmissions can be missed, and Wi-Fi eco mode adds more gaps. OUI-Spy and Mesh-Detect split one radio's time between Wi-Fi and Bluetooth; the beacon's dedicated Bluetooth scanner runs the whole time during normal scanning.
+the released boards only listen on 2.4 GHz; none has a 5 GHz radio. it cannot see equipment that never makes a supported broadcast, such as wired-only or purely optical gear. Wi-Fi is scanned one channel at a time, so short transmissions can be missed, and Wi-Fi eco mode adds more gaps. OUI-Spy and Mesh-Detect split one radio's time between Wi-Fi and Bluetooth; the beacon's dedicated Bluetooth scanner runs the whole time during normal scanning.
 
 an empty screen means nothing supported was recognized while the board was listening. **it does not mean you are unwatched.** [radio coverage](docs/radio-coverage.md) has the channel schedule, duty cycles, and Wi-Fi eco tradeoffs.
 
@@ -128,6 +128,8 @@ pio device monitor -b 115200
 
 [platformio.ini](firmware/platformio.ini) defines the shipping, capture, and bench environments. capture builds log nearby identifiers and raw payloads, so keep those logs private and reflash shipping firmware when you are done. `odid-sim` is a Remote ID simulator for bench use only.
 
+`beacon-c5` is an unreleased build for one Seeed XIAO ESP32-C5, a single radio shared between Bluetooth and 2.4 and 5 GHz Wi-Fi (see [radio coverage](docs/radio-coverage.md#the-esp32-c5-build-unreleased)); no flasher or OTA image is published for it. its platform deletes the framework versions the other builds need from the PlatformIO core folder it runs in, so a plain `pio run` skips it. build it in its own core folder, from `firmware/`: `PLATFORMIO_CORE_DIR=~/.platformio-c5 pio run -e beacon-c5`.
+
 <a id="how-the-project-is-organized"></a>
 
 ## developer documentation
@@ -151,7 +153,7 @@ the companion nRF firmware and the beacon's hardware design files are not in thi
 
 ## project status
 
-the source tree is at **2.1.0** for the ESP32-S3 firmware and **2.1.1** for both apps. published releases can trail the source, so check the app's firmware update screen and the store listings for what is actually available.
+the source tree is at **2.2.0** for the ESP32 firmware and both apps. published releases can trail the source, so check the app's firmware update screen and the store listings for what is actually available.
 
 the detector, mesh path, apps, and update flows have all been tested on real hardware. field testing continues, especially for the capture candidates. the [OTA protocol](docs/ble-protocol.md#firmware-update-ota) documents the update order.
 
@@ -159,7 +161,7 @@ the detector, mesh path, apps, and update flows have all been tested on real har
 
 ## license
 
-the project's own **application and ESP32-S3 firmware code** in this repository is licensed under [Apache-2.0](LICENSE). bundled third-party components keep their own licenses; see [CREDITS.md](CREDITS.md) and their license files. keep the applicable [LICENSE](LICENSE), [NOTICE](NOTICE), and third-party notices with any distribution.
+the project's own **application and ESP32 firmware code** (the ESP32-S3 builds and the unreleased ESP32-C5 build) in this repository is licensed under [Apache-2.0](LICENSE). bundled third-party components keep their own licenses; see [CREDITS.md](CREDITS.md) and their license files. keep the applicable [LICENSE](LICENSE), [NOTICE](NOTICE), and third-party notices with any distribution.
 
 the **companion nRF firmware, hardware design, PCB layout, enclosure, manufacturing files, product name, and trademarks are not covered** by that license unless explicitly stated otherwise.
 

@@ -4,7 +4,7 @@ beacons can recognize a device only when it receives a supported broadcast. matc
 
 ## Wi-Fi coverage
 
-the ESP32-S3 listens on **2.4 GHz only**. it cannot hear 5 GHz traffic, and it listens to one Wi-Fi channel at a time.
+every released board, the beacon included, hears Wi-Fi through an ESP32-S3, which listens on **2.4 GHz only**. it cannot hear 5 GHz traffic, and it listens to one Wi-Fi channel at a time.
 
 all shipping boards use the same channel-hopping sequence. it returns to channel 6 between visits to the other channels to favor brief Wi-Fi Remote ID broadcasts:
 
@@ -22,8 +22,8 @@ the schedule and eco behavior are defined by `WIFI_HOP_SEQ`, `wifiHopTask`, and 
 ### the 5 GHz gap (measured, open)
 
 the 2.4 GHz limit above is a real coverage hole, and it has been measured rather than assumed. a
-dual-band ESP32-C5 bench sniffer (`firmware/tools/c5-sniff`) ran a ~27 minute capture hopping both
-bands (`firmware/tools/detection logs/c5-lvt.log`); neither path is in the public repository. the
+dual-band ESP32-C5 bench sniffer (a local bench tool) ran a ~27 minute capture hopping both bands
+(the c5-lvt capture); neither the tool nor its log is in the public repository. the
 sniffer's `[diag]` counters are cumulative since boot, and the first `[diag]` line in the file, two
 seconds after it opened, read up=297s, so the frame columns below are in-window deltas: the last
 in-capture `[diag]` line (up=1901s) minus that first one.
@@ -174,9 +174,48 @@ two findings:
 closing this needs a dual-band receiver. the ESP32-S3 has no 5 GHz PHY, so it cannot become one,
 which makes this a hardware question rather than a firmware one. the C5 sniffer already runs a
 netcam OUI list generated from `netcam_signatures.h`, though the copy lags the header: all 180 of
-its blocks are in `CAMERA_VENDOR_OUI`, which now holds 194, and it matches any of the three
-address fields rather than the board's source-address rule. what is not settled is whether a second
-radio belongs in the product, in a companion, or stays a bench tool.
+its blocks are in `CAMERA_VENDOR_OUI`, which now holds 197, and it matches any of the three
+address fields rather than the board's source-address rule. the unreleased
+[ESP32-C5 build](#the-esp32-c5-build-unreleased) below is such a receiver: it runs the board's own
+detectors, that source-address rule included, on both bands. whether it ships is not settled.
+
+### the ESP32-C5 build (unreleased)
+
+`beacon-c5` runs the board firmware on one Seeed XIAO ESP32-C5, with one radio time-shared between
+Bluetooth and 2.4 and 5 GHz Wi-Fi and no nRF52840. its Bluetooth scan uses the same 67/131 window
+as OUI-Spy (see below). no flasher or OTA image is published for it.
+
+after every full 2.4 GHz sweep it dwells once on each of nine non-DFS 5 GHz channels, 36, 40,
+44, 48, 149, 153, 157, 161 and 165, so a sweep has 33 slots: channel 6 gets 12 (about 36 percent),
+every other channel gets 1 (about 3 percent), and 5 GHz gets 9 in all (about 27 percent). it never
+visits the DFS channels 52 to 144. the pass is `WIFI_HOP_SEQ_5G` and `ACAB_WIFI_5G_EVERY` in
+`wifiHopTask`.
+
+a local bench tool measured the trade-offs on 2026-10-04, on gate firmware built with ESP-IDF 5.5.0
+that uses this build's scan and hop settings but is not this image, at one home location for
+2 hours and on a drive of about 90 minutes:
+
+- with Bluetooth scanning on, 5 GHz kept 0.44 of its scan-off frame rate and 2.4 GHz kept 0.51.
+  the gate's pass rule was at least half the 2.4 GHz figure.
+- the 5 GHz pass cost the Bluetooth scan about 2 percent of adverts (93.9 against 96.0 per second)
+  and 2.4 GHz Wi-Fi about 30 percent of its frames, which is less listening time for Flock Wi-Fi
+  and Wi-Fi Remote ID.
+- it was as quick as OUI-Spy to first see a new Bluetooth device: the median was 0.2 s earlier on
+  the bench (42 devices both saw) and 2.8 s earlier on the drive, where OUI-Spy's Desert-mode rate
+  cap may have dropped some of its first sightings.
+
+on beacon-c5 itself (two builds of 2026-10-05, at home) it heard 5 GHz access points on channels 36,
+44, 48 and 149 in Desert mode and ran for an hour without a crash or a dropped phone link.
+
+the **5 GHz Wi-Fi** toggle in the Beacon tab's Scan radios screen turns the pass off. it appears
+only while Wi-Fi is on and only for a board that reports it, which no ESP32-S3 build does. the board
+stores it and it starts on; turning it off skips the 5 GHz pass from the next channel.
+
+every build, the ESP32-S3 ones included, tags each Wi-Fi detection with the channel the board was
+tuned to: the **Wi-Fi channel** detail row (for example `149 · 5 GHz`) and the `wifi_channel` and
+`wifi_band_ghz` CSV columns. the band is exact, but on 2.4 GHz a frame sent on an overlapping
+channel also decodes, so the number can be a few channels off. records replayed from the offline
+log carry no channel, and a live record too long for a small-MTU phone link drops it first.
 
 ## Bluetooth coverage
 

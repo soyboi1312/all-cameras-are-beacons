@@ -86,9 +86,9 @@ only with independent Flock-specific evidence.
   SSID ending case-insensitively in `-FALCON` as an ALPR camera at conf 85 when the frame attested
   its own SSID, or conf 72 on the probe-borne half. Conf 85 sat above the field-validated Axon OUI
   at 75, and the suffix anchor keeps `Atlanta-Falcons` out but not `NET-FALCON` or a renamed router.
-  The evidence was circular: those two strings are labels this firmware writes into the `ssid=`
-  field of its own `[wifi]` diagnostic line, and only after `falconOui()` has already matched, so a
-  capture containing them is our OUI table quoting itself. Two independent confirmations. A data
+  The evidence was circular: those two strings were labels the capture build wrote into the `ssid=`
+  field of its own `[wifi]` diagnostic line, and only after its Falcon-OUI match, so a capture
+  containing them is our OUI table quoting itself. Two independent confirmations. A data
   frame carries no SSID element at all, so `DATA-FALCON` could not have come off the air. And the
   one capture in this repo holding the string (`docs/captures/lvt-2026-08-03-summary.txt`) shows
   `ssid="PROBE-FALCON"` followed immediately by a conf-72 `Falcon probe (OUI)` verdict, which is the
@@ -97,8 +97,10 @@ only with independent Flock-specific evidence.
   the same `ext=1` gate as an unvalidated OUI row (`FLOCK_SSID_FALCON_SUFFIX_EXT`, read by
   `falconSsidSuffix()`), which is compile-time false with no runtime toggle, so both the conf-85 and
   the conf-72 half fold away in every build and no shipped firmware reports a `-FALCON` name as
-  anything. The probe label is now spelled `fwnote:falcon-oui-probe`, and the data-frame line is a
-  `FAL-DATA n=...` counter record, so the round trip cannot be made again. The `Flock-` prefix rules
+  anything. Capture builds now write no Falcon label at all (2.2.0): a Falcon-OUI probe logs as
+  `PROBE:<ssid>` with the SSID the frame carried, like every other prober, so the round trip cannot
+  be made again. Older capture logs carry the interim `fwnote:falcon-oui-probe`, `FAL-DATA` and
+  `FAL-MGMT` labels, which are firmware notes, not SSIDs. The `Flock-` prefix rules
   are untouched. To ship it: a capture of a real beacon (`0x8`) or probe-response (`0x5`) SSID IE
   ending in `-FALCON`, from a unit confirmed to be a Falcon by something other than this table.
 - **Watchlist (diag only):** the BLE name `Pigvision` is a candidate Flock signature carried ONLY in
@@ -198,8 +200,8 @@ spotting), not RF. src: DHS ALPR Market Survey (2025); EFF Street-Level Surveill
 
 **Motorola Solutions OUIs** are IEEE-confirmed, but they are the company's whole corporate
 blocks: they cover any Motorola Solutions WiFi/BLE device (two-way radios, in-car routers,
-body-cam docks, APs, infrastructure), NOT just ALPR, and NOT their LMR police radios
-(those are 700/800 MHz, off this board's 2.4 GHz band). Their dominant 2.4 GHz product
+body-cam docks, APs, infrastructure), NOT just ALPR, and NOT their LMR radios
+(those are 700/800 MHz, below every band this board hears). Their dominant 2.4 GHz product
 in the wild is the MOTOTRBO-class two-way radio carried by retail, school, and venue
 staff, so a hit usually is NOT a camera of any kind. As shipped, the match reports under
 the body-cam type (the apps have no separate Motorola category), with the detail string
@@ -367,7 +369,7 @@ What this shows, and what it does not:
 > status, NVS-persisted). Classification needs BOTH switches: body cams on AND motorola on.
 > Turning the category off silences every body-cam signature including this one; turning
 > only `motorola` off leaves the conf-90 Axon `BWCDEVICE` tag and Utility BodyWorn running.
-> Desert mode overrides both, as it does for every detector. It exists because the two used
+> Desert mode overrides both, as it does for every detector except the network-camera opt-in and the drone OUI fallback. It exists because the two used
 > to share one switch, so quieting this broad match cost the user the best signature on the
 > board. Since the 2026-07-23 airport ground truth (all 27 Motorola WiFi OUI hits confirmed
 > NOT body cams), the sub-toggle boots **off** on every build. oui-spy, beacon-board, and
@@ -430,9 +432,11 @@ the OUI up before believing a cluster.
 never mentions WiFi, Bluetooth, or a local hotspot. This is the recording-is-not-transmitting case
 from the top of this file, now measured rather than inferred.
 
-**The one gap left.** We sweep 2.4 GHz channels 1-13 only (`WIFI_HOP_SEQ`). A 5 GHz-only service AP
-inside the enclosure would be invisible to us regardless. Settling that needs either a phone WiFi
-analyser alongside the board, or the FCC ID off the unit's plate, which names every radio in it.
+**The one gap left.** That capture swept 2.4 GHz channels 1-13 only (`WIFI_HOP_SEQ`, still the whole
+hop on every S3 build), so a 5 GHz-only service AP inside the enclosure would have been invisible to
+it regardless. Settling that needs a dual-band receiver alongside the board (a phone WiFi analyser,
+or the ESP32-C5 build `env:beacon-c5`, whose `WIFI_HOP_SEQ_5G` pass hears only 5 GHz channels
+36-48 and 149-165), or the FCC ID off the unit's plate, which names every radio in it.
 Neither changes the practical answer: **there is nothing here to add a row for.**
 
 ### Considered and REJECTED: consumer cellular GPS vehicle trackers (2026-08-05, registry pass)
@@ -542,6 +546,29 @@ are not WUUK matches. Network-camera detection remains off by default, with the 
 visually validated OUI tier of 75. No new SSID rule is added; the existing Arlo base-station
 SSID rules remain at `NETCAM_SSID_CONFIDENCE` (88).
 
+### Completed vendor sets (2026-10-03)
+
+These 4 assignments complete two vendors: SkyBell already had `D0:C1:93`, and Canary is a new
+label. Each was checked against Wireshark's IEEE-derived
+[`manuf` file](https://www.wireshark.org/download/automated/data/manuf), because
+standards-oui.ieee.org refused scripted downloads that day.
+
+| Vendor label | Exact IEEE registrant | Registered prefixes |
+|---|---|---|
+| SkyBell | SkyBell Technologies Inc. | `68:F0:D0:00:00:00/24`, `9C:54:DA:00:00:00/24` |
+| Canary | Canary Connect, Inc. | `D8:42:E2:00:00:00/24`, `7C:70:BC:50:00:00/28` |
+
+Counts below deduplicate full WiFi MAC addresses across `firmware/tools/detection logs/` and
+`docs/captures/`. They are observed addresses, not visual confirmations.
+
+| Vendor | Distinct WiFi addresses | Product evidence and limits |
+|---|---:|---|
+| SkyBell (new blocks) | 3 | Both blocks broadcast SkyBell-named SSIDs: `68:F0:D0:07:DB:7A` sent `Skybell_A1BC331571` (`drive_home_9-4.log`) and `9C:54:DA:02:F0:13` sent `Skybell_938524580` (`los_angeles.log`). That ties "SkyBell Technologies Inc." to the same doorbell company as `SKYBELL, INC`. The third address, `9C:54:DA:1F:2B:A8`, sent only probe requests (`913.log`). |
+| Canary | 1 | [Canary sells three cameras](https://www.security.org/security-cameras/canary/): Pro, View, and Flex. The Pro adds a siren and air-quality sensors but is still a camera. `D8:42:E2:01:FA:8A` sent one probe request (`sep202026.log`). |
+
+All 4 entries keep `validated=0` and `NETCAM_OUI_CONFIDENCE` (65). The Canary MA-M row lives
+in `CAMERA_VENDOR_PREFIX` and keeps all 28 registered bits.
+
 ### ADMITTED 2026-08-05: Arlo, and the base-station SSID rule
 
 The first netcam vendor admitted on **our own field capture** rather than on a registry pull.
@@ -563,7 +590,8 @@ The first netcam vendor admitted on **our own field capture** rather than on a r
 - **The label is "Arlo base station", not "camera".** A hub serves cameras and has no other
   purpose, but the SSID does not prove a lens is pointed at anyone.
 - **Stated misses**, so nobody reads this as complete: 5GHz-only installs (Ultra on a VMB5000 hub,
-  dual-band Pro 5S/6), the LTE-only Arlo Go 1st gen, and all pre-spinoff hardware by OUI. The
+  dual-band Pro 5S/6), which no S3 build hears (the ESP32-C5 build `env:beacon-c5` can, on
+  channels 36-48 or 149-165), the LTE-only Arlo Go 1st gen, and all pre-spinoff hardware by OUI. The
   discontinued Arlo Security Light talks BLE to a bridge, so this match stays **WiFi-only** or a
   porch light gets labelled a camera.
 
@@ -604,9 +632,13 @@ flagged by its MAC OUI. These are each vendor's OWN corporate IEEE blocks, not c
 module silicon, so they pass the no-shared-silicon rule. Matched only when the RID decode
 finds nothing, at low confidence (60), on either radio, and the detail string names the
 vendor. These makers randomise their MAC in some Wi-Fi modes, so treat an OUI hit as
-"vendor gear nearby", not a guaranteed airborne drone. `90:3A:E6` is also the OUI the
-OpenDroneID Wi-Fi beacon vendor IE rides, but that is an information-element match decoded
-as RID first, not a transmitter-MAC match, so it does not double-count.
+"vendor gear nearby", not a guaranteed airborne drone. It runs only when the user turns it on (and drones are on);
+Desert mode does not force it. On Wi-Fi the fallback fires only on
+access-point frames (beacons, probe responses) and NAN Remote ID frames, never on a client's
+probes or association frames: every Parrot hit in the field logs was a client probing for a
+home network, while a captured ANAFI beacons. `90:3A:E6` (Parrot SA) is also the OUI the
+French DRI beacon vendor IE borrows, but that is an information-element match decoded as RID
+first, not a transmitter-MAC match, so it does not double-count.
 
 Deliberately NOT matched: Beijing Autelan (`4C:48:DA` / `00:1F:64`, a WLAN vendor, not
 Autel Robotics the drone maker). The WatchGuard exclusion is a body-cam question, not a
@@ -614,7 +646,7 @@ drone one, so it lives in the body-cam section below.
 
 | Vendor | Match on | Value | Source |
 |---|---|---|---|
-| DJI | MAC OUI (BLE, or WiFi addr2), no RID decoded | `60:60:1F` `34:D2:62` `48:1C:B9` `E4:7A:2C` `58:B8:58` `04:A8:5A` `8C:58:23` `0C:9A:E6` `88:29:85` `4C:43:F6` plus DJI Baiwang `9C:5A:8A` `EC:72:F7` `34:91:F0` | IEEE (SZ DJI Technology and wholly owned UAV manufacturer DJI Baiwang Technology) |
+| DJI | MAC OUI (BLE, or WiFi addr2), no RID decoded | `60:60:1F` `34:D2:62` `48:1C:B9` `E4:7A:2C` `58:B8:58` `04:A8:5A` `8C:58:23` `0C:9A:E6` `88:29:85` `4C:43:F6` plus DJI Baiwang `9C:5A:8A` `EC:72:F7` `34:91:F0` `C8:A1:62` | IEEE (SZ DJI Technology and wholly owned UAV manufacturer DJI Baiwang Technology) |
 | Parrot | MAC OUI, no RID decoded | `00:12:1C` `00:26:7E` `90:03:B7` `90:3A:E6` `A0:14:3D` | IEEE (Parrot SA) |
 | Skydio | MAC OUI, no RID decoded | `38:1D:14` | IEEE (Skydio Inc) |
 | Autel | MAC OUI, no RID decoded | MA-M `EC:5B:CD:E` | IEEE (Autel Robotics USA LLC) |
@@ -798,7 +830,8 @@ MACs on the block:
 - **What 2.1.0 ships.** `WATCHGUARD_VIDEO_OUI` in `bodycam_vendor_signatures.h`, matched by
   `police_detect.cpp` on BLE and on WiFi management frames (transmitter, then BSSID), the same
   path as the Motorola blocks. Same gates: the `motorola` sub-toggle (opt-in, default off on every
-  board) and the body-cam category; Desert mode forces it, as it forces every detector. Same
+  board) and the body-cam category; Desert mode forces it, as it forces every detector except
+  the network-camera opt-in and the drone OUI fallback. Same
   confidence, 45, so a hit renders as amber "weak match, verify". Its own detail string,
   `"WatchGuard Video OUI"`, which both apps resolve to the maker "WatchGuard Video" with their own
   explainer; an app that predates the string shows the generic body-cam fallback. Host test:
@@ -1100,6 +1133,7 @@ namespace, so a device that advertises no manufacturer data at all can still be 
 - OUI 00:09:BC / 00:16:ED (Utility, Inc.): https://maclookup.app/macaddress/0009BC
 - OpenDroneID core library (Apache-2.0): https://github.com/opendroneid/opendroneid-core-c
 - DJI OUI blocks (SZ DJI Technology Co.,Ltd and DJI Baiwang Technology): https://standards-oui.ieee.org/oui/oui.csv
+- DJI Baiwang C8:A1:62, listed 2026-10-02 and not yet in Wireshark's manuf on 2026-10-03: https://api.maclookup.app/v2/macs/C8A162
 - Parrot OUI blocks (Parrot SA): https://maclookup.app/vendors/parrot-sa
 - Skydio OUI block (Skydio, Inc.): https://maclookup.app/vendors/skydio-inc
 - Autel Robotics OUI blocks (Autel Robotics Co., Ltd.): https://maclookup.app/vendors/autel-robotics-co-ltd
