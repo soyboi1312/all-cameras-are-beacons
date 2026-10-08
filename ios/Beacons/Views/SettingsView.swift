@@ -540,6 +540,7 @@ struct DeviceView: View {
     @State private var bleOn = true
     @State private var wifiOn = true
     @State private var wifiEco = 0             // WiFi eco sleep seconds (0/3/7/15); battery SKU only
+    @State private var wifi5 = true            // 5 GHz pass in the Wi-Fi hop; beacon-c5 only ("wifi5")
     @State private var bufferOn = false
     @State private var lightsOut = false       // "lights out": board LED fully dark
     @State private var desertOn = false
@@ -615,7 +616,7 @@ struct DeviceView: View {
 
     private enum PendingControl: Hashable {
         case volume, flock, drone, droneOui, bodyCam, motorola, tracker, glasses, netcam
-        case ble, wifi, wifiEco, buffer, led, desert
+        case ble, wifi, wifiEco, wifi5, buffer, led, desert
 
         var label: String {
             switch self {
@@ -631,6 +632,7 @@ struct DeviceView: View {
             case .ble: return "Bluetooth scanning"
             case .wifi: return "Wi-Fi scanning"
             case .wifiEco: return "Wi-Fi eco mode"
+            case .wifi5: return "5 GHz Wi-Fi"
             case .buffer: return "offline buffer"
             case .led: return "board LED"
             case .desert: return "Desert mode"
@@ -1244,6 +1246,8 @@ struct DeviceView: View {
         if pending.contains(.ble) { if s.ble == bleOn { confirm(.ble) } } else { bleOn = s.ble }
         if pending.contains(.wifi) { if s.wifi == wifiOn { confirm(.wifi) } } else { wifiOn = s.wifi }
         if pending.contains(.wifiEco) { if s.wifiEco == wifiEco { confirm(.wifiEco) } } else { wifiEco = s.wifiEco }
+        // nil = no 5 GHz radio (row hidden): keep the last value rather than invent one.
+        if pending.contains(.wifi5) { if s.wifi5 == wifi5 { confirm(.wifi5) } } else if let w = s.wifi5 { wifi5 = w }
     }
 
     /// Arm a fresh deadline for one optimistic board write. The UUID makes an older deadline a
@@ -1289,6 +1293,7 @@ struct DeviceView: View {
         case .ble:       if let s { bleOn = s.ble }
         case .wifi:      if let s { wifiOn = s.wifi }
         case .wifiEco:   if let s { wifiEco = s.wifiEco }
+        case .wifi5:     if let w = s?.wifi5 { wifi5 = w }
         case .buffer:    if let s { bufferOn = s.bufferingOn }
         case .led:       if let s { lightsOut = !s.ledEnabled }
         case .desert:    if let s { desertOn = s.desertMode }
@@ -2298,6 +2303,20 @@ struct DeviceView: View {
                 get: { wifiOn }, set: {
                     wifiOn = $0; pending.insert(.wifi); awaitConfirmation(.wifi); ble.setWiFiScan($0)
                 }))
+            // 5 GHz pass: only when the status carries "wifi5" (beacon-c5) and Wi-Fi is on.
+            // TWIN: Android DeviceScreen.kt radiosContent; the strings are byte-identical.
+            if wifiOn, ble.status?.wifi5 != nil {
+                Divider().overlay(ACABTheme.line)
+                VStack(alignment: .leading, spacing: 8) {
+                    radioToggle("5 GHz Wi-Fi", "9 channels \u{00B7} 36 to 165", isOn: Binding(
+                        get: { wifi5 }, set: {
+                            wifi5 = $0; pending.insert(.wifi5); awaitConfirmation(.wifi5); ble.setWifi5($0)
+                        }))
+                    Text("this board shares one radio between bands. with 5 GHz on, each Wi-Fi sweep also listens on nine 5 GHz channels, so 2.4 GHz gets about 30% less listening time. Bluetooth is nearly unaffected.")
+                        .font(ACABTheme.font(.footnote)).foregroundStyle(ACABTheme.dim)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+            }
             // Eco: only on battery boards (the board reports "bat" only when it has the sense
             // divider), and only meaningful while Wi-Fi is on. Duty-cycles the Wi-Fi RX to stretch
             // runtime; Bluetooth is untouched. Honest about the tradeoff right below the control.

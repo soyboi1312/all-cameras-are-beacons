@@ -383,7 +383,8 @@ fun ContributeContent(ble: AcabBleManager, vm: ContributionViewModel) {
                         "$liveCount observation${if (liveCount == 1) "" else "s"} from ${clockTime(vm.startMs)} to ${clockTime(vm.stopMs)}, " +
                             "as CSV: MAC addresses, device type and maker, signal strength, timestamps, " +
                             "match evidence and confidence, sighting counts, company and UAS identifiers, " +
-                            "drone telemetry (altitude, speed, heading, height above ground), and Remote ID status.\n" +
+                            "drone telemetry (altitude, speed, heading, height above ground), Remote ID status, and the " +
+                            "Wi-Fi channel and band.\n" +
                             (if (vm.includeObserverLocation) "Your location: INCLUDED.\n" else "Your location: removed.\n") +
                             "Drone aircraft coordinates: ${if (vm.includeDroneLocation) "included" else "removed"}.\n" +
                             "Drone operator position: ${if (vm.includeOperatorLocation) "included" else "removed"}.\n" +

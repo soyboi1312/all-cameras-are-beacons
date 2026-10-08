@@ -1,9 +1,10 @@
 import Foundation
 
 /// Which product a board is, for COPY ONLY: the beacon (this project's own dual-radio board, the
-/// premium device), the Colonel Panic OUI-Spy, or the Colonel Panic Mesh-Detect. The app names the
-/// hardware in the owner's hand ("your OUI-Spy is listening") instead of calling every board a
-/// beacon. Nothing about pairing, OTA, detection or the scan filter reads this.
+/// premium device, and its single-radio "beacon c5" build), the Colonel Panic OUI-Spy, or the
+/// Colonel Panic Mesh-Detect. The app names the hardware in the owner's hand ("your OUI-Spy is
+/// listening") instead of calling every board a beacon. Nothing about pairing, OTA, detection or
+/// the scan filter reads this.
 ///
 /// Unknown is `nil`, never a case: every copy function takes `BoardKind?` and reads nil exactly as
 /// `.beacon`, so a fresh install, a never-connected phone, an old remembered record and sample data
@@ -91,12 +92,13 @@ enum BoardKind: String, CaseIterable, Equatable {
     }
 
     /// AUTHORITATIVE: the kind from the connected board's Status `fw` label
-    /// (DeviceStatus.firmwareLabel). "beacon board" covers rev-A, "beacon board rev-B" and the
-    /// capture builds; "mesh-detect" covers every channel build ("mesh-detect-ACAB-ch1"). Anything
-    /// else, the empty label included, is unknown. TWIN: Android BoardKind.fromFirmwareLabel.
+    /// (DeviceStatus.firmwareLabel). "beacon" covers rev-A ("beacon board"), "beacon board rev-B",
+    /// the capture builds and "beacon c5"; "mesh-detect" covers every channel build
+    /// ("mesh-detect-ACAB-ch1"). Anything else, the empty label included, is unknown. TWIN: Android
+    /// BoardKind.fromFirmwareLabel.
     static func fromFirmwareLabel(_ label: String?) -> BoardKind? {
         guard let label else { return nil }
-        if label.hasPrefix("beacon board") { return .beacon }
+        if label.hasPrefix("beacon") { return .beacon }
         if label.hasPrefix("ACAB-ouispy") { return .ouiSpy }
         if label.hasPrefix("mesh-detect") { return .meshDetect }
         return nil

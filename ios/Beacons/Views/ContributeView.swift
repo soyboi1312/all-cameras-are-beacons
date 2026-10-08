@@ -143,7 +143,8 @@ struct ContributeView: View {
         return "\(n) observation\(n == 1 ? "" : "s") from \(Self.clockTime(startMs)) to \(Self.clockTime(stopMs)), "
              + "as CSV: MAC addresses, device type and maker, signal strength, timestamps, match "
              + "evidence and confidence, sighting counts, company and UAS identifiers, drone "
-             + "telemetry (altitude, speed, heading, height above ground), and Remote ID status.\n"
+             + "telemetry (altitude, speed, heading, height above ground), Remote ID status, and the "
+             + "Wi-Fi channel and band.\n"
              + obs + "\n" + dro + "\n" + op + pho
              + "\n\nNothing is shared automatically. Diagnostic captures may contain identifiers from "
              + "nearby devices. Review and export only what you choose. This opens a pre-addressed "

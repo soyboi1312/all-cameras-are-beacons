@@ -173,9 +173,8 @@ object DeviceNames {
 val Detection.customName: String? get() = DeviceNames.label(mac)
 
 /** Best label we have: the user's own name, else advertised name, else UAS serial, else the
- *  manufacturer the device broadcast, else device class. Feeds the log row, the ignore list, and
- *  CSV export. Mirrors iOS Detection.displayName exactly so the same record leads with the same
- *  label on both platforms.
+ *  manufacturer the device broadcast, else device class. Mirrors iOS Detection.displayName
+ *  exactly so the same record leads with the same label on both platforms.
  *
  *  The `maker` rung is why a log full of network cameras no longer reads "Network camera" twelve
  *  times beside a glyph that already said so. It sits BELOW the UAS serial (a drone's serial is a

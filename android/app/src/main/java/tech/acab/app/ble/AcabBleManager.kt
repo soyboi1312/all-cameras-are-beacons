@@ -64,6 +64,7 @@ import tech.acab.app.model.DeviceStatus
 import tech.acab.app.model.DeviceType
 import tech.acab.app.model.TimeBasis
 import tech.acab.app.model.companyIdHex
+import tech.acab.app.model.wifiBandGhz
 import tech.acab.app.model.validCoord
 import tech.acab.app.model.displayName
 import tech.acab.app.model.historyBeginFromOrAbsent
@@ -122,6 +123,16 @@ internal fun historyEndDisposition(
 }
 
 internal fun historyEnvelopeAuthorizesCheckpoint(beginSeen: Boolean): Boolean = beginSeen
+
+/** May a replayed record ([replayStamp]) become the store row whose last-seen is [rowLastSeen]?
+ *  Only when it is not older. A live row carries fields a replay never has (cid, det, ch: the
+ *  board's StoredDet has no room for them), so an older replay filed over a newer live row
+ *  blanked them and this phone's CSV disagreed with the other app's for the same session. An
+ *  approx record's pseudo stamp sits below every real clock reading, so this also keeps it off
+ *  any live row. TWIN: iOS `replayReplacesRow(stamp:rowLastSeen:)` in BLEManager.swift, the
+ *  same rule; each HistoryReplayPolicy suite pins it. */
+internal fun replayReplacesRow(replayStamp: Long, rowLastSeen: Long?): Boolean =
+    rowLastSeen == null || replayStamp >= rowLastSeen
 
 internal const val DURABLE_BUFFER_KEY_BYTES = 32
 
@@ -1734,9 +1745,10 @@ internal val DEMO_SAMPLE_ROWS: List<String> = listOf(
     // tile and NETWORK CAM map chip both show up on the tour. The MAC is a real Hikvision
     // block, so this row demonstrates the maker-led title end to end. Wire values are the
     // firmware's own: s=1 is SRC_WIFI (netcamClassifyWiFi never emits a BLE source) and
-    // c=65 is NETCAM_OUI_CONFIDENCE, the registry tier a validated=0 block lands on; the
-    // twin row in iOS demoSampleRows() carries the same values.
-    """{"t":10,"s":1,"meth":1,"c":65,"mac":"44:19:B6:22:0A:5C","rssi":-70,"det":"Hikvision on wifi","lat":37.7788,"lon":-122.4183,"n":2,"new":true}""",
+    // c=65 is NETCAM_OUI_CONFIDENCE, the registry tier a validated=0 block lands on; ch=6
+    // (live WiFi rows carry one; the S3 sample board hears 2.4 GHz only); the twin row in
+    // iOS demoSampleRows() carries the same values.
+    """{"t":10,"s":1,"meth":1,"c":65,"mac":"44:19:B6:22:0A:5C","rssi":-70,"det":"Hikvision on wifi","ch":6,"lat":37.7788,"lon":-122.4183,"n":2,"new":true}""",
 )
 
 internal enum class ManagedListEditMode { PREVIEW_ONLY, LOADING_FAIL_CLOSED, DURABLE }
@@ -2025,15 +2037,60 @@ data class WatchedDevice(val mac: String, val label: String)
  *  iOS twin: ContributionCsv.detectionColumns, which BLEManager.buildCSV joins for its header the
  *  same way detectionsCsv does here.
  *
- *  `maker` is appended LAST so an existing parser keyed on column order still reads every field it
- *  knew about. */
+ *  `maker`, `wifi_channel`, `wifi_band_ghz` went on the END so a column-order parser still reads
+ *  every field it knew. WiFi columns are not locations: ContributionCsv.kt never blanks them. */
 internal val DETECTION_CSV_COLUMNS: List<String> = listOf(
     "detected_at", "time_basis", "time_precision_s", "type", "mac", "rssi",
     "source", "matched_on", "confidence", "sightings", "approx_lat", "approx_lon",
     "company_id", "uas_id", "drone_lat", "drone_lon", "altitude_m", "speed_ms",
     "heading_deg", "height_agl_m", "operator_lat", "operator_lon", "operator_alt_m",
-    "rid_status", "maker",
+    "rid_status", "maker", "wifi_channel", "wifi_band_ghz",
 )
+
+/** A detection row's wifi_channel and wifi_band_ghz cells, "" when absent (BLE, replayed rows).
+ *  Top-level so a JVM test needs no manager. TWIN: iOS BLEManager.buildCSV's last two cells. */
+internal fun detectionCsvWifiCells(channel: Int?): List<String> =
+    listOf(channel?.toString() ?: "", wifiBandGhz(channel) ?: "")
+
+/** Rebuild the compact wire JSON for a filed detection (enough to reload it). Top-level so
+ *  WifiChannelExportTest round-trips it without a manager. */
+internal fun detectionToJson(d: Detection): JSONObject = JSONObject().apply {
+    put("t", d.type.raw); put("s", d.source); put("meth", d.method); put("c", d.confidence)
+    put("mac", d.mac); put("rssi", d.rssi); put("n", d.count)
+    d.name?.let { put("name", it) }
+    d.rid?.let { put("id", it) }
+    d.detail?.let { put("det", it) }
+    d.companyId?.let { put("cid", it) }
+    d.wifiChannel?.let { put("ch", it) }
+    d.lat?.let { put("lat", it) }
+    d.lon?.let { put("lon", it) }
+    d.pilotLat?.let { put("plat", it) }
+    d.pilotLon?.let { put("plon", it) }
+    d.altitude?.let { put("alt", it) }
+    // The rest of the drone telemetry the board delivered. Dropping these left a reloaded
+    // drone dossier with speed/heading/AGL/pilot-alt/status blank for data we already had.
+    d.speedH?.let { put("spd", it) }
+    d.speedV?.let { put("vspd", it) }
+    d.heading?.let { put("hdg", it) }
+    d.heightAGL?.let { put("hgt", it) }
+    d.pilotAlt?.let { put("palt", it) }
+    d.ridStatus?.let { put("sta", it) }
+    // Fix age, or a coordinate the board stamped from a two-hour-old fix reloads with no "as
+    // of" qualifier at all (locationAgeDetail needs gage) and reads as a fix taken on the spot.
+    d.gpsAgeSec?.let { put("gage", it) }
+    // approx says the record has no real capture time, only the synthetic seq-derived sort key
+    // in _fs. Without the flag the CSV stops blanking the column and exports every buffered
+    // record as detected_at 2001-09-09, a confident fabricated timestamp in a file people hand
+    // to other people as evidence. _fs round-trips the ordering key, so seq/at stay unpersisted.
+    if (d.approx) put("approx", true)
+    // Persist the offline-record flag so a reloaded black-box record keeps its "OFFLINE" chip.
+    if (d.offline) put("offline", true)
+    // Which boot session captured the record, and how far into it. boot is what the reloaded
+    // log rebuilds its per-boot anchor bounds from, so a later drain can still bracket against
+    // boots this session anchored; ms is the capture's place within its own boot.
+    if (d.boot > 0L) put("boot", d.boot)
+    if (d.ms > 0L) put("ms", d.ms)
+}
 
 /** The aircraft and operator coordinates a CSV row may export, after the type gate. Null means the
  *  column is blank. */
@@ -5125,11 +5182,11 @@ class AcabBleManager(private val context: Context) {
                 // JSONTokener rounds decimal/exponent values to Double, so the parsed object alone
                 // cannot tell an integer 1 from a wire token such as 1.0000000000000000001.
                 val d = Detection.fromWireJson(rawJson, json)
-                // History records bypass the ignore drop: fileHistory must run its drain
-                // bookkeeping (seq cursor, histReceived, pill) for EVERY replayed record or
-                // the drain never closes - it skips the FILING of ignored records itself.
-                // Dropping them here froze the cursor below their seq and re-drained the whole
-                // buffer forever (the offline-replay livelock).
+                // History records bypass the mute drop: fileHistory files a muted MAC's
+                // buffered records (see the reason there) and must run its drain bookkeeping
+                // (seq cursor, histReceived, pill) for EVERY replayed record or the drain never
+                // closes. Dropping them here froze the cursor below their seq and re-drained the
+                // whole buffer forever (the offline-replay livelock).
                 if (d.hist) { fileHistory(d); return }
                 // Only the CURRENT watchlist beats a current mute. WATCHED on the wire is capture-
                 // time history; after an unstar + mute it must not remain a permanent bypass.
@@ -5524,28 +5581,27 @@ class AcabBleManager(private val context: Context) {
             // stamp may upgrade a pseudo one, exactly as on iOS.
             val prevLast = lastSeenAt[d.id]
             if (prevLast == null || ts > prevLast) lastSeenAt[d.id] = ts
-            // Same downgrade, one layer down: detectionsCsv blanks detected_at for any row
-            // whose approx flag is set, so re-filing an approx record over a row we heard live
-            // erases the real capture time from the file people hand over as evidence. The
-            // stamp guard above cannot prevent that, because the CSV tests the STORE ROW, not
-            // the stamp. Keep the live row and drop the replayed one, but still count it below
-            // so the replay cursor and the syncing pill advance. Skipping file() also skips
-            // this record's RSSI append and republish, which is what we want: the live row we
-            // are keeping is the fresher truth.
-            val prev = store[d.id]
-            val downgradesLiveRow = d.approx && prev != null && !prev.approx && !prev.offline
-            // An ignored MAC's buffered records still reach here (ingest routes ALL hist
-            // frames in) so the bookkeeping below always runs; only the FILING is skipped,
-            // mirroring downgradesLiveRow. The record then advances the cursor contiguously,
-            // the drain closes clean, and it is never replayed.
-            val dropIgnored = isMutedForProjection(d.mac)
+            // Same rule, one layer down: the row itself. An older replay never replaces a newer
+            // row (replayReplacesRow; TWIN: the same guard in iOS ingestHistory). A live row
+            // carries cid, det and ch that a replay never has, and detectionsCsv blanks
+            // detected_at for any approx row, so filing an older replay over a row we heard live
+            // erases evidence from the file people hand over. The stamp guards above cannot
+            // prevent that, because the CSV reads the STORE ROW, not the stamp. Keep the newer
+            // row and drop the replayed one, but still count it below so the replay cursor and
+            // the syncing pill advance. Skipping file() also skips this record's RSSI append and
+            // republish, which is what we want: the row we are keeping is the fresher truth.
+            val replacesRow = replayReplacesRow(ts, prevLast)
+            // A muted MAC's buffered records are filed like any other (history never alerts).
+            // The board buffered them while the phone was away, so no timed or place rule was
+            // in force then, and a record buffered before the mute existed is history the user
+            // keeps. The mute-filtered projection still hides the row while the rule holds.
+            // TWIN: iOS ingestDetection's live-only mute drop.
             // Anchor evidence is drain-level knowledge about the BOOT, not about this row's
             // basis: an anchored record proves its boot's span whether or not its stamp sticks
             // as the row's firstSeen below, and gating the widening on that guard threw away
             // bounds that would have bracketed the neighbouring unanchored boots. iOS widens
-            // histAnchoredBoots for every anchored record before any filing guard; ignored MACs
-            // feed anchors on neither platform.
-            if (!dropIgnored && d.at > 0L && d.boot > 0L) {
+            // histAnchoredBoots for every anchored record before any filing guard.
+            if (d.at > 0L && d.boot > 0L) {
                 bootMinAt[d.boot] = minOf(bootMinAt[d.boot] ?: d.at, d.at)
                 bootMaxAt[d.boot] = maxOf(bootMaxAt[d.boot] ?: d.at, d.at)
             }
@@ -5559,20 +5615,20 @@ class AcabBleManager(private val context: Context) {
             // already stale at capture is only a floor-ranked fallback (considerStaleLocatedSample
             // says why). Both keep the coordinate; only the ranking differs. TWIN: the same
             // `switch replayPinContest(gpsAgeSec:)` in iOS ingestHistory.
-            if (!dropIgnored && d.type != DeviceType.DRONE && validCoord(d.lat, d.lon)) {
+            if (d.type != DeviceType.DRONE && validCoord(d.lat, d.lon)) {
                 val replayCoord = d.lat!! to d.lon!!
                 when (replayPinContest(d.gpsAgeSec)) {
                     ReplayPinContest.RANKED -> considerLocatedSample(d.id, replayCoord, d.rssi)
                     ReplayPinContest.FLOOR -> considerStaleLocatedSample(d.id, replayCoord)
                 }
             }
-            if (!downgradesLiveRow && !dropIgnored) {
-                file(d, ts)
-                // Only claim the time quality when this record's stamp is the one that stuck.
-                // A row whose firstSeen came from a live sighting keeps an Exact basis, and a
-                // replayed record that lost the guard above must not relabel it.
-                if (firstSeenAt[d.id] == ts) noteHistTime(d, ts)
-            }
+            if (replacesRow) file(d, ts)
+            // Only claim the time quality when this record's stamp is the one that stuck as
+            // firstSeen, whether or not it replaced the row: an older record kept off the row can
+            // still pull firstSeen back (iOS ingestHistory notes the basis in that branch too). A
+            // row whose firstSeen came from a live sighting keeps an Exact basis, and a replayed
+            // record that lost the firstSeen guard above must not relabel it.
+            if (firstSeenAt[d.id] == ts) noteHistTime(d, ts)
         }
         // Advance the in-memory contiguous cursor, but DON'T rewrite the whole detections file
         // per record - onHistEnd checkpoints once the drain ends. If a drain is interrupted, we
@@ -6185,6 +6241,9 @@ class AcabBleManager(private val context: Context) {
     fun setWifiScan(on: Boolean) = writeConfig(JSONObject().put("wifi", on))
     // WiFi eco: 0/3/7/15 s of RX sleep between channel sweeps (battery SKU). Firmware snaps to the ladder.
     fun setWifiEco(sec: Int) = writeConfig(JSONObject().put("wifiEco", sec))
+    /** 5 GHz pass of the Wi-Fi hop (9 channels, 36 to 165). Only beacon-c5 honours "wifi5" (an S3
+     *  ignores it), hence the UI's non-null status.wifi5 gate. TWIN: iOS BLEManager.setWifi5. */
+    fun setWifi5(on: Boolean) = writeConfig(JSONObject().put("wifi5", on))
 
     /** Turn the board's offline detection buffer on or off (firmware default off). */
     fun setBuffer(on: Boolean) = writeConfig(JSONObject().put("buffer", on))
@@ -7416,7 +7475,7 @@ class AcabBleManager(private val context: Context) {
                     externalText.uasId, dLat, dLon,
                     iStr(d.altitude), iStr(d.speedH), iStr(d.heading), iStr(d.heightAGL),
                     opLat, opLon, iStr(d.pilotAlt), d.ridStatusLabel ?: "",
-                    externalText.maker),
+                    externalText.maker) + detectionCsvWifiCells(d.wifiChannel),
                 ::csvSafe,
             ))
         }
@@ -8906,44 +8965,6 @@ class AcabBleManager(private val context: Context) {
             // migrate a legacy plaintext file to the sealed form so the cleartext copy is overwritten.
             if (legacyPlaintext) runCatching { persistDetections() }
         }
-    }
-
-    /** Rebuild the compact wire JSON for a filed detection (enough to reload it). */
-    private fun detectionToJson(d: Detection): JSONObject = JSONObject().apply {
-        put("t", d.type.raw); put("s", d.source); put("meth", d.method); put("c", d.confidence)
-        put("mac", d.mac); put("rssi", d.rssi); put("n", d.count)
-        d.name?.let { put("name", it) }
-        d.rid?.let { put("id", it) }
-        d.detail?.let { put("det", it) }
-        d.companyId?.let { put("cid", it) }
-        d.lat?.let { put("lat", it) }
-        d.lon?.let { put("lon", it) }
-        d.pilotLat?.let { put("plat", it) }
-        d.pilotLon?.let { put("plon", it) }
-        d.altitude?.let { put("alt", it) }
-        // The rest of the drone telemetry the board delivered. Dropping these left a reloaded
-        // drone dossier with speed/heading/AGL/pilot-alt/status blank for data we already had.
-        d.speedH?.let { put("spd", it) }
-        d.speedV?.let { put("vspd", it) }
-        d.heading?.let { put("hdg", it) }
-        d.heightAGL?.let { put("hgt", it) }
-        d.pilotAlt?.let { put("palt", it) }
-        d.ridStatus?.let { put("sta", it) }
-        // Fix age, or a coordinate the board stamped from a two-hour-old fix reloads with no "as
-        // of" qualifier at all (locationAgeDetail needs gage) and reads as a fix taken on the spot.
-        d.gpsAgeSec?.let { put("gage", it) }
-        // approx says the record has no real capture time, only the synthetic seq-derived sort key
-        // in _fs. Without the flag the CSV stops blanking the column and exports every buffered
-        // record as detected_at 2001-09-09, a confident fabricated timestamp in a file people hand
-        // to other people as evidence. _fs round-trips the ordering key, so seq/at stay unpersisted.
-        if (d.approx) put("approx", true)
-        // Persist the offline-record flag so a reloaded black-box record keeps its "OFFLINE" chip.
-        if (d.offline) put("offline", true)
-        // Which boot session captured the record, and how far into it. boot is what the reloaded
-        // log rebuilds its per-boot anchor bounds from, so a later drain can still bracket against
-        // boots this session anchored; ms is the capture's place within its own boot.
-        if (d.boot > 0L) put("boot", d.boot)
-        if (d.ms > 0L) put("ms", d.ms)
     }
 
     /** Serialize a [TimeBasis] for the persisted log. Exact returns null: a live row has nothing

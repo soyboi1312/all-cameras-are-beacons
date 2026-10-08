@@ -124,6 +124,7 @@ import tech.acab.app.net.AlprStore
 import tech.acab.app.model.TimeBasis
 import tech.acab.app.model.isOuiMatch
 import tech.acab.app.model.companyIdText
+import tech.acab.app.model.wifiChannelText
 import tech.acab.app.model.methodLabel
 import tech.acab.app.model.ouiVendor
 import tech.acab.app.model.sourceLabel
@@ -533,6 +534,7 @@ fun DetailScreen(
                         add("OUI vendor" to if (isChipsetRegistrant(it)) "$it · chipset" else it)
                     }
                     d.companyIdText?.let { add("Company ID" to it) }
+                    d.wifiChannelText?.let { add("Wi-Fi channel" to it) }
                     add("Identifier" to d.mac)
                     add(FIRST_SEEN_LABEL to firstSeenText)
                     // isApproxTime alone is not enough here. It screens Bracketed and Unknown,

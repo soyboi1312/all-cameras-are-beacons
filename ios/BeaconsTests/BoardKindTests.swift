@@ -25,6 +25,7 @@ final class BoardKindTests: XCTestCase {
     func testFirmwareLabelIsAuthoritative() {
         XCTAssertEqual(BoardKind.fromFirmwareLabel("beacon board"), .beacon)
         XCTAssertEqual(BoardKind.fromFirmwareLabel("beacon board rev-B"), .beacon)
+        XCTAssertEqual(BoardKind.fromFirmwareLabel("beacon c5"), .beacon)
         XCTAssertEqual(BoardKind.fromFirmwareLabel("ACAB-ouispy"), .ouiSpy)
         XCTAssertEqual(BoardKind.fromFirmwareLabel("mesh-detect-ACAB"), .meshDetect)
         XCTAssertEqual(BoardKind.fromFirmwareLabel("mesh-detect-ACAB-ch1"), .meshDetect)

@@ -1166,6 +1166,9 @@ internal fun DeviceScreen(
     var wifiPending by rememberSaveable { mutableStateOf(false) }
     var wifiEco by rememberSaveable { mutableStateOf(status?.wifiEco ?: 0) }   // WiFi eco seconds (0/3/7/15)
     var wifiEcoPending by rememberSaveable { mutableStateOf(false) }
+    // Seeded with the beacon-c5 default (on); the row stays hidden until a frame carries "wifi5".
+    var wifi5On by rememberSaveable { mutableStateOf(status?.wifi5 ?: true) }
+    var wifi5Pending by rememberSaveable { mutableStateOf(false) }
     var flockOn by rememberSaveable { mutableStateOf(status?.flock != false) }   // absent = on
     var flockPending by rememberSaveable { mutableStateOf(false) }
     var droneOn by rememberSaveable { mutableStateOf(status?.drone != false) }   // absent = on
@@ -1253,6 +1256,8 @@ internal fun DeviceScreen(
                 { s -> s.wifi == wifiOn }, { s -> wifiOn = s?.wifi ?: wifiOn }, demoStatusBacked = true),
             BoardControl("Wi-Fi Eco", { wifiEcoPending }, { wifiEcoPending = it },
                 { s -> s.wifiEco == wifiEco }, { s -> wifiEco = s?.wifiEco ?: wifiEco }),
+            BoardControl("5 GHz Wi-Fi", { wifi5Pending }, { wifi5Pending = it },
+                { s -> s.wifi5 == wifi5On }, { s -> wifi5On = s?.wifi5 ?: wifi5On }, demoStatusBacked = true),
             BoardControl("ALPR detection", { flockPending }, { flockPending = it },
                 { s -> s.flock == flockOn }, { s -> flockOn = s?.flock ?: flockOn }, demoStatusBacked = true),
             BoardControl("Drone detection", { dronePending }, { dronePending = it },
@@ -1573,6 +1578,19 @@ internal fun DeviceScreen(
                 wifiOn = it; wifiPending = true
                 if (demo) ble.previewDemoStatusToggle { copy(wifi = it) } else ble.setWifiScan(it)
             }
+            // Only boards that send "wifi5" (beacon-c5), only while Wi-Fi is on. Footnote = the
+            // shared radio's 2.4 GHz cost. TWIN: iOS SettingsView "5 GHz Wi-Fi" row, same copy.
+            if (wifiOn && status?.wifi5 != null) {
+                HorizontalDivider(color = Acab.line)
+                Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                    ToggleRow("5 GHz Wi-Fi", "9 channels · 36 to 165", checked = wifi5On, pending = wifi5Pending && !demo) {
+                        wifi5On = it; wifi5Pending = true
+                        if (demo) ble.previewDemoStatusToggle { copy(wifi5 = it) } else ble.setWifi5(it)
+                    }
+                    Text("this board shares one radio between bands. with 5 GHz on, each Wi-Fi sweep also listens on nine 5 GHz channels, so 2.4 GHz gets about 30% less listening time. Bluetooth is nearly unaffected.",
+                        color = Acab.faint, fontSize = 9.5.sp)
+                }
+            }
             // Eco: battery boards only (the board reports "bat" only with the sense divider), and
             // only while Wi-Fi is on. Duty-cycles the Wi-Fi RX to stretch runtime; Bluetooth is
             // untouched. Honest tradeoff line under the segments.
@@ -1698,9 +1716,7 @@ internal fun DeviceScreen(
             ) {
                 bufferOn = it; bufferPending = true; if (!demo) ble.setBuffer(it)
             }
-            // Sample mode must never expose a real-board destructive action. `clearBufferLog()`
-            // also resets this phone's replay cursor even when there is no GATT connection, so
-            // merely previewing the sample settings cannot safely offer Erase.
+            // Sample mode must never expose a real-board destructive action.
             if (shouldOfferBufferClear(
                     isDemoMode = demo,
                     bufferOn = bufferOn,

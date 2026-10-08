@@ -316,6 +316,7 @@ struct Detection: Identifiable, Equatable {
     let uasID: String?           // RID serial / operator id  (json "id")
     let detail: String?          // raven fw, ssid, op-id, etc. (json "det")
     let companyId: Int?          // BLE mfg company ID, SIG assigned # (json "cid"); nil for WiFi / no mfg data
+    let wifiChannel: Int?        // WiFi channel the frame arrived on (json "ch"); nil for BLE and replayed (hist) rows
 
     let lat: Double?
     let lon: Double?
@@ -531,7 +532,7 @@ extension Detection {
 extension Detection: Codable {
     // The firmware's short keys; they map to the longer property names above.
     enum CodingKeys: String, CodingKey {
-        case t, s, meth, c, mac, rssi, name, id, det, cid, lat, lon, plat, plon, alt
+        case t, s, meth, c, mac, rssi, name, id, det, cid, ch, lat, lon, plat, plon, alt
         case spd, vspd, hdg, hgt, palt, sta, n, new, gage
         case rnd                     // randomized / locally-administered transmitter address
         case hist, seq, at, approx   // offline-buffer replay
@@ -572,6 +573,7 @@ extension Detection: Codable {
         else                                       { id = "\(dt.rawValue):\(mac)" }
         detail     = try? k.decodeIfPresent(String.self, forKey: .det)
         companyId  = try? k.decodeIfPresent(Int.self, forKey: .cid)
+        wifiChannel = try? k.decodeIfPresent(Int.self, forKey: .ch)
         lat        = try? k.decodeIfPresent(Double.self, forKey: .lat)
         lon        = try? k.decodeIfPresent(Double.self, forKey: .lon)
         pilotLat   = try? k.decodeIfPresent(Double.self, forKey: .plat)
@@ -637,6 +639,7 @@ extension Detection: Codable {
         try k.encodeIfPresent(uasID, forKey: .id)
         try k.encodeIfPresent(detail, forKey: .det)
         try k.encodeIfPresent(companyId, forKey: .cid)
+        try k.encodeIfPresent(wifiChannel, forKey: .ch)
         try k.encodeIfPresent(lat, forKey: .lat)
         try k.encodeIfPresent(lon, forKey: .lon)
         try k.encodeIfPresent(pilotLat, forKey: .plat)
@@ -676,6 +679,23 @@ extension Detection {
     var companyIdHex: String? {
         guard let cid = companyId, cid > 0 else { return nil }
         return String(format: "0x%04X", cid)
+    }
+
+    /// A channel's band as the CSV's wifi_band_ghz writes it; nil outside both bands. TWIN: Android
+    /// wifiBandGhz(channel) in Models.kt; the thresholds and the two strings must stay identical.
+    static func wifiBandGHz(channel: Int?) -> String? {
+        switch channel {
+        case .some(1...14):   return "2.4"
+        case .some(32...177): return "5"
+        default:              return nil
+        }
+    }
+
+    /// Detail row text: "149 · 5 GHz", the bare channel when it has no band, nil with no channel.
+    var wifiChannelText: String? {
+        guard let ch = wifiChannel else { return nil }
+        guard let band = Detection.wifiBandGHz(channel: ch) else { return "\(ch)" }
+        return "\(ch) \u{00B7} \(band) GHz"
     }
 
     /// Short vendor label for the BLE SIG company IDs most relevant here (camera glasses,

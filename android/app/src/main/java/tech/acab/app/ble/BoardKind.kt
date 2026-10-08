@@ -39,11 +39,12 @@ enum class BoardKind(
         /** AUTHORITATIVE. The Status frame's fw label (DeviceStatus.firmwareLabel, the fw string
          *  without its version). The labels are the wire contract in firmware/src/beacon-board/
          *  main.cpp (kFwLabel "beacon board", rev-B "beacon board rev-B", the single-radio
-         *  "ACAB-ouispy") and firmware/src/mesh-detect/main.cpp ("mesh-detect-ACAB", "-ch<N>" on
-         *  other channels). Prefixes, so rev-B, capture builds and channel builds all resolve. */
+         *  "ACAB-ouispy"), firmware/platformio.ini (single-radio C5 "beacon c5") and
+         *  firmware/src/mesh-detect/main.cpp ("mesh-detect-ACAB", "-ch<N>" on other channels).
+         *  Prefixes, so rev-B, C5, capture and channel builds all resolve. */
         fun fromFirmwareLabel(label: String?): BoardKind? = when {
             label == null -> null
-            label.startsWith("beacon board") -> BEACON
+            label.startsWith("beacon") -> BEACON
             label.startsWith("ACAB-ouispy") -> OUI_SPY
             label.startsWith("mesh-detect") -> MESH_DETECT
             else -> null

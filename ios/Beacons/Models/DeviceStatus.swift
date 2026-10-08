@@ -57,6 +57,8 @@ struct DeviceStatus: Equatable {
     let ble: Bool
     let wifi: Bool
     let wifiEco: Int         // WiFi eco sleep, seconds between sweeps (0/3/7/15); 0 = continuous
+    let wifi5: Bool?         // 5 GHz pass in the Wi-Fi hop; only beacon-c5 sends it, so nil = no
+                             // 5 GHz radio, control hidden. TWIN: Android DeviceStatus.wifi5 (Models.kt)
     let flock: Bool          // ALPR (Flock) detector enabled
     let drone: Bool          // drone (remote ID) detector enabled
     let droui: Bool          // drone vendor-OUI FALLBACK enabled ("droui"). Sub-option of `drone`:
@@ -74,13 +76,10 @@ struct DeviceStatus: Equatable {
     let ledEnabled: Bool     // onboard LED / idle heartbeat on ("ledon"; absent = on, the default)
     let bufCount: Int        // detections currently buffered on the board ("buf")
     let bufferingOn: Bool    // offline buffering enabled ("bufon")
-    /// Stationary/record-all capture reached the raw-ring capacity. Sent only while true and
-    /// retained until a successful clear; absence on each fresh frame therefore means false.
-    let bufferSaturated: Bool
     /// The board's signature-row flood limit refused at least one row ("bufrl"), so some real
     /// detections may be missing from the offline log. Persisted by the board until a successful
-    /// clear and sent only while true, so absence on each fresh frame means false, exactly like
-    /// `bufsat`. Twin: Android DeviceStatus.bufferRateLimited (Models.kt).
+    /// clear and sent only while true, so absence on each fresh frame means false.
+    /// Twin: Android DeviceStatus.bufferRateLimited (Models.kt).
     let bufferRateLimited: Bool
     /// Latched offline-buffer fault mask ("buferr"). Bits 0x01...0x10 are raw-ring failures,
     /// 0x20 is an offline-buffer metadata load/save failure (generation, anchors, privacy lifecycle,
@@ -130,9 +129,10 @@ extension DeviceStatus: Decodable {
                          // as Android does, so a firmware-side rename cannot strand this app
         case droui       // drone vendor-OUI fallback enabled; absent = off (the default)
         case ncam        // network-camera detector enabled; absent = off (the default)
+        case wifi5       // 5 GHz Wi-Fi pass on; absent = no 5 GHz radio (every S3 build)
         case vol         // firmware sends "vol"; we call it `volume`
         case ledon       // onboard LED master; the board omits it when on, so absent = on
-        case buf, bufon, bufsat, buferr, keymis  // offline buffer state, faults and key mismatch
+        case buf, bufon, buferr, keymis  // offline buffer state, faults and key mismatch
         case bufrl       // flood limit refused a row; the board emits it only while true
         case desert      // Desert mode (report every device)
         case ign         // board ignore-list count
@@ -157,6 +157,7 @@ extension DeviceStatus: Decodable {
         ble      = (try? k.decode(Bool.self, forKey: .ble)) ?? false
         wifi     = (try? k.decode(Bool.self, forKey: .wifi)) ?? false
         wifiEco  = (try? k.decode(Int.self,  forKey: .wifiEco)) ?? 0
+        wifi5    = try? k.decode(Bool.self, forKey: .wifi5)   // DO NOT default: absent = no 5 GHz radio
         flock    = (try? k.decode(Bool.self, forKey: .flock)) ?? true   // default on, absent = on like glasses
         drone    = (try? k.decode(Bool.self, forKey: .drone)) ?? true   // default on, absent = on like glasses
         droui    = (try? k.decode(Bool.self, forKey: .droui)) ?? false  // default OFF, absent = off like axon
@@ -170,7 +171,6 @@ extension DeviceStatus: Decodable {
         ledEnabled = (try? k.decode(Bool.self, forKey: .ledon)) ?? true   // absent = on (default)
         bufCount    = (try? k.decode(Int.self, forKey: .buf)) ?? 0
         bufferingOn = (try? k.decode(Bool.self, forKey: .bufon)) ?? false
-        bufferSaturated = (try? k.decode(Bool.self, forKey: .bufsat)) ?? false
         bufferRateLimited = (try? k.decode(Bool.self, forKey: .bufrl)) ?? false
         bufferFaults = max(0, (try? k.decode(Int.self, forKey: .buferr)) ?? 0)
         bufferKeyMismatch = (try? k.decode(Bool.self, forKey: .keymis)) ?? false
@@ -195,7 +195,6 @@ enum BufferHealthNotice: Hashable {
     case keyNotAccepted
     case storageFailed
     case floodRefused
-    case capacityReached
     case persistenceErrorRecorded
 
     var title: String {
@@ -205,7 +204,6 @@ enum BufferHealthNotice: Hashable {
         // Twin: Android BufferHealthNotice.FLOOD_REFUSED (Models.kt). Title and detail must stay
         // byte-identical; both suites pin the full literals.
         case .floodRefused: return "DETECTION FLOOD REFUSED"
-        case .capacityReached: return "CAPTURE REACHED CAPACITY"
         case .persistenceErrorRecorded: return "BUFFER METADATA ERROR RECORDED"
         }
     }
@@ -218,8 +216,6 @@ enum BufferHealthNotice: Hashable {
             return "Offline logging encountered a storage or encryption failure. Some offline detections may be missing or unavailable. Clear the offline buffer after reviewing or exporting it to reset this warning."
         case .floodRefused:
             return "the board refused a burst of detections that looked like a flood, so some real rows may be missing from the offline log. export what synced, then clear the board buffer to reset this warning."
-        case .capacityReached:
-            return "Stationary capture filled the board. Later nearby detections may be missing. Export what synced, then clear the board buffer before another deployment."
         case .persistenceErrorRecorded:
             return "The board recorded an offline-buffer metadata save/load error. Current status may already reflect a successful retry; confirm buffer state and replay timestamps before relying on them. Clear the board buffer to reset this warning."
         }
@@ -235,9 +231,7 @@ extension DeviceStatus {
         var result: [BufferHealthNotice] = []
         if bufferKeyMismatch { result.append(.keyNotAccepted) }
         if bufferFaults & ~0x20 != 0 { result.append(.storageFailed) }
-        // Ahead of capacity: a flood can cost signature rows, capacity only costs nearby ones.
         if bufferRateLimited { result.append(.floodRefused) }
-        if bufferSaturated { result.append(.capacityReached) }
         if bufferFaults & 0x20 != 0 { result.append(.persistenceErrorRecorded) }
         return result
     }

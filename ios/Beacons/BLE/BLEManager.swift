@@ -932,10 +932,11 @@ func demoSampleRows() -> [[String: Any]] {
         // tile and NETWORK CAM map chip both show up on the tour. The MAC is a real Hikvision
         // block, so this row demonstrates the maker-led title end to end. Wire values are the
         // firmware's own: s=1 is SRC_WIFI (netcamClassifyWiFi never emits a BLE source) and
-        // c=65 is NETCAM_OUI_CONFIDENCE, the registry tier a validated=0 block lands on; the
-        // twin row in Android AcabBleManager carries the same values.
+        // c=65 is NETCAM_OUI_CONFIDENCE, the registry tier a validated=0 block lands on; ch=6
+        // is 2.4 GHz, the S3 demo board's only band; the twin row in Android AcabBleManager
+        // carries the same values.
         ["t": 10, "s": 1, "meth": 1, "c": 65, "mac": "44:19:B6:22:0A:5C", "rssi": -70,
-         "det": "Hikvision on wifi", "lat": 37.7788, "lon": -122.4183, "n": 2, "new": true],
+         "det": "Hikvision on wifi", "ch": 6, "lat": 37.7788, "lon": -122.4183, "n": 2, "new": true],
     ]
 }
 
@@ -1020,6 +1021,18 @@ func historyEndDisposition(received: Int, expected: Int,
 }
 
 func historyEnvelopeAuthorizesCheckpoint(beginSeen: Bool) -> Bool { beginSeen }
+
+/// May a replayed record (`stamp`) become the store row whose last-seen is `rowLastSeen`? Only
+/// when it is not older. A live row carries fields a replay never has (companyId, det, ch: the
+/// board's StoredDet has no room for them), so an older replay filed over a newer live row would
+/// blank them and the two apps' CSVs would differ for the same session. A pseudo stamp sits below
+/// every real clock reading, so this also keeps an approx record off any live row.
+/// TWIN: Android `replayReplacesRow(replayStamp, rowLastSeen)` in AcabBleManager.kt, the same
+/// rule; each HistoryReplayPolicy suite pins it.
+func replayReplacesRow(stamp: Date, rowLastSeen: Date?) -> Bool {
+    guard let rowLastSeen else { return true }
+    return stamp >= rowLastSeen
+}
 
 let durableBufferKeyByteCount = 32
 
@@ -2235,6 +2248,9 @@ final class BLEManager: NSObject, ObservableObject {
     /// Tokens for the block observers registered in init(defaults:), so deinit can remove them.
     /// See observe().
     private var notificationObservers: [NSObjectProtocol] = []
+    /// True once loadProtectedFilesIfAvailable has read the lists and the history. Until then no
+    /// central exists, so nothing can be filed or pushed over empty lists (see that function).
+    private var protectedFilesLoaded = false
     private var lastPublish = Date.distantPast     // when we last pushed to @Published
     private let publishInterval: TimeInterval = 0.3   // ~3 Hz ceiling on UI updates
     private let liveNearbyRefreshInterval: TimeInterval = 5
@@ -2264,21 +2280,21 @@ final class BLEManager: NSObject, ObservableObject {
         // Seed the stored authorization before loading mutes/history. `freshCoord` deliberately
         // reads this published mirror so a revoked grant invalidates place rules immediately.
         locationAuthorizationStatus = locationManager.authorizationStatus
-        loadIgnored()
-        pruneExpiredMutes()
         muteExpiryTimer = Timer.scheduledTimer(withTimeInterval: 60, repeats: true) { [weak self] _ in
             self?.refreshMutePolicy()
         }
-        loadWatched()
         if let t = defaults.object(forKey: watermarkKey) as? Double {
             seenWatermark = Date(timeIntervalSince1970: t)
         }
         approxSeenSeq = UInt32(clamping: defaults.integer(forKey: approxSeenSeqKey))
-        // A previous Clear may have been interrupted after its durable tombstone landed but before
-        // the file disappeared. Resolve that intent synchronously before even scheduling a decode;
-        // on failure loadPersistedDetections stays gated and foregrounding retries.
-        retryPendingDetectionClear()
-        loadPersistedDetections()   // bring back any history filed in a past session
+        // A launch that began while the phone was locked finishes here, once the files can be read.
+        // Registered before the first attempt so an unlock between the two cannot be missed.
+        observe(UIApplication.protectedDataDidBecomeAvailableNotification) { [weak self] _ in
+            guard let self, !self.protectedFilesLoaded else { return }
+            self.loadProtectedFilesIfAvailable()
+            if self.bluetoothAuthorization == .allowedAlways { self.initializeCentral() }
+        }
+        loadProtectedFilesIfAvailable()
         // Nil-check on purpose: a missing value keeps the shipped default (counts visible),
         // while a stored Bool is the user's explicit past choice and always wins.
         if let v = defaults.object(forKey: redactKey) as? Bool { redactLockScreen = v }
@@ -2336,6 +2352,7 @@ final class BLEManager: NSObject, ObservableObject {
             // the whole process, with green toggles over a dead feature.
             self.notifier.refreshAuthorization()
             self.locationAuthorizationStatus = self.locationManager.authorizationStatus
+            self.loadProtectedFilesIfAvailable()   // no-op unless the launch began locked
             self.retryPendingDetectionClear(checkpointCurrentStoreOnSuccess: true)
             self.retryManagedListPersistence()
             // If permission changed in Settings while the first-use manager was deferred, create
@@ -2436,10 +2453,29 @@ final class BLEManager: NSObject, ObservableObject {
         }
     }
 
+    /// Reads the mute and watch lists and the detection history, once. A lock-screen intent can
+    /// cold-launch the app while the phone is locked, when these completeFileProtection files
+    /// cannot be opened, and every load here treats an unreadable file like a missing one. The
+    /// next save would then replace the real lists and the real history. So nothing is read, and
+    /// initializeCentral creates no central, until protected data is available.
+    /// TWIN: Android's managedListsReady gate.
+    private func loadProtectedFilesIfAvailable() {
+        guard !protectedFilesLoaded, UIApplication.shared.isProtectedDataAvailable else { return }
+        protectedFilesLoaded = true
+        loadIgnored()
+        pruneExpiredMutes()
+        loadWatched()
+        // A previous Clear may have been interrupted after its durable tombstone landed but before
+        // the file disappeared. Resolve that intent synchronously before even scheduling a decode;
+        // on failure loadPersistedDetections stays gated and foregrounding retries.
+        retryPendingDetectionClear()
+        loadPersistedDetections()   // bring back any history filed in a past session
+    }
+
     // MARK: - Intent
 
     private func initializeCentral() {
-        guard central == nil else { return }
+        guard central == nil, protectedFilesLoaded else { return }
         #if DEBUG
         // DEBUG `-bluetoothIdle`: every path that would create the manager (launch, foreground,
         // a Scan for Beacons tap, leaving sample data) lands here and rests on idle instead, with
@@ -3634,14 +3670,13 @@ final class BLEManager: NSObject, ObservableObject {
 
     // MARK: - Whitelist (ignored devices)
 
-    /// Drop EVERY per-id side map for one detection - the same twelve maps the cap eviction in
-    /// publishDetections clears. Any teardown that removes a row by id must go through this:
-    /// clearing only store + lastSeen left firstSeenAt (and friends) populated, which kept
-    /// inflating the widget's today count for an ignored device, resumed a stale breadcrumb
-    /// trail and closest-approach pin after an unignore, and let RSSI smoothing ride a window
-    /// from before the mute. Mirrors Android's perDeviceMaps + evictKey, plus the iOS-only
-    /// legacyObserverPair, which Android has no data for: its eleven are these twelve minus that
-    /// one.
+    /// Drop EVERY per-id side map for one detection: all twelve. Its only caller is the cap
+    /// eviction in publishDetections. Muting does NOT come here: ignoreDevice preserves the sealed
+    /// evidence row, and routing a mute through this would delete evidence. Any future teardown
+    /// that removes a row by id must use it, because clearing only store + lastSeen once left
+    /// firstSeenAt and the other maps populated. Mirrors Android's perDeviceMaps + evictKey, plus
+    /// the iOS-only legacyObserverPair, which Android has no data for: its eleven are these twelve
+    /// minus that one.
     private func evictKey(_ id: String) {
         store[id] = nil; lastSeen[id] = nil; rssiHistory[id] = nil
         trackHistory[id] = nil; firstSeenAt[id] = nil; capturedLoc[id] = nil
@@ -4308,7 +4343,7 @@ final class BLEManager: NSObject, ObservableObject {
                     case .bracketed, .unknown: return nil
                     }
                 })
-            for id in evict { evictKey(id) }   // the one full-teardown list, shared with the ignore paths
+            for id in evict { evictKey(id) }   // evictKey's only caller; muting keeps rows
             let evictIds = Set(evict)
             logRows = sorted.filter { !evictIds.contains($0.id) }
         }
@@ -4565,10 +4600,11 @@ final class BLEManager: NSObject, ObservableObject {
         // it: a reader who takes detected_at without them is reading a derived time as a clock
         // reading, which is the misuse this export exists to prevent. Header must stay
         // byte-identical to Android's.
-        // `maker` is appended LAST so an existing parser keyed on column order still reads every
-        // field it knew about. Byte-identical to Android's, which is why it moves in the same
+        // `maker` is appended at the END so an existing parser keyed on column order still reads
+        // every field it knew about. Byte-identical to Android's, which is why it moves in the same
         // commit or not at all: the UI now names a manufacturer, and the evidence file has to be
-        // able to say the same thing.
+        // able to say the same thing. wifi_channel and wifi_band_ghz follow it on the same rule;
+        // blank on BLE and replayed rows, and not a location, so no redaction set names them.
         // The header is ContributionCsv.detectionColumns, shared with the contribution redactor so
         // a rename can never leave a location column unblanked - the redactor now fails closed on
         // a policy column the header does not carry, and a hand-copied literal here was the drift
@@ -4644,7 +4680,8 @@ final class BLEManager: NSObject, ObservableObject {
                           csvUntrustedText(d.uasID ?? ""), f6(dc?.latitude), f6(dc?.longitude),
                           iStr(d.altitude), iStr(d.speedH), iStr(d.heading), iStr(d.heightAGL),
                           f6(pc?.latitude), f6(pc?.longitude), iStr(d.pilotAlt),
-                          d.ridStatusLabel ?? "", csvUntrustedText(d.maker ?? "")]
+                          d.ridStatusLabel ?? "", csvUntrustedText(d.maker ?? ""),
+                          iStr(d.wifiChannel), Detection.wifiBandGHz(channel: d.wifiChannel) ?? ""]
             rows.append(fields.map(csvSafe).joined(separator: ","))
         }
         return rows.joined(separator: "\n")
@@ -5368,6 +5405,10 @@ final class BLEManager: NSObject, ObservableObject {
     func setWifiEco(_ sec: Int) {
         writeConfig(["wifiEco": sec])
     }
+    /// 5 GHz pass in the Wi-Fi hop on/off (beacon-c5 only). TWIN: Android AcabBleManager.setWifi5.
+    func setWifi5(_ on: Bool) {
+        writeConfig(["wifi5": on])
+    }
 
     /// Config-char key -> canned-status key: the ONE place sample mode learns how a board
     /// setting echoes. The wire names grew apart across firmware revisions (droneoui->droui,
@@ -5381,6 +5422,7 @@ final class BLEManager: NSObject, ObservableObject {
         "bodycam": "bodycam", "tracker": "tracker", "glasses": "glasses",
         "desert": "desert", "buffer": "bufon", "led": "ledon", "buzzer": "buzzer",
         "volume": "vol", "ble": "ble", "wifi": "wifi", "wifiEco": "wifiEco",
+        "wifi5": "wifi5",
     ]
 
     /// Transient board commands (never state) with nothing to echo in sample mode. Kept apart
@@ -6336,17 +6378,15 @@ final class BLEManager: NSObject, ObservableObject {
             }
             return
         }
-        if isIgnored(d.mac) {
-            // Whitelisted: file nothing, alert on nothing. But a replayed HISTORY record must
-            // still run the drain bookkeeping: the board's end sentinel counts every record it
-            // sent (its replay path has no ignore filter - it can hold records buffered before
-            // the MAC was ignored), so dropping one before the count left histReceived short on
-            // every pass and the gap retry re-requested the same tail forever. Live frames keep
-            // the plain drop (the board suppresses those at capture anyway).
-            if d.isHistory {
-                recordHistoryProgress(d)
-                schedulePublish()   // the syncing pill's count still climbs, at the coalesced rate
-            }
+        if !d.isHistory, isIgnored(d.mac) {
+            // Muted: a live frame files nothing and alerts on nothing. A replayed HISTORY record
+            // is filed like any other (history never alerts). The board buffered it while the
+            // phone was away, so no timed or place rule was in force then, and a record buffered
+            // before the mute existed is history the user keeps ("Existing log history is kept").
+            // publishDetections still hides the row from active surfaces while the rule holds;
+            // logDetections keeps it. ingestHistory also runs the drain bookkeeping, which must
+            // see EVERY replayed record or the gap retry re-requests the same tail forever.
+            // TWIN: Android AcabBleManager.fileHistory.
             return
         }
 
@@ -6516,14 +6556,14 @@ final class BLEManager: NSObject, ObservableObject {
             case .floor:  considerStaleObserverPin(for: d.id, coordinate: coord)
             }
         }
-        // Don't let a replayed record clobber a fresher live entry or an earlier-filed
-        // history record for the same id.
+        // Don't let a replayed record clobber a fresher live entry or a newer history record for
+        // the same id (replayReplacesRow; TWIN: Android fileHistory files through the same rule).
         if firstTime {
             firstSeenAt[d.id] = stamp
             store[d.id] = d
             lastSeen[d.id] = stamp
             noteHistoryBasis(d, stamp: stamp, basis: basis)
-        } else if let existing = lastSeen[d.id], stamp < existing {
+        } else if !replayReplacesRow(stamp: stamp, rowLastSeen: lastSeen[d.id]) {
             // keep the newer of the two as the sort key, but make sure the record exists
             if store[d.id] == nil { store[d.id] = d }
             // ...but a buffered record that genuinely PREDATES the stored first-seen has to pull

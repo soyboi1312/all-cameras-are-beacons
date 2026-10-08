@@ -20,10 +20,10 @@ import tech.acab.app.ble.AcabBleManager
 import tech.acab.app.ble.ConnState
 
 /**
- * Quick Settings "Drive mode" tile (F28): toggles the drive-mode foreground service from the
- * shade, the Android analog of the iOS Control Center toggle (DriveModeControl.swift). Goes
- * through AcabBleManager.startDriveMode / endDriveMode, the exact same path as the in-app
- * switch on the Device screen, so the driveMode flow (and that switch) stays in sync.
+ * Quick Settings "Live Mode" tile (F28), the Android analog of the iOS Control Center toggle
+ * (DriveModeControl.swift). Turning it on does not start Live Mode here: Android 14 does not let
+ * a background tile service start a location foreground service, so onClick hands the request to
+ * MainActivity, which applies it once resumed (maybeStartRequestedDrive).
  */
 class DriveModeTileService : TileService() {
 

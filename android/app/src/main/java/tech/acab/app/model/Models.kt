@@ -294,6 +294,9 @@ data class Detection(
     // BLE manufacturer company ID (Bluetooth SIG assigned #); null for WiFi devices or a BLE
     // advert with no manufacturer data. The field the glasses/tracker detectors key on.
     val companyId: Int? = null,
+    // WiFi rx channel (json "ch"); null for BLE and replayed rows. Band: [wifiBandGhz].
+    // TWIN: iOS Detection.wifiChannel.
+    val wifiChannel: Int? = null,
 ) {
     /** Stable identity. Drones key on UAS-ID, which survives MAC rotation (same as the
      *  firmware's dedup key); everything else uses type + mac. Computed once at construction
@@ -396,6 +399,11 @@ data class Detection(
             rid = o.stringOrNull("id"),
             detail = o.stringOrNull("det"),
             companyId = if (o.has("cid")) o.optInt("cid") else null,
+            // Integral numbers only, like iOS decodeIfPresent(Int.self, forKey: .ch): optInt would
+            // read null or "x" as 0 and 6.7 as 6, where iOS reads nil.
+            wifiChannel = (o.opt("ch") as? Number)?.let { n ->
+                n as? Int ?: runCatching { java.math.BigDecimal(n.toString()).intValueExact() }.getOrNull()
+            },
             lat = o.doubleOrNull("lat"),
             lon = o.doubleOrNull("lon"),
             pilotLat = o.doubleOrNull("plat"),
@@ -530,6 +538,20 @@ val Detection.companyIdText: String?
 val Detection.companyIdHex: String?
     get() = companyId?.takeIf { it > 0 }?.let { "0x%04X".format(it) }
 
+/** Channel to its CSV wifi_band_ghz token; null outside both bands (0 = not WiFi-received).
+ *  Shared twin thresholds: keep identical to iOS Detection.wifiBandGHz(channel:). */
+fun wifiBandGhz(channel: Int?): String? = when (channel) {
+    null -> null
+    in 1..14 -> "2.4"
+    in 32..177 -> "5"
+    else -> null
+}
+
+/** Detail-row text, "149 · 5 GHz", or the bare number outside both bands.
+ *  TWIN: iOS Detection.wifiChannelText. */
+val Detection.wifiChannelText: String?
+    get() = wifiChannel?.let { ch -> wifiBandGhz(ch)?.let { "$ch · $it GHz" } ?: "$ch" }
+
 /** Short vendor label for the BLE SIG company IDs most relevant here (camera glasses, trackers,
  *  a few common makers). Everything else just shows the raw hex. Mirrors iOS bleCompanyName. */
 fun bleCompanyName(id: Int): String? = when (id) {
@@ -554,6 +576,10 @@ data class DeviceStatus(
     val ble: Boolean,
     val wifi: Boolean,
     val wifiEco: Int,       // WiFi eco sleep seconds between sweeps (0/3/7/15); 0 = continuous
+    // 5 GHz pass of the Wi-Fi hop ("wifi5"). Only beacon-c5 sends it; null = no 5 GHz radio, so
+    // the UI hides the switch. Nullable ON PURPOSE: any default would offer an S3 board a dead
+    // switch. TWIN: iOS DeviceStatus.wifi5.
+    val wifi5: Boolean? = null,
     val flock: Boolean,
     val drone: Boolean,
     // The drone vendor-OUI fallback (flag a DJI/Parrot OUI as a drone with no Remote ID). A
@@ -584,14 +610,10 @@ data class DeviceStatus(
     val gps: Boolean,
     val bufCount: Int,      // records currently held in the board's offline buffer
     val bufOn: Boolean,     // whether offline buffering is enabled on the board
-    // Stationary/record-all capture reached the raw-ring capacity. The firmware sends this only
-    // while true and keeps it set until a successful clear, so absent must decode as false on
-    // every fresh status frame rather than latching an earlier warning in the app.
-    val bufferSaturated: Boolean,
     // The board's signature-row flood limit refused at least one row ("bufrl"), so some real
     // detections may be missing from the offline log. Persisted by the board until a successful
-    // clear and sent only while true, so absent decodes as false on every fresh frame, exactly like
-    // bufsat. Twin: iOS DeviceStatus.bufferRateLimited (DeviceStatus.swift).
+    // clear and sent only while true, so absent decodes as false on every fresh frame.
+    // Twin: iOS DeviceStatus.bufferRateLimited (DeviceStatus.swift).
     val bufferRateLimited: Boolean,
     // Latched offline-buffer fault mask ("buferr"). 0x01...0x10 are raw-ring failures, 0x20 is
     // an offline-buffer metadata load/save failure (generation, anchors, privacy lifecycle, and
@@ -661,6 +683,8 @@ data class DeviceStatus(
             ble = o.optBoolean("ble", false),
             wifi = o.optBoolean("wifi", false),
             wifiEco = o.optInt("wifiEco", 0),
+            // absent (every S3 build) stays null, never a default: see wifi5
+            wifi5 = if (o.has("wifi5")) o.optBoolean("wifi5") else null,
             // ALPR (Flock) + drone (Remote ID) detectors; absent = on (default), like glasses
             flock = o.optBoolean("flock", true),
             drone = o.optBoolean("drone", true),
@@ -685,7 +709,6 @@ data class DeviceStatus(
             gps = o.optBoolean("gps", false),
             bufCount = o.optInt("buf", 0),
             bufOn = o.optBoolean("bufon", false),
-            bufferSaturated = o.optBoolean("bufsat", false),
             bufferRateLimited = o.optBoolean("bufrl", false),
             bufferFaults = o.optLong("buferr", 0L).coerceIn(0L, 0xFFFF_FFFFL),
             bufferKeyMismatch = o.optBoolean("keymis", false),
@@ -738,11 +761,6 @@ enum class BufferHealthNotice(
         "the board refused a burst of detections that looked like a flood, so some real rows may be missing from the offline log. export what synced, then clear the board buffer to reset this warning.",
         false,
     ),
-    CAPACITY_REACHED(
-        "CAPTURE REACHED CAPACITY",
-        "Stationary capture filled the board. Later nearby detections may be missing. Export what synced, then clear the board buffer before another deployment.",
-        false,
-    ),
     PERSISTENCE_ERROR_RECORDED(
         "BUFFER METADATA ERROR RECORDED",
         "The board recorded an offline-buffer metadata save/load error. Current status may already reflect a successful retry; confirm buffer state and replay timestamps before relying on them. Clear the board buffer to reset this warning.",
@@ -757,9 +775,7 @@ val DeviceStatus.bufferHealthNotices: List<BufferHealthNotice>
         if (bufferKeyMismatch) add(BufferHealthNotice.KEY_NOT_ACCEPTED)
         val nonNvsFaults = bufferFaults and 0x20L.inv()
         if (nonNvsFaults != 0L) add(BufferHealthNotice.STORAGE_FAILED)
-        // Ahead of capacity: a flood can cost signature rows, capacity only costs nearby ones.
         if (bufferRateLimited) add(BufferHealthNotice.FLOOD_REFUSED)
-        if (bufferSaturated) add(BufferHealthNotice.CAPACITY_REACHED)
         if (bufferFaults and 0x20L != 0L) add(BufferHealthNotice.PERSISTENCE_ERROR_RECORDED)
     }
 

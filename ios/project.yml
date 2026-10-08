@@ -27,7 +27,7 @@ packages:
 
 settings:
   base:
-    MARKETING_VERSION: "2.1.1"
+    MARKETING_VERSION: "2.2.0"
     # The build number RESTARTS AT 0 for each new MARKETING_VERSION, and only climbs when a SECOND
     # build of the SAME version has to go up. App Store Connect requires the build to be unique
     # within a version string, NOT across the app, so 0 is always free on a version that has never
@@ -43,8 +43,8 @@ settings:
     # clobbered by the next `xcodegen generate` AND it only touches the app target, leaving
     # BeaconsWidget behind -> "extension version must match parent app". Both targets read
     # $(CURRENT_PROJECT_VERSION), so setting it HERE and regenerating keeps them in lockstep.
-    CURRENT_PROJECT_VERSION: "0"   # 2.1.1 build 0, set 2026-10-02: a new MARKETING_VERSION restarts at 0
-                                   # (the rule above). The last 2.0.9 build set here was 1.
+    CURRENT_PROJECT_VERSION: "0"   # 2.2.0 build 0, set 2026-10-05: a new MARKETING_VERSION restarts at 0
+                                   # (the rule above). The last 2.1.1 build set here was 0.
     SWIFT_VERSION: "5.0"
     CODE_SIGN_STYLE: Automatic
     DEVELOPMENT_TEAM: "49B9T69XPF"        # baked in so `xcodegen generate` keeps signing

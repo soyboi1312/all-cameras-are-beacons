@@ -35,9 +35,10 @@ android {
         targetSdk = 36
         // versionCode is INDEPENDENT of versionName and must climb on every Play upload; Play
         // rejects a re-upload at a used code. 28 shipped as 2.0.8, 29 as 2.0.9 (tag android-v2.0.9),
-        // 30 as 2.1.0 (tag android-v2.1.0), 31 as the first android-v2.1.1 APK.
-        versionCode = 32
-        versionName = "2.1.1"
+        // 30 as 2.1.0 (tag android-v2.1.0), 31 as the first android-v2.1.1 APK, 32 on the unreleased
+        // 2.1.1 fallback commit 83495ab (held, never uploaded), so 2.2.0 takes 33.
+        versionCode = 33
+        versionName = "2.2.0"
     }
 
     signingConfigs {

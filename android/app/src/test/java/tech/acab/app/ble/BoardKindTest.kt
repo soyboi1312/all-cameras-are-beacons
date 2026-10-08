@@ -25,6 +25,7 @@ class BoardKindTest {
     @Test fun firmwareLabelIsAuthoritative() {
         assertEquals(BoardKind.BEACON, BoardKind.fromFirmwareLabel("beacon board"))
         assertEquals(BoardKind.BEACON, BoardKind.fromFirmwareLabel("beacon board rev-B"))
+        assertEquals(BoardKind.BEACON, BoardKind.fromFirmwareLabel("beacon c5"))
         assertEquals(BoardKind.OUI_SPY, BoardKind.fromFirmwareLabel("ACAB-ouispy"))
         assertEquals(BoardKind.MESH_DETECT, BoardKind.fromFirmwareLabel("mesh-detect-ACAB"))
         assertEquals(BoardKind.MESH_DETECT, BoardKind.fromFirmwareLabel("mesh-detect-ACAB-ch1"))

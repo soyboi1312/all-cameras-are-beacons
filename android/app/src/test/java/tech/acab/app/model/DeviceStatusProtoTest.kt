@@ -63,7 +63,6 @@ class DeviceStatusProtoTest {
     @Test
     fun `buffer health fields default off on every fresh status`() {
         val s = status("""{"fw":"x","buf":9,"bufon":true}""")
-        assertFalse(s.bufferSaturated)
         assertFalse("absent bufrl must decode false on every fresh frame", s.bufferRateLimited)
         assertEquals(0L, s.bufferFaults)
         assertFalse(s.bufferKeyMismatch)
@@ -83,26 +82,23 @@ class DeviceStatusProtoTest {
     }
 
     @Test
-    fun `buffer faults and saturation become ordered user-visible warnings`() {
+    fun `buffer faults become ordered user-visible warnings`() {
         // WRITE (0x04) and CRYPTO (0x40) make evidence incomplete; NVS (0x20) is historical.
-        val s = status("""{"fw":"x","bufsat":true,"buferr":100}""")
-        assertTrue(s.bufferSaturated)
+        val s = status("""{"fw":"x","buferr":100}""")
         assertEquals(100L, s.bufferFaults)
         assertEquals(
             listOf(
                 BufferHealthNotice.STORAGE_FAILED,
-                BufferHealthNotice.CAPACITY_REACHED,
                 BufferHealthNotice.PERSISTENCE_ERROR_RECORDED,
             ),
             s.bufferHealthNotices,
         )
         assertTrue(s.bufferHealthNotices[0].detail.contains("storage or encryption failure"))
         assertTrue(s.bufferHealthNotices[0].detail.contains("may be missing or unavailable"))
-        assertTrue(s.bufferHealthNotices[1].detail.contains("may be missing"))
-        assertTrue(s.bufferHealthNotices[2].detail.contains("metadata save/load error"))
-        assertTrue(s.bufferHealthNotices[2].detail.contains("may already reflect a successful retry"))
-        assertTrue(s.bufferHealthNotices[2].detail.contains("replay timestamps"))
-        assertTrue(s.bufferHealthNotices[2].detail.contains("Clear the board buffer"))
+        assertTrue(s.bufferHealthNotices[1].detail.contains("metadata save/load error"))
+        assertTrue(s.bufferHealthNotices[1].detail.contains("may already reflect a successful retry"))
+        assertTrue(s.bufferHealthNotices[1].detail.contains("replay timestamps"))
+        assertTrue(s.bufferHealthNotices[1].detail.contains("Clear the board buffer"))
     }
 
     @Test
@@ -130,14 +126,13 @@ class DeviceStatusProtoTest {
     }
 
     @Test
-    fun `flood refusal orders after storage failure and before capacity`() {
-        val s = status("""{"fw":"x","bufsat":true,"bufrl":true,"buferr":100,"keymis":true}""")
+    fun `flood refusal orders after storage failure and before metadata error`() {
+        val s = status("""{"fw":"x","bufrl":true,"buferr":100,"keymis":true}""")
         assertEquals(
             listOf(
                 BufferHealthNotice.KEY_NOT_ACCEPTED,
                 BufferHealthNotice.STORAGE_FAILED,
                 BufferHealthNotice.FLOOD_REFUSED,
-                BufferHealthNotice.CAPACITY_REACHED,
                 BufferHealthNotice.PERSISTENCE_ERROR_RECORDED,
             ),
             s.bufferHealthNotices,

@@ -205,17 +205,25 @@ private struct DetectionActivityContent: View {
 }
 
 /// Compact standalone cell for the CarPlay Dashboard (iOS 26 auto-mirror) and the Apple
-/// Watch Smart Stack. Has to read on its own glance , just the shield, the total, a word.
+/// Watch Smart Stack. Has to read on its own glance: just the shield, the total, a word.
+/// Honours `redact` like LockScreenView: the wrist and the dashboard are glanced at like a
+/// locked phone, so with counts hidden neither the total, the category, nor the shield's
+/// detection tint may show here.
 private struct SmallCell: View {
     let state: DetectionActivityAttributes.DetectionState
     var body: some View {
         HStack(spacing: 9) {
             Image(systemName: "shield.lefthalf.filled")
                 .font(.system(size: 19, weight: .semibold))
-                .foregroundStyle(state.total > 0 ? WidgetTheme.crimson : Color.white.opacity(0.6))
+                .foregroundStyle(state.total > 0 && !state.redact ? WidgetTheme.crimson : Color.white.opacity(0.6))
             VStack(alignment: .leading, spacing: 0) {
-                Text("\(state.total)")
-                    .font(WidgetTheme.digits(22)).monospacedDigit()
+                if state.redact {
+                    Image(systemName: "lock.fill")
+                        .font(.system(size: 15, weight: .semibold)).foregroundStyle(.white.opacity(0.7))
+                } else {
+                    Text("\(state.total)")
+                        .font(WidgetTheme.digits(22)).monospacedDigit()
+                }
                 Text(stateLabel)
                     .font(WidgetTheme.mono(8)).tracking(0.8)
                     .foregroundStyle(.white.opacity(0.6))
@@ -224,12 +232,15 @@ private struct SmallCell: View {
         }
         .padding(.horizontal, 12).padding(.vertical, 8)
         .accessibilityElement(children: .ignore)
-        .accessibilityLabel("Live Mode. \(detectionCountPhrase(state.total, nearby: true)). \(stateLabel).")
+        .accessibilityLabel(state.redact
+            ? "Live Mode. \(stateLabel)."
+            : "Live Mode. \(detectionCountPhrase(state.total, nearby: true)). \(stateLabel).")
         .accessibilityHint("Opens the new detections log")
     }
 
     private var stateLabel: String {
         guard state.connected else { return "reconnecting" }
+        if state.redact { return "counts hidden" }
         // All detectors off is not "no detections", it is "not looking". Saying the former over an
         // explicitly empty enabled-set is the same lie the phantom columns were.
         if state.enabled?.isEmpty == true { return "all detectors off" }

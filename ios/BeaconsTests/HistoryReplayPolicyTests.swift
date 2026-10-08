@@ -59,4 +59,27 @@ final class HistoryReplayPolicyTests: XCTestCase {
             XCTAssertNil(Detection.exactWireUInt32(forKey: "gen", in: Data(raw.utf8)), raw)
         }
     }
+
+    /// A drain files an older buffered record after the live row for the same id. The live row
+    /// carries ch, which a replay never has, so it must stay. Android used to file every anchored
+    /// replay over it, and its CSV lost wifi_channel where this export kept it. The replay stamp is
+    /// ingestHistory's capturedAt. Fixtures are verbatim in Android's twin,
+    /// HistoryReplayPolicyTest.olderReplayNeverReplacesNewerLiveRow.
+    func testOlderReplayNeverReplacesNewerLiveRow() throws {
+        let live = try Detection.decodeWireJSON(Data(
+            (#"{"t":10,"s":1,"meth":1,"c":65,"mac":"44:19:b6:22:0a:5c","rssi":-70,"# +
+             #""det":"Hikvision on wifi","ch":149,"n":2}"#).utf8))
+        let replay = try Detection.decodeWireJSON(Data(
+            (#"{"t":10,"s":1,"meth":1,"c":65,"mac":"44:19:b6:22:0a:5c","rssi":-80,"n":1,"# +
+             #""hist":true,"seq":7,"at":1790000000,"boot":3,"ms":5000}"#).utf8))
+        XCTAssertEqual(live.id, replay.id)
+        XCTAssertNil(replay.wifiChannel)
+        let replayStamp = try XCTUnwrap(replay.capturedAt)
+        let liveSeenAt = replayStamp.addingTimeInterval(60)
+        let kept = replayReplacesRow(stamp: replayStamp, rowLastSeen: liveSeenAt) ? replay : live
+        XCTAssertEqual(kept.wifiChannel, 149)
+        // A replay that is not older still files, so the rule cannot pass by refusing everything.
+        XCTAssertTrue(replayReplacesRow(stamp: liveSeenAt, rowLastSeen: liveSeenAt))
+        XCTAssertTrue(replayReplacesRow(stamp: replayStamp, rowLastSeen: nil))
+    }
 }

@@ -1049,6 +1049,7 @@ struct DetectionDetailView: View {
             idRow("OUI vendor", isChipsetRegistrant(o) ? "\(o) \u{00B7} chipset" : o)
         }
         if let cid = d.companyIdText { idRow("Company ID", cid) }
+        if let ch = d.wifiChannelText { idRow("Wi-Fi channel", ch) }
         idRow("Identifier", d.mac, monospaced: true)
         timeRow("First seen", ble.firstSeenDate(for: d.id))
         timeRow("Last seen", ble.lastSeenDate(for: d.id), sampleReadsNow: true)

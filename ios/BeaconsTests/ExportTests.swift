@@ -713,12 +713,73 @@ final class ExportTests: XCTestCase {
         XCTAssertTrue(isWellFormedXML(gpx), "GPX must parse as XML")
         XCTAssertFalse(gpx.contains("<wpt "))
     }
+
+    // MARK: - Wi-Fi channel ("ch") and band
+
+    /// A live 5 GHz WiFi netcam row, as a beacon-c5 build sends it.
+    static let wifi5JSON = """
+    {"t":10,"s":1,"meth":1,"c":65,"mac":"44:19:b6:22:0a:5c","rssi":-70,\
+    "det":"Hikvision on wifi","ch":149,"n":2}
+    """
+
+    func testChannelDecodesWhenPresentAndIsNilWhenAbsent() throws {
+        XCTAssertEqual(try decode(Self.wifi5JSON).wifiChannel, 149)
+        XCTAssertNil(try decode(Self.nearbyJSON).wifiChannel, "a BLE row carries no channel")
+    }
+
+    /// Both edges of both bands. TWIN: Android WifiChannelExportTest.band_edges.
+    func testBandEdges() {
+        for ch in [1, 13, 14] { XCTAssertEqual(Detection.wifiBandGHz(channel: ch), "2.4", "ch \(ch)") }
+        for ch in [32, 36, 165, 177] { XCTAssertEqual(Detection.wifiBandGHz(channel: ch), "5", "ch \(ch)") }
+        for ch in [0, 15, 31, 178, 200, -1] { XCTAssertNil(Detection.wifiBandGHz(channel: ch), "ch \(ch)") }
+        XCTAssertNil(Detection.wifiBandGHz(channel: nil))
+    }
+
+    func testChannelDisplayText() throws {
+        XCTAssertEqual(try decode(Self.wifi5JSON).wifiChannelText, "149 \u{00B7} 5 GHz")
+        XCTAssertEqual(try decode(#"{"t":10,"s":1,"mac":"aa:bb:cc:dd:ee:ff","ch":6}"#).wifiChannelText,
+                       "6 \u{00B7} 2.4 GHz")
+        XCTAssertEqual(try decode(#"{"t":10,"s":1,"mac":"aa:bb:cc:dd:ee:ff","ch":15}"#).wifiChannelText,
+                       "15", "a channel with no band reads bare")
+        XCTAssertNil(try decode(Self.nearbyJSON).wifiChannelText)
+    }
+
+    func testCsvHeaderEndsWithTheChannelColumns() {
+        XCTAssertEqual(Array(ContributionCsv.detectionColumns.suffix(3)),
+                       ["maker", "wifi_channel", "wifi_band_ghz"])
+    }
+
+    func testWifiRowExportsChannelAndBand_bleRowExportsTwoEmptyFields() throws {
+        let csv = BLEManager.buildCSV([try row(Self.wifi5JSON), try row(Self.nearbyJSON)])
+        let records = try XCTUnwrap(ContributionCsv.parseDocument(csv)?.records)
+        XCTAssertEqual(records.count, 3)
+        let header = records[0]
+        let chIdx = try XCTUnwrap(header.firstIndex(of: "wifi_channel"))
+        let bandIdx = try XCTUnwrap(header.firstIndex(of: "wifi_band_ghz"))
+        XCTAssertEqual(records[1].count, header.count, "a WiFi row is as wide as the header")
+        XCTAssertEqual(records[1][chIdx], "149")
+        XCTAssertEqual(records[1][bandIdx], "5")
+        XCTAssertEqual(records[2].count, header.count, "a BLE row is as wide as the header")
+        XCTAssertEqual(records[2][chIdx], "")
+        XCTAssertEqual(records[2][bandIdx], "")
+    }
+
+    /// The checkpoint persists Detection's Codable: WiFi keeps "ch" across relaunch, BLE writes none.
+    func testPersistedDetectionRoundTripsItsChannel() throws {
+        let wifi = try decode(Self.wifi5JSON)
+        let reloaded = try JSONDecoder().decode(Detection.self, from: JSONEncoder().encode(wifi))
+        XCTAssertEqual(reloaded.wifiChannel, 149)
+        let ble = try JSONEncoder().encode(try decode(Self.nearbyJSON))
+        let bleObject = try XCTUnwrap(JSONSerialization.jsonObject(with: ble) as? [String: Any])
+        XCTAssertNil(bleObject["ch"])
+        XCTAssertNil(try JSONDecoder().decode(Detection.self, from: ble).wifiChannel)
+    }
 }
 
 /// Elided live-notify records must still decode. The firmware trims optional Remote ID fields to
 /// fit a small ATT MTU rather than dropping the sighting (see firmware detect_elide.h), so a phone
 /// on a 185-MTU link receives records missing any suffix of
-/// palt -> hgt -> vspd -> spd -> hdg -> sta -> plat/plon.
+/// cid -> ch -> palt -> hgt -> vspd -> spd -> hdg -> sta -> plat/plon.
 /// The parser is written with decodeIfPresent throughout, so this SHOULD hold; the brief asked for
 /// a fixture rather than an assumption, and this is it.
 final class ElidedRecordTests: XCTestCase {

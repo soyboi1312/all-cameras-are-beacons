@@ -51,7 +51,6 @@ final class DeviceStatusProtoTests: XCTestCase {
 
     func testBufferHealthFieldsDefaultOffOnEveryFreshStatus() throws {
         let s = try status(#"{"fw":"x","buf":9,"bufon":true}"#)
-        XCTAssertFalse(s.bufferSaturated)
         XCTAssertFalse(s.bufferRateLimited, "absent bufrl must decode false on every fresh frame")
         XCTAssertEqual(s.bufferFaults, 0)
         XCTAssertFalse(s.bufferKeyMismatch)
@@ -69,20 +68,17 @@ final class DeviceStatusProtoTests: XCTestCase {
         XCTAssertTrue(s.bufferHealthNotices[0].critical)
     }
 
-    func testBufferFaultsAndSaturationBecomeOrderedUserVisibleWarnings() throws {
+    func testBufferFaultsBecomeOrderedUserVisibleWarnings() throws {
         // WRITE (0x04) and CRYPTO (0x40) make evidence incomplete; NVS (0x20) is historical.
-        let s = try status(#"{"fw":"x","bufsat":true,"buferr":100}"#)
-        XCTAssertTrue(s.bufferSaturated)
+        let s = try status(#"{"fw":"x","buferr":100}"#)
         XCTAssertEqual(s.bufferFaults, 100)
-        XCTAssertEqual(s.bufferHealthNotices,
-                       [.storageFailed, .capacityReached, .persistenceErrorRecorded])
+        XCTAssertEqual(s.bufferHealthNotices, [.storageFailed, .persistenceErrorRecorded])
         XCTAssertTrue(s.bufferHealthNotices[0].detail.contains("storage or encryption failure"))
         XCTAssertTrue(s.bufferHealthNotices[0].detail.contains("may be missing or unavailable"))
-        XCTAssertTrue(s.bufferHealthNotices[1].detail.contains("may be missing"))
-        XCTAssertTrue(s.bufferHealthNotices[2].detail.contains("metadata save/load error"))
-        XCTAssertTrue(s.bufferHealthNotices[2].detail.contains("may already reflect a successful retry"))
-        XCTAssertTrue(s.bufferHealthNotices[2].detail.contains("replay timestamps"))
-        XCTAssertTrue(s.bufferHealthNotices[2].detail.contains("Clear the board buffer"))
+        XCTAssertTrue(s.bufferHealthNotices[1].detail.contains("metadata save/load error"))
+        XCTAssertTrue(s.bufferHealthNotices[1].detail.contains("may already reflect a successful retry"))
+        XCTAssertTrue(s.bufferHealthNotices[1].detail.contains("replay timestamps"))
+        XCTAssertTrue(s.bufferHealthNotices[1].detail.contains("Clear the board buffer"))
     }
 
     /// The flood marker. Twin: Android `flood refusal becomes a user-visible warning` in
@@ -101,11 +97,10 @@ final class DeviceStatusProtoTests: XCTestCase {
         XCTAssertFalse(try status(#"{"fw":"x","bufrl":false}"#).bufferRateLimited)
     }
 
-    func testFloodRefusalOrdersAfterStorageFailureAndBeforeCapacity() throws {
-        let s = try status(#"{"fw":"x","bufsat":true,"bufrl":true,"buferr":100,"keymis":true}"#)
+    func testFloodRefusalOrdersAfterStorageFailureAndBeforeMetadataError() throws {
+        let s = try status(#"{"fw":"x","bufrl":true,"buferr":100,"keymis":true}"#)
         XCTAssertEqual(s.bufferHealthNotices,
-                       [.keyNotAccepted, .storageFailed, .floodRefused, .capacityReached,
-                        .persistenceErrorRecorded])
+                       [.keyNotAccepted, .storageFailed, .floodRefused, .persistenceErrorRecorded])
     }
 
     func testNVSRetryAloneIsNotMislabeledAsRawStorageFailure() throws {
