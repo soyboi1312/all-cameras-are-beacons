@@ -11,7 +11,7 @@ the apps are free, but live detection needs a compatible board. without one, you
 - **buy a beacon** on [Tindie](https://www.tindie.com/stores/soyboitech/) or [Etsy](https://www.etsy.com/shop/soyboitech): the slim model ([Tindie](https://www.tindie.com/products/soyboitech/beacon-slim-pocket-counter-surveillance-detector/), [Etsy](https://www.etsy.com/listing/4587255406/airtag-and-bluetooth-tracker-detector)) or the battery model ([Tindie](https://www.tindie.com/products/soyboitech/beacon-battery-pocket-counter-surveillance/), [Etsy](https://www.etsy.com/listing/4587261765/rechargeable-airtag-and-bluetooth)). [soyboi.tech](https://soyboi.tech) has current pricing and availability.
 - **try the app without hardware:** install it for [iPhone](https://apps.apple.com/us/app/beacons-surveillance-scanner/id6781841861) or [Android](https://play.google.com/store/apps/details?id=tech.soyboi.beacons) and tap **See How It Works** for a tour with made-up detections.
 - **connect a board:** turn it on, tap **Scan for Beacons**, pick your board, and approve the pairing request. the app takes you through setup and permissions. do the first pairing somewhere you trust; see the [pairing guide](docs/app-guide.md#try-it-or-connect-a-board).
-- **flash your own OUI-Spy or Mesh-Detect** with the [DIY flasher](https://soyboi1312.github.io/all-cameras-are-beacons/) or [from the command line](#flashing-from-the-command-line).
+- **flash your own OUI-Spy, Mesh-Detect, or ESP32-C5 board** with the [DIY flasher](https://soyboi1312.github.io/all-cameras-are-beacons/) or [from the command line](#flashing-from-the-command-line).
 - **get help** from the [getting-started guide](https://soyboi.tech/getting-started), the [app guide](docs/app-guide.md), or the [FAQ](https://soyboi.tech/faq), or [open an issue](https://github.com/soyboi1312/all-cameras-are-beacons/issues).
 
 <a id="the-beacon"></a>
@@ -19,13 +19,14 @@ the apps are free, but live detection needs a compatible board. without one, you
 
 ## supported hardware
 
-all three boards run the same detector engine and the same per-category settings. they differ in radio coverage and in where alerts go.
+every board runs the same detector engine and the same per-category settings. they differ in radio coverage and in where alerts go.
 
 | hardware | radios | alerts |
 |---|---|---|
 | **the beacon** (rev-A and rev-B) | nRF52840 dedicated to Bluetooth scanning; ESP32-S3 for Wi-Fi and the app link | phone app, onboard buzzer, optional encrypted offline log |
 | **OUI-Spy** | Seeed XIAO ESP32-S3, one radio shared between Wi-Fi and Bluetooth | phone app, onboard buzzer, optional encrypted offline log |
 | **Mesh-Detect** | the same XIAO build, plus a wired Heltec V3 running Meshtastic | phone app and mesh alerts, with optional phone location while connected, and an optional encrypted offline log |
+| **ESP32-C5** (DIY) | Seeed XIAO ESP32-C5, or Espressif's ESP32-C5-DevKitC-1 (untested here); one radio shared between Bluetooth and 2.4 and 5 GHz Wi-Fi | phone app, a buzzer if you wire one, optional encrypted offline log; updates are USB reflashes from the DIY flasher |
 
 the beacon is about the size of an AirPods case and runs on USB-C power; the battery model charges through the same port. retail units come pre-flashed. pair one with the app to choose detector categories, alerts, and optional location or offline logging. firmware updates come through the app, and USB recovery is specific to each board revision (see [production beacon](#production-beacon)).
 
@@ -57,7 +58,7 @@ tap a detection to see how it was matched, its confidence, and the evidence. **c
 
 ### what it can hear
 
-the released boards only listen on 2.4 GHz; none has a 5 GHz radio. it cannot see equipment that never makes a supported broadcast, such as wired-only or purely optical gear. Wi-Fi is scanned one channel at a time, so short transmissions can be missed, and Wi-Fi eco mode adds more gaps. OUI-Spy and Mesh-Detect split one radio's time between Wi-Fi and Bluetooth; the beacon's dedicated Bluetooth scanner runs the whole time during normal scanning.
+the beacon, OUI-Spy, and Mesh-Detect listen on 2.4 GHz only. the ESP32-C5 builds also visit nine 5 GHz channels, which costs 2.4 GHz about 30% of its listening time (the app has a switch for it). no board can see equipment that never makes a supported broadcast, such as wired-only or purely optical gear. Wi-Fi is scanned one channel at a time, so short transmissions can be missed, and Wi-Fi eco mode adds more gaps. OUI-Spy and Mesh-Detect split one radio's time between Wi-Fi and Bluetooth; the beacon's dedicated Bluetooth scanner runs the whole time during normal scanning.
 
 an empty screen means nothing supported was recognized while the board was listening. **it does not mean you are unwatched.** [radio coverage](docs/radio-coverage.md) has the channel schedule, duty cycles, and Wi-Fi eco tradeoffs.
 
@@ -105,13 +106,15 @@ normal updates come through the app. USB recovery depends on the board revision:
 
 **never flash one revision's image onto the other, or a DIY image onto a production beacon.** the wrong image can leave the board needing USB recovery.
 
-### DIY OUI-Spy and Mesh-Detect
+### DIY OUI-Spy, Mesh-Detect, and ESP32-C5
 
-1. connect the XIAO ESP32-S3 to your computer with a USB-C cable that carries data, not a charge-only cable.
+1. connect the XIAO ESP32-S3, or the ESP32-C5 board, to your computer with a USB-C cable that carries data, not a charge-only cable.
 2. open the [DIY flasher](https://soyboi1312.github.io/all-cameras-are-beacons/) in Chrome or Edge and pick the firmware for your board.
 3. select the board when prompted and wait for flashing to finish.
 
 the flasher uses Web Serial, so it needs a desktop browser; Safari and Firefox do not support it. the [web flasher docs](web/README.md) cover self-hosting and rebuilding the images.
+
+the ESP32-C5 images are USB-only: the apps do not offer them over-the-air updates, so update by flashing again from the same page. the ESP32-C5-DevKitC-1 image was built for [issue #2](https://github.com/soyboi1312/all-cameras-are-beacons/issues/2) on a board we do not have; results are welcome on that issue.
 
 ### flashing from the command line
 
@@ -128,7 +131,7 @@ pio device monitor -b 115200
 
 [platformio.ini](firmware/platformio.ini) defines the shipping, capture, and bench environments. capture builds log nearby identifiers and raw payloads, so keep those logs private and reflash shipping firmware when you are done. `odid-sim` is a Remote ID simulator for bench use only.
 
-`beacon-c5` is an unreleased build for one Seeed XIAO ESP32-C5, a single radio shared between Bluetooth and 2.4 and 5 GHz Wi-Fi (see [radio coverage](docs/radio-coverage.md#the-esp32-c5-build-unreleased)); no flasher or OTA image is published for it. its platform deletes the framework versions the other builds need from the PlatformIO core folder it runs in, so a plain `pio run` skips it. build it in its own core folder, from `firmware/`: `PLATFORMIO_CORE_DIR=~/.platformio-c5 pio run -e beacon-c5`.
+`beacon-c5` (Seeed XIAO ESP32-C5) and `beacon-c5-devkitc` (Espressif ESP32-C5-DevKitC-1) are the ESP32-C5 builds: a single radio shared between Bluetooth and 2.4 and 5 GHz Wi-Fi (see [radio coverage](docs/radio-coverage.md#the-esp32-c5-builds-usb-only)). their images are on the DIY flasher but not in the app's firmware manifest, so updates are USB reflashes. on the DevKitC-1 either USB-C port flashes, and serial output is on the port marked UART. their platform deletes the framework versions the other builds need from the PlatformIO core folder it runs in, so a plain `pio run` skips them. build them in their own core folder, from `firmware/`: `PLATFORMIO_CORE_DIR=~/.platformio-c5 pio run -e beacon-c5 -t upload` (or `-e beacon-c5-devkitc`).
 
 <a id="how-the-project-is-organized"></a>
 
@@ -161,7 +164,7 @@ the detector, mesh path, apps, and update flows have all been tested on real har
 
 ## license
 
-the project's own **application and ESP32 firmware code** (the ESP32-S3 builds and the unreleased ESP32-C5 build) in this repository is licensed under [Apache-2.0](LICENSE). bundled third-party components keep their own licenses; see [CREDITS.md](CREDITS.md) and their license files. keep the applicable [LICENSE](LICENSE), [NOTICE](NOTICE), and third-party notices with any distribution.
+the project's own **application and ESP32 firmware code** (the ESP32-S3 and ESP32-C5 builds) in this repository is licensed under [Apache-2.0](LICENSE). bundled third-party components keep their own licenses; see [CREDITS.md](CREDITS.md) and their license files. keep the applicable [LICENSE](LICENSE), [NOTICE](NOTICE), and third-party notices with any distribution.
 
 the **companion nRF firmware, hardware design, PCB layout, enclosure, manufacturing files, product name, and trademarks are not covered** by that license unless explicitly stated otherwise.
 

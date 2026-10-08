@@ -4,9 +4,9 @@ beacons can recognize a device only when it receives a supported broadcast. matc
 
 ## Wi-Fi coverage
 
-every released board, the beacon included, hears Wi-Fi through an ESP32-S3, which listens on **2.4 GHz only**. it cannot hear 5 GHz traffic, and it listens to one Wi-Fi channel at a time.
+the beacon, OUI-Spy, and Mesh-Detect hear Wi-Fi through an ESP32-S3, which listens on **2.4 GHz only**. it cannot hear 5 GHz traffic, and it listens to one Wi-Fi channel at a time. the DIY ESP32-C5 builds add a 5 GHz pass (see [the ESP32-C5 builds](#the-esp32-c5-builds-usb-only) below).
 
-all shipping boards use the same channel-hopping sequence. it returns to channel 6 between visits to the other channels to favor brief Wi-Fi Remote ID broadcasts:
+the ESP32-S3 boards use the same channel-hopping sequence. it returns to channel 6 between visits to the other channels to favor brief Wi-Fi Remote ID broadcasts:
 
 | channel | slots per sweep | nominal share of the active sweep |
 |---|---|---|
@@ -175,15 +175,18 @@ closing this needs a dual-band receiver. the ESP32-S3 has no 5 GHz PHY, so it ca
 which makes this a hardware question rather than a firmware one. the C5 sniffer already runs a
 netcam OUI list generated from `netcam_signatures.h`, though the copy lags the header: all 180 of
 its blocks are in `CAMERA_VENDOR_OUI`, which now holds 197, and it matches any of the three
-address fields rather than the board's source-address rule. the unreleased
-[ESP32-C5 build](#the-esp32-c5-build-unreleased) below is such a receiver: it runs the board's own
-detectors, that source-address rule included, on both bands. whether it ships is not settled.
+address fields rather than the board's source-address rule. the
+[ESP32-C5 builds](#the-esp32-c5-builds-usb-only) below are such a receiver: they run the board's
+own detectors, that source-address rule included, on both bands.
 
-### the ESP32-C5 build (unreleased)
+### the ESP32-C5 builds (USB only)
 
-`beacon-c5` runs the board firmware on one Seeed XIAO ESP32-C5, with one radio time-shared between
-Bluetooth and 2.4 and 5 GHz Wi-Fi and no nRF52840. its Bluetooth scan uses the same 67/131 window
-as OUI-Spy (see below). no flasher or OTA image is published for it.
+`beacon-c5` runs the board firmware on one Seeed XIAO ESP32-C5, and `beacon-c5-devkitc` is the
+same build for Espressif's ESP32-C5-DevKitC-1 (untested on that board here), with one radio
+time-shared between Bluetooth and 2.4 and 5 GHz Wi-Fi and no nRF52840. its Bluetooth scan uses
+the same 67/131 window as OUI-Spy (see below). both images are on the
+[DIY flasher](https://soyboi1312.github.io/all-cameras-are-beacons/); neither is in the app's
+firmware manifest, so the apps offer them no over-the-air update and an update is a USB reflash.
 
 after every full 2.4 GHz sweep it dwells once on each of nine non-DFS 5 GHz channels, 36, 40,
 44, 48, 149, 153, 157, 161 and 165, so a sweep has 33 slots: channel 6 gets 12 (about 36 percent),

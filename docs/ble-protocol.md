@@ -4,8 +4,9 @@ This is the contract between the ACAB firmware and the native apps (the
 SwiftUI iOS app and the Android app). Every build exposes one service.
 
 **Advertised name.** The v2 beacon board advertises as **`beacon`** and reports the
-`fw` label **`beacon board`** (rev-B: `beacon board rev-B`); the unreleased beacon-c5 build (a
-single-radio beacon on one XIAO ESP32-C5) also advertises as `beacon` and reports `beacon c5`;
+`fw` label **`beacon board`** (rev-B: `beacon board rev-B`); the ESP32-C5 builds (single-radio
+beacons on one XIAO ESP32-C5 or ESP32-C5-DevKitC-1, USB-flashed only) also advertise as `beacon`
+and report `beacon c5` or `beacon c5 devkitc`;
 the legacy Colonel Panic oui-spy
 build advertises as **`ACAB`** and reports `ACAB-ouispy`; the Colonel Panic Mesh-Detect build
 advertises as **`ACAB-mesh`** in its scan response (the primary advert carries the shortened
@@ -18,8 +19,8 @@ and nothing else reads this: not pairing, not the scan filter, not OTA, not dete
 kinds are `beacon`, `ouiSpy` and `meshDetect` (stored raw values, the same on both apps), and
 the apps resolve one per board in this order:
 
-1. the connected board's Status `fw` label, by prefix: `beacon` (`beacon board`, its rev-B and
-   `beacon c5`), `ACAB-ouispy`, `mesh-detect`. This is the only source the apps store, on the
+1. the connected board's Status `fw` label, by prefix: `beacon` (`beacon board`, its rev-B,
+   `beacon c5` and `beacon c5 devkitc`), `ACAB-ouispy`, `mesh-detect`. This is the only source the apps store, on the
    remembered board, from the first Status frame of a ready session. The released 2.1.x apps
    match `beacon board` only, so they name a C5 from its advert instead;
 2. a hint from the REAL advertised local name the scan heard for that board: exactly `beacon`,
@@ -287,7 +288,7 @@ Write a JSON object with any subset of keys:
 | `ble` | enable/disable the BLE detection scan. `false` stops scanning only - the GATT link to the app stays up |
 | `wifi` | enable/disable the Wi-Fi (promiscuous) detection scan |
 | `wifiEco` | Wi-Fi eco mode: integer seconds of Wi-Fi RX sleep between sweeps, `0` (off) / `3` / `7` / `15`. Battery-SKU power saver; BLE capture is untouched. The board reports the active value back in Status under the same key |
-| `wifi5` | **beacon-c5 only**, the one build whose chip has a 5 GHz radio: `true` / `false` turns the 5 GHz pass of the Wi-Fi hop on or off. On (the default) the hop dwells once on each of 9 non-DFS 5 GHz channels (36 to 48, 149 to 165) after every `ACAB_WIFI_5G_EVERY`-th full 2.4 GHz sweep (default 1, so every sweep), which on the shared radio costs about 30% of 2.4 GHz frames and about 2% of BLE adverts; off takes effect at the next channel. Persisted (NVS namespace `acab-wifi`, key `w5`). A non-bool value is ignored. Every other build compiles the key out, so it changes nothing there. The board reports the active value back in Status under the same key |
+| `wifi5` | **the ESP32-C5 builds only** (beacon-c5 and beacon-c5-devkitc, the builds whose chip has a 5 GHz radio): `true` / `false` turns the 5 GHz pass of the Wi-Fi hop on or off. On (the default) the hop dwells once on each of 9 non-DFS 5 GHz channels (36 to 48, 149 to 165) after every `ACAB_WIFI_5G_EVERY`-th full 2.4 GHz sweep (default 1, so every sweep), which on the shared radio costs about 30% of 2.4 GHz frames and about 2% of BLE adverts; off takes effect at the next channel. Persisted (NVS namespace `acab-wifi`, key `w5`). A non-bool value is ignored. Every other build compiles the key out, so it changes nothing there. The board reports the active value back in Status under the same key |
 | `beep` | `true` plays one preview beep at the current volume (pair with `volume` to audition a level) |
 | `buffer` | enable/disable the offline detection buffer (default **off**, opt-in). Every explicit `false` removes the at-rest key from RAM/NVS and durably requests erasure of any retained core dump whose task stacks may contain the key, a decrypted row, or phone coordinates. It does **not** erase the ring records themselves; drain first. See *Offline detection buffer* below |
 | `key` | 64 lowercase hex chars = the 32-byte at-rest encryption key; the app generates + persists it and pushes it on **every authenticated connection**. `sync` is refused until a valid key write has been accepted on that same session; a retained RAM key from another bonded phone never authorizes replay by itself. **The board holds the accepted key in RAM AND persists it to NVS while buffering is enabled** (`det_log.cpp` `detLogSetEnabled`), so a board left deployed keeps encrypting across reboots instead of going keyless. **TRADEOFF, state it plainly: a seized board's flash yields the key, so the at-rest buffer is decryptable and is NOT ciphertext-only.** Turning buffering off erases the key from both RAM and NVS and schedules the retained-core-dump wipe described above. If a different phone key meets a nonempty or untrusted generation, the board preserves the existing rows/key, reports session-only Status `keymis:true`, and refuses sync. Ownership transfer must be explicit: send `clearlog:true`, then re-send the replacement key (they may share one Config object; clear is processed first). A safely accepted different key still schedules the dump wipe even when the ring is empty, because old key bytes can remain in a retained stack. Flash encryption / encrypted NVS is what would restore seized-board protection. See the SECURITY block at the top of `det_log.h`. |
@@ -418,7 +419,7 @@ a hard ceiling.
 | `total` | detections emitted this session |
 | `ble` / `wifi` | detection scan active for that radio (reflects the `ble` / `wifi` config toggles) |
 | `wifiEco` | active Wi-Fi eco value: seconds of Wi-Fi RX sleep between sweeps, `0` (off) / `3` / `7` / `15`. Mirrors the `wifiEco` config key; both apps read it to drive the eco picker |
-| `wifi5` | the 5 GHz pass of the Wi-Fi hop is on. **Sent only by beacon-c5**, on every frame, as `true` or `false`. **An absent key means the board has no 5 GHz radio** (every S3 build, including the example frame above), and both apps then hide the 5 GHz toggle. Mirrors the `wifi5` config key |
+| `wifi5` | the 5 GHz pass of the Wi-Fi hop is on. **Sent only by the ESP32-C5 builds**, on every frame, as `true` or `false`. **An absent key means the board has no 5 GHz radio** (every S3 build, including the example frame above), and both apps then hide the 5 GHz toggle. Mirrors the `wifi5` config key |
 | `pairw` | seconds left in the new-phone pairing window. **Emitted only while the window is open**; absent = closed (the normal steady state). The window is 120 s from a physical start (`acabPhysicalStart` in `pair_window.h`) and is timed on the 64-bit microsecond clock, so it cannot reopen however long the board runs; before 2.2.0 a board that saw no connection attempt for about 25 days after it closed could read it open again. Lets an app show a setup countdown; neither app parses it today |
 | `buferr` | latched storage-fault bitmask for the offline buffer, **emitted only when nonzero**. Bits `0x01` read, `0x02` erase, `0x04` write, `0x08` corruption, `0x10` lock, and `0x40` cryptography (random generation, nonce/key hashing, or AES) mean the ring stopped accepting evidence rather than pretending it was stored. Bit `0x20` means NVS rejected an offline-buffer metadata load or save, including generation, anchor, connection/privacy lifecycle, flood-marker, and diagnostic-fault state; eligible work is retried from the loop task, and this bit alone does not condemn sound raw-ring geometry. The mask is historical: recovered faults remain visible until a fully successful physical wipe clears it. Both apps treat every non-`0x20` bit, including unknown future bits, as `OFFLINE LOG INCOMPLETE`; `0x20` additionally shows `BUFFER METADATA ERROR RECORDED`, says current status may already include a successful retry, asks the user to confirm buffer state and replay timestamps, and explains that a clear resets the warning |
 | `flock` | Flock/ALPR detector enabled. A missing key (older firmware) is treated as on |
@@ -810,8 +811,8 @@ can push firmware.
 **Where images come from.** The app polls
 `https://soyboi.tech/firmware/firmware-latest.json`, keyed by the board's exact `fw` label
 (`beacon board`, `beacon board rev-B`, `ACAB-ouispy`, `mesh-detect-ACAB`,
-`mesh-detect-ACAB-ch1`). `beacon c5` has no entry, and the lookup is never by prefix, so a C5
-is never offered an S3 image. Each entry carries the latest
+`mesh-detect-ACAB-ch1`). `beacon c5` and `beacon c5 devkitc` have no entry, and the lookup is
+never by prefix, so a C5 is never offered an S3 image. Each entry carries the latest
 `version` (drives the "update available" nudge without an app-store release), the image
 `url` + `sha256` + `size`, and a `flasher` URL for boards without the OTA characteristic.
 The app must verify the downloaded image's size and SHA-256 against the manifest before
