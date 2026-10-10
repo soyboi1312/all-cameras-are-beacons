@@ -27,7 +27,7 @@ web/
 ├── manifest-mesh-detect.json     # ...and the public Mesh-Detect firmware
 ├── manifest-mesh-detect-ch1.json # ...and the private-channel Mesh-Detect build
 ├── manifest-beacon-c5.json       # ...and the Seeed XIAO ESP32-C5 build (USB-only, 5 GHz)
-├── manifest-beacon-c5-devkitc.json # ...and the ESP32-C5-DevKitC-1 build (untested here)
+├── manifest-beacon-c5-devkitc.json # ...and the ESP32-C5-DevKitC-1 build (community-tested)
 ├── build-flasher.sh              # rebuilds the flashable firmware files
 ├── vendor/
 │   └── esp-web-tools/            # self-hosted ESP Web Tools 10.2.1 (see below)
@@ -42,7 +42,8 @@ web/
 The two ESP32-C5 builds are USB-only: they have no entry in `firmware-latest.json`, so the apps
 never offer them an over-the-air image and an update means flashing again from this page. Their
 bootloader part goes to 0x2000, where the ESP32-C5 ROM looks for it; the other parts keep the S3
-offsets. The DevKitC-1 image is built for GitHub issue #2 on a board nobody here owns.
+offsets. The DevKitC-1 image was built for GitHub issue #2 on a board nobody here owns; the
+reporter confirmed on 2026-10-08 that it flashes and scans.
 
 ## One canonical privacy policy
 

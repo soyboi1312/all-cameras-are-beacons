@@ -182,7 +182,8 @@ own detectors, that source-address rule included, on both bands.
 ### the ESP32-C5 builds (USB only)
 
 `beacon-c5` runs the board firmware on one Seeed XIAO ESP32-C5, and `beacon-c5-devkitc` is the
-same build for Espressif's ESP32-C5-DevKitC-1 (untested on that board here), with one radio
+same build for Espressif's ESP32-C5-DevKitC-1 (confirmed working by a community member in
+[issue #2](https://github.com/soyboi1312/all-cameras-are-beacons/issues/2); not bench-tested here), with one radio
 time-shared between Bluetooth and 2.4 and 5 GHz Wi-Fi and no nRF52840. its Bluetooth scan uses
 the same 67/131 window as OUI-Spy (see below). both images are on the
 [DIY flasher](https://soyboi1312.github.io/all-cameras-are-beacons/); neither is in the app's

@@ -277,17 +277,17 @@
       <p class="steps"><b>Seeed XIAO ESP32-C5:</b> buzzer on D2 (GPIO25), the user LED on GPIO27.
          <b>Espressif ESP32-C5-DevKitC-1 (N8R4 or N8R8):</b> built for
          <a href="https://github.com/soyboi1312/all-cameras-are-beacons/issues/2" target="_blank" rel="noopener">issue #2</a>
-         and <b>untested here</b>. Either USB-C port flashes it; detections print on the port marked
-         UART (Serial is UART0 on this kit), so open the monitor there. The onboard RGB LED is the
-         status light, and an optional passive piezo goes between GPIO23 and GND. Please report what
-         you see on that issue.</p>
+         where a community member confirmed it flashes and scans (we do not own the kit). Either
+         USB-C port flashes it; detections print on the port marked UART (Serial is UART0 on this
+         kit), so open the monitor there. The onboard RGB LED is the status light, and an optional
+         passive piezo goes between GPIO23 and GND. If something misbehaves, open an issue.</p>
       <esp-web-install-button manifest="./manifest-beacon-c5.json">
         <button class="btn" slot="activate">FLASH XIAO ESP32-C5</button>
         <span slot="unsupported" class="unsupported">Browser not supported. Use Chrome or Edge.</span>
         <span slot="not-allowed" class="not-allowed">Must be served over HTTPS or localhost.</span>
       </esp-web-install-button>
       <esp-web-install-button manifest="./manifest-beacon-c5-devkitc.json">
-        <button class="btn btn-alt" slot="activate">FLASH ESP32-C5-DEVKITC-1 (UNTESTED)</button>
+        <button class="btn btn-alt" slot="activate">FLASH ESP32-C5-DEVKITC-1</button>
         <span slot="unsupported" class="unsupported">Browser not supported. Use Chrome or Edge.</span>
         <span slot="not-allowed" class="not-allowed">Must be served over HTTPS or localhost.</span>
       </esp-web-install-button>

@@ -26,7 +26,7 @@ every board runs the same detector engine and the same per-category settings. th
 | **the beacon** (rev-A and rev-B) | nRF52840 dedicated to Bluetooth scanning; ESP32-S3 for Wi-Fi and the app link | phone app, onboard buzzer, optional encrypted offline log |
 | **OUI-Spy** | Seeed XIAO ESP32-S3, one radio shared between Wi-Fi and Bluetooth | phone app, onboard buzzer, optional encrypted offline log |
 | **Mesh-Detect** | the same XIAO build, plus a wired Heltec V3 running Meshtastic | phone app and mesh alerts, with optional phone location while connected, and an optional encrypted offline log |
-| **ESP32-C5** (DIY) | Seeed XIAO ESP32-C5, or Espressif's ESP32-C5-DevKitC-1 (untested here); one radio shared between Bluetooth and 2.4 and 5 GHz Wi-Fi | phone app, a buzzer if you wire one, optional encrypted offline log; updates are USB reflashes from the DIY flasher |
+| **ESP32-C5** (DIY) | Seeed XIAO ESP32-C5, or Espressif's ESP32-C5-DevKitC-1 (community-tested); one radio shared between Bluetooth and 2.4 and 5 GHz Wi-Fi | phone app, a buzzer if you wire one, optional encrypted offline log; updates are USB reflashes from the DIY flasher |
 
 the beacon is about the size of an AirPods case and runs on USB-C power; the battery model charges through the same port. retail units come pre-flashed. pair one with the app to choose detector categories, alerts, and optional location or offline logging. firmware updates come through the app, and USB recovery is specific to each board revision (see [production beacon](#production-beacon)).
 
@@ -114,7 +114,7 @@ normal updates come through the app. USB recovery depends on the board revision:
 
 the flasher uses Web Serial, so it needs a desktop browser; Safari and Firefox do not support it. the [web flasher docs](web/README.md) cover self-hosting and rebuilding the images.
 
-the ESP32-C5 images are USB-only: the apps do not offer them over-the-air updates, so update by flashing again from the same page. the ESP32-C5-DevKitC-1 image was built for [issue #2](https://github.com/soyboi1312/all-cameras-are-beacons/issues/2) on a board we do not have; results are welcome on that issue.
+the ESP32-C5 images are USB-only: the apps do not offer them over-the-air updates, so update by flashing again from the same page. the ESP32-C5-DevKitC-1 image was built for [issue #2](https://github.com/soyboi1312/all-cameras-are-beacons/issues/2), where a community member confirmed it flashes and scans; we do not have that board ourselves, so report problems in a new issue.
 
 ### flashing from the command line
 
