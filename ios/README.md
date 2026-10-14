@@ -1,9 +1,10 @@
 # All Cameras Are Beacons
 
-The iPhone app. It pairs with an OUI-Spy board over Bluetooth and shows you what
-it's picking up as it happens. It's the free, open-source companion to the beacon
-(the board we sell), and it works just the same with the DIY OUI-Spy and
-Mesh-Detect XIAO builds. How it talks to the board is written up in
+The iPhone app. It pairs with a beacon, OUI-Spy, Mesh-Detect, or ESP32-C5 board over
+Bluetooth and shows you what it's picking up as it happens. It's the free, open-source
+companion to the beacon (the board we sell), and it works just the same with the DIY
+OUI-Spy, Mesh-Detect, and ESP32-C5 builds (the ESP32-C5 boards update over USB, not in
+the app). How it talks to the board is written up in
 [../docs/ble-protocol.md](../docs/ble-protocol.md).
 
 > You'll need a real iPhone to do anything useful with it. Bluetooth doesn't work
@@ -24,34 +25,47 @@ xcodegen generate          # creates Beacons.xcodeproj
 open Beacons.xcodeproj
 ```
 
-Then in Xcode, pick your signing team (the Beacons target, under Signing &
-Capabilities), plug in your iPhone, and press Run. The first run on a new phone
+Then in Xcode, pick your signing team for both targets, Beacons and BeaconsWidget
+(under Signing & Capabilities), plug in your iPhone, and press Run. `project.yml` bakes in
+the maintainer's team (`DEVELOPMENT_TEAM`), bundle IDs and App Group, and `xcodegen
+generate` puts them back, so to build on your own team, change them in `project.yml` and
+regenerate. The first run on a new phone
 also needs Developer Mode turned on, under Settings → Privacy & Security →
 Developer Mode, and you'll need to unlock the phone so Xcode can finish setting
 it up.
 
-Not a fan of XcodeGen? You can start a fresh SwiftUI app (iOS 18 or newer), drop
-in everything under `Beacons/`, and add the Bluetooth and location usage
-descriptions to Info.plist.
+Not a fan of XcodeGen? A hand-made project needs more than `Beacons/` now: the
+NordicDFU Swift package (pinned in `project.yml`), a widget extension built from
+`BeaconsWidget/` plus the files in `Beacons/Shared/`, the App Group on both targets, and
+the Info.plist keys `project.yml` sets. XcodeGen is the supported path.
 
 ## What's inside
 
 ```
-ios/Beacons/
-├── ACABApp.swift            # the app entry point
-├── Models/                  # the data: device types, detections, status
-├── BLE/
-│   ├── ACABProfile.swift    # the Bluetooth service + characteristic IDs
-│   └── BLEManager.swift     # all the Bluetooth and location plumbing
-└── Views/
-    ├── Theme.swift          # the look: dark, system type, crimson accent
-    ├── Components.swift      # shared bits (wordmark, signal bars, radar, ...)
-    ├── ConnectView.swift     # find and pick a board
-    ├── DashboardView.swift   # the radar "what's around me" home screen
-    ├── MapTabView.swift      # everything located, on a map
-    ├── DetectionsView.swift  # the Log: active / new / all, search, tools menu, CSV + GPX export
-    ├── DetectionDetailView.swift
-    └── SettingsView.swift    # the Beacon screen: radios, buzzer, firmware, about
+ios/
+├── project.yml                  # XcodeGen spec: app, widget and test targets, NordicDFU package
+├── Beacons/
+│   ├── ACABApp.swift            # the app entry point
+│   ├── Models/                  # the data: device types, detections, status, firmware manifest
+│   ├── BLE/
+│   │   ├── ACABProfile.swift    # the Bluetooth service + characteristic IDs
+│   │   ├── BLEManager.swift     # all the Bluetooth and location plumbing
+│   │   └── BLEManager+OTA.swift # in-app firmware updates (+NrfDFU, +CombinedUpdate for the second radio)
+│   ├── Shared/                  # code the widget extension compiles too
+│   ├── Resources/               # fonts, Info.plist and the FAQ (faq-content.json)
+│   └── Views/
+│       ├── Theme.swift          # the look: dark, crimson accent, JetBrains Mono for telemetry
+│       ├── Components.swift     # shared bits (wordmark, signal bars, radar, ...)
+│       ├── RootView.swift       # the connect screen or the four tabs (MainTabView)
+│       ├── ConnectView.swift    # find and pick a board
+│       ├── DashboardView.swift  # Status: the radar "what's around me" home screen
+│       ├── MapTabView.swift     # Map: everything located, on a map
+│       ├── DetectionsView.swift # the Log: active / new / all, search, tools menu, CSV + GPX export
+│       ├── DetectionDetailView.swift
+│       └── SettingsView.swift   # the Beacon tab (DeviceView): radios, buzzer, firmware, about
+├── BeaconsWidget/               # widget extension: home-screen widget, Live Activity, Drive Mode control
+├── BeaconsTests/                # unit tests
+└── BeaconsUITests/              # UI tests (the Log tools menu while the feed streams)
 ```
 
 ## How it talks to the board
@@ -65,7 +79,7 @@ On connect the firmware negotiates a **512-byte ATT MTU** so the status and rich
 drone records fit one notify; iOS decides the final value, and `BLEManager+OTA`
 reads back `maximumWriteValueLength` for its chunk size rather than assuming 512.
 Dual-radio beacon boards add a co-processor-alive flag (`co`) to the status JSON;
-`SettingsView` shows a fault banner when it reads `false`, meaning the board's
+`SettingsView.swift` (the Beacon tab's `DeviceView`) shows a fault banner when it reads `false`, meaning the board's
 companion BLE scanner has gone silent (its half of detection is dark).
 
 ## Where it's at

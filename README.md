@@ -1,6 +1,6 @@
 # All Cameras Are Beacons
 
-**beacons** picks up the Wi-Fi and Bluetooth broadcasts of supported surveillance devices, such as license-plate readers, body cams, and drones, and shows them in the iPhone and Android apps. Mesh-Detect can also send them out as Meshtastic alerts. it runs on the beacon, our pocket-sized dual-radio detector, and on Colonel Panic's OUI-Spy and Mesh-Detect boards.
+**beacons** picks up the Wi-Fi and Bluetooth broadcasts of supported surveillance devices, such as license-plate readers, body cams, and drones, and shows them in the iPhone and Android apps. Mesh-Detect can also send them out as Meshtastic alerts. it runs on the beacon, our pocket-sized dual-radio detector, on Colonel Panic's OUI-Spy and Mesh-Detect boards, and on DIY ESP32-C5 boards.
 
 detection is passive: shipping firmware never probes, jams, spoofs, controls, or interferes with nearby devices. the board talks to your phone over bonded, encrypted Bluetooth, and Mesh-Detect also sends alerts through its wired Meshtastic node.
 
@@ -10,7 +10,7 @@ the apps are free, but live detection needs a compatible board. without one, you
 
 - **buy a beacon** on [Tindie](https://www.tindie.com/stores/soyboitech/) or [Etsy](https://www.etsy.com/shop/soyboitech): the slim model ([Tindie](https://www.tindie.com/products/soyboitech/beacon-slim-pocket-counter-surveillance-detector/), [Etsy](https://www.etsy.com/listing/4587255406/airtag-and-bluetooth-tracker-detector)) or the battery model ([Tindie](https://www.tindie.com/products/soyboitech/beacon-battery-pocket-counter-surveillance/), [Etsy](https://www.etsy.com/listing/4587261765/rechargeable-airtag-and-bluetooth)). [soyboi.tech](https://soyboi.tech) has current pricing and availability.
 - **try the app without hardware:** install it for [iPhone](https://apps.apple.com/us/app/beacons-surveillance-scanner/id6781841861) or [Android](https://play.google.com/store/apps/details?id=tech.soyboi.beacons) and tap **See How It Works** for a tour with made-up detections.
-- **connect a board:** turn it on, tap **Scan for Beacons**, pick your board, and approve the pairing request. the app takes you through setup and permissions. do the first pairing somewhere you trust; see the [pairing guide](docs/app-guide.md#try-it-or-connect-a-board).
+- **connect a board:** turn it on, tap **Scan for Beacons**, pick your board, and approve the pairing request. the app takes you through setup and permissions. do the first pairing somewhere you trust. to add another phone later, or to pair again after a phone forgets the board, turn the board off and on and pair within two minutes; see the [pairing guide](docs/app-guide.md#try-it-or-connect-a-board).
 - **flash your own OUI-Spy, Mesh-Detect, or ESP32-C5 board** with the [DIY flasher](https://soyboi1312.github.io/all-cameras-are-beacons/) or [from the command line](#flashing-from-the-command-line).
 - **get help** from the [getting-started guide](https://soyboi.tech/getting-started), the [app guide](docs/app-guide.md), or the [FAQ](https://soyboi.tech/faq), or [open an issue](https://github.com/soyboi1312/all-cameras-are-beacons/issues).
 
@@ -23,10 +23,10 @@ every board runs the same detector engine and the same per-category settings. th
 
 | hardware | radios | alerts |
 |---|---|---|
-| **the beacon** (rev-A and rev-B) | nRF52840 dedicated to Bluetooth scanning; ESP32-S3 for Wi-Fi and the app link | phone app, onboard buzzer, optional encrypted offline log |
+| **the beacon** (slim model: rev-A; battery model: rev-B) | nRF52840 dedicated to Bluetooth scanning; ESP32-S3 for Wi-Fi and the app link | phone app, onboard buzzer, optional encrypted offline log |
 | **OUI-Spy** | Seeed XIAO ESP32-S3, one radio shared between Wi-Fi and Bluetooth | phone app, onboard buzzer, optional encrypted offline log |
-| **Mesh-Detect** | the same XIAO build, plus a wired Heltec V3 running Meshtastic | phone app and mesh alerts, with optional phone location while connected, and an optional encrypted offline log |
-| **ESP32-C5** (DIY) | Seeed XIAO ESP32-C5, or Espressif's ESP32-C5-DevKitC-1 (community-tested); one radio shared between Bluetooth and 2.4 and 5 GHz Wi-Fi | phone app, a buzzer if you wire one, optional encrypted offline log; updates are USB reflashes from the DIY flasher |
+| **Mesh-Detect** | the same XIAO build, plus a wired Heltec V3 running Meshtastic | phone app and mesh alerts (your phone's location only on a private channel, while connected), and an optional encrypted offline log |
+| **ESP32-C5** (DIY) | Seeed XIAO ESP32-C5, or Espressif's ESP32-C5-DevKitC-1 with 8 MB flash (N8R4 or N8R8, community-tested); one radio shared between Bluetooth and 2.4 and 5 GHz Wi-Fi | phone app, a buzzer if you wire one, optional encrypted offline log; updates are USB reflashes from the DIY flasher |
 
 the beacon is about the size of an AirPods case and runs on USB-C power; the battery model charges through the same port. retail units come pre-flashed. pair one with the app to choose detector categories, alerts, and optional location or offline logging. firmware updates come through the app, and USB recovery is specific to each board revision (see [production beacon](#production-beacon)).
 
@@ -41,7 +41,7 @@ for Mesh-Detect, [mesh setup](docs/mesh-setup.md) covers the Heltec wiring and t
 | **Remote ID drones** | Bluetooth + Wi-Fi | on | broadcasts can include the aircraft's position; a separate, opt-in vendor match flags drones without Remote ID, but a hit may be a controller or other vendor gear |
 | **body cams** (Axon and Utility BodyWorn) | Bluetooth + Wi-Fi | on | Axon's device tag is the strongest match; the Motorola vendor match (Motorola Solutions and WatchGuard Video blocks) is broad, weak, and a separate opt-in |
 | **item trackers** | Bluetooth | off | Find My, Find Hub, Tile, and SmartTag; Find My and Find Hub tags only count once separated from their owner; no buzzer alerts on the board |
-| **smart or recording glasses** | Bluetooth | on | eyewear-specific evidence is stronger; some Meta identifiers also appear on other hardware |
+| **smart or recording glasses** | Bluetooth | on | every bare company ID reports as a weak match: the Luxottica, Snap and Vuzix IDs until a worn unit is captured, the Meta IDs because they also appear on other Meta hardware |
 | **network cameras** | Wi-Fi | off | a vendor match may be a camera, recorder, hub, or accessory |
 
 the [signature reference](docs/signatures.md) lists every supported manufacturer, the evidence behind each match, how confidence is set, and the matches we rejected. there are also [Axon notes](docs/axon.md) and [glasses research](docs/glasses.md). Remote ID decoding uses [OpenDroneID](https://github.com/opendroneid/opendroneid-core-c).
@@ -58,13 +58,13 @@ tap a detection to see how it was matched, its confidence, and the evidence. **c
 
 ### what it can hear
 
-the beacon, OUI-Spy, and Mesh-Detect listen on 2.4 GHz only. the ESP32-C5 builds also visit nine 5 GHz channels, which costs 2.4 GHz about 30% of its listening time (the app has a switch for it). no board can see equipment that never makes a supported broadcast, such as wired-only or purely optical gear. Wi-Fi is scanned one channel at a time, so short transmissions can be missed, and Wi-Fi eco mode adds more gaps. OUI-Spy and Mesh-Detect split one radio's time between Wi-Fi and Bluetooth; the beacon's dedicated Bluetooth scanner runs the whole time during normal scanning.
+the beacon, OUI-Spy, and Mesh-Detect listen on 2.4 GHz only. the ESP32-C5 builds also visit nine 5 GHz channels, which costs 2.4 GHz about 30% of its listening time (the app has a switch for it). no board can see equipment that never makes a supported broadcast, such as wired-only or purely optical gear. Wi-Fi is scanned one channel at a time, so short transmissions can be missed, and Wi-Fi eco mode adds more gaps. OUI-Spy, Mesh-Detect, and the ESP32-C5 builds split one radio's time between Wi-Fi and Bluetooth; the beacon's dedicated Bluetooth scanner runs the whole time during normal scanning.
 
 an empty screen means nothing supported was recognized while the board was listening. **it does not mean you are unwatched.** [radio coverage](docs/radio-coverage.md) has the channel schedule, duty cycles, and Wi-Fi eco tradeoffs.
 
 ## privacy
 
-there are no accounts, analytics, or third-party trackers, and nothing is uploaded automatically. detections stay on your board and phone unless you export or contribute them yourself. Mesh-Detect is the exception: it sends detections out as mesh alerts, which can include your phone's location while it is connected, and the default build posts them on the public channel that anyone on the mesh can read. the apps do go online to load map tiles, firmware files, and the optional mapped-camera dataset, but those requests never include your detections.
+there are no accounts, analytics, or third-party trackers, and nothing is uploaded automatically. detections stay on your board and phone unless you export or contribute them yourself. Mesh-Detect is the exception: it sends detections out as mesh alerts, and the default build posts them on the public channel that anyone on the mesh can read. your phone's location is attached only on a private channel, while the app is connected; the public build never sends it. the apps do go online to load map tiles, firmware files, and the optional mapped-camera dataset, but those requests never include your detections.
 
 if you allow location access, the phone geotags sightings and sends its position to the board over the encrypted link. offline records can keep that location. exports can include both where you were and the positions drones broadcast, so check an export before you share it.
 
@@ -73,7 +73,7 @@ two things these protections do not cover:
 - **the board can be tracked.** it advertises a fixed factory Bluetooth address, because iPhones could not connect to a rotating one in testing.
 - **offline encryption does not protect a seized board from forensic access.** while buffering is on, the key is stored on the board.
 
-read the [privacy policy](web/privacy.html) and the [Bluetooth privacy details](docs/ble-protocol.md#peripheral-address-bonding-and-privacy) before you rely on any of this.
+read the [privacy policy](https://soyboi1312.github.io/all-cameras-are-beacons/privacy.html) and the [Bluetooth privacy details](docs/ble-protocol.md#peripheral-address-bonding-and-privacy) before you rely on any of this.
 
 ## the phone apps
 
@@ -101,8 +101,8 @@ the [app guide](docs/app-guide.md) covers pairing, permissions, sample data, ale
 
 normal updates come through the app. USB recovery depends on the board revision:
 
-- [rev-A beacon flasher](https://soyboi.tech/flash.html)
-- [rev-B beacon flasher](https://soyboi.tech/flash-revb.html)
+- [rev-A beacon flasher](https://soyboi.tech/flash.html), for the slim model (no power button)
+- [rev-B beacon flasher](https://soyboi.tech/flash-revb.html), for the battery model (side button)
 
 **never flash one revision's image onto the other, or a DIY image onto a production beacon.** the wrong image can leave the board needing USB recovery.
 
@@ -131,7 +131,7 @@ pio device monitor -b 115200
 
 [platformio.ini](firmware/platformio.ini) defines the shipping, capture, and bench environments. capture builds log nearby identifiers and raw payloads, so keep those logs private and reflash shipping firmware when you are done. `odid-sim` is a Remote ID simulator for bench use only.
 
-`beacon-c5` (Seeed XIAO ESP32-C5) and `beacon-c5-devkitc` (Espressif ESP32-C5-DevKitC-1) are the ESP32-C5 builds: a single radio shared between Bluetooth and 2.4 and 5 GHz Wi-Fi (see [radio coverage](docs/radio-coverage.md#the-esp32-c5-builds-usb-only)). their images are on the DIY flasher but not in the app's firmware manifest, so updates are USB reflashes. on the DevKitC-1 either USB-C port flashes, and serial output is on the port marked UART. their platform deletes the framework versions the other builds need from the PlatformIO core folder it runs in, so a plain `pio run` skips them. build them in their own core folder, from `firmware/`: `PLATFORMIO_CORE_DIR=~/.platformio-c5 pio run -e beacon-c5 -t upload` (or `-e beacon-c5-devkitc`).
+`beacon-c5` (Seeed XIAO ESP32-C5) and `beacon-c5-devkitc` (Espressif ESP32-C5-DevKitC-1, the 8 MB N8R4 or N8R8 kits; the 4 MB kits cannot hold the partition table) are the ESP32-C5 builds: a single radio shared between Bluetooth and 2.4 and 5 GHz Wi-Fi (see [radio coverage](docs/radio-coverage.md#the-esp32-c5-builds-usb-only)). their images are on the DIY flasher but not in the app's firmware manifest, so updates are USB reflashes. on the DevKitC-1 either USB-C port flashes, and serial output is on the port marked UART. their platform deletes the framework versions the other builds need from the PlatformIO core folder it runs in, so a plain `pio run` skips them. build them in their own core folder, from `firmware/`: `PLATFORMIO_CORE_DIR=~/.platformio-c5 pio run -e beacon-c5 -t upload` (or `-e beacon-c5-devkitc`).
 
 <a id="how-the-project-is-organized"></a>
 
@@ -156,11 +156,11 @@ the companion nRF firmware and the beacon's hardware design files are not in thi
 
 ## project status
 
-the source tree is at **2.2.0** for the ESP32 firmware and both apps. published releases can trail the source, so check the app's firmware update screen and the store listings for what is actually available.
+the source tree is at **2.2.1** for the ESP32 firmware and both apps. published releases can trail the source, so check the app's firmware update screen and the store listings for what is actually available.
 
 the detector, mesh path, apps, and update flows have all been tested on real hardware. field testing continues, especially for the capture candidates. the [OTA protocol](docs/ble-protocol.md#firmware-update-ota) documents the update order.
 
-2.0.7 was a one-time transition release that rotated the OTA signing key. from 2.0.8 on, the source tree signs with the production key only. a board that installed 2.0.7 needs nothing more. a board still on 2.0.6 or older only trusts the retiring key and cannot verify a production-signed image, so read the [key-rotation guide](firmware/tools/RELEASE.md#ota-key-rotation) before you publish a release or update a board that has been offline since the transition.
+2.0.7 was a one-time transition release that rotated the OTA signing key. from 2.0.8 on, the source tree signs with the production key only. a board that installed 2.0.7 needs nothing more. a board still on 2.0.6 or older only trusts the retiring key, so it cannot verify any update published since 2.0.8. the 2.0.7 transition image is no longer served over the air, so an in-app update fails on such a board at the signature check: update it once over USB from its board's flasher. the [key-rotation guide](firmware/tools/RELEASE.md#ota-key-rotation) has the details, and the steps for a future rotation.
 
 ## license
 

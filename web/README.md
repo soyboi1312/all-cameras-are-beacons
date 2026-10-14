@@ -12,7 +12,7 @@ hardware themselves has a no-toolchain way to flash it.
 **The beacon you buy is not flashed from here.** It ships pre-flashed and takes its
 updates over Bluetooth from the app, and its USB recovery images are board-revision
 specific and live on their own pages:
-[rev-A](https://soyboi.tech/flash.html) and [rev-B](https://soyboi.tech/flash-revb.html).
+[rev-A](https://soyboi.tech/flash.html) (slim model) and [rev-B](https://soyboi.tech/flash-revb.html) (battery model).
 Both beacon products are chipFamily ESP32-S3, exactly like the S3 builds here, so ESP
 Web Tools cannot refuse a wrong image for us. Routing people in copy is the only guard
 there is, which is why `index.html` opens with a caution box that names both pages. The two
@@ -27,7 +27,7 @@ web/
 ├── manifest-mesh-detect.json     # ...and the public Mesh-Detect firmware
 ├── manifest-mesh-detect-ch1.json # ...and the private-channel Mesh-Detect build
 ├── manifest-beacon-c5.json       # ...and the Seeed XIAO ESP32-C5 build (USB-only, 5 GHz)
-├── manifest-beacon-c5-devkitc.json # ...and the ESP32-C5-DevKitC-1 build (community-tested)
+├── manifest-beacon-c5-devkitc.json # ...and the ESP32-C5-DevKitC-1 build (8 MB kits, community-tested)
 ├── build-flasher.sh              # rebuilds the flashable firmware files
 ├── vendor/
 │   └── esp-web-tools/            # self-hosted ESP Web Tools 10.2.1 (see below)
@@ -55,8 +55,8 @@ the phone's GPS fix never left the phone after offline geotagging shipped.
 
 `check-signature-drift.py` pins both app URLs to this page and checks the policy still discloses
 the load-bearing facts from `docs/signatures.md`: the phone sends its fix to the board, the offline
-buffer can retain that fix for about 18 hours, the board stores the buffer key, and the buffer is
-not sealed against a seized board.
+buffer can retain that fix for about 18 hours, the board stores the buffer key, the buffer is not
+sealed against a seized board, and the site host sees the app's firmware and dataset requests.
 
 ## Self-hosted ESP Web Tools
 
@@ -153,4 +153,6 @@ and stages each as four separate part files flashed at their own offsets, kept
 apart so a web flash preserves your pairing. Build outputs are frozen and signed before the first
 served file changes. The GitHub Pages files plus the sibling site's app binaries and manifest are
 then one rollback-guarded transaction, so a late copy or stamp failure restores both previous
-trees. Commit the updated files in `firmware/` and the hosted page refreshes itself.
+trees. Commit the updated files under `web/` (the parts in `web/firmware/`, the five manifests and the
+`index.html` footer) and push `main`, and the hosted page refreshes itself. Commit and push the
+sibling clone's updated app binaries and `firmware-latest.json` separately.

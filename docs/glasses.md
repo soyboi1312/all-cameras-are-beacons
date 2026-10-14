@@ -9,9 +9,12 @@ apps' weak-match "verify this" band, with the Quest caveat kept), token or no to
 other shared IDs stay gated: `0x058E` (Meta Quest), TCL's `0x0BC6`, and Jieli's `0x05D6`. A
 Quest on its own still stays silent; a `0x058E` advert only emits when it co-signals the
 `META_RB_GLASS` token that marks the glasses (see the gate below), and `0x0BC6` / `0x05D6`
-have no token to rescue them. The eyewear-only IDs ship enabled (like Axon) and report
-honestly as "possible recording glasses." Still capture-pending: the `META_RB_GLASS` token's
-exact byte framing, and worn-advertising confirmation for Snap and Vuzix.
+have no token to rescue them. The Luxottica, Snap and Vuzix IDs ship enabled but capped at 49,
+inside the apps' weak-match band, and report the vendor rather than the type ("Luxottica
+device, possible glasses", "Snap device, possible glasses", "Vuzix equipment, type unknown"): a
+company ID names the vendor, not the device, and none of the three has ever been heard in a
+capture. Still capture-pending: the `META_RB_GLASS` token's exact byte framing, and
+worn-advertising confirmation for Luxottica, Snap and Vuzix.
 
 **The detector reads THREE surfaces, not just manufacturer data.** Most of this page was written
 when it read one, so read it with that in mind: the company-ID material below is current and
@@ -45,9 +48,9 @@ under *Service-UUID surfaces* below and use their own methods.
 
 | Company ID | Registrant | Product | Eyewear-specific? | Confidence |
 |---|---|---|---|---|
-| `0x0D53` | Luxottica Group S.p.A | Ray-Ban Meta frames (EssilorLuxottica) | yes, eyewear-only registrant | higher |
-| `0x03C2` | Snapchat Inc | Snap Spectacles camera glasses | yes, Snap's only BLE hardware is Spectacles | higher |
-| `0x060C` | Vuzix Corporation | Vuzix camera AR glasses (Blade, M400, Shield, Z100) | yes, eyewear-only registrant | higher (70) |
+| `0x0D53` | Luxottica Group S.p.A | Ray-Ban Meta frames (EssilorLuxottica) | yes, but a company ID names the vendor, not the type | 49 (never heard in a capture; fired zero times beside worn Meta glasses 2026-07-31) |
+| `0x03C2` | Snapchat Inc | Snap Spectacles camera glasses | yes (Snap's only BLE hardware), but a company ID names the vendor, not the type | 49 (never heard in a capture) |
+| `0x060C` | Vuzix Corporation | Vuzix AR eyewear (Blade, M400, Shield carry cameras; the Z100 is a camera-less display) | yes, but not camera-only, and a company ID names the vendor, not the type | 49 (never heard in a capture) |
 | `0x058E` | Meta Platforms Technologies, LLC | Ray-Ban / Oakley Meta AI glasses **and** Meta Quest VR | no, shared across Meta hardware | bare hit gated off; token-confirmed only (72) |
 | `0x01AB` | Meta Platforms, Inc. | Meta corporate/parent ID, appears across Meta hardware | no, not eyewear-specific | bare hit ships at 45 (weak match); token-confirmed 72 |
 | `0x0BC6` | TCL COMMUNICATION EQUIPMENT CO.,LTD. | RayNeo AR/smart glasses (a TCL sub-brand), also TCL phones/tablets/TVs | no, TCL corporate ID | gated off (no token to confirm) |
@@ -62,14 +65,16 @@ authoritative registrant strings:
 - Nordic company-ID mirror: https://github.com/NordicSemiconductor/bluetooth-numbers-database
 
 Registrant-string notes worth keeping straight:
-- `0x0D53` is Luxottica, an eyewear-only registrant. The initial "not found" on the Nordic
-  fetch was a truncation false-negative; it is present. This is the cleanest Ray-Ban Meta tell.
+- `0x0D53` is Luxottica. The initial "not found" on the Nordic fetch was a truncation
+  false-negative; it is present. It has never been heard beside worn Ray-Ban Meta frames (zero
+  times in the 2026-07-31 capture), so it sits at 49 until a worn unit is captured on it.
 - `0x03C2` reads as **"Snapchat Inc"** in the authoritative registry, not "Snap Inc" as it is
   sometimes reported. Snap's only BLE hardware is Spectacles, so it is effectively eyewear-only.
-- `0x060C` is **Vuzix Corporation**, an eyewear-only AR maker whose entire hardware line is
-  camera-equipped smart glasses (Blade, M400, Shield, Z100). Like Luxottica and Snap it ships
-  no phones, watches, or headsets, so a hit is glasses with no shared-hardware caveat, which is
-  why it sits in the higher (70) eyewear-only band and needs no payload discriminator. Do **not** confuse
+- `0x060C` is **Vuzix Corporation**, an enterprise AR-eyewear maker. Blade, M400 and Shield
+  carry on-board cameras; the Z100 is a camera-less waveguide display, so even a confirmed Vuzix
+  hit is not automatically a recording device. It ships no phones, watches or headsets, so there
+  is no Quest-style caveat, but a company ID still names the vendor, not the type, and no capture
+  has heard it, so it sits at 49 and reports "Vuzix equipment, type unknown". Do **not** confuse
   it with `0x0820` Brilliant Home Technology (a smart-home hub vendor), which is a different
   company from the Brilliant Labs AR-glasses startup and is not a glasses signal.
 - `0x0BC6` is TCL's corporate ID (decimal 3014). RayNeo is a TCL-incubated brand and would
@@ -105,9 +110,10 @@ Meta IDs "will also trigger on other Bluetooth-enabled products from the same co
 including VR headsets," and where it falls back on visual context, ACAB surfaces a weak match
 on the bare `0x01AB` hit (and stays silent on the still-gated Meta IDs) rather than guess.
 
-Luxottica (`0x0D53`), Snapchat (`0x03C2`), and Vuzix (`0x060C`) sidestep the ambiguity
-entirely, because those registrants only ship eyewear, so they carry higher confidence with
-no payload discriminator needed. TCL `0x0BC6` is shared with phones and TVs and has no token
+Luxottica (`0x0D53`), Snapchat (`0x03C2`), and Vuzix (`0x060C`) sidestep the Quest ambiguity
+because those registrants ship no headsets, but a company ID still names the vendor, not the
+type, and none of the three has been heard in a capture, so they sit at 49 with vendor-not-type
+wording until a worn unit is captured. TCL `0x0BC6` is shared with phones and TVs and has no token
 to rescue it, so it stays gated off until a field capture gives RayNeo a clean discriminator.
 
 ## Capture-pending: what to confirm in the field
@@ -136,9 +142,10 @@ Two things gate promoting this from capture-pending to field-validated:
    when the token co-signals, which raises the hit to a confident glasses call and drops the
    Quest caveat, while the corporate parent ID **`0x01AB`** was un-gated on 2026-07-31 and
    now emits a conf-45 weak match on its own, token or not. What is still capture-pending is
-   confirming the token's exact byte framing against a real worn-and-recording advert, so
-   for now the token is only a confidence bump layered on the company-ID (`M_MFG_ID`) match,
-   never a standalone signal.
+   confirming the token's exact byte framing against a real worn-and-recording advert. The
+   token never matches without a Meta company ID in the same manufacturer-data record, but it
+   is more than a bump: it is what un-gates the otherwise-silent `0x058E`, so a `0x058E` record
+   carrying it emits at 72 (`M_MFG_ID`) with nothing else in the advert.
 
 ## Service-UUID surfaces
 
@@ -150,8 +157,9 @@ all, which is why the firmware evaluates them before it looks for manufacturer d
 - **16-bit SIG member service UUIDs** (method `M_SERVICE_UUID`, `meth:4`), read from the AD
   `0x02`/`0x03` UUID lists and the first two bytes of an AD `0x16` service-data record. A
   **separate namespace** from company IDs, and easily confused with them: `0xFEB7` is not company
-  ID `0xFEB7`. Shipped: Meta `0xFEB7` / `0xFEB8` at conf 45 un-gated, Snap `0xFE45` at conf 70,
-  and Meta Platforms Technologies' `0xFD5F` gated off for the same Quest reason as `0x058E`.
+  ID `0xFEB7`. Shipped: Meta `0xFEB7` / `0xFEB8` at conf 45 un-gated, Snap `0xFE45` at conf 49
+  (the same grade as its company-ID twin `0x03C2`), and Meta Platforms Technologies' `0xFD5F`
+  gated off for the same Quest reason as `0x058E`.
 - **The HeyCyan SDK's 128-bit service UUID** (method `M_SERVICE_DATA`, `meth:8`), read from the AD
   `0x06`/`0x07` 128-bit lists or AD `0x21` service data, at conf 68. It names the glasses
   SOFTWARE rather than a corporate registrant, so it carries neither the Quest nor the earbud
@@ -161,7 +169,7 @@ all, which is why the firmware evaluates them before it looks for manufacturer d
 **All three surfaces are scored, and the best confidence wins, not the first hit.** Order decides
 ties only, and the firmware's order is HeyCyan, then 16-bit member UUID, then company ID, with a
 `<=` comparison so an equal-confidence later surface never displaces an earlier one. An advert
-carrying both Snap's `0xFE45` (70) and Snap's `0x03C2` (70) therefore reports `meth:4`.
+carrying both Snap's `0xFE45` (49) and Snap's `0x03C2` (49) therefore reports `meth:4`.
 
 The gating, confidences and provenance for every row live in
 [docs/signatures.md](signatures.md); the wire fields are in
@@ -181,7 +189,8 @@ phone-only approach, and the buzzer means it works with the phone away entirely.
 Toggled with `{"glasses": true|false}` on the Config characteristic, mirroring the
 `axon` / `tracker` enable pattern, NVS-persisted, and **on by default** (like Axon). The
 Status JSON reports it as `"glasses"` beside `"axon"` and `"tracker"`. Detail strings name
-the vendor and say "possible recording glasses"; a bare `0x01AB` hit emits as a weak match at
+the vendor, not the type ("Luxottica device, possible glasses", "Snap device, possible
+glasses", "Vuzix equipment, type unknown"); a bare `0x01AB` hit emits as a weak match at
 confidence 45, the still-gated shared IDs (`0x058E`, `0x0BC6`, `0x05D6`) do not emit on their
 own, and a token-confirmed Meta hit reports as "Ray-Ban Meta: recording glasses" with no
 Quest caveat. One switch covers all three surfaces; there is no per-surface toggle, and the

@@ -240,12 +240,12 @@
          separately with <a href="https://flasher.meshtastic.org/" target="_blank" rel="noopener">Meshtastic
          firmware</a>.</p>
       <p class="steps"><b>Public</b> puts detections on the main LongFast channel (anyone
-         nearby sees them). While your phone is connected to the board, its alerts also carry
-         your phone's location as a map link, so on Public anyone nearby sees that too.
+         nearby sees them) and never sends your location.
          <b>Private</b> puts them on an encrypted <code>acab</code> channel
          only your nodes can read, and also needs the Heltec set up to match (see the
          <a href="https://github.com/soyboi1312/all-cameras-are-beacons/blob/main/docs/mesh-setup.md" target="_blank" rel="noopener">mesh
-         setup guide</a>).</p>
+         setup guide</a>). On Private, while your phone is connected to the board, its alerts
+         also carry your phone's location as a map link.</p>
       <esp-web-install-button manifest="./manifest-mesh-detect.json">
         <button class="btn" slot="activate">FLASH MESH-DETECT (PUBLIC)</button>
         <span slot="unsupported" class="unsupported">Browser not supported. Use Chrome or Edge.</span>

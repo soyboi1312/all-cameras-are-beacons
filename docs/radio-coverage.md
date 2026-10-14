@@ -224,7 +224,7 @@ log carry no channel, and a live record too long for a small-MTU phone link drop
 ## Bluetooth coverage
 
 - **OUI-Spy and Mesh-Detect** share the ESP32-S3 radio between Bluetooth scanning, Wi-Fi, and the phone link. the configured Bluetooth scan window is 67/131 of each interval, about **51 percent**. there are also short pauses between scan runs, so this is not a measured guarantee of listening time.
-- **the dual-radio beacon** gives Bluetooth scanning its own nRF52840, configured to scan continuously while enabled. it does not pause for the ESP32-S3's Wi-Fi channel hops. continuous scanning still does not guarantee that every broadcast arrives or produces a detection.
+- **the dual-radio beacon** gives Bluetooth scanning its own nRF52840, configured to scan continuously while enabled. it does not pause for the ESP32-S3's Wi-Fi channel hops. continuous scanning still does not guarantee that every broadcast arrives or produces a detection. the nRF forwards each Bluetooth address to the ESP32-S3 once per 20 s window, plus once more whenever it reads 6 dB stronger than earlier in that window, so repeat sightings inside the window do not reach the ESP32-S3 at all; Remote ID adverts bypass the window, rate-limited per address and message type.
 
 the single-radio settings and scan loop are in `acabScannerBegin` and `bleScanTask` in [acab_scanner.cpp](../firmware/lib/acab_core/acab_scanner.cpp). the dual-radio selection is defined by `ACAB_DUAL_RADIO` in [platformio.ini](../firmware/platformio.ini) and `setup` in [main.cpp](../firmware/src/beacon-board/main.cpp).
 

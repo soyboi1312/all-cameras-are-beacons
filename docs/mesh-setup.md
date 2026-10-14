@@ -9,11 +9,19 @@ The XIAO sends labelled detections to the Heltec over a wired UART, and the Helt
 puts them on your mesh. Each alert names the unit:
 
 ```
-ALPR camera detected  | WiFi | rssi -67 | 70:c9:4e:11:22:33 | https://maps.google.com/?q=34.05012,-118.24001
-Flock Raven detected  | BLE  | rssi -72 | 58:8e:81:aa:bb:cc
+ALPR camera detected  | WiFi | rssi -67 | 70:c9:4e:xx:xx:xx
+Flock Raven detected  | BLE  | rssi -72 | 58:8e:81:xx:xx:xx
 Drone detected        | RID  | rssi -61 | RID 1581F4F... | https://maps.google.com/?q=34.05,-118.24 | alt 120m
 Body camera detected  | BLE  | rssi -55 | <mac>
 ```
+
+The maps link on the drone line is the aircraft's own position, broadcast by the drone
+in its Remote ID frame, so it appears on any channel. A camera or body-cam line has no
+position of its own. On a **private** channel, while the beacons app is connected and its
+fix is under 60 s old, the firmware appends your phone's position to those lines as a
+maps link (`| https://maps.google.com/?q=34.05012,-118.24001`), which is where the device
+was seen. That is your own location, so the firmware never attaches it on the public
+channel (channel 0 / TEXTMSG), and the public build also sends no boot ping.
 
 > The Heltec/Meshtastic side (installing the Meshtastic CLI, the optional
 > mesh-mapper web app, screen and Bluetooth options) is written up in the
@@ -50,10 +58,12 @@ the XIAO. Get them matched or detections won't come through.
 | Heltec Serial Module mode | `TEXTMSG` | `PROTO` |
 | XIAO firmware | web flasher **Flash Mesh-Detect (Public)** | channel 1: web flasher **Flash Mesh-Detect (Private)**; other indexes: `-DACAB_MESH_CHANNEL=<index>` |
 | Your node still sees the mesh? | yes | yes (channel 0 is untouched) |
+| Your phone's position in the alert | never | yes, as a maps link while the beacons app is connected (fix under 60 s old) |
+| Boot self-test ping | none | `mesh-detect ACAB online` about 10 s after power-up |
 
 Either way your node stays on the public LongFast mesh and keeps seeing other
-nodes. The only difference is whether the detection *messages* are public or
-private.
+nodes. The differences are whether the detection *messages* are public or
+private, and whether they can carry your phone's position (private only).
 
 ## 1. Configure the Heltec (Meshtastic)
 
@@ -209,13 +219,15 @@ power both.
 
 ## 3. Test it
 
-**Quickest check: the boot self-test ping.** On power-up the firmware sends
-`mesh-detect ACAB online` over the configured channel about **10 s after boot**,
-before any detection. The fastest end-to-end test is to power the unit, wait ~15 s,
-and look for that message on a node listening to your channel. If it lands, the
-whole path (XIAO to Heltec to mesh to channel) works. Tap the XIAO's reset button to
-re-fire it. (Its `usbmodem` port number can change after a reset; re-run
-`ls /dev/cu.usbmodem*` if a tool can't find it.)
+**Quickest check on a private channel: the boot self-test ping.** On power-up a
+private-channel build sends `mesh-detect ACAB online` on its channel about **10 s
+after boot**, before any detection. Power the unit, wait ~15 s, and look for that
+message on a node that holds the channel. If it lands, the whole path (XIAO to Heltec
+to mesh to channel) works. Tap the XIAO's reset button to re-fire it. (Its `usbmodem`
+port number can change after a reset; re-run `ls /dev/cu.usbmodem*` if a tool can't
+find it.) The **public** build sends no ping, because announcing a detector to everyone
+on LongFast is not something it should do; on channel 0 the end-to-end test is a
+triggered detection, below.
 
 **Trigger a real detection** to see the full flow. You need something the XIAO
 recognises in range. The most controllable trigger is
@@ -235,8 +247,8 @@ pio device monitor -b 115200 --port /dev/cu.usbmodemXXXX
 A fresh detection prints two lines:
 
 ```
-[ACAB] ALPR camera    BLE  aa:bb:cc:dd:ee:ff rssi=-58 conf=70
-[ACAB-mesh] -> ALPR camera detected | BLE | rssi -58 | aa:bb:cc:dd:ee:ff
+[ACAB] ALPR camera    BLE  <mac> rssi=-58 conf=70
+[ACAB-mesh] -> ALPR camera detected | BLE | rssi -58 | <mac>
 ```
 
 The first line means the detector fired; the second means it pushed the alert to

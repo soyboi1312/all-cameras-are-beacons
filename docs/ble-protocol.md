@@ -54,11 +54,13 @@ config writes rejected by the peripheral. This table used to list `WRITE_NR` her
 firmware does not set that property on Config. Write-without-response belongs to the OTA
 characteristic, and only for the image stream.
 
-**Encryption is not an OTA-only property.** Detections and Status carry `READ_ENC` and Config
-carries `WRITE_ENC`, alongside OTA's, so an unbonded peer cannot read Status or write a setting
-at all. The notify streams are gated in firmware rather than by the descriptor: NimBLE registers
-the CCCD as plain read/write, so a subscribe can complete before bonding, but the board emits no
-detection and no status frame until `onAuthenticationComplete` has reported an encrypted bond.
+**Encryption is not an OTA-only property.** Status carries `READ | READ_ENC`, Detections is
+`NOTIFY | READ_ENC` with no `READ` (it exposes no readable value; rows arrive by notify only), and
+Config carries `WRITE_ENC`, alongside OTA's, so an unbonded peer cannot read Status or write a
+setting at all. The notify streams are gated in firmware rather than by the descriptor: NimBLE
+registers the CCCD as plain read/write, so a subscribe can complete before bonding, but the board
+emits no detection and no status frame until `onAuthenticationComplete` has reported an encrypted
+bond.
 Pairing is Just Works, no passkey, because the board has no display or keypad - so the bond buys
 encryption and a persistent identity, not MITM protection at the one-time pairing.
 
@@ -138,6 +140,20 @@ CCCD store (32 records on both chips) is sized to match. The S3 limits are set i
 beacon-c5 sets its own in `firmware/c5_sdkconfig_overrides.h`, and `acab_ble_service.cpp`
 static_asserts both.
 
+**Repeat pairing and ownership.** A repeat pairing from an address the board already holds a bond
+for (the phone forgot the beacon, or something is replaying its address) is refused outside the
+two-minute window and the link is dropped; the stock NimBLE handler would otherwise delete the
+existing bond and accept the new one (patched at build time by
+`firmware/tools/patch_nimble_repeat_pairing.py`; the decision is `acabRepeatPairingAllowed` in
+`acab_ble_service.cpp`). Ownership is a sticky NVS flag (`acab-ble` / `owned`) that is set the
+first time the board sees a bond (at init when the bond store is already non-empty, or on the
+first bonded link) and is ORed with the live bond count, so an emptied bond store does not reopen
+a board to anyone; only a full flash erase does. A pairing that was allowed to start but finishes
+after the window closed is refused at authentication and the bond it just wrote is removed from
+the board (`ble_store_util_delete_peer`, the store primitive, because `NimBLEDevice::deleteBond`
+is a no-op on the C5 while the on-chip scan runs); the phone still holds its half, so it must
+forget the beacon before pairing again inside a fresh window. The serial line says so.
+
 ## Detections (notify)
 
 One compact-JSON object per sighting. For every category except nearby devices and network
@@ -151,7 +167,7 @@ path when they are repeat sightings inside the dedup window, and new ones are ca
 gated by that cap. See `desertNotifyAllowed` and the `deliver` flag in `acab_scanner.cpp`.
 
 ```json
-{"t":1,"s":0,"meth":2,"c":80,"mac":"d4:ad:fc:11:22:33","rssi":-67,
+{"t":1,"s":0,"meth":2,"c":80,"mac":"aa:bb:cc:dd:ee:ff","rssi":-67,
  "name":"FS Ext Battery","n":3,"new":true}
 ```
 
@@ -282,17 +298,17 @@ Write a JSON object with any subset of keys:
 | `glasses` | enable/disable the smart/recording-glasses detector (Ray-Ban/Oakley Meta, Snap Spectacles, Vuzix; on by default). Scores three BLE payload surfaces (manufacturer-data company ID, 16-bit SIG member UUIDs, the HeyCyan service UUID) and keeps the best. See [docs/glasses.md](glasses.md) |
 | `netcam` | enable/disable the **network-camera** detector (default **off**, opt-in). Matches branded IP-camera OUIs (Hikvision/Dahua/Amcrest/Axis/Reolink/Ring/Wyze/eufy/Ezviz/Lorex/Swann/Arlo) on the host Wi-Fi and emits `t:10` at confidence 65 (or 75 for a field-validated block), detail "<Vendor> on wifi". Since 2.0.4 it ALSO matches a base-station SSID prefix ("ARLO_VMB_"/"NTGR_VMB_") on beacon/probe-response frames, emitting `t:10` with method `M_SSID` at confidence **88**, detail "Arlo base station" and the matched SSID in `name` - a self-attested match outranks any OUI inference. Probe REQUESTS are deliberately excluded: they name the network sought, not the transmitter. Turning it on widens Wi-Fi capture to 802.11 **data** frames so a streaming camera's cleartext source MAC can be OUI-matched; off (default) keeps capture management-frame-only for zero added CPU / 2.4GHz load. Honest scope: it matches known camera BRANDS on the network (could be an NVR/doorbell/disclosed camera) and cannot find every camera - never a "hidden camera" claim |
 | `desert` | **Desert mode**: report EVERY device in range, not just known signatures (default off). See *Desert mode* below |
-| `buzzer` | detection/session alert audio on/off. `false` mutes detection, connect, reveal, and preview sounds AND the boot jingle; the only cues that still play are the ones that always follow an explicit user action - the rev-B hold-to-start acknowledgment and the deliberate shutdown cue - at the saved nonzero volume (volume `0` silences those too) |
+| `buzzer` | detection/session alert audio on/off. `false` mutes every sound the board can make: detection, connect, reveal and preview sounds, the boot jingle, the rev-B hold-to-start acknowledgment and the shutdown cue. The hold-to-start ack keeps its LED flash (governed by `led`). The boot jingle additionally plays only on a physical start, never after an OTA restart, panic, watchdog or brownout |
 | `volume` | buzzer loudness, integer `0` to `100` (`0` is silent) |
-| `led` | onboard status LED on/off (default **on**). `false` = "lights out": no idle heartbeat, no detection flashes, no boot sweep, for covert/stationary deploys. Persists across boots |
+| `led` | onboard status LED on/off (default **on**). `false` = "lights out": no idle heartbeat, no detection flashes, no boot sweep, for covert/stationary deploys. The idle heartbeat also never runs on a boot that parks again (bump wake, charge-while-off), whatever this flag says. Persists across boots |
 | `ble` | enable/disable the BLE detection scan. `false` stops scanning only - the GATT link to the app stays up |
 | `wifi` | enable/disable the Wi-Fi (promiscuous) detection scan |
 | `wifiEco` | Wi-Fi eco mode: integer seconds of Wi-Fi RX sleep between sweeps, `0` (off) / `3` / `7` / `15`. Battery-SKU power saver; BLE capture is untouched. The board reports the active value back in Status under the same key |
 | `wifi5` | **the ESP32-C5 builds only** (beacon-c5 and beacon-c5-devkitc, the builds whose chip has a 5 GHz radio): `true` / `false` turns the 5 GHz pass of the Wi-Fi hop on or off. On (the default) the hop dwells once on each of 9 non-DFS 5 GHz channels (36 to 48, 149 to 165) after every `ACAB_WIFI_5G_EVERY`-th full 2.4 GHz sweep (default 1, so every sweep), which on the shared radio costs about 30% of 2.4 GHz frames and about 2% of BLE adverts; off takes effect at the next channel. Persisted (NVS namespace `acab-wifi`, key `w5`). A non-bool value is ignored. Every other build compiles the key out, so it changes nothing there. The board reports the active value back in Status under the same key |
 | `beep` | `true` plays one preview beep at the current volume (pair with `volume` to audition a level) |
 | `buffer` | enable/disable the offline detection buffer (default **off**, opt-in). Every explicit `false` removes the at-rest key from RAM/NVS and durably requests erasure of any retained core dump whose task stacks may contain the key, a decrypted row, or phone coordinates. It does **not** erase the ring records themselves; drain first. See *Offline detection buffer* below |
-| `key` | 64 lowercase hex chars = the 32-byte at-rest encryption key; the app generates + persists it and pushes it on **every authenticated connection**. `sync` is refused until a valid key write has been accepted on that same session; a retained RAM key from another bonded phone never authorizes replay by itself. **The board holds the accepted key in RAM AND persists it to NVS while buffering is enabled** (`det_log.cpp` `detLogSetEnabled`), so a board left deployed keeps encrypting across reboots instead of going keyless. **TRADEOFF, state it plainly: a seized board's flash yields the key, so the at-rest buffer is decryptable and is NOT ciphertext-only.** Turning buffering off erases the key from both RAM and NVS and schedules the retained-core-dump wipe described above. If a different phone key meets a nonempty or untrusted generation, the board preserves the existing rows/key, reports session-only Status `keymis:true`, and refuses sync. Ownership transfer must be explicit: send `clearlog:true`, then re-send the replacement key (they may share one Config object; clear is processed first). A safely accepted different key still schedules the dump wipe even when the ring is empty, because old key bytes can remain in a retained stack. Flash encryption / encrypted NVS is what would restore seized-board protection. See the SECURITY block at the top of `det_log.h`. |
-| `lat`,`lon` | **the phone's own GPS fix, pushed to the board.** Doubles, written as a pair and range-checked (±90 / ±180); an out-of-range pair is discarded silently. This is the only write in the protocol that carries the user's position. It is RAM-only, not NVS, but the encrypted offline ring may store the retained copy described here. The board keeps TWO copies. **The LIVE copy** (`acabBleGetPhoneGps`) belongs only to the current authenticated connection and is zeroed on disconnect. Status `gps`, live non-drone detections, BLE notify, and mesh use only this copy. **The RETAINED copy** (`acabBleGetLastPhoneGps`) may survive disconnect only when that same session supplied a key accepted for the currently published log generation; a no-key or `keymis` session clears both copies. Every successful authentication also starts by clearing both copies before Config is admitted, so two bonded phones never inherit one another's fix. The retained copy has ONE reader: `handleDetection` may put a fix younger than `DET_LOG_GPS_MAX_AGE_MS` (`0xFFFF` s, about 18h12m) into a `DetLogGpsStamp` only while no app is admitted and the row is actually bound for the encrypted ring. That stamp rides BESIDE `AcabDetection`, is read only by `detLogAppend`, and never becomes live `d.lat`/`d.lon`; a Desert row that is delivered but not buffered does not read it. The asynchronous sink additionally validates each queued row's owner-admission epoch at the final callback boundary, serialized with authentication/disconnect, so an A-era row cannot notify B or escape over mesh after a link handoff. Disconnect is a two-phase boundary: it first blocks admission and publishes the zero scanner token, then clears link-owned GPS/replay/key state, and only afterward publishes the away-session epoch together with a fresh capture generation. A sighting in that teardown window therefore cannot consume the generation intended to record the away session. Thus the retained fix reaches an AES-CTR record as `lat_e7`/`lon_e7` and no live output. It does not survive reboot. **The intended exception:** a stored record is later replayed to a session that supplies the exact accepted generation key. A different-key phone gets `keymis:true` and no replay unless it explicitly clears those rows; a phone that legitimately shares the accepted key can decrypt/replay the prior supplier's stored fix, which is the offline buffer's documented purpose. Mesh-detect separately requires a current fix newer than 60 s for LoRa and re-zeroes non-drone position at its transmission boundary. Both apps push location on connect and refresh it as the phone moves |
+| `key` | 64 lowercase hex chars = the 32-byte at-rest encryption key; the app generates + persists it and pushes it on **every authenticated connection**. `sync` is refused until a valid key write has been accepted on that same session; a retained RAM key from another bonded phone never authorizes replay by itself. **The board holds the accepted key in RAM AND persists it to NVS while buffering is enabled** (`det_log.cpp` `detLogSetEnabled`), so a board left deployed keeps encrypting across reboots instead of going keyless. **TRADEOFF, state it plainly: a seized board's flash yields the key, so the at-rest buffer is decryptable and is NOT ciphertext-only.** Turning buffering off drops the key from RAM and removes its NVS entry, which ESP-IDF NVS only marks erased: the bytes can stay in flash until that page is reclaimed. It also schedules the retained-core-dump wipe described below (*Offline detection buffer*). If a different phone key meets a nonempty or untrusted generation, the board preserves the existing rows/key, reports session-only Status `keymis:true`, and refuses sync. Ownership transfer must be explicit: send `clearlog:true`, then re-send the replacement key (they may share one Config object; clear is processed first). A safely accepted different key still schedules the dump wipe even when the ring is empty, because old key bytes can remain in a retained stack. Flash encryption / encrypted NVS is what would restore seized-board protection. See the SECURITY block at the top of `det_log.h`. |
+| `lat`,`lon` | **the phone's own GPS fix, pushed to the board.** Doubles, written as a pair and range-checked (±90 / ±180); an out-of-range pair is discarded silently. This is the only write in the protocol that carries the user's position. It is RAM-only, not NVS, but the encrypted offline ring may store the retained copy described here. The board keeps TWO copies. **The LIVE copy** (`acabBleGetPhoneGps`) belongs only to the current authenticated connection and is zeroed on disconnect. Status `gps`, live non-drone detections, BLE notify, and mesh use only this copy. **The RETAINED copy** (`acabBleGetLastPhoneGps`) may survive disconnect only when that same session supplied a key accepted for the currently published log generation; a no-key or `keymis` session clears both copies. Every successful authentication also starts by clearing both copies before Config is admitted, so two bonded phones never inherit one another's fix. The retained copy has ONE reader: `handleDetection` may put a fix younger than `DET_LOG_GPS_MAX_AGE_MS` (`0xFFFF` s, about 18h12m) into a `DetLogGpsStamp` only while no app is admitted and the row is actually bound for the encrypted ring. That stamp rides BESIDE `AcabDetection`, is read only by `detLogAppend`, and never becomes live `d.lat`/`d.lon`; a Desert row that is delivered but not buffered does not read it. The asynchronous sink additionally validates each queued row's owner-admission epoch at the final callback boundary, serialized with authentication/disconnect, so an A-era row cannot notify B or escape over mesh after a link handoff. Disconnect is a two-phase boundary: it first blocks admission and publishes the zero scanner token, then clears link-owned GPS/replay/key state, and only afterward publishes the away-session epoch together with a fresh capture generation. A sighting in that teardown window therefore cannot consume the generation intended to record the away session. Thus the retained fix reaches an AES-CTR record as `lat_e7`/`lon_e7` and no live output. It does not survive reboot. **The intended exception:** a stored record is later replayed to a session that supplies the exact accepted generation key. A different-key phone gets `keymis:true` and no replay unless it explicitly clears those rows; a phone that legitimately shares the accepted key can decrypt/replay the prior supplier's stored fix, which is the offline buffer's documented purpose. Mesh-detect separately requires a current fix newer than 60 s for LoRa, re-zeroes non-drone position at its transmission boundary, and never attaches it on the public primary channel (channel 0 / TEXTMSG); only a private-channel build (PROTO on a secondary index) carries it. Both apps push location on connect and refresh it as the phone moves, sending only a fix at most 120 s old that reports an accuracy of 250 m or better (`locationFixSupportsObserver` on both) |
 | `epoch` | unix seconds (the phone's wall clock). The board has no RTC, so this is the only wall clock it ever sees: it stores an *anchor* for the current boot and reconstructs capture times from it later. Persisted, so it dates records from earlier boots too. See *How replay times are derived* below |
 | `sync` | start a replay drain: stream stored records with `seq` greater than this value (`0` = everything). Refused unless this authenticated session has already supplied a valid `key` that the record layer accepted |
 | `clearlog` | `true` logically clears the ring immediately, then performs its real flash-sector erase in chunks (one block per loop pass, so scanning and the GATT link stay live); Status reports `wiping:true` until it finishes. It also persists an independent retained-core-dump erase generation. That intent survives power loss and a ring sweep that was already pending, and is acknowledged only after the dump partition is erased or found empty. It is also the explicit ownership-transfer authorization required before a different `key` may replace a nonempty/unknown generation |
@@ -301,7 +317,7 @@ Write a JSON object with any subset of keys:
 | `watch` | the user watchlist: an array of MAC strings (same format as `ignore`, up to 256). A watched device alerts as `t:8` every time it's seen, even with no built-in signature. Persists across boots; the app pushes its list on connect, but **only when it has something to say** (see `clr`). A MAC on both `watch` and `ignore` still alerts: on the dual-radio board the co-processor's ignore mirror is published as *ignore minus watch*, so a starred MAC is never dropped before it reaches the S3. The apps keep the two lists exclusive anyway |
 | `clr` | `true` marks an accompanying **empty** `ignore`/`watch` array as a deliberate clear. **A bare `{"watch":[]}` or `{"ignore":[]}` is REFUSED** and the stored list is kept, unless this peer already committed a non-empty list for that key on this connection. Without this, any app with an empty list wiped the board the moment it connected (a reinstall, or a second phone that had never starred anything), and a starred MAC plus its label exists nowhere else. The second clause is what keeps older apps working: boards update over the air, so the board is routinely newer than the app, and an app that has already replaced the list is not granted any new destructive power by then emptying it. Per-write like `more`; a chunked write carries at most one list, so one flag serves both |
 | `ota` | firmware-update control object (`sig` / `begin` / `end` / `abort` / `confirm`). `sig` is not optional: an image with no signature held is refused at `end`. See *Firmware update (OTA)* below |
-| `nrfdfu` | `true` requests a **co-processor (nRF) BLE DFU** (dual board and protocol 2 only). The encrypted Config session and the two-minute physical-start window must both be live. The loop-task request is stamped to that physical link and expires across connect/disconnect; its final policy/token check and UART trigger execute under the same link-boundary lease, so a disconnect/new owner cannot land between check and action. The board replies `nrf-ready` or `nrf-denied` on OTA, then sets Status `nrfup:true` only after the loop actually forwards the trigger. The app baseline-scans first, waits for `nrfup`, then drives the signed, version-bound, application-only `.zip`. **Trust asymmetry, stated plainly** (mirrors `pair_window.h`): the S3 image is signature-verified ON the board; the nRF image is not. The nRF's stock legacy bootloader is CRC-only and cannot authenticate an image, and its UART trigger accepts a bare token, so the nRF leg's protection is entirely the session + physical-window gate on the S3 side (plus the app's own signature check on the downloaded `.zip`). Migrating the bootloader to signed Secure DFU is what would close it. See *Firmware update (OTA)* below |
+| `nrfdfu` | `true` requests a **co-processor (nRF) BLE DFU** (dual board and protocol 2 only). The encrypted Config session and the two-minute physical-start window must both be live. The loop-task request is stamped to that physical link and expires across connect/disconnect; its final policy/token check and UART trigger execute under the same link-boundary lease, so a disconnect/new owner cannot land between check and action. The board replies `nrf-ready` or `nrf-denied` on OTA, then sets Status `nrfup:true` only after the loop actually forwards the trigger. The app baseline-scans first, waits for `nrfup`, then drives the signed, version-bound, application-only `.zip`. **Trust asymmetry, stated plainly** (mirrors `pair_window.h`): the S3 image is signature-verified ON the board; the nRF image is not. The nRF's stock legacy bootloader is CRC-only and cannot authenticate an image, and its UART trigger accepts a bare token, so the nRF leg's protection is entirely the session + physical-window gate on the S3 side (plus the app's own signature check on the downloaded `.zip`). Migrating the bootloader to signed Secure DFU is what would close it. The USB-console `nrfdfu` bench command is gated on the same two-minute physical-start window. See *Firmware update (OTA)* below |
 | `poweroff` | `true` asks the board to power itself off (deep sleep). **v2 beacon board, rev-B only** (Status `rev`): on a rev-A slide board the wake line is held low by the slide, so deep sleep would re-wake instantly and the request is dropped; single-radio builds do not implement it at all, and on both the key is simply ignored. The write only sets a link-stamped latch; connect/disconnect expires it, and the final token check through the shutdown callback shares the same boundary lease, so phone A cannot pass the check and then power off after phone B becomes owner. Shutdown runs on the loop task because it blocks for seconds on the co-processor park handshake and then never returns, which on the BLE host task would freeze the whole stack. The latch is also dropped while an OTA is in progress, so a self-update is never interrupted (the user re-taps). There is deliberately no physical-pairing-window gate as `nrfdfu` has: powering a board off is low-risk and `WRITE_ENC` already means only a bonded peer reaches the write. **The board answers on the OTA notify channel with `{"pwr":"off"}` before it sleeps** - see *Shutdown heads-up* below, and arm your intentional-disconnect state on that notify, never on this write |
 
 Phone-fix time and age are stamped in ESP-IDF's 64-bit monotonic microsecond domain, not uint32
@@ -420,14 +436,14 @@ a hard ceiling.
 | `ble` / `wifi` | detection scan active for that radio (reflects the `ble` / `wifi` config toggles) |
 | `wifiEco` | active Wi-Fi eco value: seconds of Wi-Fi RX sleep between sweeps, `0` (off) / `3` / `7` / `15`. Mirrors the `wifiEco` config key; both apps read it to drive the eco picker |
 | `wifi5` | the 5 GHz pass of the Wi-Fi hop is on. **Sent only by the ESP32-C5 builds**, on every frame, as `true` or `false`. **An absent key means the board has no 5 GHz radio** (every S3 build, including the example frame above), and both apps then hide the 5 GHz toggle. Mirrors the `wifi5` config key |
-| `pairw` | seconds left in the new-phone pairing window. **Emitted only while the window is open**; absent = closed (the normal steady state). The window is 120 s from a physical start (`acabPhysicalStart` in `pair_window.h`) and is timed on the 64-bit microsecond clock, so it cannot reopen however long the board runs; before 2.2.0 a board that saw no connection attempt for about 25 days after it closed could read it open again. Lets an app show a setup countdown; neither app parses it today |
+| `pairw` | seconds left in the pairing window (new phones, and known phones that must pair again). **Emitted only while the window is open**; absent = closed (the normal steady state). The window is 120 s from a physical start (`acabPhysicalStart` in `pair_window.h`) and is timed on the 64-bit microsecond clock, so it cannot reopen however long the board runs; before 2.2.0 a board that saw no connection attempt for about 25 days after it closed could read it open again. Lets an app show a setup countdown; neither app parses it today |
 | `buferr` | latched storage-fault bitmask for the offline buffer, **emitted only when nonzero**. Bits `0x01` read, `0x02` erase, `0x04` write, `0x08` corruption, `0x10` lock, and `0x40` cryptography (random generation, nonce/key hashing, or AES) mean the ring stopped accepting evidence rather than pretending it was stored. Bit `0x20` means NVS rejected an offline-buffer metadata load or save, including generation, anchor, connection/privacy lifecycle, flood-marker, and diagnostic-fault state; eligible work is retried from the loop task, and this bit alone does not condemn sound raw-ring geometry. The mask is historical: recovered faults remain visible until a fully successful physical wipe clears it. Both apps treat every non-`0x20` bit, including unknown future bits, as `OFFLINE LOG INCOMPLETE`; `0x20` additionally shows `BUFFER METADATA ERROR RECORDED`, says current status may already include a successful retry, asks the user to confirm buffer state and replay timestamps, and explains that a clear resets the warning |
 | `flock` | Flock/ALPR detector enabled. A missing key (older firmware) is treated as on |
 | `drone` | drone Remote ID detector enabled. A missing key (older firmware) is treated as on |
 | `droui` | drone vendor-OUI fallback enabled. A missing key (older firmware) is treated as off (opt-in, default off) |
 | `axon` | body-cam category enabled (Axon plus Utility BodyWorn plus, gated by `moto`, the broad Motorola OUI) |
 | `moto` | broad Motorola Solutions OUI sub-toggle enabled. **An absent key means pre-split firmware**, where the broad match rode the body-cam toggle with no separate switch: treat absent as `true` and hide or disable the sub-toggle in the UI, since writing `{"motorola":...}` to that board does nothing. Present means the board honours the sub-toggle. Note this reports the sub-toggle's own value, so `"axon":false,"moto":true` is normal and still means no Motorola hits (both switches are required) |
-| `buzzer` | detection/session alert audio enabled. `false` also mutes the boot jingle; only the explicit-user-action cues (rev-B hold-to-start ack, deliberate shutdown) are independent of it |
+| `buzzer` | detection/session alert audio enabled. `false` mutes every sound, the boot jingle and both power cues included |
 | `vol` | buzzer volume, `0` to `100` |
 | `gps` | a GPS fix is being applied to fixed-device detections |
 | `buf` | number of detections currently held in the offline buffer |
@@ -462,7 +478,7 @@ always reads as the safe default and never trips a warning.
 | `co` | co-processor (nRF) liveness. Emitted only on the dual board; the app shows "bluetooth detection offline" only when it is present **and** `false`, so an absent key (single-radio / older firmware) never warns |
 | `bat` | battery percentage, `0` to `100`. Present only on boards with a VBAT sense divider; absent on USB-only boards, so the app hides the battery gauge |
 | `chg` | battery charging. Emitted **only when `true`** (on the dual board); absent = draining or unknown = normal battery UI |
-| `nrfv` | the co-processor's last-reported app version (integer), learned from its `V<n>` line. Emitted only once the nRF has announced a version; the app gates the "co-processor update available" offer on a known `nrfv`. Clamped to `0..9999` at the firmware's UART boundary (the line is untrusted input; the real domain is a small monotonic int, currently 2), so the value is never more than 4 digits |
+| `nrfv` | the co-processor's last-reported app version (integer), learned from its `V<n>` line. Emitted only once the nRF has announced a version; the app gates the "co-processor update available" offer on a known `nrfv`. Clamped to `0..9999` at the firmware's UART boundary (the line is untrusted input; the real domain is a small monotonic int, currently 3), so the value is never more than 4 digits |
 | `nrfup` | present + `true` **only while** a co-processor BLE DFU is in flight (the fault-mute window is open). Absent otherwise. While set, the app shows "updating co-processor" and mutes the nRF fault banner even though `co` reads `false` (the nRF is in its bootloader). The window clears event-driven the instant the nRF reports a fresh version, or after a 5-minute ceiling. See *Firmware update (OTA)* / the combined one-click update |
 | `rev` | carrier-board revision, `"A"` or `"B"` (dual board only; absent on older firmware and single-radio builds). `"A"` = the first 250 boards (slide switch, copper-crossed UART); `"B"` = button power + VBUS sense. Shown next to the fw label on the device screen so support can identify the board without opening the case, and used as a belt-and-braces OTA gate: if the board reports a revision, the manifest entry about to be flashed must agree (the PRIMARY defence is that the two revisions carry distinct fw labels, `beacon board` vs `beacon board rev-B`, and the manifest is keyed by label). Apps must treat ABSENT as "not told", never as rev-A |
 
@@ -519,9 +535,12 @@ tradeoff is deliberate and is documented at the top of `det_log.h`: a seized boa
 flash yields the key, so the at-rest buffer is decryptable and **not** ciphertext-only.
 (An earlier version of this section claimed the key was never persisted. It was wrong;
 `detLogSetKey` writes it whenever buffering is on.) What remains is the opt-in default,
-the auto-wipe of records left undrained across reboots, and `{"clearlog":true}` for a
-real sector erase. Flash encryption / encrypted NVS would restore the seized-board
-property.
+the auto-wipe of records left undrained across six physical starts (power-on, reset pin,
+deep-sleep wake; a panic, watchdog, brownout or OTA restart does not count), and
+`{"clearlog":true}` for a real sector erase. The auto-wipe runs only when the firmware boots, so
+it does not protect against flash imaging; the key sits in plaintext NVS, and `buffer:false` only
+marks it erased in NVS rather than physically erasing it (ESP-IDF NVS behaviour). Flash encryption
+plus encrypted NVS would restore the seized-board property.
 
 AES-CTR's counter domain is separate from the phone-visible replay token. Each initialized ring
 namespace holds an unpredictable durable 128-bit `cryptdom`; for every record the firmware hashes
@@ -535,9 +554,9 @@ and a nonce-hash failure refuses append/replay rather than encrypting under a ze
 
 The IDF core-dump partition is a second at-rest surface. A panic can retain live task-stack copies
 of the key, a decrypted record, or phone coordinates outside the encrypted ring. `clearlog`, every
-safely accepted key replacement, every explicit `buffer:false`, and the first authenticated phone
-link of every boot (`detLogPrepareConfigSession()`, with the buffer on or off) therefore advance an
-independent NVS erase generation. `acabCoredumpWipeTick()` clears that generation only after the
+safely accepted key replacement, every explicit `buffer:false`, the boot-count auto-wipe, and the
+first authenticated phone link of every boot (`detLogPrepareConfigSession()`, with the buffer on or
+off) therefore advance an independent NVS erase generation. `acabCoredumpWipeTick()` clears that generation only after the
 dump partition is erased or found empty. Empty means the boot probe read every byte of the partition back as erased
 (0xFF, apart from the 16-byte marker `esp_core_dump_image_erase()` writes); no IDF error code counts
 as empty, and a read error counts as possible data. The request survives a power loss and remains distinguishable from the
@@ -546,9 +565,12 @@ request. The session pre-arm cannot complete on the boot that armed it, so it is
 the next boot, and a retained dump is erased on the first loop pass that sees a pending generation
 (after any ring sweep in progress, with a bounded wait). On the boot after a panic, that is the
 first pass when a phone had authenticated on the boot that crashed, and otherwise the first pass
-after a phone authenticates. A boot-count auto-wipe does not arm the generation. To decode a panic,
-read the `[coredump]` lines of the serial boot report (printed before any erase), or read the dump
-out of flash before a phone connects.
+after a phone authenticates. The boot-count auto-wipe arms the generation too, so a board that
+self-cleans also erases its retained dump; the only record that a wipe rather than an empty log
+produced `buf:0` is the serial boot-report line `[buf] auto-wipe: erasing N row(s) after K physical
+starts without the app`. To decode a panic, read the `[coredump]` lines of the serial boot report
+(printed before any erase), or read the dump out of flash before a phone connects or the auto-wipe
+fires.
 
 ### Connect handshake
 
@@ -791,7 +813,8 @@ safe replay rather than an omission. Legacy firmware without `gen` retains the o
 ### Threat model
 
 This buffer defends against a passive RF eavesdropper (the link is bonded + encrypted)
-and a casual finder (opt-in, encrypted at rest, auto-wipe, easy erase). Against an active
+and a casual finder who boots the unit (opt-in, encrypted at rest, auto-wipe after six physical
+starts, easy erase); the auto-wipe never runs against an imaged flash. Against an active
 transmitter that floods fake signature hits to push real rows out of the FIFO ring, it
 bounds the damage and reports it rather than preventing it: the flood limit (`bufrl` above)
 stretches a full overwrite from minutes to about 67.6 hours and raises a persisted flag on
@@ -832,7 +855,8 @@ and results notify on the **OTA** characteristic.
    a completed `end` both drop any held signature, so each session must send its own.
 2. `{"ota":{"begin":true,"size":<bytes>,"crc":"<hex32>","ver":"<x.y.z>"}}`. `crc` is a
    standard zlib CRC-32 of the whole image, hex. `ver` must be strictly newer than the
-   running firmware (add `"force":true` to override for a rebuild/beta). The board
+   running firmware; `"force":true` admits the same version (a re-flash of the running build,
+   for recovery) and never an older one, so a downgrade needs a USB flash. The board
    answers `{"ota":"ready","size":N}` or `{"ota":"err","e":"..."}`. Scanning pauses for
    the transfer.
 3. Stream the raw image bytes to the OTA characteristic with write-without-response, in
@@ -846,9 +870,9 @@ and results notify on the **OTA** characteristic.
    version. Send `{"ota":{"confirm":true}}` to mark the image healthy. Before its durable
    product-health gate is ready the board answers `{"ota":"health-wait"}`; after it has
    durably disarmed rollback it answers `{"ota":"ok"}`. If the app never confirms, the board self-confirms after 20 s of
-   healthy uptime; if the new image fails to reach a healthy state at all, the next boot
-   rolls back to the previous firmware, and the app should surface that the update was
-   rolled back.
+   healthy uptime (on the dual-radio board, 30 s when the co-processor stays silent), and an
+   image that never reaches a healthy state within 60 s reboots so the next boot rolls back.
+   Either way the app should surface that the update was rolled back.
 
 `{"ota":{"abort":true}}` cancels an in-flight session (the board answers
 `{"ota":"abort"}` and resumes scanning). A dropped link mid-transfer aborts the session
@@ -1010,8 +1034,8 @@ Permitted phrasing either way:
 
 **Live session** (app connected throughout):
 
-- no live notify dropped at a full sink queue: a dropped live notify usually re-arrives, but a
-  one-time advert never does
+- no live notify dropped at a full sink queue: the device's `new` edge re-arms for its next
+  sighting, but a one-time advert never does
 - no live record over the notify cap even fully elided
 - radio health for the relevant radio (below)
 - co-processor liveness sampled healthy throughout, on a dual-radio board
@@ -1127,8 +1151,8 @@ minus `end.n` shortfall is the only signal an app has - it says how many, never 
 | live record over the notify cap even fully elided | `gNotifyOverCap` | rate-limited USB serial warning | live observation lost |
 | replay record over the cap even at the fixed 159-byte core | `gDrainOverCap` | rate-limited USB serial warning | drain attempt blocked; the row was **not committed** and remains retryable. Indicates a sub-159-byte peer cap or schema/budget regression, not permanent loss |
 | replay record fit only after the *Replay trim ladder* shed keys | none | nowhere | the record went out, SHORT. Read an absent key as withheld, not as absent from the buffer |
-| deliver-only item refused by a full sink queue | none | nowhere | **possible** loss: usually re-arrives on the next sighting, but a one-time advert never does |
-| buffer-bearing item refused by a full sink queue | none | nowhere | the scanner rolls its claim back, so the device is recorded on a later sighting; a device that never transmits again is lost |
+| deliver-only item refused by a full sink queue | `gSinkDropFirehose` / `gSinkDropSignature` in `acab_scanner.cpp` (`acabScannerSinkDropsFirehose` / `acabScannerSinkDropsSignature`) | the dual-radio beacon board's 5 s serial `[diag]` line, as `sinkdrop=<firehose>/<signature>`; OUI-Spy, beacon-c5 and Mesh-Detect print neither | the scanner re-arms the device's `new` edge, so its next sighting goes out as new; a one-time advert never does |
+| buffer-bearing item refused by a full sink queue | the same two sink drop counters | the same `[diag]` line (dual-radio beacon board only) | the scanner rolls its claim back, so the device is recorded on a later sighting; a device that never transmits again is lost |
 
 A dropped live notify is not benign in the opportunistic case. A Falcon probe request or a single
 BLE advert that never repeats is exactly what this product exists to catch. The three serial

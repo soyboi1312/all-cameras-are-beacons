@@ -1,14 +1,15 @@
 # All Cameras Are Beacons, Android
 
-Native Kotlin + Jetpack Compose companion for the beacon, OUI-Spy, and Mesh-Detect
-boards, and the Android counterpart to the iOS app in `../ios`. It talks to the
+Native Kotlin + Jetpack Compose companion for the beacon, OUI-Spy, Mesh-Detect, and DIY
+ESP32-C5 boards, and the Android counterpart to the iOS app in `../ios`. It talks to the
 same firmware over the same encrypted BLE GATT service (`../docs/ble-protocol.md`).
 
-The app is the free, open-source companion to the beacon (the planned retail hardware),
-and still works with DIY XIAO builds. It surfaces what the beacon detects: body cams
-on by default, mapped ALPR awareness, drones, recording glasses, opt-in BLE item
-trackers and network cameras, and encrypted offline-buffer replay of hits logged
-while your phone was away.
+The app is the free, open-source companion to the beacon (the board we sell),
+and still works with the DIY OUI-Spy, Mesh-Detect, and ESP32-C5 builds. It surfaces what the
+board detects: ALPR radio signals (Flock cameras and Raven sensors, which many installs no longer
+broadcast), body cams, drones, and recording glasses, all on by default; opt-in BLE item trackers
+and network cameras; a community-mapped ALPR layer on the Map; and encrypted offline-buffer replay
+of hits logged while your phone was away.
 
 Install the published app from [Google Play](https://play.google.com/store/apps/details?id=tech.soyboi.beacons).
 
@@ -17,7 +18,7 @@ Install the published app from [Google Play](https://play.google.com/store/apps/
 Working end to end. Done:
 - Gradle/Compose project, runtime permissions, the Material 3 theme from the crimson seed (`ui/theme/Theme.kt`).
 - BLE layer (`ble/AcabBleManager.kt`): scan by service UUID, connect, **bond**
-  (the GATT service is encrypted as of firmware 0.2.2/0.2.3), request a **512-byte
+  (the GATT service requires an encrypted, bonded link), request a **512-byte
   ATT MTU** (so the status + richer drone JSON fit one notify; config writes stay
   chunked well under the 512 B cap), subscribe to the detection + status notifies,
   parse the JSON, write config.
@@ -25,10 +26,10 @@ Working end to end. Done:
   the dual-radio co-processor-alive flag (`co` -> `coAlive`); `DeviceScreen` shows a
   fault banner when it reads `false` (the beacon board's companion BLE scanner has
   gone silent, so its half of detection is dark).
-- Four-tab UI: status, an osmdroid (OpenStreetMap) map, log, and device controls.
+- Four-tab UI: Status, an osmdroid (OpenStreetMap) Map, Log, and Beacon (board and phone settings).
 - Tap a detection for its detail card: a signal-strength history, first-seen and
   last-seen timestamps, and identifiers, with the chart greying out when a device
-  goes stale. The phone's location is geotagged onto fixed-install hits.
+  goes stale. The phone's location is geotagged onto every non-drone hit; a drone's pin uses the position it broadcasts.
 - Firmware updates: the app checks a hosted version manifest (no Play release
   needed when firmware ships) and, on OTA-capable boards, pushes the update over
   Bluetooth with progress and safe rollback; older boards get pointed at the
@@ -66,25 +67,32 @@ to a plugged-in phone with `adb install -r app/build/outputs/apk/debug/app-debug
 The debug build above is signed with a throwaway debug key, fine for your own phone
 but not for sharing widely or for the Play Store. For a real release:
 
-1. **Make a signing key once** and keep it safe (you reuse it for every update):
+1. **Make a signing key once** and keep it safe (you reuse it for every update). Create it in
+   `~/keys/`, outside the repo; the release workflow's secret notes assume that path:
    ```bash
-   keytool -genkey -v -keystore acab-release.jks -keyalg RSA -keysize 2048 \
+   mkdir -p ~/keys
+   keytool -genkey -v -keystore ~/keys/acab-release.jks -keyalg RSA -keysize 2048 \
      -validity 10000 -alias acab
    ```
-2. Point Gradle at it: add a `signingConfig` to `app/build.gradle.kts` that reads
-   the keystore path and passwords from `~/.gradle/gradle.properties` or env vars,
-   so no secrets land in git.
+2. Point Gradle at it: set `ACAB_STORE_FILE`, `ACAB_STORE_PASSWORD`, `ACAB_KEY_ALIAS` and
+   `ACAB_KEY_PASSWORD` in `~/.gradle/gradle.properties` or as env vars. `app/build.gradle.kts`
+   already reads them, so no secrets land in git; without them the release build is left unsigned.
+   `ACAB_STORE_FILE` takes the full path, for example `/home/you/keys/acab-release.jks`: Gradle
+   does not expand `~` in gradle.properties.
 3. Build the artifact:
    - `./gradlew :app:assembleRelease` for a signed **APK** to sideload or hand out.
    - `./gradlew :app:bundleRelease` for an **AAB**, the format the Play Store wants.
 
 The public [Google Play listing](https://play.google.com/store/apps/details?id=tech.soyboi.beacons)
-is live. Store updates use the signed AAB from the protected release workflow.
+is live. Store updates use the signed AAB from the release workflow, which an `android-v*` tag triggers.
+The tag must be `android-v` plus `versionName`, and `versionCode` must be above the one at the
+previous `android-v*` tag, or the workflow stops before it builds.
 
 ## Notes
 
-- Reflashing the board with **erase** wipes its bond; after that the phone must
-  "Forget This Device" in Bluetooth settings and re-pair. Flash without erase to
-  keep the pairing (same as iOS).
+- Reflashing the board with **erase** wipes its bond; after that the phone must forget the
+  board in Bluetooth settings ("Forget" or "Unpair") and pair again. Flash without erase to
+  keep the pairing (same as iOS). A phone that forgets the board without an erase pairs as a
+  new phone: turn the board off and on, then pair within two minutes.
 - The map uses osmdroid against OpenStreetMap tiles, so there is no Google Play
   Services dependency and no map API key to register for.

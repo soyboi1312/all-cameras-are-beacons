@@ -26,11 +26,11 @@ Bulk-OUI mirrors: macaddress.io, maclookup.app, github.com/Ringmast4r/OUI-Master
 
 | Signature | Match on | Value | Public source |
 |---|---|---|---|
-| WiFi SSID | prefix | `Flock-` + partial MAC | ryanohoro, GainSec |
+| WiFi SSID | prefix + hex-only tail (4 or more digits) | `Flock-` + hex partial MAC (e.g. `Flock-A1B2C3`); a non-hex tail such as `Flock-Party` does not match | ryanohoro, GainSec |
 | WiFi SSID | suffix | `-FALCON` **NOT SHIPPING** (`ext=1`, retired 2026-08-25): compiled out of every build, matches nothing, carries no confidence. See the retirement note below | none. the capture it was cited to holds this firmware's own diagnostic label, not a broadcast SSID |
 | BLE name | prefix + digits-only tail | `Penguin-` + digits (research form: 10 digits) | ryanohoro |
 | BLE name | substring (literal) | `FS Ext Battery` | ryanohoro |
-| BLE name | prefix + hex-only tail | `FS-` + hex (e.g. `FS-BEC46A`) | own field capture (2026-06) |
+| BLE name | prefix + hex-only tail (4 or more digits) | `FS-` + 4 or more hex digits (e.g. `FS-BEC46A`); `FS-100` no longer matches | own field capture (2026-06) |
 | BLE name | prefix, loose | `Flock` | brand string, public |
 | BLE mfg data | company ID | `0x09C8` (Flock's BT module; ryanohoro attributes to XUNTONG; shared silicon, conf 45 = weak-match band) | ryanohoro |
 | MAC OUI | exact | `B4:1E:52` (Flock Safety, MA-L, reg. 2024-05-09) | IEEE / maclookup.app |
@@ -45,7 +45,9 @@ regardless of address bytes. This preserves the existing name-plus-manufacturer
 tier; `0x09C8` identifies shared XUNTONG silicon and is not exclusive to Flock.
 The public-address confidence boost was removed on 2026-09-01: a public address
 provides no Flock-specific evidence, and the WiFi local-address bit cannot determine
-BLE address type. A name-only `FS-100` hit therefore stays at 70 for every address.
+BLE address type. A name-only `FS-` hit also needs at least four hex digits after the prefix
+(`FLOCK_HEX_TAIL_MIN`, 2026-10-11): `FS-100` no longer matches at all, while `FS-1234` and the
+captured `FS-BEC46A` stay at 70 for every address. The same floor applies to the `Flock-` SSID tail.
 The bare 10-decimal-digit name ryanohoro documents as the post-Mar-2025
 pattern is deliberately NOT matched: it false-positived in the field on a phone
 advertising the placeholder name `0102000000` (removed 2026-06-18). Reconsider it
@@ -90,7 +92,7 @@ only with independent Flock-specific evidence.
   field of its own `[wifi]` diagnostic line, and only after its Falcon-OUI match, so a capture
   containing them is our OUI table quoting itself. Two independent confirmations. A data
   frame carries no SSID element at all, so `DATA-FALCON` could not have come off the air. And the
-  one capture in this repo holding the string (`docs/captures/lvt-2026-08-03-summary.txt`) shows
+  one capture holding the string (own capture lvt-2026-08-03, not published) shows
   `ssid="PROBE-FALCON"` followed immediately by a conf-72 `Falcon probe (OUI)` verdict, which is the
   verdict the classifier gives when the frame's own SSID does NOT end in `-FALCON`. Git dates the
   labels to 2026-06-19, five weeks before the drive they were credited to. The rule now sits behind
@@ -386,8 +388,9 @@ are large, obvious, unmistakably surveillance, and sitting where people actually
 
 The raw capture was 50 minutes / 105,932 lines from `firmware/tools/capture-log.py`, on a
 `-DACAB_DIAG -DACAB_DIAG_WIFI` build with Desert mode on. That file is gitignored (`*.log`, 9 MB),
-so the evidence is committed distilled instead:
-[`docs/captures/lvt-2026-08-03-summary.txt`](captures/lvt-2026-08-03-summary.txt) , every typed
+and so is its distilled summary (own capture lvt-2026-08-03, not published: it lists the full
+address of every bystander device heard, so it left `docs/captures/` on 2026-10-11). The summary
+holds every typed
 marker, every classifier detection, and every raw sighting inside the three LVT approach windows.
 Two different LVT units were approached, one at 15 ft and both at 2 m. Nothing on either trailer produced a BLE advert or a
 WiFi frame at any range.
@@ -467,7 +470,7 @@ match there is a false-positive bomb, not a signature.
 **What that leaves, and what a field session should therefore look for.** If these are ever to be
 detected it has to be an advertised **local name** or a **service UUID** captured off a real
 device, not a MAC prefix. That is a weaker and more FP-prone class of signature than this project
-normally accepts (see the Flock name-pattern rules and the `FS-100` consumer-gadget collision), so
+normally accepts (see the Flock name-pattern rules and the `FS-100` consumer-gadget collision that forced the four-hex-digit floor), so
 the bar for admitting one should be high. The honest experiment is still worth running, roughly
 $100 of hardware and a bench day next to the nRF sniffer, but it should be scoped as **"harvest a
 name or a UUID, or write the not-detectable finding"**, and nobody should expect an OUI out of it.
@@ -621,7 +624,13 @@ line actually transmits.
 ## Drone (Remote ID primary, vendor-OUI fallback)
 
 Vendor in **opendroneid-core-c (Apache-2.0)** and call its decoder. It is ASTM F3411
-compliant and covers BLE legacy/extended plus WiFi NAN/beacon Remote ID.
+compliant and covers BLE legacy/extended plus WiFi NAN/beacon Remote ID. **What the shipped radios
+receive is BT4 legacy only.** No shipped radio does BT5 extended or coded-PHY scanning: the S3
+builds pin NimBLE-Arduino with `CONFIG_BT_NIMBLE_EXT_ADV` left off (`nimconfig.h`), and the nRF
+co-processor scans legacy adverts only, through Bluefruit's scanner on the 1M PHY primary channels.
+A Remote ID module that broadcasts only on BT5 Long Range is therefore not heard, and the decoder's
+extended-advertising branches (like the 36-byte Find Hub frame in `tracker_detect.cpp`) are
+unreachable on today's hardware.
 - Library: https://github.com/opendroneid/opendroneid-core-c  (Apache-2.0, commercial-OK with attribution)
 - Spec: https://github.com/opendroneid/specs  (standard: ASTM F3411)
 - nRF52 reference for Chip B: https://github.com/sxjack/remote_id_bt5  (check its license first)
@@ -636,9 +645,13 @@ vendor. These makers randomise their MAC in some Wi-Fi modes, so treat an OUI hi
 Desert mode does not force it. On Wi-Fi the fallback fires only on
 access-point frames (beacons, probe responses) and NAN Remote ID frames, never on a client's
 probes or association frames: every Parrot hit in the field logs was a client probing for a
-home network, while a captured ANAFI beacons. `90:3A:E6` (Parrot SA) is also the OUI the
-French DRI beacon vendor IE borrows, but that is an information-element match decoded as RID
-first, not a transmitter-MAC match, so it does not double-count.
+home network, while a captured ANAFI beacons. `90:3A:E6` (Parrot SA) is also one of the two OUIs
+the Remote ID beacon vendor IE is heard under (the other is ASD-STAN's CID `FA:0B:BC`; the
+opendroneid Wireshark dissector lists exactly these two), but that is an information-element match
+(OUI type `0x0D`; other `90:3A:E6` vendor IEs are skipped) decoded as RID first, not a
+transmitter-MAC match, so it does not double-count. The French DRI vendor IE (`6A:5C:35`, OUI type
+`0x01`, upstream `frdid_wifi_build_beacon_frame`) is not decoded; the vendored `wifi.c` carries no
+French builder.
 
 Deliberately NOT matched: Beijing Autelan (`4C:48:DA` / `00:1F:64`, a WLAN vendor, not
 Autel Robotics the drone maker). The WatchGuard exclusion is a body-cam question, not a
@@ -665,8 +678,9 @@ drone one, so it lives in the body-cam section below.
 | Anduril | MAC OUI, no RID decoded | MA-M `E8:B4:70:C` | IEEE (Anduril Industries) |
 
 Every block above is the vendor's OWN corporate IEEE registration, not commodity module
-silicon, so each passes the no-shared-silicon rule that forced the Falcon Wi-Fi OUI list down
-to two entries. Parrot ANAFI and Skydio in particular are the most-deployed US public-safety
+silicon, so each passes the same no-shared-silicon rule that keeps the Falcon Wi-Fi OUI list at
+its four probe-gated entries. Parrot ANAFI and Skydio in particular are the most-deployed US
+public-safety
 craft, which is why they earn a fallback despite the low confidence.
 
 `18:D7:93:6` is deliberately excluded. IEEE assigns it to Autel Intelligent Technology,
@@ -727,7 +741,7 @@ names nobody for the second:
   An untagged `00:25:DF` advert from a car can also be in-car or other Axon equipment.
 - **The WiFi path (`axonClassifyWiFi`, conf 65) has two field hits, and each is one device with
   WiFi at the base address and BLE at base + 1.** 2026-08-03
-  ([`docs/captures/lvt-2026-08-03-summary.txt`](captures/lvt-2026-08-03-summary.txt)): WiFi
+  (own capture lvt-2026-08-03, not published): WiFi
   `00:25:DF:A3:5D:7B` four seconds after BLE `00:25:DF:A3:5D:7C`, whose advert carried the
   `BWCDEVICE` tag, so that WiFi transmitter was a body cam's. 2026-09-27, I-5 at Camp Pendleton
   (app CSV export): WiFi `00:25:DF:7F:D6:18`, 22 hits at -72 dBm, and at the same spot BLE
@@ -980,6 +994,13 @@ and the same reason, as the Apple length byte `0x19` above, which is what select
 form (the `0x12` payload type is common to both forms). The implementation and the
 accepted-miss note are in `firmware/lib/acab_core/tracker_detect.cpp`.
 
+**Tile and SmartTag are the exception: they match in every state.** Their service-data frames
+(`0xFEED`, `0xFD5A`) carry no separated bit the firmware decodes, so a Tile (65) or a SmartTag (60)
+fires beside its owner as readily as away from them. The separated-only rule above applies to Apple
+and Google only. Matching only their separated states needs a capture with a known-separated tag to
+pin the state-field layout first; until then read those two rows as "a tag is nearby", not "a tag
+is following".
+
 ## Smart / recording glasses
 
 Its own category (`t=9`, not trackers, not body cam). **Three match surfaces**, all
@@ -1003,7 +1024,7 @@ that reads only manufacturer data is blind to two of the three, which is what th
 until 2026-07-31.
 
 **Get the tie rule wrong and you emit the wrong `meth`.** A Snap Spectacles advert carrying both
-member UUID `0xFE45` (conf 70) and company ID `0x03C2` (conf 70) reports `meth:4`, not `meth:3`,
+member UUID `0xFE45` (conf 49) and company ID `0x03C2` (conf 49) reports `meth:4`, not `meth:3`,
 because surface 2 set the best score first. Same for `0xFEB7` (45) beside `0x01AB` (45). The
 detail strings are identical on both paths, so `meth` is the only field that shows which surface
 fired, and it is the field someone triaging a hit reads.
@@ -1011,14 +1032,15 @@ fired, and it is the field someone triaging a hit reads.
 A 2026-07-31 field capture confirmed advertise-while-worn (`0x01AB` fired twice during the
 worn window, and nowhere else in the 1568-row capture, while three Meta glasses were
 worn); the Quest discriminator token's byte framing is still
-capture-pending, so most rows stay at "possible recording glasses." Background and provenance in
+capture-pending, so every bare company-ID row sits below 50 and names the vendor rather than the
+type ("Luxottica device, possible glasses"). Background and provenance in
 [docs/glasses.md](glasses.md); the tables here are the shipped ones.
 
 | Product | Match on | Value | Registrant | Eyewear-only? | Shipped? | Public source |
 |---|---|---|---|---|---|---|
-| Ray-Ban Meta frames | mfg company ID | `0x0D53` (conf 70) | Luxottica Group S.p.A | yes | on by default | Bluetooth SIG |
-| Snap Spectacles | mfg company ID | `0x03C2` (conf 70) | Snapchat Inc | yes (Snap's only BLE hardware) | on by default | Bluetooth SIG |
-| Vuzix camera AR glasses (Blade/M400/Shield/Z100) | mfg company ID | `0x060C` (conf 70) | Vuzix Corporation | yes (AR-eyewear-only maker) | on by default | Bluetooth SIG |
+| Ray-Ban Meta frames | mfg company ID | `0x0D53` (conf 49, "Luxottica device, possible glasses") | Luxottica Group S.p.A | yes, but a company ID names the vendor, not the type | on by default (never heard in a capture; fired zero times beside worn Meta glasses 2026-07-31) | Bluetooth SIG |
+| Snap Spectacles | mfg company ID | `0x03C2` (conf 49, "Snap device, possible glasses") | Snapchat Inc | yes (Snap's only BLE hardware), but a company ID names the vendor, not the type | on by default (never heard in a capture) | Bluetooth SIG |
+| Vuzix AR eyewear (Blade/M400/Shield carry cameras; the Z100 is a camera-less display) | mfg company ID | `0x060C` (conf 49, "Vuzix equipment, type unknown") | Vuzix Corporation | yes, but not camera-only, and a company ID names the vendor, not the type | on by default (never heard in a capture) | Bluetooth SIG |
 | Ray-Ban / Oakley Meta glasses | mfg company ID | `0x058E` (conf 49 if ever enabled) | Meta Platforms Technologies, LLC | **no**, shared with Meta Quest VR | **gated OFF** (token-confirmed hits only) | Bluetooth SIG |
 | Meta hardware (corporate ID) | mfg company ID | `0x01AB` (conf 45) | Meta Platforms, Inc. | **no**, corporate/parent ID | **on** (weak match, un-gated 2026-07-31) | Bluetooth SIG |
 | RayNeo AR/smart glasses | mfg company ID | `0x0BC6` (conf 45 if ever enabled) | TCL COMMUNICATION EQUIPMENT CO.,LTD. | **no**, TCL phones/tablets/TVs | **gated OFF** (no token to rescue it) | Bluetooth SIG |
@@ -1044,14 +1066,17 @@ capture-pending, so most rows stay at "possible recording glasses." Background a
   since it is still a corporate ID). That capture also disproved the old fallback: Ray-Ban
   Meta coverage rides the un-gated `0x01AB`, not `0x0D53`, which never fired against real
   worn frames. Luxottica `0x0D53`, Snapchat `0x03C2`, and Vuzix `0x060C` are
-  eyewear-only registrants: on by default, higher confidence, no payload discriminator
-  needed.
-- **Vuzix `0x060C`.** Vuzix Corporation is an eyewear-only AR maker whose whole line is
-  camera-equipped smart glasses (Blade, M400, Shield, Z100). Same `0xFF` manufacturer-data
-  company-ID mechanism as the Luxottica and Snap entries, so it survives MAC randomization,
-  and it carries the same eyewear-only confidence (70 - deliberately below the
-  field-validated Axon OUI at 75, because it is still capture-pending) with no Quest-style
-  shared-hardware caveat.
+  eyewear-leaning registrants that no capture here has ever heard: on by default, capped at 49
+  with vendor-not-type wording (`Luxottica device, possible glasses`, `Snap device, possible
+  glasses`, `Vuzix equipment, type unknown`) until a worn-unit capture exists, because one SIG
+  company ID names the vendor, never the device type (the same ladder as
+  `bodycam_vendor_signatures.h`).
+- **Vuzix `0x060C`.** Vuzix Corporation is an enterprise AR-eyewear maker. Blade, M400 and
+  Shield carry on-board cameras, but the Z100 is a camera-less waveguide display, so even a
+  confirmed Vuzix hit is not automatically a recording device. Same `0xFF` manufacturer-data
+  company-ID mechanism as the Luxottica and Snap entries, so it survives MAC randomization; it
+  carries the same uncaptured-registrant confidence (49) and reports `Vuzix equipment, type
+  unknown`.
 - **Meta Quest discriminator (capture-pending).** The documented way to separate the
   Ray-Ban/Oakley Meta glasses from a Quest under `0x058E` is the manufacturer-data payload,
   not a service UUID: the glasses' payload is reported to carry the ASCII token
@@ -1086,7 +1111,7 @@ namespace, so a device that advertises no manufacturer data at all can still be 
 | Meta hardware (corporate registrant, same as `0x01AB`) | 16-bit SIG member service UUID | `0xFEB7` (conf 45) | Meta Platforms, Inc. | on by default | Bluetooth SIG `member_uuids.yaml` |
 | Meta hardware (corporate registrant, same as `0x01AB`) | 16-bit SIG member service UUID | `0xFEB8` (conf 45) | Meta Platforms, Inc. | on by default | Bluetooth SIG `member_uuids.yaml` |
 | Meta hardware (Quest registrant, same as `0x058E`) | 16-bit SIG member service UUID | `0xFD5F` (conf 49 if ever enabled) | Meta Platforms Technologies, LLC | **gated OFF** | Bluetooth SIG `member_uuids.yaml` |
-| Snap Spectacles | 16-bit SIG member service UUID | `0xFE45` (conf 70) | Snapchat Inc | on by default | Bluetooth SIG `member_uuids.yaml` |
+| Snap Spectacles | 16-bit SIG member service UUID | `0xFE45` (conf 49, "Snap device, possible glasses", same grade as `0x03C2`) | Snapchat Inc | on by default | Bluetooth SIG `member_uuids.yaml` |
 | HeyCyan-SDK glasses (Nilox Smart AI Glasses and rebrands) | 128-bit service UUID, **full 16 bytes**, both byte orders | `7905FFF0-B5CE-4E99-A40F-4B1E122D00D0` (conf 68) | n/a, a vendor SDK UUID rather than a SIG allocation | on by default | yj_nearbyglasses README; HeyCyanSmartGlassesSDK |
 
 **Notes:**

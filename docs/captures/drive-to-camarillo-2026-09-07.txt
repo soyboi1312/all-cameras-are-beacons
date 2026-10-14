@@ -26,8 +26,8 @@ Nothing else fired. There are no body-cam, network-camera or Falcon-WiFi detecti
 
 2. DRONE REMOTE ID  (conf=99, the highest-confidence result in the log)
 
-  L31727  18:16:11  60:60:1F:13:A2:8C  ssid="RID-1581F4Z4324C5006T00T"  14 sightings, peak -82
-  L76454  19:00:56  8C:1E:D9:71:29:EC  ssid="RID-1581F8LQC25CT0027F7Z"  52 sightings, peak -60
+  L31727  18:16:11  60:60:1F:xx:xx:xx  ssid="RID-1581F4Z4324C5006T00T"  14 sightings, peak -82
+  L76454  19:00:56  8C:1E:D9:xx:xx:xx  ssid="RID-1581F8LQC25CT0027F7Z"  52 sightings, peak -60
 
 Both broadcast a UAS serial in the clear in the SSID, in ANSI/CTA-2063-A form. This is a
 self-declared identifier, not an inference from a vendor prefix or an advertised name, which is why
@@ -40,10 +40,10 @@ evidence in its own right; a static false positive does not produce it.
 
 3. ALPR / FS Ext Battery
 
-  L176573  20:15:09  04:0D:84:4C:73:66  rssi=-91  name="FS Ext Battery"
+  L176573  20:15:09  04:0D:84:xx:xx:xx  rssi=-91  name="FS Ext Battery"
            adv=0201060F094653204578742042617474657279
            AD 0F 09 -> complete local name, 14 bytes, "FS Ext Battery"
-  L176574  [ACAB] ALPR camera BLE 04:0d:84:4c:73:66 rssi=-91 conf=80 FS Ext Battery
+  L176574  [ACAB] ALPR camera BLE 04:0d:84:xx:xx:xx rssi=-91 conf=80 FS Ext Battery
 
 Matches the FLOCK_NAME_LITERAL row in flock_signatures.h:142 (credited there to ryanohoro).
 flock_detect.cpp:282 states this is the only literal that ranks strong on its own, so conf=80 from
@@ -55,7 +55,7 @@ establish an associated camera, and this run has no ground-truth marker to pair 
 
 4. SNAP SPECTACLES
 
-  L79903  19:04:23  FA:F1:72:0E:9F:D3  rssi=-85  name=".... Specs"
+  L79903  19:04:23  FA:F1:72:xx:xx:xx  rssi=-85  name=".... Specs"
           adv=02010608FFC203E0819EA7C50B09F09F988E205370656373
           08 FF C2 03 -> manufacturer specific, company ID 0x03C2 (little-endian on the wire)
           0B 09 F0 9F 98 8E 20 53 70 65 63 73 -> complete local name, emoji + " Specs"
@@ -67,7 +67,7 @@ hex, not read from that field.
 
 Context for this row: the glasses category fired 8 times. The other 7 are Meta at conf=45
 ("possible recording glasses or Quest"), at L54144, L61487, L78187, L99792, L114618, L138005,
-L141455. One address (45:7b:65:e8:94:84) appears twice, 12 minutes apart. The Spectacles hit is the
+L141455. One address (45:7b:65:xx:xx:xx) appears twice, 12 minutes apart. The Spectacles hit is the
 only glasses result above 45 in the run.
 
 
@@ -78,16 +78,16 @@ only glasses result above 45 in the run.
 
 TEN OF THE 25 ADDRESSES ARE ONE DEVICE RIDING IN THE VEHICLE:
 
-  E5:A7:7D:5B:76:5F   18:00:00 -> 18:14:43   55 adv   -45..-39
-  C3:D3:D1:06:69:4F   18:15:00 -> 18:29:51   54 adv   -42..-44
-  E5:07:8C:47:CD:D1   18:30:00 -> 18:44:47   54 adv   -54..-41
-  E8:9C:FA:18:54:FA   18:45:00 -> 18:59:50   53 adv   -45..-39
-  EB:32:F3:5C:F3:F8   19:00:00 -> 19:14:47   54 adv   -41..-39
-  C6:53:6E:63:5D:97   19:15:00 -> 19:29:59   55 adv   -42..-40
-  F7:EA:86:B4:17:07   19:30:00 -> 19:44:38   48 adv   -41..-45
-  F1:8C:0F:EA:85:A4   19:45:00 -> 19:59:51   55 adv   -49..-39
-  D5:55:CE:67:3A:AD   20:00:00 -> 20:14:49   47 adv   -39..-42
-  C9:C9:15:61:1C:AD   20:15:00 -> 20:24:37   40 adv   -42..-43
+  E5:A7:7D:xx:xx:xx   18:00:00 -> 18:14:43   55 adv   -45..-39
+  C3:D3:D1:xx:xx:xx   18:15:00 -> 18:29:51   54 adv   -42..-44
+  E5:07:8C:xx:xx:xx   18:30:00 -> 18:44:47   54 adv   -54..-41
+  E8:9C:FA:xx:xx:xx   18:45:00 -> 18:59:50   53 adv   -45..-39
+  EB:32:F3:xx:xx:xx   19:00:00 -> 19:14:47   54 adv   -41..-39
+  C6:53:6E:xx:xx:xx   19:15:00 -> 19:29:59   55 adv   -42..-40
+  F7:EA:86:xx:xx:xx   19:30:00 -> 19:44:38   48 adv   -41..-45
+  F1:8C:0F:xx:xx:xx   19:45:00 -> 19:59:51   55 adv   -49..-39
+  D5:55:CE:xx:xx:xx   20:00:00 -> 20:14:49   47 adv   -39..-42
+  C9:C9:15:xx:xx:xx   20:15:00 -> 20:24:37   40 adv   -42..-43
 
 Four things make this conclusive, not suggestive:
   a. Every window OPENS on an exact wall-clock 15-minute boundary, to the second.
@@ -114,7 +114,7 @@ Consequences:
 
 6. TILE
 
-  L53094  18:32:38..18:39:40  D4:68:39:32:26:51  7 raw adv, 3 detections, conf=65
+  L53094  18:32:38..18:39:40  D4:68:39:xx:xx:xx  7 raw adv, 3 detections, conf=65
           adv=0201060D16EDFE...0303EDFE -> service data + service UUID 0xFEED
 
 Static public address (not a random one), so repeat sightings are the same physical tag. The
