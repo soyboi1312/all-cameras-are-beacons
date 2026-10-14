@@ -226,7 +226,13 @@ extension Detection {
             // Pebblebee tags advertise the same offline Find My payload, so the NETWORK is what
             // was proved, not the manufacturer. "(offline)" is dropped from the title only
             // because it would read as the row's OFFLINE buffer-replay tag, which it is not.
+            // "Apple AirTag (offline)" is the name a firmware after 2.2.1 gives a frame whose status
+            // byte declares an AirTag (a display choice, never part of the match); firmware up to
+            // 2.2.1 sends only the generic string. Most separated Find My frames are offline Apple
+            // devices, third-party tags or AirPods, which keep "Apple Find My". TWIN: android OuiVendors.kt, same
+            // two keys.
             switch det {
+            case "Apple AirTag (offline)":  return "Apple AirTag"
             case "Apple Find My (offline)": return "Apple Find My"
             case "Tile":                    return "Tile"
             case "Samsung SmartTag":        return "Samsung SmartTag"

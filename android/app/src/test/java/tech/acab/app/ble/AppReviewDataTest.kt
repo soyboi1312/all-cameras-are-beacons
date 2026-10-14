@@ -1,12 +1,15 @@
 package tech.acab.app.ble
 
+import org.json.JSONObject
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
+import tech.acab.app.model.Detection
 import tech.acab.app.model.DeviceType
+import tech.acab.app.model.maker
 import tech.acab.app.ui.logUnreadableNotice
 import java.io.File
 import java.nio.file.Files
@@ -264,5 +267,20 @@ class AppReviewDataTest {
         assertFalse(tech.acab.app.tileDriveRequestFresh(1_000L, 61_001L))
         assertFalse(tech.acab.app.tileDriveRequestFresh(0L, 1_000L))
         assertFalse(tech.acab.app.tileDriveRequestFresh(2_000L, 1_000L))
+    }
+
+    /** "Apple AirTag" only for the AirTag string a firmware after 2.2.1 sends (the status byte
+     *  declared an AirTag); the generic Find My string keeps "Apple Find My", which most separated
+     *  frames are (offline Apple devices, third-party tags, AirPods). FAILS before the AirTag key:
+     *  maker was null.
+     *  TWIN: iOS AppReviewDataTests.testTrackerTitleIsAirTagOnlyWhenDeclared. */
+    @Test
+    fun trackerTitleIsAirTagOnlyWhenDeclared() {
+        fun maker(det: String) = Detection.fromJson(
+            JSONObject().put("t", DeviceType.TRACKER.raw).put("s", 0).put("meth", 3).put("c", 85)
+                .put("mac", "aa:bb:cc:dd:ee:01").put("rssi", -60).put("det", det),
+        ).maker
+        assertEquals("Apple AirTag", maker("Apple AirTag (offline)"))
+        assertEquals("Apple Find My", maker("Apple Find My (offline)"))
     }
 }

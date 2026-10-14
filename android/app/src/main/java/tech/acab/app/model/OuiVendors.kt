@@ -325,7 +325,13 @@ val Detection.maker: String?
             // Pebblebee tags advertise the same offline Find My payload, so the NETWORK is what
             // was proved, not the manufacturer. "(offline)" is dropped from the title only
             // because it would read as the row's OFFLINE buffer-replay tag, which it is not.
+            // "Apple AirTag (offline)" is the name a firmware after 2.2.1 gives a frame whose status
+            // byte declares an AirTag (a display choice, never part of the match); firmware up to
+            // 2.2.1 sends only the generic string. Most separated Find My frames are offline Apple
+            // devices, third-party tags or AirPods, which keep "Apple Find My". TWIN: iOS OUIVendors.swift, same
+            // two keys.
             DeviceType.TRACKER -> when (det) {
+                "Apple AirTag (offline)"  -> "Apple AirTag"
                 "Apple Find My (offline)" -> "Apple Find My"
                 "Tile"                    -> "Tile"
                 "Samsung SmartTag"        -> "Samsung SmartTag"

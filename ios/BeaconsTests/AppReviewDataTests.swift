@@ -285,4 +285,21 @@ final class AppReviewDataTests: XCTestCase {
         XCTAssertTrue(full.wiping)
         XCTAssertEqual(full.moto, false)
     }
+
+    // MARK: - Tracker title (owner request 2026-10-14)
+
+    /// "Apple AirTag" only for the AirTag string a firmware after 2.2.1 sends (the status byte
+    /// declared an AirTag); the generic Find My string keeps "Apple Find My", which most separated
+    /// frames are (offline Apple devices, third-party tags, AirPods). FAILS before the AirTag key:
+    /// maker was nil.
+    /// TWIN: android AppReviewDataTest.trackerTitleIsAirTagOnlyWhenDeclared.
+    func testTrackerTitleIsAirTagOnlyWhenDeclared() throws {
+        func maker(_ det: String) throws -> String? {
+            let json: [String: Any] = ["t": DeviceType.tracker.rawValue, "s": 0, "meth": 3, "c": 85,
+                                       "mac": "aa:bb:cc:dd:ee:01", "rssi": -60, "n": 1, "det": det]
+            return try Detection.decodeWireJSON(JSONSerialization.data(withJSONObject: json)).maker
+        }
+        XCTAssertEqual(try maker("Apple AirTag (offline)"), "Apple AirTag")
+        XCTAssertEqual(try maker("Apple Find My (offline)"), "Apple Find My")
+    }
 }
