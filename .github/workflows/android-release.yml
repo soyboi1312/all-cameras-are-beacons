@@ -1,8 +1,9 @@
 name: Android release
 
 # Push a tag like android-v2.0.4 to build, sign, and publish a GitHub Release with the
-# APK + AAB. A manual run (workflow_dispatch) builds and uploads the artifacts
-# without publishing a release, which is a handy dry run for the secrets.
+# APK + AAB + SHA256SUMS. A manual run (workflow_dispatch) builds and uploads the artifacts
+# without publishing a release, which is a handy dry run for the secrets. A tag run first checks
+# that the tag is android-v<versionName> and that versionCode climbed past the previous tag's.
 #
 # Needs three repo secrets (Settings > Secrets and variables > Actions):
 #   ACAB_KEYSTORE_BASE64  base64 of ~/keys/acab-release.jks
@@ -22,20 +23,77 @@ on:
       - 'android-v*'
   workflow_dispatch:
 
+# READ-ONLY by default. The build job runs AGP, Kotlin and every plugin resolved from
+# google()/mavenCentral(), so it gets no write token; only the publish job, which runs no
+# third-party build code, gets contents: write.
 permissions:
-  contents: write   # publish the Release and upload its assets
+  contents: read
+
+# One run per tag at a time, queued, never cancelled: cancelling a run mid-publish can leave a
+# Release with half its assets.
+concurrency:
+  group: android-release-${{ github.ref }}
+  cancel-in-progress: false
 
 jobs:
   build:
     runs-on: ubuntu-latest
+    timeout-minutes: 45
     steps:
+      # fetch-depth: 0 brings every tag, which the preflight's previous-tag lookup needs.
+      # persist-credentials: false keeps the token out of .git/config while Gradle runs.
       - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+          persist-credentials: false
 
-      - name: Set up JDK 17
+      # PREFLIGHT, tag runs only (a manual run's ref is a branch, not a tag). Without it, a tag
+      # pushed before the version bump publishes a release whose name says one version and whose
+      # APK installs as another, and a versionCode that did not climb is only caught by Play.
+      # "Previous" is the android-v* tag that sorts just below this one (sort -V), so re-running
+      # an old tag still compares against its own predecessor. Every android-v* tag from
+      # android-v2.0.4 to android-v2.2.0 passes this check (verified 2026-10-12).
+      - name: Preflight (tag matches versionName, versionCode climbed)
+        if: startsWith(github.ref, 'refs/tags/')
+        run: |
+          GRADLE=android/app/build.gradle.kts
+          code_of() { sed -nE 's/^[[:space:]]*versionCode = ([0-9]+)[[:space:]]*$/\1/p'; }
+          NAME="$(sed -nE 's/^[[:space:]]*versionName = "([^"]+)"[[:space:]]*$/\1/p' "$GRADLE")"
+          CODE="$(code_of < "$GRADLE")"
+          # The regexes also reject an empty or a multi-line result (two matches).
+          if ! [[ "$NAME" =~ ^[0-9]+(\.[0-9]+)*$ && "$CODE" =~ ^[0-9]+$ ]]; then
+            echo "::error::could not read exactly one versionName and versionCode from $GRADLE"
+            exit 1
+          fi
+          if [ "$GITHUB_REF_NAME" != "android-v$NAME" ]; then
+            echo "::error::tag $GITHUB_REF_NAME does not match versionName $NAME in $GRADLE (expected android-v$NAME)"
+            exit 1
+          fi
+          if [ "$(git rev-parse --is-shallow-repository)" != false ]; then echo "::error::shallow checkout, so the previous android-v* tags are missing (keep fetch-depth: 0)"; exit 1; fi
+          PREV="$(git tag -l 'android-v*' | sort -V | awk -v cur="$GITHUB_REF_NAME" '$0 == cur { print prev; exit } { prev = $0 }')"
+          if [ -z "$PREV" ]; then
+            echo "::notice::no android-v* tag sorts below $GITHUB_REF_NAME, so the versionCode comparison is skipped"
+            exit 0
+          fi
+          PREV_CODE="$(git show "${PREV}:${GRADLE}" | code_of)"
+          if ! [[ "$PREV_CODE" =~ ^[0-9]+$ ]]; then
+            echo "::error::could not read exactly one versionCode from $GRADLE at $PREV"
+            exit 1
+          fi
+          if [ "$CODE" -le "$PREV_CODE" ]; then
+            echo "::error::versionCode $CODE is not above $PREV_CODE at $PREV; Play rejects a used code"
+            exit 1
+          fi
+          echo "versionName $NAME, versionCode $CODE (previous: $PREV_CODE at $PREV)"
+
+      # JetBrains Runtime 21, the exact JVM android/gradle/gradle-daemon-jvm.properties asks the
+      # Gradle daemon for. With Temurin here, Gradle fetched a JBR 21 through api.foojay.io on
+      # every run, unpinned, and that JVM ran the whole build (and, for releases, the signing).
+      - name: Set up JDK 21 (JetBrains Runtime)
         uses: actions/setup-java@v5
         with:
-          distribution: temurin
-          java-version: '17'
+          distribution: jetbrains
+          java-version: '21'
           cache: gradle
 
       # FULL lint, as its own gate. assembleRelease only triggers lintVitalRelease, which runs the
@@ -89,11 +147,15 @@ jobs:
           APKSIGNER="$(find "$ANDROID_SDK_ROOT/build-tools" -name apksigner | sort -V | tail -1)"
           "$APKSIGNER" verify --verbose android/app/build/outputs/apk/release/app-release.apk
 
+      # SHA256SUMS holds bare file names, so `sha256sum -c SHA256SUMS` works in the folder the
+      # release assets are downloaded to.
       - name: Stage artifacts
         run: |
           mkdir -p dist
           cp android/app/build/outputs/apk/release/app-release.apk "dist/beacons-${GITHUB_REF_NAME}.apk"
           cp android/app/build/outputs/bundle/release/app-release.aab "dist/beacons-${GITHUB_REF_NAME}.aab"
+          cd dist
+          sha256sum "beacons-${GITHUB_REF_NAME}.apk" "beacons-${GITHUB_REF_NAME}.aab" > SHA256SUMS
 
       - name: Upload build artifacts
         uses: actions/upload-artifact@v5
@@ -102,12 +164,37 @@ jobs:
           path: dist/*
           if-no-files-found: error
 
+      # The R8 mapping for this exact build (release is minified), as a workflow artifact for quick
+      # symbolication. It is not secret: the same file ships inside the public .aab
+      # (BUNDLE-METADATA/com.android.tools.build.obfuscation/proguard.map), which Play also reads, so the
+      # .aab on the Release is the permanent copy and this artifact may expire (90 days max on a public repo).
+      - name: Upload R8 mapping
+        uses: actions/upload-artifact@v5
+        with:
+          name: beacons-${{ github.ref_name }}-r8-mapping
+          path: android/app/build/outputs/mapping/release/mapping.txt
+          retention-days: 90
+          if-no-files-found: error
+
+  publish:
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write   # publish the Release and upload its assets
+    steps:
+      - name: Download build artifacts
+        uses: actions/download-artifact@v5
+        with:
+          name: beacons-${{ github.ref_name }}
+          path: dist
+
       - name: Publish GitHub Release
-        if: startsWith(github.ref, 'refs/tags/')
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          ASSETS=("dist/beacons-${GITHUB_REF_NAME}.apk" "dist/beacons-${GITHUB_REF_NAME}.aab")
+          ASSETS=("dist/beacons-${GITHUB_REF_NAME}.apk" "dist/beacons-${GITHUB_REF_NAME}.aab" "dist/SHA256SUMS")
           if gh release view "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
             # Release already exists (a re-run, or a moved/force-pushed tag): refresh its
             # assets in place instead of failing on `gh release create`.

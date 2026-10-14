@@ -15,6 +15,7 @@ purpose that a run is not watching upstream.
 """
 import argparse
 import fractions
+import glob
 import hashlib
 import json
 import os
@@ -33,6 +34,7 @@ ODID_BASELINE_RELEASE = "v2.0"   # latest release reviewed (2026-06-16)
 
 # The two enums whose faqKey values ARE the keys of faq-content.json's relatedHelp map.
 IOS_DEVICE_TYPE = "ios/Beacons/Models/DeviceType.swift"
+IOS_DEVICE_STATUS = "ios/Beacons/Models/DeviceStatus.swift"
 AND_DEVICE_TYPE = "android/app/src/main/java/tech/acab/app/model/Models.kt"
 
 # The app files carrying constants that must read the same on both platforms (see
@@ -43,6 +45,9 @@ IOS_BLE_OTA = "ios/Beacons/BLE/BLEManager+OTA.swift"
 IOS_BLE_NRF_DFU = "ios/Beacons/BLE/BLEManager+NrfDFU.swift"
 AND_BLE_MANAGER = "android/app/src/main/java/tech/acab/app/ble/AcabBleManager.kt"
 AND_NRF_DFU = "android/app/src/main/java/tech/acab/app/ble/NrfDfuCoordinator.kt"
+AND_FIRMWARE_MANIFEST = "android/app/src/main/java/tech/acab/app/net/FirmwareManifest.kt"
+IOS_DETECTION_NOTIFIER = "ios/Beacons/BLE/DetectionNotifier.swift"
+AND_DETECTION_NOTIFIER = "android/app/src/main/java/tech/acab/app/ble/DetectionNotifier.kt"
 IOS_SETTINGS = "ios/Beacons/Views/SettingsView.swift"
 AND_DEVICE_SCREEN = "android/app/src/main/java/tech/acab/app/ui/DeviceScreen.kt"
 IOS_ROOT_VIEW = "ios/Beacons/Views/RootView.swift"
@@ -99,6 +104,27 @@ CANONICAL_PRIVACY = "web/privacy.html"
 CANONICAL_PRIVACY_URL = (
     "https://soyboi1312.github.io/all-cameras-are-beacons/privacy.html"
 )
+# A full 6-octet hardware address in a tracked file is a privacy defect (review 2026-10-11, A.2): a
+# BSSID geolocates through public wardriving databases, and a dated comment turns one into a trail.
+# Tracked sources and docs carry the OUI (first three octets) plus the capture log name instead; the
+# full addresses stay in the gitignored "firmware/tools/detection logs/". firmware/tools/host-tests
+# is outside this set because test fixtures legitimately hold synthetic addresses. Two docs are
+# exempt by owner decision: docs/signatures.md and docs/false-positives.md are the curated
+# ground-truth evidence record, and whether its full addresses stay is the owner's call, not this
+# gate's.
+MAC_SCAN_GLOBS = (
+    "firmware/lib/acab_core/*.h", "firmware/lib/acab_core/*.cpp",
+    "firmware/src/**/*.cpp", "firmware/src/**/*.h",
+    "docs/captures/*.txt", "docs/ble-protocol.md", "docs/mesh-setup.md",
+)
+# Addresses that are not devices, lowercase and colon-separated; each names why it is allowed.
+MAC_SYNTHETIC = {
+    "aa:bb:cc:dd:ee:ff",  # the format placeholder (acabFormatMac in detection.h, parseMac6, doc samples)
+    "51:6f:9a:01:00:00",  # the Wi-Fi NAN network ID Remote ID NAN frames are addressed to (wifi.c target_addr)
+    "fa:f3:11:0d:1d:01",  # odid-sim's own random-static advertiser address: a bench transmitter, not a capture
+}
+MAC_RE = re.compile(r"(?<![0-9a-f:])(?:[0-9a-f]{2}:){5}[0-9a-f]{2}(?![0-9a-f:])"
+                    r"|(?<![0-9a-f-])(?:[0-9a-f]{2}-){5}[0-9a-f]{2}(?![0-9a-f-])", re.IGNORECASE)
 # ----------------------------------------------------------------------------
 
 
@@ -397,11 +423,15 @@ def _toggle_title_rows():
         ("Detectors trackers toggle title", "AirTag", None),
         ("Detectors glasses toggle title", "Ray-Ban", None),
         ("Detectors network cameras toggle title", "known IP-camera", None),
-        ("Offline buffer toggle title", "board buffers while away", r"bufferSubtitle,"),
+        ("Offline buffer toggle title", "board records while ", r"bufferSubtitle,"),
         ("Desert mode toggle title", "show \\+ log ANY", None),
         ("Board LED lights-out toggle title", "no LEDs", None),
         ("Display higher-contrast toggle title", "brighter secondary text",
          r"if \(ContrastMode\.systemHasControl\)"),
+        # The two subtitles differ on purpose (the surfaces differ), so the Android side is
+        # anchored on the state the row binds instead of its subtitle's words.
+        ("Live Mode lock-screen toggle title", "show only ",
+         r'"[^"]*",\s*checked = shownRedactLock\b'),
     ):
         rows.append({
             "what": what,
@@ -426,6 +456,31 @@ SHARED_CONSTANTS = (
                 r"static\s+let\s+detectionColumns\s*:\s*\[String\]\s*=\s*\[(.*?)\]"),
         "android": (AND_BLE_MANAGER,
                     r"\bval\s+DETECTION_CSV_COLUMNS\s*:\s*List<String>\s*=\s*listOf\((.*?)\)"),
+    },
+    {
+        "what": "firmware that mutes the power cues",
+        "kind": "string",
+        # From this version the alert mute covers the shutdown motif and the rev-B hold-to-start
+        # ack too (alerts.cpp buzzerTone), and both apps' Alerts caption and Desert note switch to
+        # the "all board sounds off" wording at it.
+        "why": "both phones must call the same board silent: one phone promising silence while the"
+               " other warns about the shutdown cue would leave a muted user guessing which is true",
+        "ios": (IOS_DEVICE_STATUS,
+                r'static\s+let\s+muteCoversPowerCuesSince\s*=\s*"((?:[^"\\]|\\.)*)"'),
+        "android": (AND_BLE_MANAGER,
+                    r'\bconst\s+val\s+MUTE_COVERS_POWER_CUES_SINCE\s*=\s*"((?:[^"\\]|\\.)*)"'),
+    },
+    {
+        "what": "latest published firmware",
+        "kind": "string",
+        # The beacon-board line only. iOS keeps a second literal for the Colonel Panic builds
+        # (DeviceStatus.colonelLatestVersion); Android's one constant serves every fallback entry.
+        "why": "the offline fallback each phone compares a board against when no firmware manifest"
+               " has loaded; one phone a release behind would call a board current that the other"
+               " offers to update",
+        "ios": (IOS_DEVICE_STATUS, r'static\s+let\s+latestVersion\s*=\s*"((?:[^"\\]|\\.)*)"'),
+        "android": (AND_FIRMWARE_MANIFEST,
+                    r'\bconst\s+val\s+LATEST_PUBLISHED_FIRMWARE\s*=\s*"((?:[^"\\]|\\.)*)"'),
     },
     {
         "what": "pairing-window hint",
@@ -470,6 +525,38 @@ SHARED_CONSTANTS = (
         "ios": (IOS_BLE_MANAGER,
                 r"\blet\s+currentLocationFixMaxAge\s*:\s*TimeInterval\s*=\s*(\d+)\b"),
         "android": (AND_BLE_MANAGER, r"\bconst\s+val\s+FIX_MAX_AGE_SEC\s*=\s*(\d+)\b"),
+    },
+    {
+        "what": "observer fix accuracy limit (meters)",
+        "kind": "string",
+        # The fraction is captured, so a 250.5 on one side cannot read as 250; Android's float
+        # suffix is matched and left out of the value.
+        "why": "one limit decides which phone fix may become an observer pin, a breadcrumb or the"
+               " board's lat/lon (app review 2026-10-12 S3); a looser limit on one phone pins"
+               " evidence where that phone never was",
+        "ios": (IOS_BLE_MANAGER,
+                r"\blet\s+observerFixMaxAccuracyMeters\s*:\s*Double\s*=\s*(\d+(?:\.\d+)?)\b"),
+        "android": (AND_BLE_MANAGER,
+                    r"\bconst\s+val\s+OBSERVER_FIX_MAX_ACCURACY_M\s*=\s*(\d+(?:\.\d+)?)[fF]?\b"),
+    },
+    # The generic alert (app review 2026-10-12 S6): every alert while the redact switch is on, and
+    # the locked face otherwise (iOS hiddenPreviewsBodyPlaceholder, Android's public version).
+    {
+        "what": "generic detection alert title",
+        "kind": "string",
+        "why": "user-facing copy: the alert that names nothing reads the same on both phones",
+        "ios": (IOS_DETECTION_NOTIFIER,
+                r'\bif\s+redact\s*\{\s*return\s*\(\s*"((?:[^"\\]|\\.)*)"\s*,\s*redactedBody\s*\)'),
+        "android": (AND_DETECTION_NOTIFIER,
+                    r'\bconst\s+val\s+REDACTED_ALERT_TITLE\s*=\s*"((?:[^"\\]|\\.)*)"'),
+    },
+    {
+        "what": "generic detection alert body",
+        "kind": "string",
+        "why": "user-facing copy: the alert that names nothing reads the same on both phones",
+        "ios": (IOS_DETECTION_NOTIFIER, r'static\s+let\s+redactedBody\s*=\s*"((?:[^"\\]|\\.)*)"'),
+        "android": (AND_DETECTION_NOTIFIER,
+                    r'\bconst\s+val\s+REDACTED_ALERT_BODY\s*=\s*"((?:[^"\\]|\\.)*)"'),
     },
     {
         "what": "stale capture-era pin floor (RSSI)",
@@ -1136,9 +1223,13 @@ SHARED_CONSTANTS = (
         "why": "the second-phone rule under a failed connect reads the same on both phones; the"
                " board hangs up before it can explain itself, so this line is the only"
                " explanation a user who missed the window gets",
-        "ios": (IOS_CONNECT_VIEW, r'Text\("(already paired to another phone\? )"\s*'
+        # 2026-10-11: the note also names a phone that forgot the board, which firmware 2.2.1
+        # refuses outside the window too (acabRepeatPairingAllowed).
+        "ios": (IOS_CONNECT_VIEW, r'Text\("(already paired to another phone, or forgotten in this'
+                r' phone\'s Bluetooth settings\? )"\s*'
                 r'\+ renderBoardCopy\(BLEManager\.pairWindowHint, kind\)\)'),
-        "android": (AND_ACAB_APP, r'"(already paired to another phone\? )" \+ AcabBleManager\.pairWindowHint\(kind\)'),
+        "android": (AND_ACAB_APP, r'"(already paired to another phone, or forgotten in this phone\'s'
+                    r' Bluetooth settings\? )" \+ AcabBleManager\.pairWindowHint\(kind\)'),
     },
     {
         "what": "remembered row title",
@@ -1630,9 +1721,10 @@ SHARED_CONSTANTS = (
     # Row titles are sentence case since the 2026-09-26 review (P3-11, decisions R20: the first
     # letter up, feature and company names keep their case). Each Beacon sub-screen toggle that
     # exists on both phones is one row here, anchored on the opening words of its OWN subtitle so
-    # the title hole is read from the right call and a retitled row still matches; the platform-
-    # only rows (iOS Live Activity counter / Hide counts on lock screen, Android Live counter
-    # notification / Keep counts private on lock screen) have no twin and are not listed.
+    # the title hole is read from the right call and a retitled row still matches; the Live Mode
+    # switch has a platform name (iOS Live Activity counter, Android Live counter notification)
+    # and is not listed. The lock-screen switch is listed: both apps title it "Hide details on
+    # lock screen" since 2026-10-12.
     *_toggle_title_rows(),
     {
         "what": "offline buffer erase row title",
@@ -1641,6 +1733,56 @@ SHARED_CONSTANTS = (
                " (P3-11); it was 'buffered log' on Android and 'Buffered log' on iOS",
         "ios": (IOS_SETTINGS, r'Text\("([Bb]uffered log)"\)\.font\(ACABTheme\.font\(\.body, weight: \.medium\)\)'),
         "android": (AND_DEVICE_SCREEN, r'Text\("([Bb]uffered log)", color = Acab\.text, fontSize = 14\.sp'),
+    },
+    # FRAGMENTS, not string, for the buffer rows below: iOS writes the middle dot as \u{00B7}.
+    {
+        "what": "offline buffer toggle subtitle",
+        "kind": "fragments",
+        "why": "what the buffer switch does, in the same words on both phones (app review"
+               " 2026-10-12 S11); Android's 'clearing…' and 'N buffered' variants are a"
+               " documented platform difference, so only its base line, the elvis fallback right"
+               " before the toggle, is compared",
+        "ios": (IOS_SETTINGS, r'radioToggle\("Store detections offline",\s*("[^"\n]*")'),
+        "android": (AND_DEVICE_SCREEN,
+                    r'\?:\s*("[^"\n]*")\s*\n\s*ToggleRow\(\s*"Store detections offline"'),
+    },
+    {
+        "what": "offline buffer seizure note",
+        "kind": "fragments",
+        "why": "the note under the buffer switch is the in-place disclosure that a taken board"
+               " gives up the key and the last phone position; a phone that drops or softens it"
+               " lets the user turn the buffer on without the trade-off in front of them",
+        "ios": (IOS_SETTINGS, r'Text\(("the board keeps the key[^"\n]*")\)'),
+        "android": (AND_DEVICE_SCREEN, r'Text\(("the board keeps the key[^"\n]*"),'),
+    },
+    # A refused mute names the guard that refused it, one sentence per MuteRefusal case (app
+    # review 2026-10-12 S4). Read from each case arm, so a sentence moved to another case reads as
+    # drift too. FRAGMENTS because Android joins two of the sentences across lines with `+`.
+    *({
+        "what": f"mute refusal sentence ({what})",
+        "kind": "fragments",
+        "why": "the mute sheet's error says why this mute was refused, in the same words on both"
+               " phones; an address the beacon cannot store used to fall through to the list-full"
+               " text, an instruction that could never help",
+        "ios": (IOS_DETECTION_DETAIL, r"case \." + ios_case + r':\s*muteError = ("[^"\n]*")'),
+        "android": (AND_DETAIL_SCREEN,
+                    r"MuteRefusal\." + and_case + r' ->\s*("[^"\n]*"(?:\s*\+\s*"[^"\n]*")*)'),
+    } for what, ios_case, and_case in (
+        ("unstorable address", "unstorableAddress", "UNSTORABLE_ADDRESS"),
+        ("place mute with no qualifying fix", "locationNeeded", "LOCATION_NEEDED"),
+        ("list full", "listFull", "LIST_FULL"),
+    )),
+    {
+        "what": "mid-drain replay checkpoint adopts a changed generation",
+        "kind": "string",
+        "why": "the every-200 replay checkpoint may make the board's new generation durable, so a"
+               " disconnect partway through a first sync or a post-Clear drain resumes from the"
+               " cursor; a phone that passes false replays the whole drain (app review 2026-10-12"
+               " B.4)",
+        "ios": (IOS_BLE_MANAGER,
+                r"!checkpointInFlight \{ checkpointHistory\(adoptsGeneration: (true|false)\) \}"),
+        "android": (AND_BLE_MANAGER,
+                    r"!checkpointInFlight\) checkpointHistory\(adoptsGeneration = (true|false)\)"),
     },
     {
         "what": "Scan radios row value in sample data",
@@ -2122,8 +2264,9 @@ _FAQ_DESERT_PROMISES = (
      re.escape("deduplication, and rate limits still apply. desert mode sets the board to silent"
                " while it runs. turning desert mode off yourself restores your previous alert"
                " mode, unless you picked a mode by hand (including silent) while desert mode was"
-               " running. when the board ends desert mode on its own (after a factory reset, on an"
-               " older board, or because another paired phone ended it), the app doesn't change"
+               " running. when the board ends desert mode on its own (after a USB reflash that"
+               " erases the board, on an older board, or because another paired phone ended it),"
+               " the app doesn't change"
                " your alert mode. if this phone saved a mode when desert mode started, the app"
                " offers to restore it: a Restore Alerts control appears on the desert card under"
                " Beacon, and under alerts when that section is shown. nothing changes until you"
@@ -3431,9 +3574,9 @@ SHARED_SHAPES = (
                r"\bseenWatermark = sampleSeenWatermark\(seededAt: seededAt\)"))),
             ("iOS Mark Seen", IOS_BLE_MANAGER, r"\n    func markAllSeen\(\) \{(.*?)\n    \}",
              (("moves the watermark in memory, then stops before disk in sample data",
-               r"\bseenWatermark = now\b[\s\S]*?"
+               r"\bseenWatermark = mark\b[\s\S]*?"
                r"guard seenWatermarkWritesAllowed\(isDemoMode: demoMode\) else \{ return \}\s*\n\s*"
-               r"defaults\.set\(now\.timeIntervalSince1970, forKey: watermarkKey\)"),)),
+               r"defaults\.set\(mark\.timeIntervalSince1970, forKey: watermarkKey\)"),)),
             ("iOS first-run baseline", IOS_BLE_MANAGER,
              r"\n    func seedSeenWatermarkOnce\(\) \{(.*?)\n    \}",
              (("never runs in sample data, before it reads the once-only flag",
@@ -3446,10 +3589,10 @@ SHARED_SHAPES = (
                r"ble\.markAllSeen\(\)"),
               ("and nothing else here marks seen", r"markAllSeen\(\)", 1))),
             ("iOS Log tools", IOS_DETECTIONS_VIEW,
-             r"private func logToolsMenu\(_ snap: LogSnapshot\) -> some View \{(.*?)\n    \}",
+             r"\nstruct LogToolsMenu: View \{.*?\n    func menuElements\(\) -> \[UIMenuElement\] \{(.*?)\n    \}",
              (("Mark Seen is offered ungated, right after Select",
-               r'Label\("Select", systemImage: "checkmark\.circle"\) \}\s*\n\s*'
-               r"Button \{ markSeen\(\) \} label:"),)),
+               r'UIAction\(title: "Select", image: symbol\("checkmark\.circle"\)\) \{ _ in select\(\) \},\s*\n\s*'
+               r'UIAction\(title: "Mark Seen", image: symbol\("checkmark"\)\) \{ _ in markSeen\(\) \}'),)),
             ("Android seed", AND_BLE_MANAGER, None,
              (("each row's first-seen comes from its flag",
                r"firstSeenAt\[d\.id\] = sampleFirstSeenMs\(d\.isNew, now\)"),
@@ -3457,7 +3600,7 @@ SHARED_SHAPES = (
                r"_seenWatermark\.value = sampleSeenWatermarkMs\(now\)"))),
             ("Android Mark Seen", AND_BLE_MANAGER, r"\n    fun markAllSeen\(\) \{(.*?)\n    \}",
              (("moves the watermark in memory, then stops before disk in sample data",
-               r"_seenWatermark\.value = stamps[\s\S]*?"
+               r"_seenWatermark\.value = liveSeenWatermark\(stamps, System\.currentTimeMillis\(\)\)[\s\S]*?"
                r"if \(!persistedLogMutationAllowed\(_demoMode\.value\)\) return\s*\n\s*prefs\.edit\(\)"),)),
             ("Android first-run baseline", AND_BLE_MANAGER,
              r"\n    fun seedSeenWatermarkOnce\(\) \{(.*?)\n    \}",
@@ -3474,6 +3617,29 @@ SHARED_SHAPES = (
                r"markSeen = hasRows, export = hasRows, clear = !demo\)"),
               ("and its handler is not gated either",
                r"LogTool\.MarkSeen -> \{ ble\.markAllSeen\(\); scope = LogScope\.All \}"))),
+        ),
+    },
+    {
+        "what": "Mark Seen baseline (newest real first-seen stamp clamped to now, else now)",
+        "why": "a buffered record drained after the tap, dated between the newest row and the tap,"
+               " was never in front of the user and must read New on both phones; iOS stamped the"
+               " wall clock until 2026-10-12 (app review S12). The clamp keeps a row stamped in the"
+               " future (phone clock moved back) from marking later live rows seen (U2)",
+        "sides": (
+            ("iOS", IOS_BLE_MANAGER, r"\n    func markAllSeen\(\) \{(.*?)\n    \}",
+             (("the newest first-seen stamp above the pseudo band, clamped to now, else now",
+               r"let now = Date\(\)\s*\n\s*"
+               r"let newest = store\.keys\.compactMap \{ firstSeenAt\[\$0\] \}"
+               r"\.filter \{ \$0 > histPseudoBase \}\.max\(\)\s*\n\s*"
+               r"let mark = min\(newest \?\? now, now\)"),)),
+            ("Android", AND_BLE_MANAGER, r"\n    fun markAllSeen\(\) \{(.*?)\n    \}",
+             (("the live axis takes the helper's pick at now",
+               r"_seenWatermark\.value = liveSeenWatermark\(stamps, System\.currentTimeMillis\(\)\)"),)),
+            ("Android helper", AND_BLE_MANAGER, None,
+             (("the newest first-seen stamp above the pseudo band, clamped to now, else now",
+               r"internal fun liveSeenWatermark\(stamps: List<Long>, nowMs: Long\): Long =\s*\n\s*"
+               r"minOf\(stamps\.filter \{ it > AcabBleManager\.HIST_PSEUDO_BASE \}\.maxOrNull\(\)"
+               r" \?: nowMs, nowMs\)"),)),
         ),
     },
     {
@@ -4653,6 +4819,27 @@ def check_privacy_contract():
     return drift
 
 
+def check_no_field_macs():
+    """Fail on any full 6-octet MAC / BSSID in tracked firmware sources, capture extracts and the
+    protocol docs (MAC_SCAN_GLOBS). Only the OUI and the capture log name belong in the tree."""
+    print("\n== no full hardware addresses in tracked sources and docs (privacy) ==")
+    root = repo_root()
+    files = sorted({p for g in MAC_SCAN_GLOBS for p in glob.glob(os.path.join(root, g), recursive=True)})
+    hits = 0
+    for path in files:
+        rel = os.path.relpath(path, root)
+        with open(path, encoding="utf-8", errors="replace") as f:
+            for n, line in enumerate(f, 1):
+                for m in MAC_RE.finditer(line):
+                    if m.group(0).lower().replace("-", ":") in MAC_SYNTHETIC:
+                        continue
+                    print(f"   !! {rel}:{n}: full address {m.group(0)} (keep the OUI + capture log name)")
+                    hits += 1
+    if not hits:
+        print(f"   ok: {len(files)} files carry no full hardware address")
+    return hits
+
+
 def main():
     ap = argparse.ArgumentParser(
         description="ACAB signature + vendored-copy drift check (reports only, changes nothing)")
@@ -4667,7 +4854,8 @@ def main():
              + check_shared_constants()
              + check_shared_shapes() + check_board_kinds() + check_map_refresh_ladder()
              + check_pin_priority()
-             + check_privacy_contract())
+             + check_privacy_contract()
+             + check_no_field_macs())
     print()
     if drift:
         print(f"DRIFT: {drift} item(s) need a look. Review and re-port by hand.")

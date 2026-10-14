@@ -16,6 +16,7 @@ import tech.acab.app.R
 import tech.acab.app.model.Detection
 import tech.acab.app.model.DeviceType
 import tech.acab.app.model.displayName
+import tech.acab.app.ui.rowTitleCase
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.atomic.AtomicLong
 
@@ -34,7 +35,8 @@ import java.util.concurrent.atomic.AtomicLong
  *  - THE COOLDOWN IS THE EDGE, not the caller's first-sighting flag. The first version gated on
  *    AcabBleManager's `firstTime`, but the detection store is PERSISTED across launches, so a
  *    device seen in any earlier session was never "first" again and could never notify.
- *  - Never for ignored devices (dropped before the hook), never for Desert-mode NEARBY_DEVICE.
+ *  - Never for ignored devices (dropped before the hook) or a place-muted one still waiting on a
+ *    qualifying fix (fileLive's placeRuleMutesAlerts), never for Desert-mode NEARBY_DEVICE.
  *  - POST_NOTIFICATIONS (API 33+) requested lazily on the first enable.
  *
  * THREADING: the detection path runs on a BINDER thread. BluetoothGattCallback.onCharacteristicChanged
@@ -173,11 +175,17 @@ class DetectionNotifier(private val ctx: Context) {
     /**
      * Post for a detection if its category is on and the rate limits allow.
      *
-     * REDACTION: [redact] is the app's LOCK-SCREEN setting, so it is applied the way Android
-     * actually models that, via setPublicVersion, exactly as AcabLinkService.buildPublic already
-     * does for drive mode. The first version redacted the main content instead, which hid the
-     * category on an UNLOCKED phone too, i.e. in the state the feature exists for. (Redaction
-     * itself now defaults OFF; this path only runs for users who turned it on.)
+     * LOCK SCREEN. Every alert is VISIBILITY_PRIVATE with the generic public version, so the
+     * system's own "sensitive notifications" setting decides what a locked phone shows. Never
+     * PUBLIC: that overrides a user who told the OS to hide details (app review 2026-10-12 A.5).
+     *
+     * REDACTION. [redact] is the app's "hide details on lock screen" switch. PRIVATE alone leaves
+     * the locked face to the system setting, whose default shows everything, so with the switch
+     * on the alert ITSELF is generic ([detectionAlertText]): the shade loses the details on an
+     * unlocked phone too. The quieter side of the trade, and the shared rule with iOS (app review
+     * 2026-10-12 S6, DetectionNotifier.alertText(for:redact:)). An earlier version did this and
+     * moved to public-version-only redaction; it is back because a PRIVATE alert's locked face
+     * now follows the system setting whether this switch is on or off.
      */
     fun notifyIfNeeded(d: Detection, redact: Boolean) {
         if (d.hist) return                             // an offline replay is not a live event
@@ -196,17 +204,10 @@ class DetectionNotifier(private val ctx: Context) {
         lastAt.set(now)
         pruneCooldowns(now)
 
-        // The name is radio-controlled: any nearby device can broadcast newlines, control
-        // characters or bidi overrides to reshape or spoof the banner, so it is stripped here
-        // (notification text only; the log rows render the raw name). A name that strips to
-        // nothing falls back to the category label.
-        val who = notificationSafeName(d.displayName).ifBlank { d.type.label }
-        val body = if (who == d.type.label) "Detected nearby, ${d.confidence}% confidence."
-                   else "$who detected, ${d.confidence}% confidence."
-
+        val (title, body) = detectionAlertText(d.type, d.displayName, d.confidence, redact)
         val b = NotificationCompat.Builder(ctx, CHANNEL_ID)
             .setSmallIcon(R.drawable.ic_stat_beacons)
-            .setContentTitle(d.type.label)
+            .setContentTitle(title)
             .setContentText(body)
             .setPriority(NotificationCompat.PRIORITY_HIGH)
             // STATUS, not ALARM. CATEGORY_ALARM punches through Do Not Disturb, which contradicts
@@ -215,23 +216,20 @@ class DetectionNotifier(private val ctx: Context) {
             .setCategory(NotificationCompat.CATEGORY_STATUS)
             .setAutoCancel(true)
             .setContentIntent(tapIntent())
-        if (redact) {
-            b.setVisibility(NotificationCompat.VISIBILITY_PRIVATE)
-            b.setPublicVersion(
+            .setVisibility(NotificationCompat.VISIBILITY_PRIVATE)
+            .setPublicVersion(
                 NotificationCompat.Builder(ctx, CHANNEL_ID)
                     .setSmallIcon(R.drawable.ic_stat_beacons)
-                    .setContentTitle("beacons")
-                    .setContentText("Something was detected nearby.")
+                    .setContentTitle(REDACTED_ALERT_TITLE)
+                    .setContentText(REDACTED_ALERT_BODY)
                     .setContentIntent(tapIntent())
                     .build()
             )
-        } else {
-            b.setVisibility(NotificationCompat.VISIBILITY_PUBLIC)
-        }
         try {
-            // Per-MAC id so a repeat REPLACES rather than stacks. Tagged so it cannot collide with
-            // the foreground-service notification's own id space.
-            NotificationManagerCompat.from(ctx).notify(NOTIFICATION_TAG, d.mac.hashCode(), b.build())
+            // Per-MAC id so a repeat REPLACES rather than stacks, and so [cancelPostedAlert] can
+            // withdraw it. Tagged so it cannot collide with the foreground-service notification's
+            // own id space.
+            NotificationManagerCompat.from(ctx).notify(NOTIFICATION_TAG, alertId(d.mac), b.build())
         } catch (_: SecurityException) {
             // Permission revoked between the check above and the post. The next enable re-requests.
         }
@@ -261,11 +259,64 @@ class DetectionNotifier(private val ctx: Context) {
         }
     }
 
+    /**
+     * Withdraw the delivered alert for one device, whatever its type: muting it (single or bulk)
+     * and un-watching it call this, so a device the user just silenced stops naming itself in the
+     * shade. A no-op when nothing is posted for [mac]. One binder call, no listing.
+     *
+     * Shared rule with iOS (app review 2026-10-12 S8), whose alerts are per MAC the same way.
+     * iOS twin: DetectionNotifier.removeDetectionNotifications(forMacs:), the same scope.
+     */
+    fun cancelPostedAlert(mac: String) {
+        runCatching { NotificationManagerCompat.from(ctx).cancel(NOTIFICATION_TAG, alertId(mac)) }
+    }
+
     /** Drop cooldown state so a genuinely new session can alert on the same devices again. */
     fun reset() {
         lastByMac.clear()
         lastAt.set(0L)
     }
+}
+
+/** The alert's one id per device. Lowercased so a post and a withdrawal agree whatever case the
+ *  MAC arrived in: the managed lists, which un-watch passes from, store it lowercased. iOS twin:
+ *  DetectionNotifier.alertIdentifier(_:), lowercased the same way. */
+private fun alertId(mac: String): Int = mac.lowercase().hashCode()
+
+/** Title and body of a locked phone's generic alert, and of every alert while the redact switch
+ *  is on. The body sentence is shared with iOS (app review 2026-10-12 S6: its
+ *  hiddenPreviewsBodyPlaceholder and its redacted alert body). */
+internal const val REDACTED_ALERT_TITLE = "beacons"
+internal const val REDACTED_ALERT_BODY = "Something was detected nearby."
+
+/**
+ * The alert's title and body. Pure, so the casing and the redaction rule are pinned in a JVM
+ * test (AppReviewDataTest).
+ *
+ * TITLE: the category in sentence case, [DeviceType.inlineLabel] with its first letter raised
+ * ("ALPR camera", "Body cam", "Recording glasses"), never [DeviceType.label], which mixes Title
+ * Case ("ALPR Camera", "Body Camera") with sentence case and put both conventions in one shade.
+ * Same transform as a row title (rowTitleCase). Shared rule with iOS (app review 2026-10-12 S5).
+ *
+ * BODY: the name is radio-controlled: any nearby device can broadcast newlines, control
+ * characters or bidi overrides to reshape or spoof the banner, so it is stripped here
+ * (notification text only; the log rows render the raw name). A name that strips to nothing, or
+ * that is only the category label ([displayName]'s last fallback), reads "Detected nearby"; the
+ * comparison is with [DeviceType.label] exactly, not with the title.
+ *
+ * iOS twin: DetectionNotifier.alertText(for:redact:), the same title, body and redaction rule.
+ */
+internal fun detectionAlertText(
+    type: DeviceType,
+    displayName: String,
+    confidence: Int,
+    redact: Boolean,
+): Pair<String, String> {
+    if (redact) return REDACTED_ALERT_TITLE to REDACTED_ALERT_BODY
+    val who = notificationSafeName(displayName).ifBlank { type.label }
+    val body = if (who == type.label) "Detected nearby, $confidence% confidence."
+               else "$who detected, $confidence% confidence."
+    return rowTitleCase(type.inlineLabel) to body
 }
 
 /**

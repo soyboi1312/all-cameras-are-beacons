@@ -655,9 +655,9 @@ struct DeviceView: View {
         NavigationStack(path: $path) { beaconDeepLinks }
             .onAppear(perform: sync)
             .onChange(of: ble.status) { (_: DeviceStatus?, _: DeviceStatus?) in sync() }
-            // "moto" lives outside DeviceStatus, so a frame that changed only the Motorola sub-toggle
-            // (the board echoing our write back) wouldn't move `status` and wouldn't clear the pending
-            // hold. Watch it directly.
+            // motorolaOn is its own mirror: a real frame moves `status` too (DeviceStatus.moto), but
+            // the sample-data echo of a Motorola write moves only motorolaOn (BLEManager.writeConfig),
+            // and without this the pending hold would never clear there. Watch it directly.
             .onChange(of: ble.motorolaOn) { (_: Bool, _: Bool) in sync() }
             // DetectionNotifier refreshes its cached authorization on foreground, but it is not an
             // ObservableObject itself, so this view must nudge itself. Issue the refresh ourselves
@@ -1232,8 +1232,9 @@ struct DeviceView: View {
         if pending.contains(.drone) { if s.drone == droneOn { confirm(.drone) } } else { droneOn = s.drone }
         if pending.contains(.droneOui) { if s.droui == droneOuiOn { confirm(.droneOui) } } else { droneOuiOn = s.droui }
         if pending.contains(.bodyCam) { if s.axon == bodyCamOn { confirm(.bodyCam) } } else { bodyCamOn = s.axon }
-        // The Motorola sub-toggle rides "moto", which isn't part of DeviceStatus; BLEManager reads
-        // it off the status frame, so mirror from there instead of `s`. Same hold-until-confirmed.
+        // The Motorola sub-toggle mirrors BLEManager.motorolaOn rather than `s.moto`: that mirror
+        // folds in the absent-key default (pre-split firmware reads on) and the sample-data echo.
+        // Same hold-until-confirmed.
         if pending.contains(.motorola) { if ble.motorolaOn == motorolaOn { confirm(.motorola) } } else { motorolaOn = ble.motorolaOn }
         if pending.contains(.tracker) { if s.tracker == trackerOn { confirm(.tracker) } } else { trackerOn = s.tracker }
         if pending.contains(.glasses) { if s.glasses == glassesOn { confirm(.glasses) } } else { glassesOn = s.glasses }
@@ -1910,19 +1911,10 @@ struct DeviceView: View {
         if (ble.status?.firmwareLabel ?? "").lowercased().contains("rev-\(r.lowercased())") { return "" }
         return " · rev-\(r)"
     }
-    // Belt-and-braces OTA revision gate. The PRIMARY defence is that rev-B firmware reports a
-    // distinct fw label ("beacon board rev-B", set in platformio.ini) and the manifest is KEYED by
-    // that label (FirmwareManifest.build(forFwLabel:) is a dictionary lookup), so a rev-B board
-    // cannot resolve the rev-A entry at all - and until the manifest gains a rev-B key it resolves
-    // nothing and falls back to the browser flasher. Both are fail-closed.
-    // This second check catches the case where someone re-unifies the labels or hand-edits the
-    // manifest: if the board TELLS us its revision, the key we are about to flash from has to agree.
-    // A wrong-image flash parks the unit after every boot and is USB-recovery only, so a false
-    // refusal is by far the cheaper error.
+    // Belt-and-braces OTA revision gate; the rule and its reasons live in
+    // FirmwareVersionPolicy.revisionMatches, which startFirmwareUpdate applies too.
     private var revisionMatchesManifest: Bool {
-        guard let rev = ble.status?.boardRev, rev == "A" || rev == "B" else { return true }  // not told = do not block
-        let entryIsRevB = fwLabel.lowercased().contains("rev-b")
-        return entryIsRevB == (rev == "B")
+        FirmwareVersionPolicy.revisionMatches(boardRev: ble.status?.boardRev, fwLabel: fwLabel)
     }
     // Latest version from the manifest (falls back to the shipped constant when unlisted).
     private var latestVersion: String { manifest.latestVersion(forFwLabel: fwLabel) }
@@ -2443,11 +2435,17 @@ struct DeviceView: View {
             ForEach(ble.status?.bufferHealthNotices ?? [], id: \.self) {
                 BufferHealthBanner(notice: $0)
             }
-            radioToggle("Store detections offline", "board buffers while away \u{00B7} replays on reconnect", isOn: Binding(
+            radioToggle("Store detections offline", "board records while your phone is away \u{00B7} replays on reconnect", isOn: Binding(
                 get: { bufferOn }, set: {
                     bufferOn = $0; pending.insert(.buffer)
                     awaitConfirmation(.buffer); ble.setBufferingEnabled($0)
                 }))
+            // What the switch costs, in place, because a seized board is the case it changes
+            // (FAQ q-buffer, privacy.html). Byte-identical to the note under the Android twin's
+            // toggle in DeviceScreen.kt's bufferContent.
+            Text("the board keeps the key and your phone's last position \u{00B7} anyone who takes the board can read what it stored")
+                .font(ACABTheme.font(.footnote)).foregroundStyle(ACABTheme.dim)
+                .fixedSize(horizontal: false, vertical: true)
             if shouldOfferBufferClear(
                 isDemoMode: ble.demoMode,
                 bufferOn: bufferOn,
@@ -2534,15 +2532,17 @@ struct DeviceView: View {
                         isOn: Binding(get: { ble.settingsDriveModeWanted },
                                       set: { on in if on { ble.startDriveMode() } else { ble.endDriveMode() } }))
             Divider().overlay(ACABTheme.line)
-            // SCOPE, and it is NARROWER than the Android twin on purpose. Here this switch governs
-            // the Live Activity alone, which is exactly what the subtitle claims. Android's
-            // same-named toggle also strips the category from a locked per-detection alert and the
-            // count from the Android 16 status-bar chip (see _redactLockScreen in AcabBleManager),
-            // so its subtitle names three surfaces where this one names one. Both are accurate
-            // about their own platform; on this product a toggle may be quieter than advertised,
-            // never louder, so the fix was to widen the Android copy, not to widen this behaviour.
-            radioToggle("Hide counts on lock screen",
-                        "show only \u{201C}Live Mode active\u{201D} when locked \u{00B7} counts stay in the app + other supported surfaces",
+            // SCOPE. This switch governs three surfaces here: the Live Activity (the lock screen
+            // and the Watch / CarPlay small family hide the counts, LockScreenView and SmallCell in
+            // DetectionLiveActivity.swift; the Dynamic Island keeps them), every detection alert
+            // (DetectionNotifier.alertText posts the generic "beacons" alert while it is on), and
+            // the home-screen widget, which draws its "counts hidden" face (w_redact, written by
+            // BLEManager.writeWidgetSummary). The subtitle names the first two, and "counts stay
+            // in the app" already excludes the widget. The title is the Android twin's, byte for
+            // byte ("Hide details on lock screen", DeviceScreen.kt); the subtitles differ because
+            // Android's covers a status-bar chip this platform does not have.
+            radioToggle("Hide details on lock screen",
+                        "show only \u{201C}Live Mode active\u{201D} when locked \u{00B7} alerts drop their details \u{00B7} counts stay in the app and the Dynamic Island",
                         isOn: Binding(get: { ble.settingsRedactLockScreen },
                                       set: { ble.setSettingsRedactLockScreen($0) }))
             if !ble.demoMode, !ble.liveActivitiesEnabled {
@@ -2598,12 +2598,17 @@ struct DeviceView: View {
             if desertOn {
                 // The startup jingle is NOT exempt from the mute (alerts.cpp, 2026-08-24: the boot
                 // motif is a UserAlert, so a muted board never announces itself - an unattended
-                // power restore is indistinguishable from a hand on the plug). The shutdown motif
-                // is the cue that still plays muted. Said plainly here so a user who mutes the
-                // board, power-cycles it and hears nothing does not read silence as a dead board.
-                // Worded as the JINGLE, not as "starts silently": the rev-B hold-to-start ack is a
-                // separate cue and does still chirp through the mute.
-                Text("Detection alerts are muted while Desert mode runs. With every nearby device reporting in, a beep for each would never let up. The shutdown cue still plays unless volume is 0; the startup jingle is muted along with everything else.")
+                // power restore is indistinguishable from a hand on the plug). Said plainly here so
+                // a user who mutes the board, power-cycles it and hears nothing does not read
+                // silence as a dead board. TWO WORDINGS by firmware, the same rule as
+                // alertModeCaption: from 2.2.1 the mute also covers the shutdown motif and the rev-B
+                // hold-to-start ack (DeviceStatus.muteCoversPowerCues), so the note says both power
+                // cues are muted; older firmware still plays the shutdown motif muted, and that
+                // wording names it. Android twin: the same two strings in DeviceScreen.kt's
+                // desertContent.
+                Text(ble.status?.muteCoversPowerCues == true
+                     ? "Detection alerts are muted while Desert mode runs. With every nearby device reporting in, a beep for each would never let up. The startup and shutdown cues are muted too."
+                     : "Detection alerts are muted while Desert mode runs. With every nearby device reporting in, a beep for each would never let up. The shutdown cue still plays unless volume is 0; the startup jingle is muted along with everything else.")
                     .font(ACABTheme.font(.footnote)).foregroundStyle(ACABTheme.warn)
                     .fixedSize(horizontal: false, vertical: true)
             }
@@ -2709,11 +2714,12 @@ struct DeviceView: View {
             // the moment Desert comes back on or the user picks anything by hand.
             if alertRestoreOffered { AlertRestoreOffer() }
 
-            // LIVE IN ALL THREE MODES. Vibrate and Silent turn detection beeps off, so the only
-            // thing this level still governs there is the shutdown cue the caption above names -
-            // and volume 0 is the ONLY thing that silences it (firmware alerts.cpp buzzerTone: a
-            // PowerState cue bypasses the alert mute, a zero volume does not). Greying the slider
-            // out in those two modes made the remedy their own copy names unreachable from them.
+            // LIVE IN ALL THREE MODES. Vibrate and Silent turn detection beeps off. On firmware
+            // before 2.2.1 the only thing this level still governs there is the shutdown cue the
+            // older caption names, and volume 0 is the ONLY thing that silences it (a PowerState
+            // cue bypassed the alert mute there; from 2.2.1 buzzerTone mutes every cue, see
+            // DeviceStatus.muteCoversPowerCues). Greying the slider out in those two modes made the
+            // remedy that copy names unreachable from them, and an older board still needs it.
             // Android twin: the same rule on VolumeSlider in DeviceScreen.kt's BuzzerCard.
             VStack(spacing: 14) {
                 slider("Master volume", value: $master, tone: ACABTheme.tint, bold: true,
@@ -2904,14 +2910,17 @@ struct DeviceView: View {
         .accessibilityHint("Opens this app's iOS settings")
     }
 
-    /// "power cues" used to cover the boot jingle too, which the board no longer plays while muted
-    /// (alerts.cpp 2026-08-24: the boot motif is a UserAlert, so mute wins; see the Desert-mode
-    /// note above). Two cues still bypass the mute, both PowerState: the shutdown motif and the
-    /// rev-B hold-to-start ack. Only the shutdown one is named here, because it is the one every
-    /// SKU plays and the one a muted user is surprised by; the ack always directly follows the
-    /// user's own hold on the button, so it explains itself. Volume 0 silences both.
-    /// Android twin: DeviceScreen.kt's BuzzerCard. Buzzer and Silent are byte-identical there and
-    /// MUST stay so. Vibrate is NOT, deliberately: these haptics are UIKit feedback generators, so
+    /// TWO WORDINGS, chosen by the connected board's firmware (DeviceStatus.muteCoversPowerCues).
+    /// From 2.2.1 the alert mute covers every cue (alerts.cpp buzzerTone), so Vibrate and Silent
+    /// say all board sounds are off. Before it, two cues still bypassed the mute, both PowerState:
+    /// the shutdown motif and the rev-B hold-to-start ack. That wording names only the shutdown
+    /// one, because it is the one every SKU plays and the one a muted user is surprised by; the
+    /// ack always directly follows the user's own hold on the button, so it explains itself.
+    /// Volume 0 silences both there. A status that has not arrived, or a version that does not
+    /// parse, gets the older wording: a caption may promise less silence than the board delivers,
+    /// never more. Android twin: DeviceScreen.kt's BuzzerCard. Buzzer and Silent are
+    /// byte-identical there, in both wordings, and MUST stay so. Vibrate is NOT, deliberately:
+    /// these haptics are UIKit feedback generators, so
     /// they only fire while the app is foregrounded, which is why this string adds the scope
     /// qualifier and the Live Mode pointer. Android's haptic fires in AcabBleManager.alertHaptic
     /// on the detection ingest path, and it does buzz with the screen locked while Live Mode's
@@ -2922,10 +2931,15 @@ struct DeviceView: View {
     /// Sync the other two strings freely; do not converge this one without changing the
     /// behaviour first.
     private var alertModeCaption: String {
+        let quiet = ble.status?.muteCoversPowerCues == true
         switch ble.alertMode {
         case .buzzer:  return "board beeps when it spots gear"
-        case .vibrate: return "detection beeps off, the shutdown cue still plays unless volume is 0. This phone buzzes on new hits while the app is open. Use Live Mode for locked-screen alerts."
-        case .silent:  return "detection beeps and phone feedback off, the shutdown cue still plays unless volume is 0"
+        case .vibrate: return quiet
+            ? "all board sounds off. This phone buzzes on new hits while the app is open. Use Live Mode for locked-screen alerts."
+            : "detection beeps off, the shutdown cue still plays unless volume is 0. This phone buzzes on new hits while the app is open. Use Live Mode for locked-screen alerts."
+        case .silent:  return quiet
+            ? "all board sounds and phone feedback off"
+            : "detection beeps and phone feedback off, the shutdown cue still plays unless volume is 0"
         }
     }
 
@@ -2937,8 +2951,9 @@ struct DeviceView: View {
                 Text(label).font(ACABTheme.font(.subheadline, weight: bold ? .medium : .regular)).foregroundStyle(ACABTheme.text)
                 Spacer()
                 // Always the number, in every alert mode. It used to read "-" outside Buzzer, which
-                // hid the one value a Vibrate/Silent user needs to see: the caption there names
-                // volume 0 as the only thing that still silences the shutdown cue, and a dash
+                // hid the one value a Vibrate/Silent user needs to see: on firmware before 2.2.1
+                // the caption names volume 0 as the only thing that still silences the shutdown
+                // cue, and a dash
                 // cannot tell them whether they are already at it. Android twin: VolumeSlider in
                 // DeviceScreen.kt, which prints value.toInt() unconditionally.
                 Text("\(Int(value.wrappedValue))")

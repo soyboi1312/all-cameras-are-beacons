@@ -66,11 +66,11 @@ func logFirstOpenBaselineRuns(deepLinkNew: Bool, hasVisit: Bool,
 /// ALPR, DRONE, BODY CAM, TRACKER, GLASSES, CAMERA (Network camera), and WATCHED. Reuses each
 /// type's existing tint + glyph (netcamTone + web.camera.fill for the CAMERA / networkCamera
 /// entry). The Log's tools menu offers the six detector categories always and WATCHED only while
-/// at least one row belongs (tuneCategories); the Map's chips show a category while it has rows (a
-/// selected detector chip stays at zero). `chipLabel` stays in caps (chips and the lens footer);
-/// `menuLabel` is the same words in Title Case for the tools menu, where menu items use Apple
-/// title-style capitalization. TWIN: Android `LOG_CATEGORIES` (`LogCategory.menuLabel`) in
-/// LogScreen.kt.
+/// at least one row belongs (LogToolsMenu.hasWatched); the Map's chips show a category while it
+/// has rows (a selected detector chip stays at zero). `chipLabel` stays in caps (chips and the
+/// lens footer); `menuLabel` is the same words in Title Case for the tools menu, where menu items
+/// use Apple title-style capitalization. TWIN: Android `LOG_CATEGORIES` (`LogCategory.menuLabel`)
+/// in LogScreen.kt.
 let detectionCategories: [DetectionCategory] = [
     .init(type: .flockCamera,      key: "ALPR",     chipLabel: "ALPR",        menuLabel: "ALPR",        spoken: "automatic license plate readers"),
     .init(type: .drone,            key: "DRONE",    chipLabel: "DRONE",       menuLabel: "Drone",       spoken: "drones"),
@@ -224,6 +224,11 @@ func logFocusSeed(pendingAll: Bool, pendingCategory: String?) -> LogFocusSeed? {
     if let pendingCategory { return LogFocusSeed(scope: .all, category: pendingCategory) }
     return nil
 }
+
+/// What the Log's unreadable-log notice shows: `notice` (BLEManager.unreadableLogNotice), or nil in
+/// sample data, where it never shows. Pure so AppReviewDataTests can pin the gate.
+/// TWIN: logUnreadableNotice in android LogScreen.kt.
+func logUnreadableNotice(_ notice: String?, demo: Bool) -> String? { demo ? nil : notice }
 
 /// The Log tab: the retained detection store as an inset-grouped List under the large "Log"
 /// title, with the system search field, an active / new / all segment, a chip row for the tools
@@ -664,10 +669,12 @@ struct DetectionsView: View {
         }
     }
 
-    /// Scroll anchor for the top of the master list, parked on the scope picker row (the first
-    /// row whenever the store is non-empty); when buffer-health banners lead the list, the seed
-    /// scrolls to the first banner's own ForEach id instead.
+    /// Scroll anchor for the top of the master list, parked on the scope picker row; when the
+    /// unreadable-log notice or buffer-health banners lead the list, the seed scrolls to the first
+    /// of them instead (noticeAnchorID, or the first banner's own ForEach id).
     private static let topAnchorID = "logTop"
+    /// Scroll anchor on the unreadable-log notice row, the list's first row while it shows.
+    private static let noticeAnchorID = "logUnreadable"
 
     /// Put the master list back at the top for a seed, at most once per seed.
     /// Called from the token's onChange (the usual path, this list is on screen) and from the
@@ -682,16 +689,51 @@ struct DetectionsView: View {
         guard appliedScrollToken != seedScrollToken else { return }
         let token = seedScrollToken
         DispatchQueue.main.async {
-            if let first = ble.status?.bufferHealthNotices.first { proxy.scrollTo(first, anchor: .top) }
-            else { proxy.scrollTo(Self.topAnchorID, anchor: .top) }
+            if logUnreadableNotice(ble.unreadableLogNotice, demo: ble.demoMode) != nil {
+                proxy.scrollTo(Self.noticeAnchorID, anchor: .top)
+            } else if let first = ble.status?.bufferHealthNotices.first {
+                proxy.scrollTo(first, anchor: .top)
+            } else { proxy.scrollTo(Self.topAnchorID, anchor: .top) }
             if onScreen { appliedScrollToken = token }
         }
     }
 
+    /// The unreadable-log notice: BufferHealthBanner's look plus a Dismiss button.
+    private func unreadableLogNoticeRow(_ notice: String) -> some View {
+        HStack(alignment: .top, spacing: 9) {
+            Image(systemName: "exclamationmark.triangle.fill")
+                .font(ACABTheme.font(.subheadline, weight: .semibold))
+                .foregroundStyle(ACABTheme.warn)
+                .padding(.top, 1)
+            VStack(alignment: .leading, spacing: 4) {
+                Text(notice)
+                    .font(ACABTheme.font(.footnote))
+                    .foregroundStyle(ACABTheme.text)
+                    .fixedSize(horizontal: false, vertical: true)
+                Button { ble.dismissUnreadableLogNotice() } label: {
+                    Text("Dismiss")
+                        .font(ACABTheme.font(.footnote, weight: .semibold))
+                        .frame(minHeight: 44)   // 44pt hit target inside the label
+                        .contentShape(Rectangle())
+                }
+                .buttonStyle(.borderless)
+            }
+            Spacer(minLength: 0)
+        }
+        .padding(12)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(ACABTheme.warn.opacity(0.10),
+                    in: RoundedRectangle(cornerRadius: ACABTheme.radius, style: .continuous))
+        .listRowBackground(Color.clear)
+        .listRowInsets(EdgeInsets(top: 4, leading: 0, bottom: 4, trailing: 0))
+        .listRowSeparator(.hidden)
+    }
+
     /// The Log screen: the whole view when compact, the left column when regular.
     /// Keeps its own nav / sheet / dialog modifiers so both layouts get them. The vertical order
-    /// is fixed (contracts 3.6): buffer-health banners, the controls (scope picker, then the
-    /// filter chips), then the content (empty state, no-match state, or the rows).
+    /// is fixed (contracts 3.6): the unreadable-log notice, buffer-health banners, the controls
+    /// (scope picker, then the filter chips), then the content (empty state, no-match state, or
+    /// the rows).
     ///
     /// Shared rules, TWIN: Android LogScreen's LazyColumn items. The controls are drawn only
     /// while the log has rows: an empty log shows its empty state alone (Android gates its
@@ -701,6 +743,13 @@ struct DetectionsView: View {
     private func masterList(_ snap: LogSnapshot) -> some View {
         ScrollViewReader { proxy in
             List {
+                // One-shot: the launch load moved an unreadable saved log aside
+                // (BLEManager.unreadableLogNotice), drawn like the banners below until dismissed or
+                // a real Clear Log. Never in sample data (logUnreadableNotice).
+                // TWIN: Android LogScreen's "log-unreadable" item.
+                if let notice = logUnreadableNotice(ble.unreadableLogNotice, demo: ble.demoMode) {
+                    Section { unreadableLogNoticeRow(notice).id(Self.noticeAnchorID) }
+                }
                 // Persistent board-side loss/censoring flags belong beside the evidence,
                 // not behind a settings disclosure. The Offline Buffer card repeats them.
                 if let notices = ble.status?.bufferHealthNotices, !notices.isEmpty {
@@ -789,11 +838,23 @@ struct DetectionsView: View {
         }
         // One header row: "Log" leading, the tools menu (or Done in select mode) trailing
         // (TabHeader, M2). The .searchable above is untouched.
-        .tabHeader("Log") {
+        // The tools button draws its own glass (LogToolsMenu.body); Done keeps the bar's.
+        .tabHeader("Log", trailingSharedBackground: selecting ? .automatic : .hidden) {
             if selecting {
                 Button("Done") { exitSelect() }
             } else {
-                logToolsMenu(snap).disabled(ble.logDetections.isEmpty)
+                LogToolsMenu(sortOrder: sortOrder, filter: filter, offlineOnly: offlineOnly,
+                             paused: paused, hasWatched: snap.watchedCount > 0,
+                             demoMode: ble.demoMode,
+                             setSort: { sortOrder = $0 }, setFilter: { filter = $0 },
+                             setOfflineOnly: { offlineOnly = $0 },
+                             setPaused: { want in
+                                 if want != paused { want ? pauseFeed() : resumeFeed() }
+                             },
+                             select: { resumeFeed(); selecting = true },
+                             markSeen: { markSeen() }, export: { export($0) },
+                             clear: { confirmClear = true })
+                    .disabled(ble.logDetections.isEmpty)
             }
         }
         .navigationDestination(for: Detection.self) { d in
@@ -850,12 +911,12 @@ struct DetectionsView: View {
         // it. The composition ends when the user leaves the Log tab, and a manual tab tap
         // resets logFilterSeed.
         //
-        // What a visit fails to end on: a watermark that returns to the recorded value.
-        // markAllSeen always stamps a new Date, so while this view exists only
-        // BLEManager.exitDemo can do that, by restoring the watermark seedDemoData saved, and
-        // only when the watermark had not moved between the record and the start of sample
-        // data. The skip then holds until the user next leaves the Log tab. A skip never marks
-        // a row seen, so this leaves New dots in place and hides nothing.
+        // What a visit fails to end on: a watermark that returns to, or stays at, the recorded
+        // value. markAllSeen baselines on the newest real first-seen stamp (capped at now), so a
+        // leave with no newer real row since the record can write the same value, and
+        // BLEManager.exitDemo can restore the watermark seedDemoData saved. The skip then holds
+        // until the watermark next moves. A skip never marks a row seen, so this leaves New dots
+        // in place and hides nothing.
         //
         // Regular width is closed: seedLens clears selectedDetail, so the right pane drops
         // back to its placeholder instead of holding a dossier the seeded lens does not list.
@@ -1018,69 +1079,6 @@ struct DetectionsView: View {
         .buttonStyle(.plain)
         .accessibilityLabel(spoken)
         .accessibilityHint(hint ?? "")
-    }
-
-    /// Every Log tool in ONE toolbar menu (contracts 3.6, same items and order as Android's):
-    /// sort, category, offline only, pause / resume, select, mark seen, export, clear.
-    /// TWIN: Android `LogToolsMenu` and `logToolGates` in LogScreen.kt.
-    ///
-    /// Mark Seen is offered in sample data on both apps: markAllSeen moves the in-memory
-    /// watermark and seenWatermarkWritesAllowed keeps it off disk (Android: the
-    /// persistedLogMutationAllowed gate in markAllSeen), so the sample New segment empties and
-    /// the real watermark returns on exit.
-    /// PLATFORM DIFFERENCE, sample data only: iOS offers "Clear Sample" in place of "Clear Log";
-    /// Android's logToolGates hides Clear in sample data. With a real board both menus list the
-    /// same items in the same order.
-    private func logToolsMenu(_ snap: LogSnapshot) -> some View {
-        Menu {
-            Picker("Sort Detections", selection: $sortOrder) {
-                ForEach(DetectionLogSort.allCases, id: \.self) { Text($0.label).tag($0) }
-            }
-            Menu("Category") {
-                Button { filter = nil } label: { checkLabel("All Categories", on: filter == nil) }
-                ForEach(tuneCategories(watchedCount: snap.watchedCount)) { c in
-                    Button { filter = c.key } label: { checkLabel(c.menuLabel, on: filter == c.key) }
-                        .accessibilityLabel(c.spoken)
-                }
-            }
-            Toggle("Offline Only", isOn: $offlineOnly)
-            Divider()
-            Button { paused ? resumeFeed() : pauseFeed() } label: {
-                Label(paused ? "Resume Live Feed" : "Pause Live Feed",
-                      systemImage: paused ? "play.fill" : "pause.fill")
-            }
-            // Bulk-mute acts on retained Log rows, so select mode starts from the live feed.
-            Button { resumeFeed(); selecting = true } label: { Label("Select", systemImage: "checkmark.circle") }
-            Button { markSeen() } label: { Label("Mark Seen", systemImage: "checkmark") }
-            // Both formats carry the CURRENT category filter, and the item names it by the
-            // category's menu label ("Export Drone", "Export Network Cam") so a partial export
-            // can't be mistaken for the whole log. The key ("CAMERA") stays in the filename slug
-            // only.
-            Menu {
-                Button { export(.csv) } label: { Label("CSV, Shown Rows", systemImage: "tablecells") }
-                Button { export(.gpx) } label: { Label("GPX, for Maps", systemImage: "mappin.and.ellipse") }
-            } label: {
-                Label(logExportMenuLabel(filter), systemImage: "square.and.arrow.up")
-            }
-            Divider()
-            Button(role: .destructive) { confirmClear = true } label: {
-                Label(ble.demoMode ? "Clear Sample" : "Clear Log", systemImage: "trash")
-            }
-        } label: {
-            Label("Log tools", systemImage: "slider.horizontal.3")
-        }
-    }
-
-    @ViewBuilder
-    private func checkLabel(_ text: String, on: Bool) -> some View {
-        if on { Label(text, systemImage: "checkmark") } else { Text(text) }
-    }
-
-    /// The tools menu's categories: the six detector categories always, and WATCHED only while it
-    /// has a member (the rule the watched-count reset in body enforces; Android's reset in
-    /// LogScreen.kt reads tallies.watchedCount the same way).
-    private func tuneCategories(watchedCount: Int) -> [DetectionCategory] {
-        detectionCategories.filter { $0.key != DeviceType.watched.category || watchedCount > 0 }
     }
 
     /// Mark Seen: move the watermark, then show everything. Re-record a live seeded NEW visit
@@ -1325,7 +1323,7 @@ struct DetectionsView: View {
             title: refused == 0 ? "Devices muted" : "Some devices weren't muted",
             message: refused == 0
                 ? "\(muted) device\(muted == 1 ? "" : "s") muted. Existing history was kept."
-                : "\(muted) muted; \(refused) couldn't be added because the muted-device list is full."
+                : "\(muted) muted; \(refused) couldn't be muted."
         )
         exitSelect()
     }
@@ -1448,6 +1446,158 @@ struct DetectionsView: View {
             }
             return "No detections in this category yet."
         }
+    }
+}
+
+/// Every Log tool in ONE toolbar menu (contracts 3.6, same items and order as Android's):
+/// sort, category, offline only, pause / resume, select, mark seen, export, clear.
+/// TWIN: Android `LogToolsMenu` and `logToolGates` in LogScreen.kt.
+///
+/// A UIKit menu (LogToolsMenuButton), not a SwiftUI `Menu`, because of a user report
+/// (2026-10-12): with a board streaming, Log tools > Category opened and then folded shut by
+/// itself, again on every try. SwiftUI rebuilds a toolbar `Menu`'s UIMenu on every update pass
+/// of the tab, and a rebuilt menu closes an open submenu; neither `.equatable()` on this view nor
+/// a toolbar declared from a view whose body did not re-run stopped it. A UIButton that owns its
+/// menu, filled by UIDeferredMenuElement.uncached each time it opens, is never rebuilt by a
+/// publish. Reproduced and verified in the iOS 26.5 and 27 simulators with the DEBUG `-demo
+/// -demoStream` launch arguments: the SwiftUI menu's submenu folded when the feed started, this
+/// one stayed open. LogToolsMenuUITests pins it.
+///
+/// Mark Seen is offered in sample data on both apps: markAllSeen moves the in-memory
+/// watermark and seenWatermarkWritesAllowed keeps it off disk (Android: the
+/// persistedLogMutationAllowed gate in markAllSeen), so the sample New segment empties and
+/// the real watermark returns on exit.
+/// PLATFORM DIFFERENCE, sample data only: iOS offers "Clear Sample" in place of "Clear Log";
+/// Android's logToolGates hides Clear in sample data. With a real board both menus list the
+/// same items in the same order.
+struct LogToolsMenu: View {
+    let sortOrder: DetectionLogSort
+    let filter: String?
+    let offlineOnly: Bool
+    let paused: Bool
+    /// WATCHED is offered only while it has a member (the rule DetectionsView's watched-count
+    /// reset enforces; Android's reset in LogScreen.kt reads tallies.watchedCount the same way).
+    let hasWatched: Bool
+    let demoMode: Bool
+    let setSort: (DetectionLogSort) -> Void
+    let setFilter: (String?) -> Void
+    let setOfflineOnly: (Bool) -> Void
+    let setPaused: (Bool) -> Void
+    let select: () -> Void
+    let markSeen: () -> Void
+    let export: (BLEManager.ExportFormat) -> Void
+    let clear: () -> Void
+
+    var body: some View {
+        // The bar's standard 44 pt item. On iOS 26 the circle is this view's own glass, with the
+        // bar's shared glass turned off (the Log's tabHeader call): the bar pads custom content
+        // with glass that takes no taps, so a tap near the rim lit the glass and opened nothing.
+        // This way the whole 44 pt circle is the button.
+        let button = LogToolsMenuButton(menu: self).frame(width: 44, height: 44)
+        if #available(iOS 26, *) {
+            button.glassEffect(.regular.interactive(), in: .circle)
+        } else {
+            button
+        }
+    }
+
+    /// The menu's items, built from this value when the menu opens. Each group is one section
+    /// between dividers, as the SwiftUI menu drew them.
+    func menuElements() -> [UIMenuElement] {
+        func checked(_ on: Bool) -> UIMenuElement.State { on ? .on : .off }
+        func symbol(_ name: String) -> UIImage? { UIImage(systemName: name) }
+        let sort = UIMenu(title: "", options: [.displayInline, .singleSelection],
+                          children: DetectionLogSort.allCases.map { order in
+            UIAction(title: order.label, state: checked(sortOrder == order)) { _ in setSort(order) }
+        })
+        let all = UIAction(title: "All Categories", state: checked(filter == nil)) { _ in setFilter(nil) }
+        let categories = detectionCategories
+            .filter { $0.key != DeviceType.watched.category || hasWatched }
+            .map { c -> UIAction in
+                let item = UIAction(title: c.menuLabel, state: checked(filter == c.key)) { _ in setFilter(c.key) }
+                item.accessibilityLabel = c.spoken
+                return item
+            }
+        let filters = UIMenu(title: "", options: .displayInline, children: [
+            UIMenu(title: "Category", children: [all] + categories),
+            UIAction(title: "Offline Only", state: checked(offlineOnly)) { _ in setOfflineOnly(!offlineOnly) },
+        ])
+        // Both formats carry the CURRENT category filter, and the item names it by the category's
+        // menu label ("Export Drone", "Export Network Cam") so a partial export can't be mistaken
+        // for the whole log. The key ("CAMERA") stays in the filename slug only.
+        let exportMenu = UIMenu(title: logExportMenuLabel(filter), image: symbol("square.and.arrow.up"),
+                                children: [
+            UIAction(title: "CSV, Shown Rows", image: symbol("tablecells")) { _ in export(.csv) },
+            UIAction(title: "GPX, for Maps", image: symbol("mappin.and.ellipse")) { _ in export(.gpx) },
+        ])
+        // Bulk-mute acts on retained Log rows, so select mode starts from the live feed.
+        let actions = UIMenu(title: "", options: .displayInline, children: [
+            UIAction(title: paused ? "Resume Live Feed" : "Pause Live Feed",
+                     image: symbol(paused ? "play.fill" : "pause.fill")) { _ in setPaused(!paused) },
+            UIAction(title: "Select", image: symbol("checkmark.circle")) { _ in select() },
+            UIAction(title: "Mark Seen", image: symbol("checkmark")) { _ in markSeen() },
+            exportMenu,
+        ])
+        let clearItem = UIAction(title: demoMode ? "Clear Sample" : "Clear Log", image: symbol("trash"),
+                                 attributes: .destructive) { _ in clear() }
+        return [sort, filters, actions, UIMenu(title: "", options: .displayInline, children: [clearItem])]
+    }
+}
+
+/// The toolbar button behind LogToolsMenu: a UIButton whose menu is built when it opens, from
+/// the latest LogToolsMenu value, which every update hands to the coordinator. Updates never
+/// touch `menu` itself, so an open menu (and an open submenu) survives them. An open menu is
+/// therefore a snapshot from when it opened, and each item acts on what it showed (Resume Live
+/// Feed never pauses: if a deep link resumed the feed while the menu was open, the tap does
+/// nothing).
+private struct LogToolsMenuButton: UIViewRepresentable {
+    let menu: LogToolsMenu
+    @Environment(\.isEnabled) private var isEnabled
+
+    final class Coordinator {
+        var menu: LogToolsMenu
+        var iconCategory: UIContentSizeCategory?   // the text size the icon was last drawn for
+        init(_ menu: LogToolsMenu) { self.menu = menu }
+    }
+
+    func makeCoordinator() -> Coordinator { Coordinator(menu) }
+
+    func makeUIView(context: Context) -> UIButton {
+        let button = UIButton(type: .system)
+        button.accessibilityLabel = "Log tools"
+        // A hover highlight under an iPad pointer. No large content viewer: at accessibility text
+        // sizes a press opens the menu, which draws its items large itself.
+        button.isPointerInteractionEnabled = true
+        button.showsMenuAsPrimaryAction = true
+        button.tintColor = UIColor(ACABTheme.tint)   // dynamic: follows the high-contrast trait
+        let coordinator = context.coordinator
+        button.menu = UIMenu(children: [UIDeferredMenuElement.uncached { [weak coordinator] done in
+            done(coordinator?.menu.menuElements() ?? [])
+        }])
+        return button
+    }
+
+    func updateUIView(_ button: UIButton, context: Context) {
+        context.coordinator.menu = menu
+        button.isEnabled = isEnabled
+        // From the app's text size, as the native bar icon was: inside the toolbar both SwiftUI's
+        // dynamicTypeSize and the view's trait read Large at the smaller sizes (probed at XS,
+        // 2026-10-12). Redrawn only when the size changes, not on every publish; a text-size
+        // change re-renders the Log, which lands here.
+        let category = UIApplication.shared.preferredContentSizeCategory
+        if context.coordinator.iconCategory != category {
+            context.coordinator.iconCategory = category
+            button.setImage(Self.icon(for: category), for: .normal)
+        }
+    }
+
+    /// The SwiftUI bar icon's size and weight: the body text size, growing no further than
+    /// xxLarge, in medium weight (measured against it at XS, Large and AX5, 2026-10-12).
+    static func icon(for category: UIContentSizeCategory) -> UIImage? {
+        let capped = UITraitCollection(preferredContentSizeCategory: min(category, .extraExtraLarge))
+        let size = UIFont.preferredFont(forTextStyle: .body, compatibleWith: capped).pointSize
+        return UIImage(systemName: "slider.horizontal.3",
+                       withConfiguration: UIImage.SymbolConfiguration(pointSize: size, weight: .medium))
     }
 }
 

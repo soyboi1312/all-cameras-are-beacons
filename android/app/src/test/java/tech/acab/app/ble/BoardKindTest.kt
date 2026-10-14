@@ -249,11 +249,11 @@ class BoardKindTest {
     }
 
     @Test fun pairWindowHintPerKind() {
-        assertEquals("turn the beacon off and on, then connect within two minutes.",
+        assertEquals("turn off Bluetooth on any other phone that uses the beacon, then turn the beacon off and on and connect within two minutes.",
             AcabBleManager.pairWindowHint(null))
-        assertEquals("turn the OUI-Spy off and on, then connect within two minutes.",
+        assertEquals("turn off Bluetooth on any other phone that uses the OUI-Spy, then turn the OUI-Spy off and on and connect within two minutes.",
             AcabBleManager.pairWindowHint(BoardKind.OUI_SPY))
-        assertEquals("turn the Mesh-Detect off and on, then connect within two minutes.",
+        assertEquals("turn off Bluetooth on any other phone that uses the Mesh-Detect, then turn the Mesh-Detect off and on and connect within two minutes.",
             AcabBleManager.pairWindowHint(BoardKind.MESH_DETECT))
     }
 

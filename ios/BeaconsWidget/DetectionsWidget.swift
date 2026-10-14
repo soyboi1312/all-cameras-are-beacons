@@ -16,6 +16,9 @@ import SwiftUI
 //                           rows with no strip glyph (nearby device, watched, unknown) count in
 //                           w_countToday but in no w_c_ key, so the cells may sum to LESS - see
 //                           the MediumView comment below and writeWidgetSummary in BLEManager.
+//   w_redact     (Bool)   - the app's "Hide details on lock screen" setting
+//                           (BLEManager.settingsRedactLockScreen). True draws RedactedView in place
+//                           of every count and the last hit; absent reads false.
 // The app calls WidgetCenter.shared.reloadAllTimelines() whenever it writes, so the
 // glance updates promptly on change; the 15-minute timeline policy below is only a
 // backstop so relative time and link state cannot drift too far while the app is idle.
@@ -27,6 +30,7 @@ private enum WK {
     static let lastType   = "w_lastType"
     static let lastAt     = "w_lastAt"
     static let connected  = "w_connected"
+    static let redact     = "w_redact"
 }
 
 /// Local day index (whole days since epoch in the device's current time zone). MUST match the
@@ -112,6 +116,8 @@ struct DetectionsEntry: TimelineEntry {
     let lastType: String
     let lastAt: Date?     // nil when there is no recorded last hit
     let connected: Bool
+    /// w_redact: draw RedactedView instead of the counts and the last hit.
+    let redact: Bool
     /// Today's per-category counts, same day-stamp rule as countToday. Only non-zero entries are
     /// drawn, so a quiet day collapses the strip instead of showing six zeroes.
     /// A struct, not a tuple: ForEach needs an id key path and Swift has no key paths into tuples.
@@ -125,7 +131,7 @@ struct DetectionsProvider: TimelineProvider {
     /// Shown in the widget gallery and before the first read resolves.
     func placeholder(in context: Context) -> DetectionsEntry {
         DetectionsEntry(date: Date(), countToday: 0, lastType: "", lastAt: nil, connected: false,
-                        categories: [])
+                        redact: false, categories: [])
     }
 
     func getSnapshot(in context: Context, completion: @escaping (DetectionsEntry) -> Void) {
@@ -152,6 +158,7 @@ struct DetectionsProvider: TimelineProvider {
         let type  = d?.string(forKey: WK.lastType) ?? ""
         let atRaw = d?.double(forKey: WK.lastAt) ?? 0
         let connected = d?.bool(forKey: WK.connected) ?? false
+        let redact = d?.bool(forKey: WK.redact) ?? false
         let at: Date? = atRaw > 0 ? Date(timeIntervalSince1970: atRaw) : nil
         // Same stale-day rule as the headline count: a breakdown from yesterday next to a zeroed
         // total would be worse than showing nothing.
@@ -162,7 +169,7 @@ struct DetectionsProvider: TimelineProvider {
               }
             : []
         return DetectionsEntry(date: Date(), countToday: count, lastType: type, lastAt: at,
-                               connected: connected, categories: cats)
+                               connected: connected, redact: redact, categories: cats)
     }
 }
 
@@ -194,7 +201,8 @@ private struct WidgetHeader: View {
 
 /// The last-detection line (category + "3m ago"), or an honest empty state (WidgetEmptyState:
 /// neutral half shield, dim ink, never an all-clear check). Uses a self-updating relative Text so
-/// "ago" stays fresh between the 15-minute reloads.
+/// "ago" stays fresh between the 15-minute reloads. Both states are `.privacySensitive()`, so iOS
+/// redacts the line wherever it draws widgets for a locked phone (StandBy), independent of w_redact.
 private struct LastHitLine: View {
     let entry: DetectionsEntry
     var compact: Bool
@@ -212,6 +220,7 @@ private struct LastHitLine: View {
                     .lineLimit(1)
                 Spacer(minLength: 0)
             }
+            .privacySensitive()
         } else {
             HStack(spacing: 5) {
                 Image(systemName: WidgetEmptyState.symbol)
@@ -222,11 +231,15 @@ private struct LastHitLine: View {
                     .foregroundStyle(.white.opacity(0.45))
                 Spacer(minLength: 0)
             }
+            // Redacted too: "no detections" next to a redacted count would tell an onlooker
+            // nothing fired. The LinkDot already shows link state.
+            .privacySensitive()
         }
     }
 }
 
 /// Today's count with its kicker. Crimson when anything fired today, dim when zero.
+/// `.privacySensitive()` like LastHitLine.
 private struct CountBlock: View {
     let entry: DetectionsEntry
     var size: CGFloat
@@ -240,6 +253,7 @@ private struct CountBlock: View {
                 .font(WidgetTheme.mono(9)).tracking(1.0)
                 .foregroundStyle(entry.countToday > 0 ? WidgetTheme.crimson : .white.opacity(0.4))
         }
+        .privacySensitive()
     }
 }
 
@@ -277,7 +291,8 @@ private extension WidgetCategory {
 /// A ROW, not a list. Medium is short and already carries the header, the count, the link state and
 /// the last-hit line, so six stacked rows would not fit. Six glyph-and-count cells do. Empty
 /// categories are dropped rather than shown as zeroes, so a quiet day just collapses the strip and
-/// the layout gives the space back to whatever is above it.
+/// the layout gives the space back to whatever is above it. `.privacySensitive()` like CountBlock:
+/// it is the same count, split.
 private struct CategoryStrip: View {
     let items: [CategoryCount]
     var body: some View {
@@ -297,6 +312,7 @@ private struct CategoryStrip: View {
             }
             Spacer(minLength: 0)
         }
+        .privacySensitive()
     }
 }
 
@@ -347,14 +363,40 @@ struct DetectionsWidget: Widget {
     }
 }
 
-/// Routes by family so the two sizes share one entry but lay out for their space.
+/// Both sizes while w_redact is set: the wordmark, the link dot, a lock and "counts hidden", the
+/// words the Live Activity's redacted cells use (DetectionLiveActivity.swift SmallCell). No count,
+/// no category, no last hit.
+private struct RedactedView: View {
+    let entry: DetectionsEntry
+    var body: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            WidgetHeader(connected: entry.connected)
+            Spacer(minLength: 4)
+            Image(systemName: "lock.fill")
+                .font(.system(size: 22, weight: .semibold))
+                .foregroundStyle(.white.opacity(0.7))
+                .accessibilityHidden(true)
+            Spacer(minLength: 6)
+            Text("counts hidden")
+                .font(WidgetTheme.mono(11))
+                .foregroundStyle(.white.opacity(0.55))
+        }
+    }
+}
+
+/// Routes by family so the two sizes share one entry but lay out for their space; w_redact
+/// takes both sizes to RedactedView.
 private struct DetectionsWidgetView: View {
     @Environment(\.widgetFamily) private var family
     let entry: DetectionsEntry
     var body: some View {
-        switch family {
-        case .systemMedium: MediumView(entry: entry)
-        default:            SmallView(entry: entry)
+        if entry.redact {
+            RedactedView(entry: entry)
+        } else {
+            switch family {
+            case .systemMedium: MediumView(entry: entry)
+            default:            SmallView(entry: entry)
+            }
         }
     }
 }

@@ -128,7 +128,11 @@ extension BLEManager {
             otaState = .failed(reason: "Install the latest companion app before updating this board.")
             return
         }
-        guard status.firmwareLabel == fwLabel else {
+        // The label match, and the board-revision gate the card applies too
+        // (FirmwareVersionPolicy.revisionMatches), so a caller that skips the view still cannot
+        // flash a listing the board's reported revision contradicts.
+        guard status.firmwareLabel == fwLabel,
+              FirmwareVersionPolicy.revisionMatches(boardRev: status.boardRev, fwLabel: fwLabel) else {
             otaState = .failed(reason: "The published update does not match this board, so it was not started.")
             return
         }

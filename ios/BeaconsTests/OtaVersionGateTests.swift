@@ -68,4 +68,19 @@ final class OtaVersionGateTests: XCTestCase {
         XCTAssertFalse(try status(version: "2.0.5").updateAvailable(latest: "2.0.1024"))
         XCTAssertFalse(try status(version: "ESP32").updateAvailable(latest: "2.0.6"))
     }
+
+    /// alerts.cpp buzzerTone mutes the shutdown motif and the rev-B hold-to-start ack from 2.2.1;
+    /// older firmware plays them muted, so the Alerts caption and Desert note must keep warning
+    /// there. Both sides of the boundary are asserted, so moving the threshold either way fails.
+    /// TWIN: OtaSafetyPolicyTest "the Alerts copy promises muted power cues only from firmware
+    /// 2_2_1" (Android).
+    func testMuteCoversPowerCuesFromFirmware221() throws {
+        XCTAssertFalse(try status(version: "2.2.0").muteCoversPowerCues)
+        XCTAssertTrue(try status(version: "2.2.1").muteCoversPowerCues)
+        XCTAssertTrue(try status(version: "2.3.0").muteCoversPowerCues)
+        XCTAssertFalse(try status(version: "2.1.9").muteCoversPowerCues)
+        // A version that does not parse keeps the louder, older wording.
+        XCTAssertFalse(try status(version: "2.2.1x").muteCoversPowerCues)
+        XCTAssertFalse(try status(version: "ESP32").muteCoversPowerCues)
+    }
 }

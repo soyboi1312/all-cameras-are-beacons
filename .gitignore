@@ -43,6 +43,13 @@ ios/BeaconsWidget/Info.plist
 # (lib/acab_core/ota_pubkey.h) ships. Losing this key just means re-keying + a web-flash.
 firmware/tools/ota_signing/*.pem
 
+# App signing material (Android keystore, Apple certificates, App Store Connect keys,
+# provisioning profiles). Keep these outside the repo, e.g. ~/keys/; this rule is the backstop.
+*.jks
+*.p12
+*.p8
+*.mobileprovision
+
 # Python bytecode (firmware tooling)
 __pycache__/
 *.pyc

@@ -16,7 +16,8 @@ import UserNotifications
 ///    again and could never notify, and the ten-minute cooldown decided nothing. Worse, a detection
 ///    suppressed by the global gap was destroyed rather than deferred, because there was only ever
 ///    one offer per device. Owning the dedup here makes both correct and matches the shipped copy.
-///  - Never for ignored devices (dropped before the hook), never for Desert-mode `.nearbyDevice`.
+///  - Never for ignored devices or a MAC whose place rule holds alerts (both gated before the
+///    hook, see placeRuleSuppressesAlerts), never for Desert-mode `.nearbyDevice`.
 ///  - Authorization is requested LAZILY on the first enable, not at launch.
 ///
 /// FOREGROUND PRESENTATION: this must be the notification-center delegate. Without one, iOS
@@ -55,7 +56,22 @@ final class DetectionNotifier: NSObject, UNUserNotificationCenterDelegate {
         // Must be set before any notification is posted, and this object is built during
         // BLEManager's own construction, which happens at app launch.
         UNUserNotificationCenter.current().delegate = self
+        // Every alert carries this category, so the system's own "Show Previews: When Unlocked"
+        // shows redactedBody on a locked phone instead of the alert, title included (no
+        // .hiddenPreviewsShowTitle). The only category this app registers.
+        UNUserNotificationCenter.current().setNotificationCategories([
+            UNNotificationCategory(identifier: Self.categoryIdentifier, actions: [],
+                                   intentIdentifiers: [],
+                                   hiddenPreviewsBodyPlaceholder: Self.redactedBody,
+                                   options: [])
+        ])
     }
+
+    static let categoryIdentifier = "acab.detection"
+    /// The sentence an alert shows in place of its details: the hidden-previews placeholder above,
+    /// and the whole body while the in-app switch is on (alertText). TWIN: the public version text
+    /// in android DetectionNotifier.kt, the same sentence.
+    static let redactedBody = "Something was detected nearby."
 
     // MARK: - Foreground presentation
 
@@ -172,13 +188,14 @@ final class DetectionNotifier: NSObject, UNUserNotificationCenterDelegate {
     ///
     /// NOT gated on the caller's first-sighting edge, deliberately. See the type comment.
     ///
-    /// REDACTION: the notification TEXT is never redacted here. `redactLockScreen` is a
-    /// lock-screen-scoped setting, and redacting the body unconditionally hid the category on an
-    /// UNLOCKED phone too, which is the state the feature exists for. iOS already has the right
-    /// mechanism: the user's own "Show Previews" setting governs whether the body appears on a
-    /// locked screen, per-app and system-wide. Honoring that instead of second-guessing it is both
-    /// correct and less surprising.
-    func notifyIfNeeded(_ d: Detection) {
+    /// REDACTION, two layers. The system's "Show Previews" setting still governs a locked phone,
+    /// and the category registered in init gives its hidden preview a sentence (redactedBody)
+    /// instead of the system's generic stand-in. `redact` is the in-app switch ("Hide details on
+    /// lock screen", BLEManager.settingsRedactLockScreen): while it is on the alert ITSELF names
+    /// nothing (alertText), unlocked too, because iOS posts one text per alert and gives no
+    /// separate locked version the way Android's public version does. The switch's subtitle says
+    /// alerts drop their details; a quieter alert than the user expects is the safe side.
+    func notifyIfNeeded(_ d: Detection, redact: Bool) {
         guard authorized,
               !d.isHistory,                       // an offline replay is not a live event
               d.type != .nearbyDevice,            // Desert rows are ambient, never an alert
@@ -197,18 +214,12 @@ final class DetectionNotifier: NSObject, UNUserNotificationCenterDelegate {
         lastNotifiedAt = now
         pruneCooldowns(now)
 
+        let text = Self.alertText(for: d, redact: redact)
         let content = UNMutableNotificationContent()
-        content.title = d.type.label
-        // The name is radio-controlled: any nearby device can broadcast newlines or bidi overrides
-        // to spoof banner text, so it is stripped here (notification text only; rows render the
-        // raw name). A name that strips to nothing falls back to the category label.
-        let safeName = d.hasName ? Self.notificationSafeName(d.displayName) : ""
-        let who = safeName.isEmpty ? d.type.label : safeName
-        // Avoid "Tracker / Tracker detected" when the device has no name of its own.
-        content.body = who == d.type.label
-            ? "Detected nearby, \(d.confidence)% confidence."
-            : "\(who) detected, \(d.confidence)% confidence."
+        content.title = text.title
+        content.body = text.body
         content.sound = .default
+        content.categoryIdentifier = Self.categoryIdentifier
 
         // NOTE: .timeSensitive is deliberately NOT set. It requires the
         // com.apple.developer.usernotifications.time-sensitive entitlement, which this target does
@@ -218,11 +229,31 @@ final class DetectionNotifier: NSObject, UNUserNotificationCenterDelegate {
         // matches Android, which no longer uses CATEGORY_ALARM for the same reason.
 
         // Per-MAC identifier so a repeat replaces rather than stacks.
-        let req = UNNotificationRequest(identifier: Self.identifierPrefix + d.mac,
+        let req = UNNotificationRequest(identifier: Self.alertIdentifier(d.mac),
                                         content: content, trigger: nil)
         UNUserNotificationCenter.current().add(req) { err in
             if let err { print("[ACAB] notification post failed: \(err.localizedDescription)") }
         }
+    }
+
+    /// An alert's title and body. Pure, so AppReviewDataTests pins it. With `redact` it names
+    /// nothing: "beacons" over redactedBody. Otherwise the title is the category in sentence case
+    /// (inlineLabel through DeviceView.sentenceCaseRowTitle: "ALPR camera", "Body cam", "Drone"),
+    /// the casing row titles use; `label` mixed Title Case and sentence case in one shade.
+    /// TWIN: android DetectionNotifier.kt detectionAlertText, the same title AND body rule.
+    static func alertText(for d: Detection, redact: Bool) -> (title: String, body: String) {
+        if redact { return ("beacons", redactedBody) }
+        let title = DeviceView.sentenceCaseRowTitle(d.type.inlineLabel)
+        // The name is radio-controlled: any nearby device can broadcast newlines or bidi overrides
+        // to spoof banner text, so it is stripped here (notification text only; rows render the
+        // raw name). A name that strips to nothing reads as no name.
+        let safeName = d.hasName ? notificationSafeName(d.displayName) : ""
+        // Avoid "Tracker / Tracker detected" when the device has no name of its own: compared
+        // with `label` exactly, as android does, not with the new title.
+        let body = safeName.isEmpty || safeName == d.type.label
+            ? "Detected nearby, \(d.confidence)% confidence."
+            : "\(safeName) detected, \(d.confidence)% confidence."
+        return (title, body)
     }
 
     /// Drop expired entries so a long drive past thousands of devices cannot grow this without
@@ -234,7 +265,7 @@ final class DetectionNotifier: NSObject, UNUserNotificationCenterDelegate {
         }
     }
 
-    // MARK: - Clear log
+    // MARK: - Withdrawal (Clear log, mute, unwatch)
 
     /// Every detection notification's identifier starts with this (one per MAC, see notifyIfNeeded).
     static let identifierPrefix = "acab.det."
@@ -260,6 +291,24 @@ final class DetectionNotifier: NSObject, UNUserNotificationCenterDelegate {
             let ids = Self.detectionNotificationIDs(pending.map(\.identifier))
             if !ids.isEmpty { center.removePendingNotificationRequests(withIdentifiers: ids) }
         }
+    }
+
+    /// The one identifier every alert for `mac` posts under, whatever its kind. Lowercased, so a
+    /// withdrawal from a managed list (stored lowercased) finds it whatever case the MAC arrived
+    /// in. TWIN: alertId in android DetectionNotifier.kt.
+    static func alertIdentifier(_ mac: String) -> String { identifierPrefix + mac.lowercased() }
+
+    /// Withdraw the delivered alert, and any still pending, for each MAC, whatever its kind: muting
+    /// a device (single or bulk) and un-watching it call this, so a device the user just silenced
+    /// stops naming itself in Notification Center. By identifier, so nothing is enumerated. Not
+    /// for sample data (the callers skip it there). TWIN: cancelPostedAlert in android
+    /// DetectionNotifier.kt, the same scope.
+    func removeDetectionNotifications(forMacs macs: [String]) {
+        guard !macs.isEmpty else { return }
+        let ids = macs.map { Self.alertIdentifier($0) }
+        let center = UNUserNotificationCenter.current()
+        center.removeDeliveredNotifications(withIdentifiers: ids)
+        center.removePendingNotificationRequests(withIdentifiers: ids)
     }
 
     // MARK: - Banner text safety

@@ -46,6 +46,7 @@ import androidx.compose.material.icons.filled.Place
 import androidx.compose.material.icons.filled.PlayArrow
 import androidx.compose.material.icons.filled.Search
 import androidx.compose.material.icons.filled.Tune
+import androidx.compose.material.icons.filled.WarningAmber
 import androidx.compose.material.icons.outlined.Circle
 import androidx.compose.material.icons.outlined.FilterAlt
 import androidx.compose.material.icons.outlined.Inbox
@@ -133,6 +134,7 @@ import tech.acab.app.model.methodLabel
 import tech.acab.app.model.ouiVendor
 import tech.acab.app.model.sourceLabel
 import tech.acab.app.model.vendor
+import tech.acab.app.ui.theme.Acab
 import tech.acab.app.ui.theme.AcabTypography
 import tech.acab.app.ui.theme.telemetry
 import java.io.File
@@ -556,9 +558,9 @@ internal data class LogToolGates(
  *  restores the real one), exactly as iOS does. Clear Log is never offered in sample mode, because
  *  it would imply the retained log is erased. PLATFORM DIFFERENCE, sample data only: iOS offers
  *  "Clear Sample" there and Android offers no clear; with a real board both menus list the same
- *  items (TWIN: iOS DetectionsView.logToolsMenu). An empty real log disables the whole menu (TWIN:
- *  iOS disables the button on an empty log), so Clear Log is not reachable there; the old
- *  icon-only clear pill was, and that change is deliberate. [clear] only gates the item inside an
+ *  items (TWIN: iOS LogToolsMenu in DetectionsView.swift). An empty real log disables the whole
+ *  menu (TWIN: iOS disables the button on an empty log), so Clear Log is not reachable there; the
+ *  old icon-only clear pill was, and that change is deliberate. [clear] only gates the item inside an
  *  enabled menu. [hasRows] is the live store, [feedHasRows] the shown feed. */
 internal fun logToolGates(hasRows: Boolean, feedHasRows: Boolean, paused: Boolean, demo: Boolean) =
     LogToolGates(menu = hasRows || paused, pause = feedHasRows || paused, select = hasRows,
@@ -659,6 +661,11 @@ private class LogTallies(
     val watchedCount: Int,
 )
 
+/** What the Log's unreadable-log notice shows: [notice] (AcabBleManager.unreadableLogNotice), or
+ *  null in sample data, where it never shows. Pure so AppReviewDataTest can pin the gate. */
+internal fun logUnreadableNotice(notice: String?, demo: Boolean): String? =
+    notice.takeUnless { demo }
+
 /** The Log: detection history. Search sits in the tab's top bar (MainScreen's slot), or inline at
  *  the top of the column when no slot is provided (the connect screen's saved log). Under it: the
  *  active / new / all segments, a chip row for each filter that is on (paused, category,
@@ -695,6 +702,7 @@ fun LogScreen(
     val watermark by ble.seenWatermark.collectAsState()   // recomposes "New only" when it moves
     val status by ble.status.collectAsState()
     val demo by ble.demoMode.collectAsState()
+    val unreadableNotice by ble.unreadableLogNotice.collectAsState()
     val context = LocalContext.current
     val coScope = rememberCoroutineScope()   // for the CSV export; `scope` below is the log lens
     // Independent lens axes, ANDed together like iOS: a nullable category filter, the offline
@@ -952,8 +960,8 @@ fun LogScreen(
     }
 
     val gates = logToolGates(hasRows = detections.isNotEmpty(), feedHasRows = feed.isNotEmpty(), paused = paused, demo = demo)
-    // WATCHED is offered only while it has a member, as on iOS (tuneCategories); the auto-reset
-    // above clears it when the last member goes.
+    // WATCHED is offered only while it has a member, as on iOS (LogToolsMenu.hasWatched); the
+    // auto-reset above clears it when the last member goes.
     val showWatched = tallies.watchedCount > 0
     // Read only inside click handlers (LogToolsMenu), so the bar never captures this body's
     // state; an exhaustive `when` with no else, so a new LogTool fails the build until handled.
@@ -1013,6 +1021,24 @@ fun LogScreen(
                     // underneath.
                     contentPadding = PaddingValues(bottom = if (selectMode) 136.dp else 16.dp),
                 ) {
+                    // One-shot: the startup load set an unreadable saved log aside
+                    // (AcabBleManager.unreadableLogNotice). Never in sample data
+                    // (logUnreadableNotice); Dismiss and Clear Log both clear it. First row, above
+                    // the buffer-health banners. TWIN: the iOS Log's banner over
+                    // BLEManager.unreadableLogNotice (DetectionsView), same sentence, button and
+                    // place.
+                    logUnreadableNotice(unreadableNotice, demo)?.let { notice ->
+                        item(key = "log-unreadable", contentType = "banner") {
+                            Box(Modifier.padding(start = 16.dp, end = 16.dp, top = 8.dp)) {
+                                AcabBanner(notice, Modifier.fillMaxWidth(),
+                                    icon = Icons.Filled.WarningAmber, iconTint = Acab.warn) {
+                                    TextButton(onClick = { ble.dismissUnreadableLogNotice() }) {
+                                        Text("Dismiss")
+                                    }
+                                }
+                            }
+                        }
+                    }
                     // Board-side loss/censoring flags belong beside the evidence, not buried in
                     // settings. They are persistent and intentionally cannot be dismissed locally.
                     status?.bufferHealthNotices?.forEach { notice ->
@@ -1170,7 +1196,7 @@ fun LogScreen(
                     val message = if (refused == 0) {
                         "$muted device${if (muted == 1) "" else "s"} muted. Existing history was kept."
                     } else {
-                        "$muted muted; $refused couldn't be added because the muted-device list is full."
+                        "$muted muted; $refused couldn't be muted."
                     }
                     Toast.makeText(context.applicationContext, message, Toast.LENGTH_LONG).show()
                     exitSelect()
@@ -1303,7 +1329,7 @@ private fun LogSearchBar(
 /** The header over the Log tools menu's two export items: "Export", or "Export <menu label>"
  *  while a category filter is on ([LogCategory.menuLabel], so the CAMERA key reads Export Network
  *  Cam; a key the menu does not list reads as the key itself, as [logCategoryLabel] does).
- *  TWIN: the iOS Export submenu label in DetectionsView.logToolsMenu, byte-identical. */
+ *  TWIN: iOS `logExportMenuLabel` in DetectionsView.swift, byte-identical. */
 internal fun logExportMenuHeader(catFilter: String?): String =
     catFilter?.let { k -> "Export ${LOG_CATEGORIES.firstOrNull { it.key == k }?.menuLabel ?: k}" } ?: "Export"
 
@@ -1311,10 +1337,10 @@ internal fun logExportMenuHeader(catFilter: String?): String =
  *  [showWatched]), offline only, then the actions [gates] allows (the two export items under a
  *  non-clickable [logExportMenuHeader] line). Default M3 colours. Every item
  *  closes the menu, then hands its [LogTool] to [onTool], which is read only here in the click
- *  handlers. TWIN: the iOS "Log tools" Menu (DetectionsView.logToolsMenu), same items in the same
- *  order with a real board (iOS nests category and export in submenus). In sample data both keep
- *  Mark Seen (in memory only) and they differ on Clear alone: this menu hides Clear Log, iOS
- *  offers "Clear Sample" (see [logToolGates]). */
+ *  handlers. TWIN: the iOS "Log tools" Menu (LogToolsMenu in DetectionsView.swift), same items in
+ *  the same order with a real board (iOS nests category and export in submenus). In sample data
+ *  both keep Mark Seen (in memory only) and they differ on Clear alone: this menu hides Clear Log,
+ *  iOS offers "Clear Sample" (see [logToolGates]). */
 @Composable
 private fun LogToolsMenu(
     gates: LogToolGates,

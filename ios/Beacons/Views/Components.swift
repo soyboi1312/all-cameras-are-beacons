@@ -1018,8 +1018,9 @@ func tabHeaderUsesSingleRow(_ size: DynamicTypeSize) -> Bool { !size.isAccessibi
 ///   largest non-accessibility size) Title1 is 34pt on a 41pt line and fits the 44pt bar, while
 ///   LargeTitle reaches 40pt on a 48pt line and would clip (Apple's Dynamic Type size table).
 ///   On iOS 26 the title and the empty principal item carry `.sharedBackgroundVisibility(.hidden)`
-///   so no glass capsule is drawn around them; the buttons keep the system glass. The branch is
-///   at the VIEW level, because availability branching inside a ToolbarContentBuilder is not
+///   so no glass capsule is drawn around them; the buttons keep the system glass unless the
+///   caller passes `trailingSharedBackground: .hidden` (the Log's tools button, which draws its
+///   own; the accessibility-size branch applies the same setting). The branch is at the VIEW level, because availability branching inside a ToolbarContentBuilder is not
 ///   assumed (the plain `if` on usesHiddenPrincipal inside it is an ordinary builder branch).
 /// - No principal at regular width on iOS 26 (usesHiddenPrincipal): there the tab bar floats at
 ///   the top in the bar's centre, the inline title has no centre slot to draw in, and a principal
@@ -1040,6 +1041,9 @@ func tabHeaderUsesSingleRow(_ size: DynamicTypeSize) -> Bool { !size.isAccessibi
 struct TabHeader<Trailing: View>: ViewModifier {
     let title: String
     let accessibilityTitleMode: NavigationBarItem.TitleDisplayMode
+    /// iOS 26 only: `.hidden` for trailing items that draw their own glass (the Log's UIKit tools
+    /// button); the bar otherwise pads them with shared glass that takes no taps.
+    let trailingSharedBackground: Visibility
     @ViewBuilder let trailing: () -> Trailing
     @Environment(\.dynamicTypeSize) private var dynamicTypeSize
     @Environment(\.horizontalSizeClass) private var hSize
@@ -1071,6 +1075,7 @@ struct TabHeader<Trailing: View>: ViewModifier {
                             .sharedBackgroundVisibility(.hidden)
                         if hasTrailingItems {
                             ToolbarItemGroup(placement: .topBarTrailing) { trailing() }
+                                .sharedBackgroundVisibility(trailingSharedBackground)
                         }
                     }
             } else {
@@ -1084,6 +1089,15 @@ struct TabHeader<Trailing: View>: ViewModifier {
                         }
                     }
             }
+        } else if #available(iOS 26, *) {
+            titled
+                .navigationBarTitleDisplayMode(accessibilityTitleMode)
+                .toolbar {
+                    if hasTrailingItems {
+                        ToolbarItemGroup(placement: .topBarTrailing) { trailing() }
+                            .sharedBackgroundVisibility(trailingSharedBackground)
+                    }
+                }
         } else {
             titled
                 .navigationBarTitleDisplayMode(accessibilityTitleMode)
@@ -1116,8 +1130,9 @@ extension View {
     /// A tab root's header row (TabHeader): `title` leading, `trailing` buttons on the same line.
     func tabHeader<Trailing: View>(_ title: String,
                                    accessibilityTitleMode: NavigationBarItem.TitleDisplayMode = .large,
+                                   trailingSharedBackground: Visibility = .automatic,
                                    @ViewBuilder trailing: @escaping () -> Trailing) -> some View {
         modifier(TabHeader(title: title, accessibilityTitleMode: accessibilityTitleMode,
-                           trailing: trailing))
+                           trailingSharedBackground: trailingSharedBackground, trailing: trailing))
     }
 }

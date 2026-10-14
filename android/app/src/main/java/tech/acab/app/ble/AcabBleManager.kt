@@ -71,6 +71,7 @@ import tech.acab.app.model.historyBeginFromOrAbsent
 import tech.acab.app.model.historyBeginGenerationOrAbsent
 import tech.acab.app.model.methodLabel
 import tech.acab.app.model.sourceLabel
+import tech.acab.app.net.APP_USER_AGENT
 import tech.acab.app.net.FirmwareBuild
 import tech.acab.app.net.FirmwareManifest
 import tech.acab.app.net.firmwareArtifactResponseAllowed
@@ -80,6 +81,7 @@ import tech.acab.app.widget.BeaconsWidgetProvider
 import java.time.LocalDate
 import java.time.ZoneId
 import java.io.File
+import java.io.FileOutputStream
 import java.net.HttpURLConnection
 import java.security.KeyStore
 import java.security.MessageDigest
@@ -164,6 +166,28 @@ internal fun resolveDurableBufferKey(
 }
 
 internal enum class BufferHandshakeWrite { KEY, EPOCH, SYNC }
+
+/** Why startBufferHandshake did or did not start. Split out of a Boolean because only a key
+ *  failure is a storage problem: a duplicate DETECTIONS CCCD success (onMtuChanged re-subscribes
+ *  unconditionally) used to land on "already running" and was reported as the Keystore being
+ *  unavailable. */
+internal enum class BufferHandshakeStart { STARTED, ALREADY_RUNNING, KEY_UNAVAILABLE, NOT_QUEUED }
+
+/** The startup-chain hint for a handshake that did not start, or null to carry on. Only
+ *  KEY_UNAVAILABLE names key storage; a key write the queue refused is a handshake failure; a
+ *  handshake already running is not a failure at all. */
+internal fun startupHandshakeFailure(start: BufferHandshakeStart): SecureSetupFailure? = when (start) {
+    BufferHandshakeStart.STARTED, BufferHandshakeStart.ALREADY_RUNNING -> null
+    BufferHandshakeStart.KEY_UNAVAILABLE -> SecureSetupFailure.BUFFER_KEY_UNAVAILABLE
+    BufferHandshakeStart.NOT_QUEUED -> SecureSetupFailure.BUFFER_HANDSHAKE_FAILED
+}
+
+/** Does a link drop on a fresh connect earn its one quiet retry? A non-success GATT status
+ *  (usually 133) on a [freshAttempt] (a user's connect that never reached READY, not an auto- or
+ *  OTA reconnect, and not a pairing or secure-link drop, which have their own hints) retries once
+ *  per tap; the second failure shows the LINK-stage hint. */
+internal fun retriesFreshLinkDrop(gattStatus: Int, freshAttempt: Boolean, alreadyRetried: Boolean): Boolean =
+    gattStatus != BluetoothGatt.GATT_SUCCESS && freshAttempt && !alreadyRetried
 internal data class BufferHandshakeTransition(
     val next: BufferHandshakeWrite? = null,
     val complete: Boolean = false,
@@ -308,8 +332,8 @@ internal fun linkWatchdogConnectHint(kind: BoardKind?): ConnectHint =
 /** Why the session's own setup failed after the encrypted Detections subscription succeeded:
  *  every cause is the SECURE_SETUP stage, where a second phone is never the cause. */
 internal enum class SecureSetupFailure {
-    /** startBufferHandshake could not resolve a durable buffer key (the Keystore is locked or
-     *  unreadable). */
+    /** startBufferHandshake could not resolve a durable buffer key (the Keystore or the stored
+     *  wrapped key is unreadable). */
     BUFFER_KEY_UNAVAILABLE,
     /** The board rejected the offline-history clear write (ConfigWritePurpose.CLEAR_LOG). */
     CLEAR_LOG_REJECTED,
@@ -318,8 +342,8 @@ internal enum class SecureSetupFailure {
 }
 
 /** The hint for one SecureSetupFailure. Each sentence is fixed text, not a per-kind template.
- *  TWIN: iOS ConnectHint.secureSetup (BLEManager.swift), whose call sites pass the same three
- *  sentences. */
+ *  TWIN: iOS ConnectHint.secureSetup (BLEManager.swift), whose call sites pass the same
+ *  sentences except the key-storage one (see BUFFER_KEY_UNAVAILABLE_HINT). */
 internal fun secureSetupConnectHint(failure: SecureSetupFailure): ConnectHint = ConnectHint(
     when (failure) {
         SecureSetupFailure.BUFFER_KEY_UNAVAILABLE -> AcabBleManager.BUFFER_KEY_UNAVAILABLE_HINT
@@ -414,20 +438,32 @@ enum class AlertModeOrigin {
     APP,    // Desert's forced mute, or a restore the app is carrying out
 }
 
-/** What the connect path writes to the board's buzzer: the stored mode's buzzer state, or NOTHING
- *  (null) when this phone holds no stored mode (a fresh install, a reinstall, cleared data, a
- *  second phone).
+/** What the connect path writes to the board's buzzer: a MUTE (false) when this phone stores a
+ *  quiet mode (VIBRATE or SILENT), otherwise NOTHING (null). A connect never writes sound on by
+ *  itself. [pickOwed] is the one exception: a mode the user picked while no board was connected
+ *  (the restore offer is reachable from the pre-connect screen) is a user action this link has
+ *  not delivered yet, so it is written as picked, BUZZER included.
  *
- *  WHY NOTHING AND NOT "SOUND ON" (security review 2026-09-29). The in-memory mode defaults to
- *  BUZZER when nothing is stored, and finishReady used to push that default. A board the user had
- *  muted from another install or phone was un-muted and saved the change to its own flash, Desert
- *  included, with nobody tapping anything. allowBackup=false means every reinstall got here. Only
+ *  WHY A STORED BUZZER WRITES NOTHING (app review 2026-10-12 A.7). It used to write buzzer:true
+ *  at every connect, so a board muted from a second phone, by hand or for covert use sounded
+ *  again with nobody touching this phone. A stored BUZZER now meets the board the way a phone
+ *  with no stored mode does: the link is marked at STATE_CONNECTED (storedModeMirrorsThisLink;
+ *  finishReady then writes nothing) and reconcileBuzzer mirrors the board through
+ *  [mirroredAlertMode] until the user picks.
+ *
+ *  WHY NOTHING AND NOT "SOUND ON" WITH NO STORED MODE (security review 2026-09-29). The
+ *  in-memory mode defaults to BUZZER when nothing is stored, and finishReady used to push that
+ *  default. A board the user had muted from another install or phone was un-muted and saved the
+ *  change to its own flash, Desert included, with nobody tapping anything. allowBackup=false means every reinstall got here. Only
  *  the user changes whether the detector makes sound (see desertAlertModeTransition), so a phone
  *  with no stored mode mirrors the board instead ([mirroredAlertMode]) and writes nothing at
  *  connect until the user picks a mode.
  *  iOS twin: connectBuzzerWrite in BLEManager.swift. */
-internal fun connectBuzzerWrite(hasStoredMode: Boolean, mode: AlertMode): Boolean? =
-    if (hasStoredMode) mode == AlertMode.BUZZER else null
+internal fun connectBuzzerWrite(hasStoredMode: Boolean, mode: AlertMode, pickOwed: Boolean = false): Boolean? = when {
+    pickOwed && hasStoredMode -> mode == AlertMode.BUZZER
+    hasStoredMode && mode != AlertMode.BUZZER -> false
+    else -> null
+}
 
 /** The alert mode a status frame puts on screen, or null when this phone is holding a mode of its
  *  own and the frame is only something to reconcile against.
@@ -439,7 +475,9 @@ internal fun connectBuzzerWrite(hasStoredMode: Boolean, mode: AlertMode): Boolea
  *  has no buzzer and always reports false, so it mirrors as SILENT too, which is true: it cannot
  *  make a sound. That matters for Desert, which captures the mode on screen: an unmirrored BUZZER
  *  default captured on a mesh board used to come back as a real un-mute on the next beacon. In
- *  memory only; a mirror is never stored. iOS twin: mirroredAlertMode in BLEManager.swift. */
+ *  memory only; a mirror is never stored. reconcileBuzzer also passes hasStoredMode = false for a
+ *  phone storing BUZZER that wrote nothing at connect (storedModeMirrorsThisLink, app review
+ *  2026-10-12 A.7). iOS twin: mirroredAlertMode in BLEManager.swift. */
 internal fun mirroredAlertMode(hasStoredMode: Boolean, heldThisLink: Boolean, boardBuzzer: Boolean): AlertMode? =
     if (hasStoredMode || heldThisLink) null
     else if (boardBuzzer) AlertMode.BUZZER else AlertMode.SILENT
@@ -1306,6 +1344,13 @@ internal fun frozenNewIdSet(
     }
 }
 
+/** markAllSeen's live-axis watermark: the newest real (non-pseudo) first-seen stamp in [stamps],
+ *  clamped to [nowMs], or [nowMs] when there is none. The clamp keeps a row stamped in the future
+ *  (the phone clock was moved back after it landed) from marking later live rows as seen. TWIN:
+ *  iOS markAllSeen. */
+internal fun liveSeenWatermark(stamps: List<Long>, nowMs: Long): Long =
+    minOf(stamps.filter { it > AcabBleManager.HIST_PSEUDO_BASE }.maxOrNull() ?: nowMs, nowMs)
+
 /** What the app knows about a buffered row's time: how the stamp was arrived at, and the key
  *  the log orders it by. The two are deliberately separate. A bracketed or unbounded record
  *  carries the seq-derived pseudo stamp, which sits near 2001, so sorting on the stamp buries
@@ -1471,6 +1516,19 @@ internal fun isFirmwareVersionOlder(installed: String, latest: String): Boolean 
     isNumericFirmwareVersion(installed) && isNumericFirmwareVersion(latest) &&
         !isFirmwareVersionAtLeast(installed, latest)
 
+/** The first firmware that applies the alert mute to the power cues too (alerts.cpp buzzerTone,
+ *  2.2.1). Before it a muted board still played the shutdown motif and the rev-B hold-to-start
+ *  beep, and only volume 0 silenced them, so the Alerts caption and the Desert note describe the
+ *  cues THIS board plays. TWIN: DeviceStatus.muteCoversPowerCuesSince and muteCoversPowerCues in
+ *  DeviceStatus.swift; check-signature-drift.py pins the literal. */
+internal const val MUTE_COVERS_POWER_CUES_SINCE = "2.2.1"
+
+/** Does a board on [firmwareVersion] mute every cue, the power cues included? False for a missing
+ *  version or one that does not parse, which keeps the older description: a caption may promise
+ *  less silence than the board delivers, never more. */
+internal fun muteCoversPowerCues(firmwareVersion: String?): Boolean =
+    firmwareVersion != null && isFirmwareVersionAtLeast(firmwareVersion, MUTE_COVERS_POWER_CUES_SINCE)
+
 internal fun decideOtaPostReboot(
     runningVersion: String,
     runningLabel: String,
@@ -1499,6 +1557,35 @@ enum class MuteRuleStatus {
     CURRENT_LOCATION_REQUIRED,
     OUTSIDE_RADIUS,
     INVALID_PLACE,
+}
+
+/** Does a saved place rule in [status] keep this phone's alerts (haptic and notification) quiet
+ *  for its device? Yes when ACTIVE, and also when CURRENT_LOCATION_REQUIRED: the 50 m / 120 s fix
+ *  bar is routinely missed indoors, where "mute at this place" is used most, so a device muted at
+ *  home used to resume buzzing the moment the fix degraded. The row still shows (the projection
+ *  drops ACTIVE only); only the alerts stay quiet. Shared rule with iOS
+ *  (placeRuleSuppressesAlerts in BLEManager.swift, app review 2026-10-12 A.6). */
+internal fun placeRuleSuppressesAlerts(status: MuteRuleStatus): Boolean =
+    status == MuteRuleStatus.ACTIVE || status == MuteRuleStatus.CURRENT_LOCATION_REQUIRED
+
+/** Why [AcabBleManager.ignoreDevice] refused, in its own guard order, so the mute sheet can say
+ *  the one sentence that helps. Shared with iOS (MuteRefusal in BLEManager.swift), plus
+ *  SAVE_FAILED, Android only: commitManagedLists can refuse (lists still loading, or a sealed write
+ *  that did not land), and iOS's ignoreDevice has no such refusal. */
+enum class MuteRefusal { LIST_FULL, LOCATION_NEEDED, UNSTORABLE_ADDRESS, SAVE_FAILED }
+
+/** [AcabBleManager.muteRefusal]'s rule over plain inputs, in ignoreDevice's guard order: an address
+ *  the board cannot store, then a place mute whose fix [here] cannot anchor a 50 m rule, then a
+ *  full list ([listFull]: a new row with IGNORE_CAP rules already stored), and otherwise a save
+ *  that did not land. */
+internal fun muteRefusalFor(
+    mac: String, scope: MuteScope, here: MutePosition?, listFull: Boolean,
+): MuteRefusal = when {
+    !isBoardPushableMac(mac.lowercase()) -> MuteRefusal.UNSTORABLE_ADDRESS
+    scope == MuteScope.HERE && !positionSupportsHere(here, DEFAULT_HERE_RADIUS_METERS) ->
+        MuteRefusal.LOCATION_NEEDED
+    listFull -> MuteRefusal.LIST_FULL
+    else -> MuteRefusal.SAVE_FAILED
 }
 
 /** "Heard recently enough to count as nearby now": the ONE Android owner of that window. It is the
@@ -1930,6 +2017,42 @@ internal class PersistedDetectionClearTombstone(
     }
 }
 
+/** The persisted log's rows, or null when the file cannot be opened: [open] (the Keystore unseal)
+ *  threw, which includes the zero-length or partial file a power cut can leave, or the result is
+ *  not a JSON array. An old build's plaintext array (leading '[') is read as is. Per-row damage
+ *  is not this function's business: the loader skips bad rows and keeps the rest. */
+internal fun persistedLogRows(stored: String, open: (String) -> String): JSONArray? =
+    runCatching { JSONArray(if (stored.startsWith("[")) stored else open(stored)) }.getOrNull()
+
+/** Move an unreadable log [store] out of the next checkpoint's way, to
+ *  "<name>.unreadable-<nowMs>" beside it, never onto an existing file. Returns the kept file, or
+ *  null when the rename failed. No automatic sweep touches these; only Clear Log deletes them
+ *  ([deletePersistedLogFiles]): it is evidence this build could not read, kept for a later one,
+ *  but it still holds MACs and GPS, so the user's own delete covers it. */
+internal fun setAsideUnreadableLog(store: File, nowMs: Long): File? {
+    val dir = store.absoluteFile.parentFile ?: return null
+    var kept = File(dir, "${store.name}.unreadable-$nowMs")
+    var n = 0
+    while (kept.exists()) kept = File(dir, "${store.name}.unreadable-$nowMs-${++n}")
+    return kept.takeIf { store.renameTo(it) }
+}
+
+/** Clear Log's file half: delete [store], the [temp] staging file an interrupted checkpoint can
+ *  leave, and every file [setAsideUnreadableLog] kept beside [store]. True only on confirmed
+ *  absence of all of them. Caller holds persistMutex. */
+internal fun deletePersistedLogFiles(store: File, temp: File): Boolean {
+    fun files() = listOf(store, temp) + store.absoluteFile.parentFile
+        ?.listFiles { f -> f.name.startsWith("${store.name}.unreadable-") }.orEmpty()
+    return performConfirmedPersistedDetectionDeletion(
+        fileExists = { files().any { it.exists() } },
+        remove = {
+            for (file in files()) {
+                if (file.exists() && !file.delete()) error("persisted detection delete failed")
+            }
+        },
+    )
+}
+
 internal class PersistedDetectionLoadGate {
     private val generation = AtomicLong(0L)
     fun beginLoad(): Long = generation.incrementAndGet()
@@ -1958,6 +2081,22 @@ internal fun positionSupportsHere(position: MutePosition?, radiusMeters: Double)
         validCoord(position.coord.first, position.coord.second) &&
         accuracy.isFinite() && accuracy >= 0.0 && accuracy <= radiusMeters
 }
+
+/** Widest horizontal uncertainty an observer fix may carry: the pin stamped on a live row, its CSV
+ *  approx_lat/lon, and the lat/lon pushed to the board. Shared value with iOS
+ *  (observerFixMaxAccuracyMeters in BLEManager.swift). */
+internal const val OBSERVER_FIX_MAX_ACCURACY_M = 250f
+
+/** May a fix [ageNanos] old with [accuracyMeters] of uncertainty (null when the platform reported
+ *  none, Location.hasAccuracy() false) stand as where this phone was? The current-fix age rule
+ *  ([FIX_MAX_AGE_SEC]) AND a reported, finite, non-negative accuracy AND at most
+ *  [OBSERVER_FIX_MAX_ACCURACY_M]. A first cell or Wi-Fi fix is often kilometres wide and used to
+ *  become a pin and the board's position. Beside [positionSupportsHere], whose bar is the rule's
+ *  radius. Shared rule with iOS (locationFixSupportsObserver in BLEManager.swift). */
+internal fun locationFixSupportsObserver(ageNanos: Long, accuracyMeters: Double?): Boolean =
+    ageNanos in 0..FIX_MAX_AGE_SEC * 1_000_000_000L &&
+        accuracyMeters != null && accuracyMeters.isFinite() && accuracyMeters >= 0.0 &&
+        accuracyMeters <= OBSERVER_FIX_MAX_ACCURACY_M
 
 /** Only rules with no time or place boundary are safe to persist on the board. */
 internal fun isBoardBackedMute(item: IgnoredDevice): Boolean =
@@ -2338,6 +2477,16 @@ class AcabBleManager(private val context: Context) {
     private val _offlineSyncBanner = MutableStateFlow<Int?>(null)
     val offlineSyncBanner: StateFlow<Int?> = _offlineSyncBanner.asStateFlow()
 
+    // One-shot: [UNREADABLE_LOG_NOTICE] when the startup load found a saved log it could not open
+    // and moved it aside (setAsideUnreadableLog) instead of letting the next checkpoint overwrite
+    // it. Null otherwise. In memory only, and the renamed file is never read again (Clear Log
+    // deletes it, and clears this notice with it), so it is raised at most once per unreadable
+    // file. The Log renders it outside sample data and calls dismissUnreadableLogNotice. TWIN:
+    // iOS BLEManager.unreadableLogNotice.
+    private val _unreadableLogNotice = MutableStateFlow<String?>(null)
+    val unreadableLogNotice: StateFlow<String?> = _unreadableLogNotice.asStateFlow()
+    fun dismissUnreadableLogNotice() { _unreadableLogNotice.value = null }
+
     // One-shot beside the banner: records the board PROMISED ({"hist":"begin","n"}) but did not
     // SEND in this attempt ({"hist":"end","n"}). A record past notifyCap() now blocks the drain
     // without committing that row, so it remains in the ring for a later sync from a larger-MTU
@@ -2389,6 +2538,21 @@ class AcabBleManager(private val context: Context) {
      *  iOS twin: appHeldAlertModeThisLink in BLEManager. */
     @Volatile private var appHeldAlertModeThisLink = false
 
+    /** This link belongs to a phone that STORES Buzzer with no pick owed, so it writes nothing at
+     *  connect and, until the user picks, [reconcileBuzzer] mirrors the board exactly as a phone
+     *  with no stored mode does: a board muted elsewhere stays muted (app review 2026-10-12 A.7).
+     *  Decided where every link starts (STATE_CONNECTED), before any status frame of the link can
+     *  reach the reconcile, and from the STORED pref rather than the in-memory mode, which an
+     *  earlier link's mirror may have changed. Cleared by cleanup() and by any [setAlertMode]. In
+     *  memory only; the stored mode is untouched. Written under [alertModeLock]. */
+    @Volatile private var storedModeMirrorsThisLink = false
+
+    /** A user pick made while no board was READY (the restore offer leads the pre-connect screen),
+     *  owed to the next board as a write ([connectBuzzerWrite]'s pickOwed). Cleared by the connect
+     *  that delivers it and by a pick made on a READY link, which setAlertMode writes at once.
+     *  Written under [alertModeLock]. */
+    @Volatile private var alertModePickOwed = false
+
     /** Guards the pair (hasStoredAlertMode or appHeldAlertModeThisLink, _alertMode) against a
      *  torn read. [reconcileBuzzer]'s mirror runs on the GATT callback thread and [setAlertMode] on
      *  the main thread; without one lock, a mirror that read "no mode" just before a user pick could
@@ -2401,6 +2565,14 @@ class AcabBleManager(private val context: Context) {
     private val _driveModeWanted = MutableStateFlow(true)
     val driveModeWanted: StateFlow<Boolean> = _driveModeWanted.asStateFlow()
 
+    /** A Live Mode start the Quick Settings tile asked for, carried IN-PROCESS to MainActivity:
+     *  the tap's SystemClock.elapsedRealtime(), 0 when none. MainActivity consumes it on its next
+     *  ON_RESUME and honours it only while tileDriveRequestFresh (a minute), so an abandoned tap
+     *  never starts Live Mode on a later open. DriveModeTileService is the only writer; an intent
+     *  extra let any app start Live Mode through the exported activity (app review 2026-10-12
+     *  A.10). */
+    val tileDriveStartRequestedAt = AtomicLong(0L)
+
     /** Per-category phone notifications (see DetectionNotifier). Independent of alertMode. */
     val notifier = DetectionNotifier(context)
 
@@ -2408,19 +2580,18 @@ class AcabBleManager(private val context: Context) {
     // unless the user turns redaction on; a stored choice always wins over the default). The app
     // always shows the full breakdown. Loaded from prefs in init.
     //
-    // SCOPE. On Android this switch reaches THREE surfaces: the Live Mode notification
-    // (AcabLinkService.build -> VISIBILITY_PRIVATE + buildPublic), the Android 16 promoted chip
-    // (AcabLinkService.shortCriticalText, which drops the count locked OR not, because the chip
-    // sits in the status bar either way), and per-detection alerts (DetectionNotifier's own public
-    // version, which replaces the category with "Something was detected nearby."). Erring private
-    // is the deliberate direction for this product, so the copy widened to name all three rather
-    // than the behaviour narrowing: DeviceScreen's toggle subtitle now says so. iOS scopes its
-    // same-named toggle to the Live Activity only, which is why the iOS subtitle reads narrower -
-    // that is a real behaviour difference, deliberately left as the quieter platform winning.
+    // SCOPE. On Android this switch reaches THREE surfaces, each locked OR not: the Live Mode
+    // notification's text becomes the generic face and loses its breakdown
+    // (AcabLinkService.liveFaceText; VISIBILITY_PRIVATE alone would leave a locked phone to the
+    // system setting, whose default shows everything), the Android 16 promoted chip drops its
+    // count (AcabLinkService.shortCriticalText), and per-detection alerts become generic
+    // (DetectionNotifier, "beacons" / "Something was detected nearby.", the shared rule with
+    // iOS's alerts, app review 2026-10-12 S6). Erring private is the deliberate direction for
+    // this product.
     //
-    // Four places point HERE for that scope, so keep this block on the declaration when editing:
-    // setRedactLockScreen's KDoc and the fileLive notify block in this file, DeviceScreen's toggle
-    // subtitle comment, and SettingsView.swift's Live Activity note.
+    // Three places point HERE for that scope, so keep this block on the declaration when editing:
+    // setRedactLockScreen's KDoc and the fileLive notify block in this file, and DeviceScreen's
+    // toggle subtitle comment.
     private val _redactLockScreen = MutableStateFlow(false)
     val redactLockScreen: StateFlow<Boolean> = _redactLockScreen.asStateFlow()
 
@@ -2490,7 +2661,7 @@ class AcabBleManager(private val context: Context) {
                 lastMuteFix = fix
                 fixCacheAt = nowNanos
                 fixCache = fix
-                setLocation(location.latitude, location.longitude)
+                setLocation(fix)
             }
         }
         override fun onProviderEnabled(provider: String) { syncLocationOwnership() }
@@ -2775,8 +2946,11 @@ class AcabBleManager(private val context: Context) {
     private val publishDirty = AtomicBoolean(false)
     @Volatile private var publishPumpRunning = false
 
-    private var gatt: BluetoothGatt? = null
-    private var target: BluetoothDevice? = null
+    // @Volatile: written on main (connect, bond relaunch, reconnectAfterOta) and on the binder
+    // thread (cleanup from onConnectionStateChange), and read on the binder thread as the
+    // `g !== gatt` identity guard.
+    @Volatile private var gatt: BluetoothGatt? = null
+    @Volatile private var target: BluetoothDevice? = null
     private val store = LinkedHashMap<String, Detection>()
     // The ids of the ACTIVE projection as of the last publish, which is the set of devices the map
     // and the dossier are currently allowed to see. A set and not a list because routine sightings
@@ -3024,6 +3198,19 @@ class AcabBleManager(private val context: Context) {
     // row for a powered-off board, ~30 s status-133) must fail to the resting screen, not arm a
     // perpetual no-cancel "Connecting…".
     @Volatile private var sessionWasReady = false
+
+    // True once this session's FIRST encrypted DETECTIONS subscription started the startup buffer
+    // handshake (set in onDescriptorWrite, cleared at STATE_CONNECTED and in cleanup). A later DETECTIONS CCCD success in
+    // the same session is a duplicate (onMtuChanged re-subscribes unconditionally, so a late or
+    // repeated MTU callback, which the app review of 2026-10-12 judged plausible on Android 14+,
+    // writes the CCCD again) and is ignored: it used to start a second handshake or, mid-handshake,
+    // tear the link down blaming key storage.
+    @Volatile private var startupHandshakeStarted = false
+
+    // The one quiet retry a user's fresh connect gets after a non-success drop (retriesFreshLinkDrop).
+    // Reset by connect() once past its in-flight guard, never by the retry itself or by a tap that
+    // guard turns away, so a powered-off board cannot loop.
+    @Volatile private var freshConnectRetried = false
 
     // CCCD writes we've already retried once this session (see onDescriptorWrite). Per-session so a
     // reconnect gets a clean shot at every subscription, and bounded to one retry apiece so a board
@@ -3485,6 +3672,9 @@ class AcabBleManager(private val context: Context) {
         runCatching { gatt?.close() }
         gatt = null
         _state.value = ConnState.CONNECTING
+        // A fresh retry budget (retriesFreshLinkDrop), past the in-flight guard so a second tap
+        // during the retry gap cannot buy a second retry.
+        freshConnectRetried = false
         target = board.device
         _deviceName.value = board.name
         // Not connected yet, so no fw kind: the row's live advert hint, else the stored kind when
@@ -3626,10 +3816,10 @@ class AcabBleManager(private val context: Context) {
         AcabLinkService.stop(context)
     }
 
-    /** Hide/show detection counts on the lock screen: the Live Mode notification and its Android 16
-     *  chip, plus the category on a per-detection alert (the service re-renders). All three are
-     *  named in the toggle's own subtitle; see the _redactLockScreen declaration for the full
-     *  scope and for why iOS's same-named toggle covers less. */
+    /** Hide details, locked or not: the Live Mode notification shows only the generic face and
+     *  the Android 16 chip drops its count (the service re-renders), and every detection alert
+     *  becomes generic (detectionAlertText). See the _redactLockScreen declaration for the full
+     *  scope. */
     fun setRedactLockScreen(on: Boolean) {
         _redactLockScreen.value = on
         prefs.edit().putBoolean("redactLock", on).apply()
@@ -3771,7 +3961,10 @@ class AcabBleManager(private val context: Context) {
         // An app-set alert mode holds for its link only (see appHeldAlertModeThisLink). Most
         // teardowns of an established session run through here (STATE_DISCONNECTED, onRadioOff, a
         // permission revoke); the STATE_CONNECTED clear covers the rest.
-        synchronized(alertModeLock) { appHeldAlertModeThisLink = false }
+        synchronized(alertModeLock) {
+            appHeldAlertModeThisLink = false
+            storedModeMirrorsThisLink = false
+        }
         bondTimeoutJob?.cancel()
         bondTimeoutJob = null
         secureReadyTimeoutJob?.cancel()
@@ -3797,6 +3990,7 @@ class AcabBleManager(private val context: Context) {
             bufferHandshakeCompletion = null
         }
         sessionWasReady = false
+        startupHandshakeStarted = false
         cccdRetried.clear()            // fresh session gets a fresh retry per subscription
         reconnectClientArmed = false   // the pending client (if any) was just closed
         histReceived = 0
@@ -3805,9 +3999,12 @@ class AcabBleManager(private val context: Context) {
         histResyncAttempts = 0
         // A per-record advance is only volatile until its matching store checkpoint completes.
         // Reconnect from the durable tuple, never from RAM that a process kill could still lose.
-        val resumeCursor = synchronized(cursorLock) { lastSeqPersisted to lastLogGenerationPersisted }
-        lastSeq = resumeCursor.first
-        activeLogGeneration = resumeCursor.second
+        // Under cursorLock, as checkpointHistory reads the pair: this can run on the main thread
+        // while a replay record is still handled on the binder thread.
+        synchronized(cursorLock) {
+            lastSeq = lastSeqPersisted
+            activeLogGeneration = lastLogGenerationPersisted
+        }
         // A drain cut short never reaches resolveBrackets, and the cursor didn't advance, so the
         // next session replays these same records. Drop the half-batch rather than bracketing
         // those rows twice over; they stay unknown until a replay closes cleanly.
@@ -4032,7 +4229,7 @@ class AcabBleManager(private val context: Context) {
         return true
     }
 
-    private val gattCb = object : android.bluetooth.BluetoothGattCallback() {
+    private val gattCb: android.bluetooth.BluetoothGattCallback = object : android.bluetooth.BluetoothGattCallback() {
         override fun onConnectionStateChange(g: BluetoothGatt, status: Int, newState: Int) {
             if (rejectGattCallbackWithoutPermission()) return
             // A closed client can deliver its final callback after a reconnect has installed a new
@@ -4045,8 +4242,16 @@ class AcabBleManager(private val context: Context) {
                 autoReconnecting = false
                 reconnectClientArmed = false
                 connectGen++
-                // A new link never inherits an app-set alert mode (see appHeldAlertModeThisLink).
-                synchronized(alertModeLock) { appHeldAlertModeThisLink = false }
+                // Every link starts its own buffer handshake, even one whose predecessor was closed
+                // without cleanup() (connect(), the watchdog, the bond-retry receiver).
+                startupHandshakeStarted = false
+                // A new link never inherits an app-set alert mode (see appHeldAlertModeThisLink), and
+                // decides its own stored-Buzzer mirror (storedModeMirrorsThisLink).
+                synchronized(alertModeLock) {
+                    appHeldAlertModeThisLink = false
+                    storedModeMirrorsThisLink = hasStoredAlertMode && !alertModePickOwed &&
+                        prefs.getString("alertMode", null) == AlertMode.BUZZER.name
+                }
                 // Already bonded? Go straight to discovery. Otherwise bond first.
                 if (runCatching { g.device.bondState == BluetoothDevice.BOND_BONDED }.getOrDefault(false)) {
                     armSecureReadyTimeout(g.device)
@@ -4101,6 +4306,39 @@ class AcabBleManager(private val context: Context) {
                     !autoReconnecting && sessionWasReady && wasTarget != null &&
                     hasConnectPermission() &&
                     runCatching { adapter?.isEnabled == true }.getOrDefault(false)
+                // A user's fresh connect that dropped with an error (status 133 and kin) before any
+                // link stage with its own hint. It used to land silently on the scan screen; it now
+                // gets one quiet retry ~1 s later, then the LINK-stage hint below. A drop the app
+                // already explained (a hint is up, e.g. the buffer-key teardown) is not one.
+                val freshLinkDrop = _state.value == ConnState.CONNECTING && !sessionWasReady &&
+                    !userDisconnect && !reconnectForOta && !midOta && !autoReconnecting &&
+                    !otaReconnecting && !secureReadyDropped && !pairingDropped && wasTarget != null &&
+                    _connectHint.value == null
+                if (retriesFreshLinkDrop(status, freshLinkDrop, freshConnectRetried)) {
+                    // Nothing was established (no bond, no secure link, empty queue), so only the
+                    // client goes; state, target and the connect watchdog (still bounding the whole
+                    // tap) stay. A Cancel in the gap runs cleanup(), which bumps connectGen.
+                    val dev = wasTarget ?: return   // freshLinkDrop already required it
+                    freshConnectRetried = true
+                    runCatching { g.close() }
+                    gatt = null
+                    val gen = connectGen
+                    scope.launch {
+                        delay(FRESH_CONNECT_RETRY_MS)
+                        withContext(Dispatchers.Main) {
+                            if (gen != connectGen || target !== dev || gatt != null ||
+                                _state.value != ConnState.CONNECTING || !hasConnectPermission()) return@withContext
+                            gatt = runCatching {
+                                dev.connectGatt(context, false, gattCb, BluetoothDevice.TRANSPORT_LE)
+                            }.getOrNull()
+                            if (gatt == null) {
+                                cleanup()
+                                _connectHint.value = linkWatchdogConnectHint(_targetKind.value)
+                            }
+                        }
+                    }
+                    return
+                }
                 // Treat the OTA reboot-reconnect like an auto-reconnect for teardown: skip the
                 // scan-screen state reset + Drive-mode end, since reconnectAfterOta is about to chase
                 // the same board (else Drive mode dies and the UI flashes the scan screen mid-reboot).
@@ -4109,6 +4347,9 @@ class AcabBleManager(private val context: Context) {
                     showPairingFailure(PairingFailure.SECURE_LINK_NOT_READY)
                 } else if (pairingDropped && !doAutoReconnect && !reconnectForOta) {
                     showPairingFailure(PairingFailure.CANCELED_OR_FAILED)
+                } else if (freshLinkDrop && status != BluetoothGatt.GATT_SUCCESS) {
+                    // The retry above was spent: say so instead of a silent scan screen.
+                    _connectHint.value = linkWatchdogConnectHint(_targetKind.value)
                 }
                 when {
                     reconnectForOta && wasTarget != null -> reconnectAfterOta(wasTarget)
@@ -4190,14 +4431,20 @@ class AcabBleManager(private val context: Context) {
             }
             when (cccdFor) {
                 AcabProfile.DETECTIONS -> {
+                    // A second success in one session is a duplicate (see startupHandshakeStarted):
+                    // the chain is already running or done, so there is nothing to start.
+                    if (startupHandshakeStarted) return
+                    startupHandshakeStarted = true
                     // The Detections subscription is live, so the board can now NOTIFY the
                     // replay. Hand it our key + clock, then ask for everything past lastSeq.
-                    if (!startBufferHandshake(BufferHandshakeCompletion.STARTUP)) {
+                    val failure = startupHandshakeFailure(startBufferHandshake(BufferHandshakeCompletion.STARTUP))
+                    if (failure != null) {
                         // A generated key is useful only if it survives this process. Never hand
                         // the board an ephemeral replacement: it would encrypt buffered evidence
                         // that this phone cannot decrypt after a restart. Keep an unreadable blob
                         // intact too; a transient Keystore failure is not authority to rotate it.
-                        _connectHint.value = secureSetupConnectHint(SecureSetupFailure.BUFFER_KEY_UNAVAILABLE)
+                        // Only a key failure names key storage (startupHandshakeFailure).
+                        _connectHint.value = secureSetupConnectHint(failure)
                         secureReadyTimeoutJob?.cancel()
                         secureReadyTimeoutJob = null
                         secureReadyArmed = false
@@ -4430,7 +4677,15 @@ class AcabBleManager(private val context: Context) {
         // record's kind (stampRememberedKind), which a different board just reset to unknown.
         kindStampDone = false
         _state.value = ConnState.READY
+        // The board zeroed its fix at the last disconnect, so this link gets one now even if the
+        // previous push was under 15 s ago. TWIN: iOS finishReadyAfterBufferHandshake's
+        // `lastGpsSent = .distantPast; sendPhoneLocation()`. A newly registered listener pushes its seed below; when ownership
+        // was already held (a fast drop and reconnect) no callback comes for a parked phone (10 m
+        // displacement filter), so push the current fix ourselves. freshSelfFix is null when this
+        // process does not own location, so nothing is pushed off a released registration.
+        lastGpsSent = 0L
         syncLocationOwnership()
+        freshSelfFix()?.let(::setLocation)
         // Prime the Status characteristic once the CCCD chain is fully written (all queued
         // descriptor writes have drained by now), so this read can't collide with an in-flight
         // OTA CCCD write. A Status notify also arrives on connect, so this is just a fast first
@@ -4443,12 +4698,16 @@ class AcabBleManager(private val context: Context) {
         buzzerReassertAttempts = 0                       // fresh link: first status frame is pre-write
         lastBuzzerMuteWrite = 0L                         // and the slow mute retry starts over with it
         ignorePushAttempts = 0; watchPushAttempts = 0    // and a fresh board gets a fresh convergence budget
-        // Only a phone that stores a mode writes the buzzer here. One that does not (fresh install,
-        // reinstall, second phone) mirrors the board from its first status frame instead, so a
-        // board muted elsewhere stays muted. See connectBuzzerWrite.
+        // A connect writes a stored QUIET mode, or a pick owed from while no board was connected,
+        // and nothing else. A phone with no stored mode, or one storing Buzzer, mirrors the board
+        // from its first status frame instead, so a board muted elsewhere stays muted. See
+        // connectBuzzerWrite.
         val connectWrite = synchronized(alertModeLock) {
             appHeldAlertModeThisLink = false   // already cleared at STATE_CONNECTED; repeated at the session edge
-            connectBuzzerWrite(hasStoredAlertMode, _alertMode.value)
+            val write = if (storedModeMirrorsThisLink) null
+                else connectBuzzerWrite(hasStoredAlertMode, _alertMode.value, alertModePickOwed)
+            alertModePickOwed = false
+            write
         }
         connectWrite?.let { setBuzzer(it) }
         // Board just connected: make sure the firmware manifest is current so the update nudge
@@ -4664,6 +4923,7 @@ class AcabBleManager(private val context: Context) {
         if (touchedBoard && ownerGen >= 0) otaQuarantinedConnectGen = ownerGen
         clearOtaStreamState()
         setOtaPhase(OtaPhase.FAILED, message = "Update cancelled.")
+        settleOtaLink()
     }
 
     /** Once the end control is queued, the image may already be committing even before the board's
@@ -4859,7 +5119,22 @@ class AcabBleManager(private val context: Context) {
     private fun beginStreaming() {
         otaChunkIdx = 0
         otaStreaming = true
+        // One chunk goes out per write callback, so the connection interval bounds throughput.
+        // A hint only (no state depends on it); settleOtaLink hands the link back to BALANCED.
+        gatt?.let { g -> runCatching { g.requestConnectionPriority(BluetoothGatt.CONNECTION_PRIORITY_HIGH) } }
         sendNextOtaChunk()
+    }
+
+    /** The image stream is over on this link (done, err, abort, a failure or a cancel): return the
+     *  connection interval to BALANCED and send the one location push setLocation held back while
+     *  it streamed (otaDeferredLocation; setLocation re-checks its age, READY and the throttle).
+     *  The "done" arm clears that push first, since the board is about to reboot. */
+    private fun settleOtaLink() {
+        gatt?.let { g -> runCatching { g.requestConnectionPriority(BluetoothGatt.CONNECTION_PRIORITY_BALANCED) } }
+        otaDeferredLocation?.let { fix ->
+            otaDeferredLocation = null
+            setLocation(fix)
+        }
     }
 
     /** Queue the next image chunk as a WRITE_NO_RESPONSE op, or, once the last chunk is out,
@@ -5013,6 +5288,7 @@ class AcabBleManager(private val context: Context) {
         if (touchedBoard && ownerGen >= 0) otaQuarantinedConnectGen = ownerGen
         clearOtaStreamState()
         setOtaPhase(OtaPhase.FAILED, message = reason)
+        settleOtaLink()
     }
 
     private fun clearOtaStreamState() {
@@ -5095,6 +5371,7 @@ class AcabBleManager(private val context: Context) {
             connectTimeout = 15_000
             readTimeout = 20_000
             instanceFollowRedirects = false
+            setRequestProperty("User-Agent", APP_USER_AGENT)
         }
         try {
             val responseCode = conn.responseCode
@@ -5208,7 +5485,11 @@ class AcabBleManager(private val context: Context) {
                 }
                 val revision = statusRevision.incrementAndGet()
                 nrfDfu.handleStatusUpdate(s, connectGen.toLong(), revision)
-                reconcileBuzzer(s)
+                // While the OTA image streams, the buzzer and list reconciles wait for the next frame
+                // after it: their WRITE_TYPE_DEFAULT round trips (a list push is up to 13 chunk
+                // writes) share the serialized GATT queue with the image chunks. Same rule as the
+                // status poll (startStatusPolling) and the location push (setLocation).
+                if (!otaStreaming) reconcileBuzzer(s)
                 reconcileDesert(s)   // rare since firmware persists Desert; still needed for older boards / NVS wipe
                 if (!managedListsReady) {
                     // A present-but-unreadable encrypted list is not an authoritative empty list.
@@ -5217,7 +5498,7 @@ class AcabBleManager(private val context: Context) {
                     if (otaAwaitingConfirm) checkPostRebootConfirm()
                     return
                 }
-                managedListEdits.withLock {
+                if (!otaStreaming) managedListEdits.withLock {
                 // Read counts, decide, push, and durably retire a matching clear ACK under the
                 // same boundary as paired list edits. Otherwise an ACK calculated for generation
                 // N can clear the pending bit while generation N+1 is concurrently committing a
@@ -5356,6 +5637,10 @@ class AcabBleManager(private val context: Context) {
                 otaRebootGen = connectGen
                 setOtaPhase(OtaPhase.REBOOTING, pct = 100,
                     message = "Board is rebooting into the new firmware.")
+                // Drop the held location push: the reboot zeroes the board's fix, and finishReady
+                // pushes one to the next link anyway. Only the priority hint is left to settle.
+                otaDeferredLocation = null
+                settleOtaLink()
             }
             "ok" -> {
                 // Reply to our confirm: rollback disarmed, we're settled on the new version.
@@ -5454,14 +5739,16 @@ class AcabBleManager(private val context: Context) {
 
     /** A live detection: timestamp is now, and a fresh sighting may buzz the phone. */
     private fun fileLive(d: Detection) {
+        // The observer fix is read BEFORE storeLock: it can cost two getLastKnownLocation binder
+        // calls (once per FIX_CACHE_NANOS), which must not run inside the monitor feedSnapshots,
+        // updateWidget and nearbySnapshot contend on. The fix is the same one either side of the
+        // lock; the capture-local sample is independent of capturedLoc's session-global closest pin.
+        val observer = freshSelfCoord()
         synchronized(storeLock) {
             // Read the clock only after acquiring the same lock Stop freezes under. Whichever
             // operation wins the lock defines the boundary, so a callback cannot carry a
             // pre-Stop timestamp while filing after the frozen snapshot.
             val observedAt = System.currentTimeMillis()
-            // One observer read and one wall-clock instant describe this exact sighting. The
-            // capture-local sample is independent of capturedLoc's session-global closest pin.
-            val observer = freshSelfCoord()
             val previousLastSeen = lastSeenAt[d.id]
             val first = !firstSeenAt.containsKey(d.id)
             if (first) {
@@ -5528,23 +5815,34 @@ class AcabBleManager(private val context: Context) {
         checkpointDetections()
         // hapticDue RECORDS, so it stays LAST: the cheap gates short-circuit ahead of it, and a
         // buzz suppressed by DND must not start the cooldown that suppressed it.
-        if (_alertMode.value == AlertMode.VIBRATE && !focusSuppressed() && hapticDue(d.mac)) alertHaptic(d.type)   // buzz past the per-device cooldown, unless DND/Focus is on
+        // A device with a saved place rule stays quiet on this phone while that rule is active OR
+        // waiting on a qualifying fix (placeRuleSuppressesAlerts); its row still files and shows.
+        if (_alertMode.value == AlertMode.VIBRATE && !focusSuppressed() && !placeRuleMutesAlerts(d.mac) &&
+            hapticDue(d.mac)) alertHaptic(d.type)   // buzz past the per-device cooldown, unless DND/Focus is on
         // Phone notification, per category, opt-in. INDEPENDENT of alertMode: that governs the
         // board buzzer, and a silent board is not a silent phone. Ignored devices are dropped
         // before this point so they can never notify.
         //
         // The lock-screen redaction toggle rides along here as well as on Live Mode: with it on,
-        // a locked screen shows "Something was detected nearby." instead of naming the category.
-        // That is a surface iOS's same-named toggle does not cover, and it is kept on purpose: on
-        // this product, quieter is the safe side of a mismatch. The toggle's subtitle names it.
-        // See the _redactLockScreen declaration for the full scope.
+        // the alert itself reads "Something was detected nearby." instead of naming the category
+        // (DetectionNotifier.notifyIfNeeded), the shared rule with iOS's alerts. See the
+        // _redactLockScreen declaration for the full scope.
         //
         // NOT gated on `firstTime`, deliberately: that is `store[d.id] == null` and the store is
         // PERSISTED across launches, so a device seen in any earlier session was never first again
         // and could never notify. The notifier owns the dedup via its per-device cooldown.
-        if (!d.hist && DetectionNotifier.anyEnabled(context)) {
+        if (!d.hist && DetectionNotifier.anyEnabled(context) && !placeRuleMutesAlerts(d.mac)) {
             notifier.notifyIfNeeded(d, _redactLockScreen.value)
         }
+    }
+
+    /** True when [mac] has a saved place rule that keeps its alerts quiet right now
+     *  ([placeRuleSuppressesAlerts]). Called after the cheap alert gates in fileLive, so the rule
+     *  evaluation (one map lookup, then a fix read cached for FIX_CACHE_NANOS) runs only for a
+     *  sighting that would otherwise alert. */
+    private fun placeRuleMutesAlerts(mac: String): Boolean {
+        val item = managedListIndexes.ignoredByMac[mac.lowercase()] ?: return false
+        return item.isPlaceRule && placeRuleSuppressesAlerts(muteRuleStatus(item))
     }
 
     /** A replayed history record. Use the board's recorded timestamp when it has one;
@@ -5648,7 +5946,15 @@ class AcabBleManager(private val context: Context) {
             // and the board never re-sends an acked seq, so rows 1..800 were gone from both
             // ends. Skip while one is in flight (each checkpoint re-seals the whole store);
             // onHistEnd's final checkpoint is the one that has to be complete.
-            if (lastSeq % 200L == 0L && !checkpointInFlight) checkpointHistory()
+            // It adopts a CHANGED generation too (the begin sentinel above named it), so a
+            // disconnect partway through a first sync or a post-Clear drain resumes from here
+            // instead of replaying the lot. Twin: iOS checkpointHistory(adoptsGeneration: true) at
+            // its every-200 checkpoint (check-signature-drift.py pins both).
+            // ponytail: that adoption bumps cursorGen (persistCursor), which drops an end
+            // checkpoint launched while this one is in flight, so a drain that ends within one
+            // write of its 200th record keeps this cursor and re-drains that tail next connect
+            // (filing is idempotent). Chain the end checkpoint behind this one if that ever matters.
+            if (lastSeq % 200L == 0L && !checkpointInFlight) checkpointHistory(adoptsGeneration = true)
         }
         if (historyEnvelopeAuthorizesCheckpoint(histBeginSeen) &&
             d.seq > histHighestContiguous) histHighestContiguous = d.seq
@@ -6070,7 +6376,7 @@ class AcabBleManager(private val context: Context) {
             // Persist the store, THEN the cursor, and the cursor only if the write landed (see
             // checkpointHistory). No begin means no generation authority: at the retry cap leave
             // both durable tuple fields untouched so reconnect requests the envelope again.
-            checkpointHistory(finalizeGeneration = disposition == HistoryEndDisposition.COMPLETE)
+            checkpointHistory(adoptsGeneration = disposition == HistoryEndDisposition.COMPLETE)
         }
         // Drain finished cleanly. Drop the "syncing" pill, and, only when the board actually
         // buffered records while we were away, raise the one-shot count banner. n == 0 (an
@@ -6186,7 +6492,7 @@ class AcabBleManager(private val context: Context) {
                 return
             }
             resetReplayCursorAfterClearAck()
-            if (!startBufferHandshake(BufferHandshakeCompletion.REKEY_AFTER_CLEAR)) {
+            if (startBufferHandshake(BufferHandshakeCompletion.REKEY_AFTER_CLEAR) != BufferHandshakeStart.STARTED) {
                 failBufferHandshake(g, BufferHandshakeWrite.KEY)
             }
         } else if (!success) {
@@ -6405,19 +6711,22 @@ class AcabBleManager(private val context: Context) {
     /** Start an ACK-gated key -> epoch -> sync transaction. Only the key exists in the queue now;
      * each successful Config response creates its successor, and sync success alone may advance
      * the startup subscription chain toward READY. */
-    private fun startBufferHandshake(completion: BufferHandshakeCompletion): Boolean {
+    private fun startBufferHandshake(completion: BufferHandshakeCompletion): BufferHandshakeStart {
         // Successors are priority-queued, so a clear cannot normally reach its ACK until the
         // active chain settles. Keep the invariant explicit as a final guard against duplicate
         // callbacks or a future caller bypassing that queue policy.
-        if (bufferHandshakeCompletion != null) return false
+        if (bufferHandshakeCompletion != null) return BufferHandshakeStart.ALREADY_RUNNING
         // Resolve and durably commit the key before queuing ANY handshake write. If storage or
         // Keystore access fails, the caller tears down this not-yet-ready session.
-        val key = keyHex() ?: return false
+        val key = keyHex() ?: return BufferHandshakeStart.KEY_UNAVAILABLE
         // Reload again at the point of use: an auto-reconnect may race an async checkpoint that
         // completed after cleanup. Either durable position is safe; an ahead volatile one is not.
-        val resumeCursor = synchronized(cursorLock) { lastSeqPersisted to lastLogGenerationPersisted }
-        lastSeq = resumeCursor.first
-        activeLogGeneration = resumeCursor.second
+        // Under cursorLock, as checkpointHistory reads the pair: this can run on the main thread
+        // while a replay record is still handled on the binder thread.
+        synchronized(cursorLock) {
+            lastSeq = lastSeqPersisted
+            activeLogGeneration = lastLogGenerationPersisted
+        }
         // We've asked the board to replay everything past lastSeq. The pill is driven by the
         // board's {"hist":"begin"} lead-in, NOT this handshake: the board streams sentinels only
         // when it actually buffered records, so a buffer-off/empty connect shows no pill (and can't
@@ -6429,7 +6738,7 @@ class AcabBleManager(private val context: Context) {
         bufferHandshakeCompletion = completion
         val queued = enqueueBufferHandshakeWrite(BufferHandshakeWrite.KEY, key)
         if (!queued) bufferHandshakeCompletion = null
-        return queued
+        return if (queued) BufferHandshakeStart.STARTED else BufferHandshakeStart.NOT_QUEUED
     }
 
     private fun enqueueBufferHandshakeWrite(step: BufferHandshakeWrite, key: String? = null): Boolean {
@@ -6500,8 +6809,11 @@ class AcabBleManager(private val context: Context) {
         // leaving the BUZZER placeholder for Desert to capture (see mirroredAlertMode). The decision
         // and the write happen under alertModeLock, so a user pick on the main thread lands either
         // wholly before (and the mirror stands down) or wholly after (and overwrites the mirror).
+        // A stored Buzzer that wrote nothing at connect mirrors the same way (see
+        // storedModeMirrorsThisLink): to this function it holds no mode until the user picks.
         val mirrored = synchronized(alertModeLock) {
-            mirroredAlertMode(hasStoredAlertMode, appHeldAlertModeThisLink, s.buzzer)
+            mirroredAlertMode(hasStoredAlertMode && !storedModeMirrorsThisLink,
+                appHeldAlertModeThisLink, s.buzzer)
                 ?.also { _alertMode.value = it }
         }
         if (mirrored != null) {
@@ -6557,6 +6869,11 @@ class AcabBleManager(private val context: Context) {
             val store = origin == AlertModeOrigin.USER || hasStoredAlertMode
             if (store) hasStoredAlertMode = true else appHeldAlertModeThisLink = true
             _alertMode.value = mode
+            // The phone holds a mode on this link again, so the connect-time mirror stands down.
+            storedModeMirrorsThisLink = false
+            // A pick with no READY board cannot be written now (setBuzzer below has no link), so
+            // the next connect owes it; a pick on a READY link is written right here.
+            if (origin == AlertModeOrigin.USER) alertModePickOwed = _state.value != ConnState.READY
             store
         }
         if (store) prefs.edit().putString("alertMode", mode.name).apply()
@@ -6909,8 +7226,17 @@ class AcabBleManager(private val context: Context) {
      *  clock) so a time-zone hop or an NTP correction can't make a fresh fix look ancient.
      *
      *  Cached briefly: this runs on the BLE callback thread once per new device, and a Desert-mode
-     *  flood would otherwise fire a binder call per record. A second of lag is centimetres. */
-    private fun freshSelfCoord(): Pair<Double, Double>? = freshSelfFix()?.coord
+     *  flood would otherwise fire a binder call per record. A second of lag is centimetres.
+     *
+     *  Accuracy-gated too ([locationFixSupportsObserver]): a fix with no reported accuracy or one
+     *  wider than OBSERVER_FIX_MAX_ACCURACY_M is not a pin. Only the observer pin reads this; the
+     *  HERE paths keep their own, stricter bar. */
+    private fun freshSelfCoord(): Pair<Double, Double>? = freshSelfFix()
+        ?.takeIf {
+            locationFixSupportsObserver(
+                SystemClock.elapsedRealtimeNanos() - it.elapsedRealtimeNanos, it.horizontalAccuracyMeters)
+        }
+        ?.coord
 
     private fun freshSelfFix(): TimedCoord? {
         if (!locationOwnershipNeeded()) {
@@ -7104,9 +7430,16 @@ class AcabBleManager(private val context: Context) {
     }
 
     private var lastGpsSent = 0L
+    /** One board location push setLocation held back while the OTA image streamed, sent when the
+     *  stream settles on this link (settleOtaLink). Re-checked for age there. */
+    @Volatile private var otaDeferredLocation: TimedCoord? = null
+
     /** Feed in the phone's location: geotag non-drone detections locally, and push it
-     *  to a connected board so a Mesh-Detect uplink can carry where we are (throttled). */
-    fun setLocation(lat: Double, lon: Double) {
+     *  to a connected board so a Mesh-Detect uplink can carry where we are (throttled).
+     *  The board push takes only an observer-grade fix ([locationFixSupportsObserver]): the board
+     *  stamps it into its ring, and a kilometre-wide first fix is not where the phone was. */
+    private fun setLocation(fix: TimedCoord) {
+        val (lat, lon) = fix.coord
         if (!validCoord(lat, lon)) return
         lastLat = lat; lastLon = lon
         // The listener primes fixCache before calling here, retaining the source fix's timestamp
@@ -7116,9 +7449,17 @@ class AcabBleManager(private val context: Context) {
             placeDemoDetections(lat, lon)
         }
         val now = System.currentTimeMillis()
-        if (_state.value == ConnState.READY && now - lastGpsSent > 15_000) {
-            lastGpsSent = now
-            writeConfig(JSONObject().put("lat", lat).put("lon", lon))
+        if (_state.value == ConnState.READY && now - lastGpsSent > 15_000 &&
+            locationFixSupportsObserver(
+                SystemClock.elapsedRealtimeNanos() - fix.elapsedRealtimeNanos, fix.horizontalAccuracyMeters)) {
+            if (otaStreaming) {
+                // A lat/lon write is a WRITE_TYPE_DEFAULT round trip whose accepted echo is a Status
+                // notify; neither belongs in the image chunk stream. Hold the newest one back.
+                otaDeferredLocation = fix
+            } else {
+                lastGpsSent = now
+                writeConfig(JSONObject().put("lat", lat).put("lon", lon))
+            }
         }
         // HERE rules are phone-side only. Crossing their boundary hides/reveals the retained
         // evidence locally; it must never rewrite the board's persistent ignore list.
@@ -7207,6 +7548,9 @@ class AcabBleManager(private val context: Context) {
         // loses the file; the user asked for the history to be gone, so Clear wins. An export
         // still being written can land after this sweep; the next export or app start bounds it
         // to EXPORT_PACKAGE_MAX_AGE_MS. iOS twin: BLEManager.clearDetections.
+        // The set-aside unreadable logs go with the file (deletePersistedLogFiles), so the notice
+        // about one goes too.
+        _unreadableLogNotice.value = null
         scope.launch(Dispatchers.IO) {
             runCatching { notifier.cancelPostedAlerts() }
             runCatching { tech.acab.app.ui.sweepExportPackages(context.cacheDir, olderThanMs = null) }
@@ -7673,16 +8017,14 @@ class AcabBleManager(private val context: Context) {
     }
 
     /** Silence a device locally; permanent scope is also persisted on the board. Ignore and
-     *  watch are mutually exclusive, so ignoring a starred device un-stars it first.
+     *  watch are mutually exclusive, so ignoring a starred device un-stars it first. A mute past
+     *  the refusal guards withdraws the device's delivered alert (DetectionNotifier.cancelPostedAlert).
      *
-     *  Returns false for THREE reasons, and the caller can only tell two of them apart: the list
-     *  is already full and the device was NOT ignored (the board holds IGNORE_CAP entries and
-     *  silently drops the rest); a HERE scope with no fix good enough to anchor it; or a MAC the
-     *  board could never store (see isBoardPushableMac, widened from "blank" to "full shape").
-     *  DetailScreen's mute sheet has a two-branch else, so that third case shows the "the
-     *  muted-device list is full" copy and an instruction that can never help. Unreachable from
-     *  genuine hardware - only a spoofed or non-conforming peer advertises a MAC of that shape -
-     *  and fixing it properly means a third message in that sheet, not a change here. */
+     *  Returns false for THREE reasons: a MAC the board could never store (see
+     *  isBoardPushableMac, widened from "blank" to "full shape"; only a spoofed or non-conforming
+     *  peer advertises one), a HERE scope with no fix good enough to anchor it, or a full list
+     *  (the board holds IGNORE_CAP entries and silently drops the rest). [muteRefusal] names which,
+     *  in this same order, so the mute sheet can say the sentence that helps. */
     fun ignoreDevice(d: Detection, scope: MuteScope = MuteScope.PERMANENT): Boolean =
         managedListEdits.serialized { _ ->
         val mac = d.mac.lowercase()
@@ -7709,6 +8051,10 @@ class AcabBleManager(private val context: Context) {
             longitude = if (scope == MuteScope.HERE) here?.coord?.second else null,
         )
         val wasWatched = isWatched(mac)
+        // Past every refusal guard, before the unchanged-rule return, as iOS's ignoreDevice does:
+        // a device already muted this way must not keep naming itself in the shade either. A
+        // failed commit below then leaves the alert withdrawn, the quieter side.
+        notifier.cancelPostedAlert(mac)
         if (previous == replacement && !wasWatched) return@serialized true
         val proposedIgnored = if (previous == null) {
             _ignored.value + replacement
@@ -7723,6 +8069,15 @@ class AcabBleManager(private val context: Context) {
         true
     }
 
+    /** Why [ignoreDevice] just returned false for [d] and [scope] ([muteRefusalFor], with the same
+     *  fix ignoreDevice reads). Shared rule with iOS (muteRefusal(for:scope:) in BLEManager.swift,
+     *  app review 2026-10-12 B.8). */
+    fun muteRefusal(d: Detection, scope: MuteScope): MuteRefusal = muteRefusalFor(
+        d.mac, scope, if (scope == MuteScope.HERE) freshSelfFix()?.asMutePosition() else null,
+        listFull = _ignored.value.let { list ->
+            list.size >= IGNORE_CAP && list.none { it.mac == d.mac.lowercase() }
+        })
+
     /** Silence a batch of devices at once (Log select-mode): one merged ignore-list push to the
      *  board (chunked per MAC_CHUNK by sendMacList) and one republish, instead of one push per
      *  row. Caps at the firmware's 256-entry ignore list.
@@ -7731,10 +8086,9 @@ class AcabBleManager(private val context: Context) {
      *
      *  A MAC the board could never store (isBoardPushableMac) IS counted here, because such a row
      *  ends up muted NOWHERE - the board cannot parse it, and a rule the board never took is not a
-     *  mute. That shares this return's wording with the list-full case, which stays a known gap:
-     *  today every unit of this return is worded as "the muted-device list is full", and the honest
-     *  repair is a second reason in the caller's toast rather than a bigger number out of here.
-     *  iOS twin: BLEManager.ignoreDevices, same rule and same wording gap. */
+     *  mute. The return mixes that reason with the full list, so the caller's toast names no
+     *  reason ("N couldn't be muted"); a single mute from the detail screen says which.
+     *  iOS twin: BLEManager.ignoreDevices, same rule and same wording. */
     fun ignoreDevices(detections: List<Detection>): Int = managedListEdits.serialized { _ ->
         if (detections.isEmpty()) return@serialized 0
         val existing = _ignored.value.associateBy { it.mac }.toMutableMap()
@@ -7778,6 +8132,8 @@ class AcabBleManager(private val context: Context) {
             }
             publishNow()
         }
+        // Every selected device is muted now, so none may keep naming itself in the shade.
+        selected.forEach(notifier::cancelPostedAlert)
         refused
     }
 
@@ -7822,12 +8178,16 @@ class AcabBleManager(private val context: Context) {
         }
     }
 
-    /** Un-star a device. */
+    /** Un-star a device, and withdraw its delivered alert: alerts are one per MAC, so that is
+     *  whatever alert it last posted, a category alert from before the star included, the same
+     *  scope as a mute. iOS twin: BLEManager.unwatch, through
+     *  DetectionNotifier.removeDetectionNotifications(forMacs:). */
     fun unwatch(mac: String) {
         managedListEdits.serialized { _ ->
             val kept = _watched.value.filterNot { it.mac == mac.lowercase() }
             if (kept.size == _watched.value.size) return@serialized
-            commitManagedLists(_ignored.value, kept)
+            if (!commitManagedLists(_ignored.value, kept)) return@serialized
+            notifier.cancelPostedAlert(mac)
         }
     }
 
@@ -8004,20 +8364,22 @@ class AcabBleManager(private val context: Context) {
 
     // ---- "mark all seen" baseline watermark ----
 
-    /** Drop a baseline at the newest detection's first-seen time. The Log's "New only" view
-     *  then shows only detections first heard after this point (and not on the ignore list).
-     *  In sample data it moves the watermarks IN MEMORY ONLY (exitDemo restores the real ones). */
+    /** Drop a baseline at the newest detection's first-seen time, never later than now. The Log's
+     *  "New only" view then shows only detections first heard after this point (and not on the
+     *  ignore list). In sample data it moves the watermarks IN MEMORY ONLY (exitDemo restores the
+     *  real ones). */
     fun markAllSeen() {
         // Two axes, two baselines. The buffered rows carry seq-derived ordering keys, not times,
         // so they only compare meaningfully against each other. Fall back to now on the live axis
         // when nothing live is in the store, or a store of buffered rows alone would drag the live
-        // watermark down to 2001 and every real sighting since would still read as new.
+        // watermark down to 2001 and every real sighting since would still read as new. The live
+        // pick is min(newest real stamp, now) (liveSeenWatermark), so a row stamped in the future
+        // cannot mark later live rows seen. TWIN: iOS markAllSeen.
         // Snapshot the store's values under storeLock so this main-thread read can't collide with
         // the BLE callback thread mutating the shared map; do the stamp mapping outside the lock.
         // snapshot store AND read firstSeenAt in ONE locked section (both are BLE-thread-mutated).
         val stamps = synchronized(storeLock) { store.values.mapNotNull { firstSeenAt[it.id] } }
-        _seenWatermark.value = stamps.filter { it > HIST_PSEUDO_BASE }.maxOrNull()
-            ?: System.currentTimeMillis()
+        _seenWatermark.value = liveSeenWatermark(stamps, System.currentTimeMillis())
         // min, not max: the pseudo axis descends with seq, so the smallest stamp in the store is
         // the most recent buffered record. Taking the max would baseline on the OLDEST one and
         // leave every later drain reading as already-seen.
@@ -8321,10 +8683,10 @@ class AcabBleManager(private val context: Context) {
             // "moto" is present so the tour shows the Motorola sub-toggle. Omitting it would make
             // the demo board look like pre-split firmware and hide the control the tour exists to
             // introduce. "axon":true so the parent category is on and the sub-row is not dimmed.
-            """{"fw":"beacon board 2.1.0","up":4920,"total":6,"ble":true,"wifi":true,"axon":true,"moto":true,"tracker":true,"glasses":true,"ncam":true,"buzzer":true,"vol":70,"gps":true,"bat":82}""").apply {
+            """{"fw":"beacon board 2.2.0","up":4920,"total":6,"ble":true,"wifi":true,"axon":true,"moto":true,"tracker":true,"glasses":true,"ncam":true,"buzzer":true,"vol":70,"gps":true,"bat":82}""").apply {
             when (debugKind) {
-                BoardKind.OUI_SPY -> put("fw", "ACAB-ouispy 2.1.0")
-                BoardKind.MESH_DETECT -> put("fw", "mesh-detect-ACAB 2.1.0")
+                BoardKind.OUI_SPY -> put("fw", "ACAB-ouispy 2.2.0")
+                BoardKind.MESH_DETECT -> put("fw", "mesh-detect-ACAB 2.2.0")
                 BoardKind.BEACON, null -> Unit
             }
         })
@@ -8507,17 +8869,11 @@ class AcabBleManager(private val context: Context) {
     private fun detectionStore(): File = File(context.filesDir, "detections.json")
     private fun detectionTempStore(): File = File(context.filesDir, "detections.json.tmp")
 
-    /** Delete both the live atomic target and a staging file left by an interrupted checkpoint.
-     *  Caller holds [persistMutex], so no rename can cross the confirmed-absence check. */
+    /** Delete the live atomic target, a staging file left by an interrupted checkpoint, and every
+     *  unreadable log set aside at load ([deletePersistedLogFiles]). Caller holds [persistMutex],
+     *  so no rename can cross the confirmed-absence check. */
     private fun deletePersistedDetectionFilesLocked(): Boolean =
-        performConfirmedPersistedDetectionDeletion(
-            fileExists = { detectionStore().exists() || detectionTempStore().exists() },
-            remove = {
-                for (file in listOf(detectionStore(), detectionTempStore())) {
-                    if (file.exists() && !file.delete()) error("persisted detection delete failed")
-                }
-            },
-        )
+        deletePersistedLogFiles(detectionStore(), detectionTempStore())
 
     /** Fallback boundary when SharedPreferences cannot durably arm the write-ahead tombstone. */
     private fun deletePersistedDetectionsSynchronously(): Boolean = runCatching {
@@ -8700,10 +9056,12 @@ class AcabBleManager(private val context: Context) {
      *  rows the write covers nor undo a wipe that landed while the write was in flight; on
      *  failure the cursor stays put, the board re-sends, and filing is idempotent by id, so a
      *  re-drain costs a little radio and nothing else. */
-    private fun checkpointHistory(finalizeGeneration: Boolean = false) {
-        val cursor = lastSeq
-        val logGeneration = activeLogGeneration
-        val cursorEpoch = synchronized(cursorLock) { cursorGen }
+    private fun checkpointHistory(adoptsGeneration: Boolean) {
+        // One locked read: cleanup()/startBufferHandshake reload this pair on the main thread, and
+        // a torn read (the reloaded cursor with the drain's new generation) adopted mid-drain
+        // would make the board skip records it never delivered.
+        val (cursor, logGeneration, cursorEpoch) =
+            synchronized(cursorLock) { Triple(lastSeq, activeLogGeneration, cursorGen) }
         checkpointInFlight = true
         persistDetections { saved ->
             checkpointInFlight = false
@@ -8711,7 +9069,7 @@ class AcabBleManager(private val context: Context) {
                 cursor,
                 logGeneration = logGeneration,
                 cursorEpoch = cursorEpoch,
-                finalizeGeneration = finalizeGeneration,
+                finalizeGeneration = adoptsGeneration,
             )
         }
     }
@@ -8836,12 +9194,18 @@ class AcabBleManager(private val context: Context) {
                         )) {
                         false
                     } else runCatching {
-                        // Stage a sibling, then rename it in. writeText() TRUNCATES the live file
-                        // and then streams into it, so a kill mid-write must not truncate the only
-                        // retained copy. rename(2) within one directory is atomic.
+                        // Stage a sibling, then rename it in. Writing the live file in place would
+                        // TRUNCATE it first, so a kill mid-write must not truncate the only retained
+                        // copy. rename(2) within one directory is atomic for the NAME only: with
+                        // delayed allocation a power cut can still leave the renamed file empty, so
+                        // the bytes are fsynced before the rename (what AlprStore gets from
+                        // AtomicFile).
                         val f = detectionStore()
                         val tmp = detectionTempStore()
-                        tmp.writeText(gcmSeal(text.encodeToByteArray()))
+                        FileOutputStream(tmp).use { out ->
+                            out.write(gcmSeal(text.encodeToByteArray()).encodeToByteArray())
+                            out.fd.sync()
+                        }
                         if (!tmp.renameTo(f)) { tmp.delete(); error("detections rename failed") }
                     }.isSuccess
                 }
@@ -8861,16 +9225,26 @@ class AcabBleManager(private val context: Context) {
         val loadToken = persistedDetectionLoadGate.beginLoad()
         val stored = runCatching { detectionStore().readText() }.getOrNull()?.trim() ?: return
         // sealed blobs are "ivHex:ctHex"; an old build wrote a plaintext JSON array (starts with '[').
-        // decrypt the sealed form, tolerate the legacy plaintext, and on any decrypt failure just
-        // start fresh (best-effort, never crash).
         val legacyPlaintext = stored.startsWith("[")
-        val raw = if (legacyPlaintext) stored
-                  else runCatching { gcmOpen(stored).decodeToString() }.getOrNull() ?: return
+        val arr = persistedLogRows(stored) { gcmOpen(it).decodeToString() }
+        if (arr == null) {
+            // Unreadable (a decrypt or parse failure). This used to start fresh with the file left
+            // in place, and the next checkpoint overwrote it: evidence destroyed in silence. Move it
+            // aside instead, under the writers' mutex so no checkpoint renames in between, and say
+            // so once. The log line names no contents, like the skipped-row one below.
+            val kept = persistMutex.withLock {
+                setAsideUnreadableLog(detectionStore(), System.currentTimeMillis())
+            }
+            android.util.Log.w("AcabBleManager",
+                if (kept != null) "persisted log unreadable; kept aside" else "persisted log unreadable; set-aside failed")
+            if (kept != null) _unreadableLogNotice.value = UNREADABLE_LOG_NOTICE
+            return
+        }
         runCatching {
-            val arr = JSONArray(raw)
             // PER-ROW tolerant, matching iOS. One malformed row must never cost the user their
             // whole history: parse each entry independently and keep every row that survives.
-            // The outer runCatching only guards the top-level JSONArray parse now.
+            // The top-level parse already happened in persistedLogRows; this runCatching is only
+            // a last guard against an unexpected throw.
             // Order on the SORT KEY, not the stamp. A bracketed or unbounded record carries the
             // seq pseudo-stamp, which sits near 2001, so sorting on "_fs" buries every buffered
             // row the board couldn't date under the whole real log, however recently it was
@@ -9001,8 +9375,11 @@ class AcabBleManager(private val context: Context) {
         /** The one sentence a user needs when a connect will not take, as a template: the connect
          *  watchdog renders it for the target's kind, the pair-window note in the connect
          *  screen's failure panel (AcabApp ConnectionHintPanel) for the screen's kind. Kept byte-identical to iOS BLEManager.pairWindowHint: this is
-         *  user-facing copy and the two apps must not diverge. */
-        const val PAIR_WINDOW_HINT_TEMPLATE = "turn the {noun} off and on, then connect within two minutes."
+         *  user-facing copy and the two apps must not diverge. It starts with the other phone's
+         *  Bluetooth because the board holds one link at a time (CONFIG_BT_NIMBLE_MAX_CONNECTIONS=1)
+         *  and stops advertising while it has one: a paired phone running Live Mode reconnects first
+         *  after the power cycle, so the new phone never sees the board inside its window. */
+        const val PAIR_WINDOW_HINT_TEMPLATE = "turn off Bluetooth on any other phone that uses the {noun}, then turn the {noun} off and on and connect within two minutes."
 
         /** [PAIR_WINDOW_HINT_TEMPLATE] for [kind]; null reads as beacon. */
         fun pairWindowHint(kind: BoardKind?): String = renderBoardCopy(PAIR_WINDOW_HINT_TEMPLATE, kind)
@@ -9010,8 +9387,16 @@ class AcabBleManager(private val context: Context) {
         /** The DEBUG stand-in row's address (applyDebugBoardKind): locally administered (the 0x02
          *  bit of the first octet), so no factory MAC can collide with it. */
         internal const val DEBUG_REMEMBERED_ADDRESS = "02:00:00:00:00:01"
+        /** PLATFORM DIFFERENCE from its iOS twin (BLEManager.swift's .secureSetup call site, which
+         *  says "Unlock your phone and reconnect."): the iOS key is AfterFirstUnlockThisDeviceOnly,
+         *  so unlocking can help there, while wrappingKey here sets no unlock or authentication
+         *  requirement, so the advice would be false. */
         const val BUFFER_KEY_UNAVAILABLE_HINT =
-            "Secure buffer key storage is unavailable. Unlock your phone and reconnect."
+            "Secure buffer key storage is unavailable. Reconnect, and restart your phone if it keeps happening."
+
+        /** [unreadableLogNotice]'s sentence. Lowercase-first body copy. */
+        const val UNREADABLE_LOG_NOTICE =
+            "an earlier saved log could not be opened, so this phone kept it aside and started a new one."
 
         @Volatile private var INSTANCE: AcabBleManager? = null
 
@@ -9140,6 +9525,10 @@ class AcabBleManager(private val context: Context) {
         // connectTimeoutTimer; the platform's own failure (status 133) takes ~30 s and lands on
         // a static resting screen instead of a live rescan.
         private const val CONNECT_TIMEOUT_MS = 15_000L
+        // The pause before a fresh connect's one retry after an error drop (retriesFreshLinkDrop):
+        // time for the stack to release the failed client, well inside CONNECT_TIMEOUT_MS, which
+        // still bounds the whole tap.
+        private const val FRESH_CONNECT_RETRY_MS = 1_000L
         // The user may have to approve Android's system pairing sheet. Give that interaction room,
         // but never leave the app's Pairing screen unbounded if no terminal broadcast arrives.
         private const val PAIRING_TIMEOUT_MS = 45_000L
@@ -9163,9 +9552,11 @@ class AcabBleManager(private val context: Context) {
         // Rides across the stop->start gap of a rotation (ProcessLifecycleOwner uses ~700 ms).
         private const val BACKGROUND_DEBOUNCE_MS = 700L
 
-        // Re-drain requests allowed per connection before onHistEnd accepts a short drain
-        // as-is (cross-platform contract with iOS: cap of 2, accept-at-cap advances the
-        // cursor to the highest seq actually received).
+        // Re-drain requests allowed per connection before onHistEnd stops asking (cross-platform
+        // contract with iOS: cap of 2). At the cap the attempt settles as DEFER_INCOMPLETE
+        // (historyEndDisposition): the contiguous cursor is retained, never advanced across the
+        // gap, and the next connection retries from it (docs/ble-protocol.md, "Why the replay
+        // check needs all three numbers").
         private const val HIST_RESYNC_MAX = 2
     }
 }

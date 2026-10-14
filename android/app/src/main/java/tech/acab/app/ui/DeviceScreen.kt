@@ -161,12 +161,14 @@ import tech.acab.app.ble.DetectionNotifier
 import tech.acab.app.ble.connectedBoardKind
 import tech.acab.app.ble.isBoardBackedMute
 import tech.acab.app.ble.isFirmwareVersionOlder
+import tech.acab.app.ble.muteCoversPowerCues
 import tech.acab.app.ble.renderBoardCopy
 import tech.acab.app.ble.unrepresentedBoardRuleCount
 import tech.acab.app.model.DeviceStatus
 import tech.acab.app.model.DeviceType
 import tech.acab.app.net.FirmwareBuild
 import tech.acab.app.net.FirmwareManifest
+import tech.acab.app.net.LATEST_PUBLISHED_FIRMWARE
 import tech.acab.app.ui.theme.Acab
 import tech.acab.app.ui.theme.AcabTypography
 import tech.acab.app.ui.theme.ContrastMode
@@ -993,8 +995,9 @@ private val StatTileValueStyle = AcabTypography.titleLarge.telemetry(weight = Fo
 private val HeroMarkSize = 56.dp
 
 /** Latest published beacon-board firmware; last-resort offline fallback for an unrecognized
- *  board label (known boards read their per-board version from the manifest). Bump on release. */
-private const val LATEST = "2.1.0"
+ *  board label (known boards read their per-board version from the manifest). An alias, not a
+ *  literal: bump [LATEST_PUBLISHED_FIRMWARE] in net/FirmwareManifest.kt, which FALLBACK reads too. */
+private const val LATEST = LATEST_PUBLISHED_FIRMWARE
 
 /**
  * One optimistic board control, described once. Three sites derive everything from the list of
@@ -1704,10 +1707,13 @@ internal fun DeviceScreen(
             // trust. The Log shows the same notices beside the retained evidence.
             status?.bufferHealthNotices?.forEach { BufferHealthBanner(it) }
             // While a deferred board-side erase is still sweeping, the bufCount is stale, so say
-            // "clearing…" instead of a leftover number until the wipe settles.
+            // "clearing…" instead of a leftover number until the wipe settles. The base line is
+            // the iOS twin's subtitle byte for byte (SettingsView.swift offlineBufferCard); the
+            // "clearing…" and "N buffered" variants are a documented Android-only difference, as
+            // iOS's toggle row has no live count.
             val bufferSubtitle = if (status?.wiping == true) "clearing buffer…"
                 else status?.bufCount?.takeIf { bufferOn }?.let { "$it buffered · replays on reconnect" }
-                    ?: "board records while phone is away"
+                    ?: "board records while your phone is away · replays on reconnect"
             ToggleRow(
                 "Store detections offline",
                 bufferSubtitle,
@@ -1716,6 +1722,13 @@ internal fun DeviceScreen(
             ) {
                 bufferOn = it; bufferPending = true; if (!demo) ble.setBuffer(it)
             }
+            // In-place disclosure of the seizure tradeoff (privacy.html weighs it before switching
+            // the buffer on): while buffering, the board keeps the key in flash and stamps buffered
+            // rows with the last fix this phone pushed (docs/ble-protocol.md `key`, `lat`,`lon`),
+            // so a taken board is readable. Always shown, on or off. iOS twin: the same sentence under
+            // the toggle in SettingsView.swift offlineBufferCard.
+            Text("the board keeps the key and your phone's last position · anyone who takes the board can read what it stored",
+                color = Acab.faint, fontSize = 11.sp)
             // Sample mode must never expose a real-board destructive action.
             if (shouldOfferBufferClear(
                     isDemoMode = demo,
@@ -1808,20 +1821,21 @@ internal fun DeviceScreen(
                     color = Acab.warn, fontSize = 11.sp)
             }
             HorizontalDivider(color = Acab.line)
-            // The subtitle names ALL THREE surfaces this switch reaches on Android, because it
-            // reaches more than the lock screen: the Live Mode notification (locked face drops to
-            // "Live Mode active"), the Android 16 promoted chip (loses its running count, locked
-            // or not), and per-detection alerts (locked face stops naming the category). The old
-            // wording promised counts "remain visible in the shade", which the chip half has not
-            // been true of since AcabLinkService.shortCriticalText started reading this flag, and
-            // it said nothing about the alerts half at all. Erring quieter than advertised is the
-            // safe side of a mismatch on this product, so the copy widened, not the behaviour.
-            // iOS scopes its same-named toggle to the Live Activity only, which is why its
-            // subtitle (SettingsView.swift) still reads narrower; see the _redactLockScreen
-            // declaration in AcabBleManager for the full scope.
+            // TITLE is the iOS twin's byte for byte (SettingsView.swift, the radioToggle bound to
+            // settingsRedactLockScreen); until 2026-10-12 it read "Keep counts private on lock
+            // screen" here and "Hide counts on lock screen" there, and the switch hides more than
+            // counts on both. The SUBTITLES stay platform-specific because the surfaces differ
+            // (iOS: Live Activity, alerts and widget, no status-bar chip). This one names the three
+            // surfaces the switch reaches here, each locked or not: the Live Mode notification's
+            // text becomes the generic face (AcabLinkService.liveFaceText), per-detection alerts go
+            // generic (DetectionNotifier.notifyIfNeeded), and the Android 16 promoted chip loses
+            // its running count (AcabLinkService.shortCriticalText). SystemReadinessCard's
+            // "Lock-screen counts" PRIVATE and beaconLiveRowValue's COUNTS PRIVATE rest on the
+            // same three. A subtitle may promise less than the switch does, never more. The scope
+            // has one owner: the _redactLockScreen declaration in AcabBleManager.
             ToggleRow(
-                "Keep counts private on lock screen",
-                "lock screen shows only “Live Mode active” · locked alerts drop their details, and the status-bar chip drops its count everywhere · the app itself still shows everything",
+                "Hide details on lock screen",
+                "Live Mode shows only “Active · counts in app” · alerts drop their details · the status-bar chip drops its count · the app itself still shows everything",
                 checked = shownRedactLock,
             ) { if (demo) sampleRedactLock = it else ble.setRedactLockScreen(it) }
         }
@@ -1840,13 +1854,16 @@ internal fun DeviceScreen(
             if (desertOn) {
                 // The startup jingle is NOT exempt from the mute (alerts.cpp, 2026-08-24: the boot
                 // motif is a UserAlert, so a muted board never announces itself - an unattended
-                // power restore is indistinguishable from a hand on the plug). The shutdown motif
-                // is the cue that still plays muted. Said plainly here so a user who mutes the
-                // board, power-cycles it and hears nothing does not read silence as a dead board.
-                // Worded as the JINGLE, not as "starts silently": the rev-B hold-to-start ack is a
-                // separate cue and does still chirp through the mute.
-                // iOS twin: the same string in SettingsView.swift's desertModeCard.
-                Text("Detection alerts are muted while Desert mode runs. With every nearby device reporting in, a beep for each would never let up. The shutdown cue still plays unless volume is 0; the startup jingle is muted along with everything else.",
+                // power restore is indistinguishable from a hand on the plug). Said plainly here so
+                // a user who mutes the board, power-cycles it and hears nothing does not read
+                // silence as a dead board. TWO WORDINGS by firmware, the same rule as BuzzerCard's
+                // caption: from 2.2.1 the mute also covers the shutdown motif and the rev-B
+                // hold-to-start ack ([muteCoversPowerCues]), so the note says both power cues are
+                // muted; older firmware still plays the shutdown motif muted, and that wording names
+                // it. iOS twin: the same two strings in SettingsView.swift's desertModeCard.
+                Text(if (muteCoversPowerCues(status?.version))
+                        "Detection alerts are muted while Desert mode runs. With every nearby device reporting in, a beep for each would never let up. The startup and shutdown cues are muted too."
+                    else "Detection alerts are muted while Desert mode runs. With every nearby device reporting in, a beep for each would never let up. The shutdown cue still plays unless volume is 0; the startup jingle is muted along with everything else.",
                     color = Acab.warn, fontSize = 11.sp)
             }
             // Desert is over and the alert mode stayed SILENT. Nothing above says so, and a user
@@ -2152,6 +2169,7 @@ internal fun DeviceScreen(
             // (beaconRows meshBoard), and the pending mode is cleared the
             // moment Desert comes back on or the user picks anything by hand.
             restoreOffered = alertRestoreOffered,
+            muteCoversPowerCues = muteCoversPowerCues(status?.version),
             onRestore = takeAlertRestore,
             onMasterChange = { masterVolume = it; volumeDragging = true },
             onMode = {
@@ -3535,6 +3553,7 @@ private fun BuzzerCard(
     mode: AlertMode,
     master: Float,
     restoreOffered: Boolean,
+    muteCoversPowerCues: Boolean,
     onRestore: () -> Unit,
     onMasterChange: (Float) -> Unit,
     onMode: (AlertMode) -> Unit,
@@ -3544,14 +3563,17 @@ private fun BuzzerCard(
         CardKicker("ALERTS")
 
         AlertModePicker(mode = mode, onMode = onMode)
-        // "power cues" used to cover the boot jingle too, which the board no longer plays while
-        // muted (alerts.cpp 2026-08-24: the boot motif is a UserAlert, so mute wins; see the
-        // Desert-mode note in DeviceScreen). Two cues still bypass the mute, both PowerState: the
-        // shutdown motif and the rev-B hold-to-start ack. Only the shutdown one is named here,
-        // because it is the one every SKU plays and the one a muted user is surprised by; the ack
-        // always directly follows the user's own hold on the button, so it explains itself.
-        // Volume 0 silences both. iOS twin: alertModeCaption in SettingsView.swift. Buzzer and
-        // Silent are byte-identical there and MUST stay so. Vibrate is NOT, deliberately: the
+        // TWO WORDINGS, chosen by the connected board's firmware ([muteCoversPowerCues], computed
+        // by the caller from the status). From 2.2.1 the alert mute covers every cue (alerts.cpp
+        // buzzerTone), so Vibrate and Silent say all board sounds are off. Before it, two cues
+        // still bypassed the mute, both PowerState: the shutdown motif and the rev-B hold-to-start
+        // ack. That wording names only the shutdown one, because it is the one every SKU plays and
+        // the one a muted user is surprised by; the ack always directly follows the user's own
+        // hold on the button, so it explains itself. Volume 0 silences both there. A status that
+        // has not arrived, or a version that does not parse, gets the older wording: a caption may
+        // promise less silence than the board delivers, never more. iOS twin: alertModeCaption in
+        // SettingsView.swift. Buzzer and Silent are byte-identical there, in both wordings, and
+        // MUST stay so. Vibrate is NOT, deliberately: the
         // haptic here fires in AcabBleManager.alertHaptic on the detection ingest path, so it
         // runs wherever ingest runs - including with the screen locked, whenever something keeps
         // the process and the link alive, which in the background is Live Mode's foreground
@@ -3562,19 +3584,22 @@ private fun BuzzerCard(
         Text(
             when (mode) {
                 AlertMode.BUZZER -> "board beeps when it spots gear"
-                AlertMode.VIBRATE -> "detection beeps off, the shutdown cue still plays unless volume is 0. This phone buzzes on new hits"
-                AlertMode.SILENT -> "detection beeps and phone feedback off, the shutdown cue still plays unless volume is 0"
+                AlertMode.VIBRATE -> if (muteCoversPowerCues) "all board sounds off. This phone buzzes on new hits"
+                    else "detection beeps off, the shutdown cue still plays unless volume is 0. This phone buzzes on new hits"
+                AlertMode.SILENT -> if (muteCoversPowerCues) "all board sounds and phone feedback off"
+                    else "detection beeps and phone feedback off, the shutdown cue still plays unless volume is 0"
             },
             color = Acab.faint, fontSize = 11.sp,
         )
 
         if (restoreOffered) AlertRestoreOffer(onRestore)
 
-        // LIVE IN ALL THREE MODES. Vibrate and Silent turn detection beeps off, so the only
-        // thing this level still governs there is the shutdown cue the caption above names - and
-        // volume 0 is the ONLY thing that silences it (firmware alerts.cpp buzzerTone: a
-        // PowerState cue bypasses the alert mute, a zero volume does not). Greying the slider out
-        // in those two modes made the remedy their own copy names unreachable from them.
+        // LIVE IN ALL THREE MODES. Vibrate and Silent turn detection beeps off. On firmware before
+        // 2.2.1 the only thing this level still governs there is the shutdown cue the older caption
+        // names, and volume 0 is the ONLY thing that silences it (a PowerState cue bypassed the
+        // alert mute there; from 2.2.1 buzzerTone mutes every cue, see [muteCoversPowerCues]).
+        // Greying the slider out in those two modes made the remedy that copy names unreachable
+        // from them, and an older board still needs it.
         // iOS twin: the same rule on the Master volume slider in SettingsView.swift's buzzerCard.
         VolumeSlider("Master volume", value = master, tone = Acab.accent, bold = true,
             // Round, don't truncate: the status-echo check compares roundToInt(), so a truncated

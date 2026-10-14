@@ -41,6 +41,19 @@ import tech.acab.app.ui.relativeAgo
 internal fun shortCriticalText(total: Int, connected: Boolean, redact: Boolean): String? =
     if (redact || !connected || total <= 0) null else total.toString()
 
+/** The generic Live Mode face: the public version, and the whole text while the switch is on. */
+internal const val LIVE_GENERIC_TEXT = "Active · counts in app"
+
+/**
+ * The Live Mode notification's own text. With the "Hide details on lock screen" switch on it is
+ * the generic face, locked or not: VISIBILITY_PRIVATE alone leaves a locked phone to Android's
+ * sensitive-notification setting, whose default shows a private notification in full. Off, or
+ * while reconnecting (that line carries no detail), the live text. iOS twin: the Live Activity's
+ * redacted face in DetectionLiveActivity.swift.
+ */
+internal fun liveFaceText(text: String, connected: Boolean, redact: Boolean): String =
+    if (redact && connected) LIVE_GENERIC_TEXT else text
+
 /**
  * Drive-mode foreground service. Keeps the BLE link alive in the background (the manager
  * is a process singleton) and posts an ongoing "glanceable counter" notification , a live
@@ -295,27 +308,25 @@ class AcabLinkService : Service() {
         val b = NotificationCompat.Builder(this, CHANNEL_ID)
             .setSmallIcon(R.drawable.ic_stat_beacons)
             .setContentTitle("LIVE MODE")
-            .setContentText(face.text)
+            .setContentText(liveFaceText(face.text, face.connected, face.redact))
             .setOngoing(true)
             .setOnlyAlertOnce(true)
             .setShowWhen(false)
             .setContentIntent(tap)
             .setCategory(NotificationCompat.CATEGORY_STATUS)
             .setForegroundServiceBehavior(NotificationCompat.FOREGROUND_SERVICE_IMMEDIATE)
-        // The expanded shade keeps the per-category tally, the analog of the iOS tile row.
-        if (face.connected && face.breakdown.isNotEmpty()) {
+        // The expanded shade keeps the per-category tally, the analog of the iOS tile row, unless
+        // the switch is on (liveFaceText).
+        if (!face.redact && face.connected && face.breakdown.isNotEmpty()) {
             b.setStyle(NotificationCompat.BigTextStyle().bigText("${face.text}\n${face.breakdown}"))
         }
-        if (face.redact) {
-            // Lock-screen privacy (user setting, default OFF so counts are visible unless the
-            // user turns redaction on): while on, a locked phone shows only the redacted public
-            // version ("Live Mode active"), never the gear breakdown. The full text appears in
-            // the shade once unlocked.
-            b.setVisibility(NotificationCompat.VISIBILITY_PRIVATE)
-            b.setPublicVersion(buildPublic(tap))
-        } else {
-            b.setVisibility(NotificationCompat.VISIBILITY_PUBLIC)
-        }
+        // Lock screen: always PRIVATE with the generic public face, so the system's own
+        // "sensitive notifications" setting also applies. Never PUBLIC, which overrode a user who
+        // told the OS to hide details (app review 2026-10-12 A.5). The in-app switch does not rely
+        // on that setting: it makes the text itself generic (liveFaceText) and drops the chip's
+        // count (promoteIfSupported).
+        b.setVisibility(NotificationCompat.VISIBILITY_PRIVATE)
+        b.setPublicVersion(buildPublic(tap))
         promoteIfSupported(b, face.total, face.connected, face.redact)
         return b.build()
     }
@@ -352,7 +363,7 @@ class AcabLinkService : Service() {
         NotificationCompat.Builder(this, CHANNEL_ID)
             .setSmallIcon(R.drawable.ic_stat_beacons)
             .setContentTitle("LIVE MODE")
-            .setContentText("Active · counts in app")
+            .setContentText(LIVE_GENERIC_TEXT)
             .setOngoing(true)
             .setShowWhen(false)
             .setContentIntent(tap)

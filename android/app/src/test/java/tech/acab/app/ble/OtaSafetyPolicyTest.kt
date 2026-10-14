@@ -328,6 +328,22 @@ class OtaSafetyPolicyTest {
     }
 
     @Test
+    fun `the Alerts copy promises muted power cues only from firmware 2_2_1`() {
+        // alerts.cpp buzzerTone mutes the shutdown motif and the rev-B hold-to-start ack from
+        // 2.2.1; older firmware plays them muted, so the caption must keep warning there. Both
+        // sides of the boundary are asserted, so moving the threshold either way fails here.
+        // TWIN: OtaVersionGateTests.testMuteCoversPowerCuesFromFirmware221 (iOS).
+        assertFalse(muteCoversPowerCues("2.2.0"))
+        assertTrue(muteCoversPowerCues("2.2.1"))
+        assertTrue(muteCoversPowerCues("2.3.0"))
+        assertFalse(muteCoversPowerCues("2.1.9"))
+        // No status yet, or a version that does not parse: keep the louder, older wording.
+        assertFalse(muteCoversPowerCues(null))
+        assertFalse(muteCoversPowerCues("2.2.1x"))
+        assertFalse(muteCoversPowerCues("ESP32"))
+    }
+
+    @Test
     fun `firmware version gate matches the complete release grammar`() {
         for (valid in listOf(
             "2", "2.0", "2.0.6", "0.0.1", "1023.1023.1023", "2.0.6-rc1",

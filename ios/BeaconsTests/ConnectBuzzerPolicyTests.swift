@@ -1,7 +1,9 @@
 import XCTest
 @testable import Beacons
 
-/// A phone with no stored alert mode must never change whether the board makes sound on its own.
+/// A phone with no stored alert mode must never change whether the board makes sound on its own,
+/// and since the app review of 2026-10-12 (A.7) neither may a stored Buzzer: a connect writes only
+/// a stored quiet mode, or a pick the user made while no board was ready.
 ///
 /// THE DEFECT (security review 2026-09-29). With nothing stored, the in-memory mode defaulted to
 /// .buzzer and the connect path pushed it, so a reinstall, cleared data or a second phone un-muted
@@ -12,26 +14,41 @@ import XCTest
 /// The pure-rule tests pin what both platforms run. The manager tests drive the REAL BLEManager
 /// over an isolated preference suite: its reconcileBuzzer, setAlertMode and setDesertMode, and
 /// connectTimeBuzzerWrite, the exact value the connect path hands to the board.
-/// Not covered here, because both need a real peripheral: the per-link hold being cleared in
-/// didConnect, clearConnection, didDisconnect and at READY, and the Config object setDesertMode
-/// actually sends (the pure desertEnableConfig and desertDisableConfig are pinned instead). Android twin: ConnectBuzzerPolicyTest.kt, same
+/// Not covered here, because they need a real peripheral: the per-link hold being cleared in
+/// didConnect, clearConnection, didDisconnect and at READY, the owed pick being consumed at READY,
+/// and the Config object setDesertMode actually sends (the pure desertEnableConfig and
+/// desertDisableConfig are pinned instead). Android twin: ConnectBuzzerPolicyTest.kt, same
 /// pure-rule vectors.
 final class ConnectBuzzerPolicyTests: XCTestCase {
 
     // MARK: - the pure rules
 
-    /// No stored mode writes nothing, whatever mode is on screen; a stored mode writes exactly its
-    /// own buzzer state. Reverting to "write mode == .buzzer" fails the first two lines.
-    func testConnectWritesOnlyAStoredMode() {
+    /// A connect writes a stored QUIET mode and nothing else: no stored mode writes nothing, and a
+    /// stored Buzzer writes nothing either, so a board muted from another phone stays muted.
+    /// Reverting to "write mode == .buzzer" fails the first two lines; the previous rule,
+    /// `hasStoredMode ? mode == .buzzer : nil`, fails the third (it wrote true).
+    func testConnectWritesOnlyAStoredQuietMode() {
         XCTAssertNil(connectBuzzerWrite(hasStoredMode: false, mode: .buzzer))
         XCTAssertNil(connectBuzzerWrite(hasStoredMode: false, mode: .silent))
-        XCTAssertEqual(connectBuzzerWrite(hasStoredMode: true, mode: .buzzer), true)
+        XCTAssertNil(connectBuzzerWrite(hasStoredMode: true, mode: .buzzer))
         XCTAssertEqual(connectBuzzerWrite(hasStoredMode: true, mode: .vibrate), false)
         XCTAssertEqual(connectBuzzerWrite(hasStoredMode: true, mode: .silent), false)
     }
 
+    /// The one exception: a pick the user made while no board was ready (the Desert restore offer
+    /// on the connect screen) is written at the next connect, Buzzer included. With nothing stored
+    /// there is no pick to owe. Dropping the pickOwed arm fails the first line (nil, not true).
+    func testAPickOwedFromWhileAwayIsWrittenAtConnect() {
+        XCTAssertEqual(connectBuzzerWrite(hasStoredMode: true, mode: .buzzer, pickOwed: true), true)
+        XCTAssertEqual(connectBuzzerWrite(hasStoredMode: true, mode: .silent, pickOwed: true), false)
+        XCTAssertEqual(connectBuzzerWrite(hasStoredMode: true, mode: .vibrate, pickOwed: true), false)
+        XCTAssertNil(connectBuzzerWrite(hasStoredMode: false, mode: .buzzer, pickOwed: true))
+    }
+
     /// A phone with no mode mirrors: sound on reads .buzzer, muted reads .silent (never .vibrate).
-    /// A stored mode or an app-held mode on this link turns the mirror off.
+    /// A stored mode or an app-held mode on this link turns the mirror off. A stored Buzzer the
+    /// phone did not set on this link reaches this rule as hasStoredMode false (reconcileBuzzer),
+    /// so it mirrors a muted board as .silent by the second line.
     func testMirrorRule() {
         XCTAssertEqual(mirroredAlertMode(hasStoredMode: false, heldThisLink: false, boardBuzzer: true), .buzzer)
         XCTAssertEqual(mirroredAlertMode(hasStoredMode: false, heldThisLink: false, boardBuzzer: false), .silent)
@@ -146,18 +163,52 @@ final class ConnectBuzzerPolicyTests: XCTestCase {
         XCTAssertNil(ble.connectTimeBuzzerWrite)
     }
 
-    /// A phone that stores a mode keeps the old mesh bail: mesh frames (always buzzer:false) must
-    /// not correct a stored Buzzer to Silent, which would mute the user's real beacon on its next
-    /// connect. Four frames, one past the re-assert burst, because the in-memory correction only
-    /// runs once the burst is spent; with the bail removed this fails on both assertions.
-    func testMeshBailStillProtectsAStoredMode() throws {
+    /// THE A.7 DEFECT. A stored Buzzer meeting a muted board used to re-assert sound (three
+    /// buzzer:true writes, alertMode held at .buzzer) and wrote buzzer:true at every connect. It
+    /// now mirrors the board like a phone with no mode: Silent on screen, the pick still stored,
+    /// nothing written at connect, and sound shown again once the board reports it. On the old
+    /// code the first assertion fails (.buzzer) and so does the connect write (true).
+    func testAStoredBuzzerMirrorsAMutedBoardAndWritesNothingAtConnect() throws {
         let defaults = isolatedDefaults()
         defaults.set(true, forKey: originAwareKey)   // stored after the upgrade rule, so it is a pick
         defaults.set(AlertMode.buzzer.rawValue, forKey: modeKey)
         let ble = BLEManager(defaults: defaults)
-        for _ in 0..<4 { ble.reconcileBuzzer(try status(buzzer: false, fw: "mesh-detect-ACAB")) }
         XCTAssertEqual(ble.alertMode, .buzzer)
+        ble.reconcileBuzzer(try status(buzzer: false))
+        XCTAssertEqual(ble.alertMode, .silent, "a board muted elsewhere stays muted and says so")
+        XCTAssertNil(ble.connectTimeBuzzerWrite)
+        XCTAssertEqual(defaults.string(forKey: modeKey), AlertMode.buzzer.rawValue,
+                       "the mirror moves the screen, never the stored pick")
+        ble.reconcileBuzzer(try status(buzzer: true))
+        XCTAssertEqual(ble.alertMode, .buzzer)
+        XCTAssertNil(ble.connectTimeBuzzerWrite)
+    }
+
+    /// A mesh board (always buzzer:false) meets a stored Buzzer the same way: mirrored as Silent in
+    /// memory only. The stored pick survives, so the user's real beacon is neither muted nor
+    /// un-muted by its next connect. Four frames, one past the old re-assert burst.
+    func testMeshFramesNeverRewriteAStoredBuzzer() throws {
+        let defaults = isolatedDefaults()
+        defaults.set(true, forKey: originAwareKey)
+        defaults.set(AlertMode.buzzer.rawValue, forKey: modeKey)
+        let ble = BLEManager(defaults: defaults)
+        for _ in 0..<4 { ble.reconcileBuzzer(try status(buzzer: false, fw: "mesh-detect-ACAB")) }
+        XCTAssertEqual(ble.alertMode, .silent)
+        XCTAssertEqual(defaults.string(forKey: modeKey), AlertMode.buzzer.rawValue)
+        XCTAssertNil(ble.connectTimeBuzzerWrite)
+    }
+
+    /// The exception through the real manager: a pick made with no ready board (a test manager
+    /// never has one) is owed to the next connect, Buzzer included, and the pick holds against a
+    /// muted frame instead of being mirrored away. Without the owed pick the connect write is nil.
+    func testAPickMadeWhileAwayIsWrittenAtTheNextConnect() throws {
+        let defaults = isolatedDefaults()
+        defaults.set(true, forKey: originAwareKey)
+        let ble = BLEManager(defaults: defaults)
+        ble.setAlertMode(.buzzer, origin: .user)
         XCTAssertEqual(ble.connectTimeBuzzerWrite, true)
+        ble.reconcileBuzzer(try status(buzzer: false))
+        XCTAssertEqual(ble.alertMode, .buzzer, "a pick is asserted, not mirrored")
     }
 
     /// The upgrade from 2.1.0: a stored Buzzer with no upgrade flag may be Desert's restore, so it
@@ -206,7 +257,8 @@ final class ConnectBuzzerPolicyTests: XCTestCase {
     }
 
     /// A legacy quiet mode survives the upgrade, and a Buzzer stored after it (a pick) survives a
-    /// relaunch.
+    /// relaunch. The owed write does not: a relaunched phone holds the pick as a stored Buzzer,
+    /// which mirrors the board and writes nothing at connect.
     func testUpgradeKeepsQuietModesAndLaterPicks() throws {
         let quiet = isolatedDefaults()
         quiet.set(AlertMode.vibrate.rawValue, forKey: modeKey)
@@ -215,8 +267,9 @@ final class ConnectBuzzerPolicyTests: XCTestCase {
         let picked = isolatedDefaults()
         let first = BLEManager(defaults: picked)
         first.setAlertMode(.buzzer, origin: .user)
+        XCTAssertEqual(first.connectTimeBuzzerWrite, true, "owed to this process's next connect")
         let relaunched = BLEManager(defaults: picked)
-        XCTAssertEqual(relaunched.connectTimeBuzzerWrite, true)
+        XCTAssertNil(relaunched.connectTimeBuzzerWrite)
         XCTAssertEqual(relaunched.alertMode, .buzzer)
     }
 }

@@ -1187,46 +1187,48 @@ struct DetectionDetailView: View {
                     Image(systemName: "clock.badge.exclamationmark").foregroundStyle(ACABTheme.warn)
                 }
             }
-            // CORROBORATION, positive-only. If this is an ALPR-type hit AND a community-mapped
-            // camera sits within ~150m, say so - a live detection landing on an independently
-            // mapped node is strong confirmation, and names the mapped maker when known.
+            // PROXIMITY, positive-only. If this is an ALPR-type hit AND a community-mapped camera
+            // sits within ~150m, say so, and name the mapped maker when the record attributes one.
+            // It is context, NOT confirmation: until 2026-10-11 this read "matches a mapped camera"
+            // beside a seal glyph, while the FAQ (q-alpr-quiet, q-mapcam) tells the user that a
+            // ring and a nearby detection do not confirm each other. Android twin: the same line
+            // in DetailScreen.kt's LOCATION card.
             // We NEVER show a "no mapped camera" line: OSM lags new installs and mobile cruiser
             // ALPR is meant to move, so absence is not evidence of a false positive (the confidence
             // row is the false-positive tell). Only shows when the ALPR layer is loaded.
             // Read from the cache, never from the store: see alprMatch.
             // The words take accentText, never flockTone: the ALPR hue is a fill, not a text
-            // colour on bg2. The seal glyph keeps the hue.
+            // colour on bg2. The pin glyph keeps the hue.
             if (d.type == .flockCamera || d.type == .flockRaven),
                let hit = alprMatch, hit.meters <= 150 {
                 Label {
-                    // This line is the app VOUCHING for a detection using the mapped maker as
-                    // corroboration, so it must not spend the maker's credibility on a maker
-                    // nobody verified. An unverified node still corroborates the LOCATION (someone
-                    // mapped a camera here) but not the NAME, so it drops the maker from the
-                    // sentence rather than repeating a guess back at the user as evidence.
+                    // The maker is named only from a structured attribution (hit.confirmed), so
+                    // the line never repeats an unverified guess back at the user. An unverified
+                    // node still records that someone mapped a camera here, so it keeps the
+                    // location and drops the name.
                     Text(hit.confirmed
                          ? (hit.maker.isEmpty
-                            ? "matches a mapped camera · \(Int(hit.meters.rounded())) m"
-                            : "matches a mapped \(hit.maker) camera · \(Int(hit.meters.rounded())) m")
+                            ? "near a mapped camera · \(Int(hit.meters.rounded())) m"
+                            : "near a mapped \(hit.maker) camera · \(Int(hit.meters.rounded())) m")
                          : "near a community-mapped camera · \(Int(hit.meters.rounded())) m")
                         .font(ACABTheme.font(.subheadline, weight: .medium))
                         .foregroundStyle(hit.confirmed ? ACABTheme.accentText : ACABTheme.warn)
                         .fixedSize(horizontal: false, vertical: true)
                 } icon: {
-                    Image(systemName: "checkmark.seal.fill")
+                    Image(systemName: "mappin.and.ellipse")
                         .foregroundStyle(hit.confirmed ? ACABTheme.flockTone : ACABTheme.warn)
                 }
                 // Must mirror the VISIBLE claim exactly. This branched on maker alone, so
-                // VoiceOver spoke "matches a mapped Motorola camera" for a node the sighted user
-                // is deliberately told is only "near a community-mapped camera" - the screen
-                // reader was making the stronger claim the visible copy refuses to make.
+                // VoiceOver named a maker for a node the sighted user is deliberately told is
+                // only "near a community-mapped camera" - the screen reader was making the
+                // stronger claim the visible copy refuses to make.
                 .accessibilityLabel(!hit.confirmed
                      ? (hit.tier == 2
                         ? "near a legacy-tag community camera candidate, about \(Int(hit.meters.rounded())) meters away"
                         : "near a canonical community-mapped camera, about \(Int(hit.meters.rounded())) meters away, manufacturer attribution not structured")
                      : (hit.maker.isEmpty
-                        ? "matches a mapped camera about \(Int(hit.meters.rounded())) meters away"
-                        : "matches a mapped \(hit.maker) camera about \(Int(hit.meters.rounded())) meters away"))
+                        ? "near a mapped camera, about \(Int(hit.meters.rounded())) meters away"
+                        : "near a mapped \(hit.maker) camera, about \(Int(hit.meters.rounded())) meters away"))
             }
             VStack(alignment: .leading, spacing: 8) {
                 // The whole thumbnail is one tap target: close the dossier and hand the full
@@ -1684,13 +1686,22 @@ struct DetectionDetailView: View {
         return base + " This device uses a rotating address, so the mute may stop matching after the address changes."
     }
 
+    /// A refused mute names the guard that refused it (BLEManager.muteRefusal, ignoreDevice's
+    /// guard order). Until 2026-10-12 an address the beacon cannot store fell through to the
+    /// list-full text, an instruction that could never help. TWIN: Android DetailScreen.kt
+    /// ScopedMuteDialog's onChoose, identical strings.
     private func applyMute(_ scope: MuteScope) {
         if ble.ignoreDevice(d, scope: scope) {
             muteError = nil
             showMuteOptions = false
-        } else if scope == .here && ble.currentLocationCoord == nil {
+            return
+        }
+        switch ble.muteRefusal(for: d, scope: scope) {
+        case .unstorableAddress:
+            muteError = "This address can't be stored by the beacon, so it can't be muted. Turn off its category instead."
+        case .locationNeeded:
             muteError = "A fresh location fix accurate to 50 meters is required for a place mute. Keep the beacon connected and try again."
-        } else {
+        case .listFull:
             muteError = "The muted-device list is full. Unmute another device and try again."
         }
     }

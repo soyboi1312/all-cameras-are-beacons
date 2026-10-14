@@ -114,6 +114,7 @@ import org.osmdroid.views.overlay.Marker
 import org.osmdroid.views.overlay.Polyline
 import tech.acab.app.ble.AcabBleManager
 import tech.acab.app.ble.ConnState
+import tech.acab.app.ble.MuteRefusal
 import tech.acab.app.ble.MuteRuleStatus
 import tech.acab.app.ble.MuteScope
 import tech.acab.app.model.Detection
@@ -636,11 +637,19 @@ fun DetailScreen(
                         showMuteOptions = false
                         muteError = null
                     } else {
-                        muteError = if (scope == MuteScope.HERE && ble.currentSelfCoord() == null) {
-                            "A fresh location accurate to 50 meters is required for a place mute. " +
-                                "Keep the beacon connected and try again."
-                        } else {
-                            "The muted-device list is full. Unmute another device and try again."
+                        // One sentence per refusal reason, asked of the manager in ignoreDevice's
+                        // own guard order. iOS twin: DetectionDetailView.applyMute, same three
+                        // strings byte for byte; SAVE_FAILED is Android only (MuteRefusal).
+                        muteError = when (ble.muteRefusal(d, scope)) {
+                            MuteRefusal.UNSTORABLE_ADDRESS ->
+                                "This address can't be stored by the beacon, so it can't be muted. " +
+                                    "Turn off its category instead."
+                            MuteRefusal.LOCATION_NEEDED ->
+                                "A fresh location fix accurate to 50 meters is required for a place mute. " +
+                                    "Keep the beacon connected and try again."
+                            MuteRefusal.LIST_FULL ->
+                                "The muted-device list is full. Unmute another device and try again."
+                            MuteRefusal.SAVE_FAILED -> "The mute couldn't be saved. Try again."
                         }
                     }
                 },
@@ -1280,28 +1289,31 @@ private fun LocationPanel(
                             style = MaterialTheme.typography.bodyMedium, color = Acab.warn)
                     }
                 }
-                // CORROBORATION, positive-only (mirrors iOS). An ALPR-type hit within ~150m of a
-                // community-mapped camera is strong confirmation, and names the mapped maker when known.
+                // PROXIMITY, positive-only (mirrors iOS). An ALPR-type hit within ~150m of a
+                // community-mapped camera says so, and names the mapped maker when the record
+                // attributes one. It is context, NOT confirmation: until 2026-10-11 these lines
+                // carried a check mark and tier 1 read "matches a mapped camera", while the FAQ
+                // (q-alpr-quiet, q-mapcam) tells the user that a ring and a nearby detection do not
+                // confirm each other.
                 // We NEVER show a "no mapped camera" line: OSM lags installs and cruiser ALPR is meant to
                 // move, so absence is not evidence of a false positive (the confidence row is that tell).
                 // Null for anything that is not an ALPR-type hit: the memo above owns that gate.
                 nearestAlpr?.let { (meters, maker, tier) ->
                     if (meters <= 150) {
                         val m = meters.roundToInt()
-                        // This line is the app using the mapped record as corroboration. Only tier 1
-                        // carries structured manufacturer attribution; tier 0 can support the mapped
-                        // location without naming a maker, while tier 2 stays explicitly a legacy
-                        // candidate. Mirrors iOS DetectionDetailView.
+                        // Only tier 1 carries structured manufacturer attribution, so only tier 1
+                        // names a maker; tier 0 marks a mapped location without a maker, while tier 2
+                        // stays explicitly a legacy candidate. Mirrors iOS DetectionDetailView.
                         Text(
                             when {
                                 tier == 0 ->
-                                    "\u2713 near a mapped ALPR camera · no structured manufacturer · $m m"
+                                    "near a mapped ALPR camera · no structured manufacturer · $m m"
                                 tier == 2 -> "near a legacy ALPR candidate · $m m"
                                 tier == ALPR_TIER_LEGACY_FORMAT ->
-                                    "\u2713 near a mapped ALPR camera · legacy dataset format · $m m"
+                                    "near a mapped ALPR camera · legacy dataset format · $m m"
                                 tier == 1 && maker.isEmpty() ->
-                                    "\u2713 near a mapped ALPR camera · manufacturer attributed · $m m"
-                                tier == 1 -> "\u2713 matches a mapped $maker camera · $m m"
+                                    "near a mapped ALPR camera · manufacturer attributed · $m m"
+                                tier == 1 -> "near a mapped $maker camera · $m m"
                                 else -> "near a mapped ALPR record · unknown attribution tier · $m m"
                             },
                             Modifier.padding(horizontal = 16.dp, vertical = 4.dp),

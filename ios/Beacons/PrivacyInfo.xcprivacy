@@ -4,10 +4,12 @@
 <dict>
     <!-- Beacons does not track users or automatically collect user data. Improve Detection and
          Log export create files only after a user action, and the user chooses and confirms the
-         destination in the system mail/share UI. Two required-reason APIs: UserDefaults for
-         on-device settings (CA92.1) and the App Group detection summary (1C8F.1), and system boot
+         destination in the system mail/share UI. Three required-reason APIs: UserDefaults for
+         on-device settings (CA92.1) and the App Group detection summary (1C8F.1); system boot
          time (35F9.1), which MapTabView reads as ProcessInfo.systemUptime to measure elapsed time
-         between the map peek and snapshot refresh throttles. -->
+         between the map peek and snapshot refresh throttles; and file timestamps (C617.1), which
+         ExportTempCache.sweep reads as contentModificationDateKey to age out the app's own export
+         and contribution files in its temporary directory. -->
     <key>NSPrivacyTracking</key>
     <false/>
     <key>NSPrivacyTrackingDomains</key>
@@ -31,6 +33,14 @@
             <key>NSPrivacyAccessedAPITypeReasons</key>
             <array>
                 <string>35F9.1</string>
+            </array>
+        </dict>
+        <dict>
+            <key>NSPrivacyAccessedAPIType</key>
+            <string>NSPrivacyAccessedAPICategoryFileTimestamp</string>
+            <key>NSPrivacyAccessedAPITypeReasons</key>
+            <array>
+                <string>C617.1</string>
             </array>
         </dict>
     </array>

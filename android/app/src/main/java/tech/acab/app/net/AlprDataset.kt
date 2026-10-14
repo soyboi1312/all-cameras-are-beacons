@@ -621,6 +621,7 @@ class AlprStore private constructor(context: Context) {
                     connectTimeout = 8_000
                     readTimeout = 30_000
                     instanceFollowRedirects = false
+                    setRequestProperty("User-Agent", APP_USER_AGENT)
                 }
                 conn = connection
                 val registered = synchronized(enableLock) {

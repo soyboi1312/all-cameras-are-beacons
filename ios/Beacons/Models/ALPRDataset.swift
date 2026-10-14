@@ -652,7 +652,16 @@ final class ALPRStore: ObservableObject {
                     at: cacheURL.deletingLastPathComponent(),
                     withIntermediateDirectories: true
                 )
-                try bin.write(to: cacheURL, options: [.atomic, .completeFileProtection])
+                // Public OpenStreetMap-derived data, so no protection class: under
+                // .completeFileProtection a refresh that finished while the phone was locked
+                // (Live Mode in a pocket) failed this write and dropped the new version. Kept out
+                // of backups because a re-download restores it (B.7). Set after every write:
+                // .atomic swaps in a new file, so the flag does not carry over.
+                try bin.write(to: cacheURL, options: [.atomic, .noFileProtection])
+                var excluded = URLResourceValues()
+                excluded.isExcludedFromBackup = true
+                var u = cacheURL
+                try? u.setResourceValues(excluded)
                 let check = try Data(contentsOf: cacheURL, options: .mappedIfSafe)
                 return check.count == bin.count && Self.sha256(check) == expectedHash
             } catch {

@@ -40,6 +40,7 @@ struct ACABApp: App {
                     }
                     if demo {
                         ble.seedDemoData(showTour: false)
+                        if args.contains("-demoStream") { ble.startDebugDemoStream() }
                     }
                     // `-bluetoothIdle` (simulator startup-screen shots) is not parsed here: it has
                     // to act before the manager would create its CBCentralManager, so BLEManager

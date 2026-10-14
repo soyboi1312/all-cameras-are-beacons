@@ -43,6 +43,21 @@ enum FirmwareVersionPolicy {
         return true
     }
 
+    /// Belt-and-braces OTA revision gate. The PRIMARY defence is that rev-B firmware reports a
+    /// distinct fw label ("beacon board rev-B", set in platformio.ini) and the manifest is KEYED by
+    /// that label (FirmwareManifest.build(forFwLabel:) is a dictionary lookup), so a rev-B board
+    /// cannot resolve the rev-A entry at all. This catches a re-unified label or a hand-edited
+    /// manifest: when the board TELLS us its revision ("A" or "B"), the label we would flash from
+    /// has to agree. Anything else (absent, an unknown letter) is "not told" and does not block. A
+    /// wrong-image flash parks the unit after every boot and is USB-recovery only, so a false
+    /// refusal is by far the cheaper error. Callers: BLEManager.startFirmwareUpdate (the engine)
+    /// and DeviceView.revisionMatchesManifest (the offer and the card).
+    /// TWIN: revisionMatchesManifest in android DeviceScreen.kt, the same rule.
+    static func revisionMatches(boardRev: String?, fwLabel: String) -> Bool {
+        guard let rev = boardRev, rev == "A" || rev == "B" else { return true }
+        return fwLabel.lowercased().contains("rev-b") == (rev == "B")
+    }
+
     private static func isASCIIAlphaNumeric(_ byte: UInt8) -> Bool {
         (byte >= 0x30 && byte <= 0x39) || (byte >= 0x41 && byte <= 0x5A)
             || (byte >= 0x61 && byte <= 0x7A)
@@ -107,6 +122,10 @@ struct DeviceStatus: Equatable {
     let boardRev: String?    // carrier revision the board reports ("A" = the first 250, slide
                              // switch; "B" = button power + VBUS sense). nil on firmware older than
                              // 2026-07-28 and on single-radio builds, which never emit it.
+    let wiping: Bool         // a deferred buffer erase is still sweeping ("wiping"); absent = idle
+    let moto: Bool?          // broad Motorola-OUI sub-toggle ("moto"); nil = pre-split firmware with
+                             // no switch of its own. BLEManager.ingestStatus mirrors both into
+                             // bufferWiping / motorolaOn / motorolaSupported.
 
     /// BLE JSON contract version the board reports; 0 when the firmware predates the key.
     let protoVersion: Int
@@ -143,6 +162,8 @@ extension DeviceStatus: Decodable {
         case nrfv        // running nRF co-processor version (int); absent until the co-proc reports
         case chg         // battery charging flag
         case rev         // carrier revision, "A" or "B"; absent on older/single-radio firmware
+        case wiping      // deferred buffer erase still sweeping; the board emits it only while true
+        case moto        // broad Motorola-OUI sub-toggle; absent on pre-split firmware
         case proto       // BLE JSON contract version; ABSENT MEANS 0 (see protoVersion)
     }
 
@@ -186,6 +207,8 @@ extension DeviceStatus: Decodable {
                                                                 // "A" - "we were not told" and "this
                                                                 // is a rev-A board" must stay
                                                                 // distinguishable to the OTA gate.
+        wiping      = (try? k.decode(Bool.self, forKey: .wiping)) ?? false   // absent = idle
+        moto        = try? k.decode(Bool.self, forKey: .moto)   // nil when absent: DO NOT default
     }
 }
 
@@ -243,12 +266,12 @@ extension DeviceStatus {
     /// firmware manifest (see FirmwareManifestStore); bump this on a beacon-board release so the
     /// offline path still matches. The Colonel Panic single-board builds (oui-spy / mesh-detect)
     /// track a separate line now that the beacon board has moved ahead - see colonelLatestVersion.
-    static let latestVersion = "2.1.0"
+    static let latestVersion = "2.2.0"
 
     /// Latest firmware for the Colonel Panic single-board builds, which stayed on the shared
     /// acab_version.h default when the beacon board diverged. Offline fallback only; bump on a
     /// Colonel Panic release.
-    static let colonelLatestVersion = "2.1.0"
+    static let colonelLatestVersion = "2.2.0"
 
     /// Just the version number out of `fw` ("ACAB-ouispy 0.1.0" -> "0.1.0").
     var version: String { firmware.split(separator: " ").last.map(String.init) ?? firmware }
@@ -261,6 +284,20 @@ extension DeviceStatus {
 
     /// True for a Mesh-Detect board (no buzzer; its fw label starts "mesh-detect").
     var isMeshDetect: Bool { firmware.hasPrefix("mesh-detect") }
+
+    /// The first firmware that applies the alert mute to the power cues too (alerts.cpp
+    /// buzzerTone, 2.2.1). Before it a muted board still played the shutdown motif and the rev-B
+    /// hold-to-start beep, and only volume 0 silenced them, so the Alerts caption and the Desert
+    /// note describe the cues THIS board plays. TWIN: MUTE_COVERS_POWER_CUES_SINCE and
+    /// muteCoversPowerCues in AcabBleManager.kt; check-signature-drift.py pins the literal.
+    static let muteCoversPowerCuesSince = "2.2.1"
+
+    /// Does this board's firmware mute every cue, the power cues included? False for a version
+    /// that does not parse, which keeps the older description: a caption may promise less silence
+    /// than the board delivers, never more.
+    var muteCoversPowerCues: Bool {
+        FirmwareVersionPolicy.isAtLeast(version, Self.muteCoversPowerCuesSince)
+    }
 
     /// Installed firmware strictly older than `latest`, using the exact validated numeric core
     /// the board packs. A suffix does not make an equal core newer, and malformed input fails

@@ -3,11 +3,13 @@ package tech.acab.app.ble
 import android.annotation.SuppressLint
 import android.bluetooth.BluetoothAdapter
 import android.bluetooth.le.ScanCallback
+import android.bluetooth.le.ScanFilter
 import android.bluetooth.le.ScanResult
 import android.bluetooth.le.ScanSettings
 import android.content.Context
 import android.os.Handler
 import android.os.Looper
+import android.os.ParcelUuid
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -21,6 +23,7 @@ import no.nordicsemi.android.dfu.DfuProgressListenerAdapter
 import no.nordicsemi.android.dfu.DfuServiceInitiator
 import no.nordicsemi.android.dfu.DfuServiceListenerHelper
 import tech.acab.app.model.DeviceStatus
+import tech.acab.app.net.APP_USER_AGENT
 import tech.acab.app.net.FirmwareBuild
 import tech.acab.app.net.NrfBuild
 import tech.acab.app.net.firmwareArtifactResponseAllowed
@@ -138,6 +141,16 @@ class NrfDfuCoordinator(
     companion object {
         // Legacy Nordic DFU service, advertised by the Adafruit/Seeed bootloader in OTA mode.
         private val DFU_SERVICE = UUID.fromString("00001530-1212-EFDE-1523-785FEABCD123")
+
+        /** Hardware filters for both bootloader scans, OR'd by the platform: the DFU service or
+         *  the "AdaDFU" name. Android 8.1+ delivers no results to an UNFILTERED scan while the
+         *  screen is off, so a phone locked during the safety check or SCANNING timed out on a
+         *  bootloader that was advertising. The callback still matches (matchingDfuAddress) and
+         *  RSSI-gates exactly as before; the filters only keep results flowing. */
+        private fun dfuScanFilters(): List<ScanFilter> = listOf(
+            ScanFilter.Builder().setServiceUuid(ParcelUuid(DFU_SERVICE)).build(),
+            ScanFilter.Builder().setDeviceName("AdaDFU").build(),
+        )
         private const val SCAN_TIMEOUT_MS = 40_000L
         // Let the Adafruit HCI queue drain after AdaDFU appears, before we open the transfer.
         private const val SETTLE_MS = 3_000L
@@ -469,7 +482,7 @@ class NrfDfuCoordinator(
         preflightScanCb = cb
         val settings = ScanSettings.Builder()
             .setScanMode(ScanSettings.SCAN_MODE_LOW_LATENCY).build()
-        runCatching { scanner.startScan(null, settings, cb) }
+        runCatching { scanner.startScan(dfuScanFilters(), settings, cb) }
             .onFailure {
                 stopPreflightScan()
                 set(NrfDfuPhase.FAILED, 0,
@@ -515,6 +528,7 @@ class NrfDfuCoordinator(
         val conn = (parsed.openConnection() as HttpURLConnection).apply {
             requestMethod = "GET"; connectTimeout = 15_000; readTimeout = 20_000
             instanceFollowRedirects = false
+            setRequestProperty("User-Agent", APP_USER_AGENT)
         }
         val bytes = try {
             val responseCode = conn.responseCode
@@ -563,7 +577,7 @@ class NrfDfuCoordinator(
 
         val cb = object : ScanCallback() {
             override fun onScanResult(callbackType: Int, result: ScanResult) {
-                // Once-guard: the scan is unfiltered LOW_LATENCY against a ~100ms advertiser, so
+                // Once-guard: the scan is LOW_LATENCY against a ~100ms advertiser, so
                 // duplicate results can already be queued on the main looper when the winning
                 // match calls stopScan(). Without this, a queued duplicate overwrites the settle
                 // runnable and posts a SECOND beginDfu (FLASHING passes the isRunning check),
@@ -588,10 +602,11 @@ class NrfDfuCoordinator(
             }
         }
         scanCb = cb
-        // No hardware filter; match in the callback (see above).
+        // Filtered so results keep arriving with the screen off (dfuScanFilters); the callback
+        // still does the matching and the RSSI gate.
         val settings = ScanSettings.Builder()
             .setScanMode(ScanSettings.SCAN_MODE_LOW_LATENCY).build()
-        runCatching { scanner.startScan(null, settings, cb) }
+        runCatching { scanner.startScan(dfuScanFilters(), settings, cb) }
             .onFailure { set(NrfDfuPhase.FAILED, 0, "Couldn't start the update scan."); return }
 
         clearScanTimeout()

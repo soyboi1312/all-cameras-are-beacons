@@ -8,8 +8,8 @@ import org.junit.Test
  * What the Android 16 promoted-ongoing chip may put in the status bar.
  *
  * The chip is a lock-screen surface, and setVisibility/setPublicVersion do not reach it: SystemUI
- * renders shortCriticalText off the notification itself. So the "keep counts private on lock
- * screen" toggle has to be honoured here too, or a user who turned it on still gets a live
+ * renders shortCriticalText off the notification itself. So the "Hide details on lock screen"
+ * toggle has to be honoured here too, or a user who turned it on still gets a live
  * surveillance-detection tally on a locked phone - the exact glance the setting exists to deny.
  * This table is the guard against the two paths drifting apart again.
  */
@@ -27,5 +27,14 @@ class LiveModeChipTest {
         assertNull(shortCriticalText(total = 7, connected = false, redact = false))
         // Nothing nearby: no number, rather than a chip reading "0".
         assertNull(shortCriticalText(total = 0, connected = true, redact = false))
+    }
+
+    /** The notification text itself, which Android's default lock-screen setting shows in full. */
+    @Test fun redactionMakesTheLiveTextGeneric() {
+        assertEquals(LIVE_GENERIC_TEXT,
+            liveFaceText("last ALPR 2m ago", connected = true, redact = true))
+        assertEquals("last ALPR 2m ago",
+            liveFaceText("last ALPR 2m ago", connected = true, redact = false))
+        assertEquals("Reconnecting…", liveFaceText("Reconnecting…", connected = false, redact = true))
     }
 }

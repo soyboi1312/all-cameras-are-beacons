@@ -10,11 +10,24 @@ import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import org.json.JSONObject
+import tech.acab.app.BuildConfig
 import java.io.ByteArrayOutputStream
 import java.io.InputStream
 import java.net.HttpURLConnection
 import java.net.URL
 import java.util.concurrent.atomic.AtomicBoolean
+
+/** The newest firmware version this app was built knowing about. The one Android literal: the
+ *  offline FALLBACK manifest below and the Beacon tab's update nudge (DeviceScreen LATEST) both
+ *  read it, so a release bumps one line. It names the PUBLISHED firmware, which can trail the
+ *  working tree's ACAB_FW_VERSION while a release is unpublished. iOS twin:
+ *  DeviceStatus.latestVersion in DeviceStatus.swift. */
+internal const val LATEST_PUBLISHED_FIRMWARE = "2.2.0"
+
+/** The User-Agent on every request this app makes itself (the firmware manifest and artifacts,
+ *  the ALPR dataset). The platform default names the phone model and OS build; this names only
+ *  the app and its version. osmdroid's tile requests carry their own (MapScreen). */
+internal val APP_USER_AGENT = "beacons-android/${BuildConfig.VERSION_NAME}"
 
 /** Read [input] to its end without closing it. Null when it holds more than [cap] bytes. */
 internal fun readBounded(input: InputStream, cap: Long): ByteArray? {
@@ -207,8 +220,8 @@ class FirmwareManifest private constructor(context: Context) {
             }
 
         /**
-         * Baked-in fallback, used only when there is no cache and no network yet. Mirrors the
-         * hardcoded LATEST the app shipped with, so the "update available" nudge still works
+         * Baked-in fallback, used only when there is no cache and no network yet. Every entry is
+         * [LATEST_PUBLISHED_FIRMWARE], so the "update available" nudge still works
          * offline. Deliberately marks nothing OTA-capable and carries no image, so a cold,
          * offline start can only ever point at the browser flasher, never at an unverified
          * in-app download.
@@ -218,26 +231,26 @@ class FirmwareManifest private constructor(context: Context) {
             updated = "",
             builds = mapOf(
                 "beacon board" to FirmwareBuild(
-                    version = "2.1.0", ota = false, appUrl = "", sha256 = "", size = 0L, sig = "",
+                    version = LATEST_PUBLISHED_FIRMWARE, ota = false, appUrl = "", sha256 = "", size = 0L, sig = "",
                     flasher = "https://soyboi.tech/flash.html", notes = "",
                 ),
                 // rev-B rides the beacon version line but flashes from its own page: its image
                 // must never land on rev-A hardware, so the fallback must not point it at
                 // flash.html. Matches the iOS fallback.
                 "beacon board rev-B" to FirmwareBuild(
-                    version = "2.1.0", ota = false, appUrl = "", sha256 = "", size = 0L, sig = "",
+                    version = LATEST_PUBLISHED_FIRMWARE, ota = false, appUrl = "", sha256 = "", size = 0L, sig = "",
                     flasher = "https://soyboi.tech/flash-revb.html", notes = "",
                 ),
                 "ACAB-ouispy" to FirmwareBuild(
-                    version = "2.1.0", ota = false, appUrl = "", sha256 = "", size = 0L, sig = "",
+                    version = LATEST_PUBLISHED_FIRMWARE, ota = false, appUrl = "", sha256 = "", size = 0L, sig = "",
                     flasher = "https://soyboi1312.github.io/all-cameras-are-beacons/", notes = "",
                 ),
                 "mesh-detect-ACAB" to FirmwareBuild(
-                    version = "2.1.0", ota = false, appUrl = "", sha256 = "", size = 0L, sig = "",
+                    version = LATEST_PUBLISHED_FIRMWARE, ota = false, appUrl = "", sha256 = "", size = 0L, sig = "",
                     flasher = "https://soyboi1312.github.io/all-cameras-are-beacons/", notes = "",
                 ),
                 "mesh-detect-ACAB-ch1" to FirmwareBuild(
-                    version = "2.1.0", ota = false, appUrl = "", sha256 = "", size = 0L, sig = "",
+                    version = LATEST_PUBLISHED_FIRMWARE, ota = false, appUrl = "", sha256 = "", size = 0L, sig = "",
                     flasher = "https://soyboi1312.github.io/all-cameras-are-beacons/", notes = "",
                 ),
             ),
@@ -309,6 +322,7 @@ class FirmwareManifest private constructor(context: Context) {
                     readTimeout = 8_000
                     instanceFollowRedirects = false
                     setRequestProperty("Accept", "application/json")
+                    setRequestProperty("User-Agent", APP_USER_AGENT)
                 }
                 val status = conn.responseCode
                 if (!firmwareArtifactResponseAllowed(initial, conn.url, status)) return null

@@ -95,6 +95,51 @@ final class MuteAndNearbyPolicyTests: XCTestCase {
             horizontalAccuracy: 5, now: now))
     }
 
+    /// Observer pins and the board uplink (freshCoord) take a fix only when it is current, valid
+    /// and no wider than 250 m. Both sides of each edge, so moving the bar either way, dropping
+    /// the negative (invalid) check or losing the age rule fails here. TWIN: android
+    /// AppReviewDataTest observerFixNeedsAgeAndAccuracy.
+    func testObserverFixRequiresAValidAccuracyWithin250Meters() {
+        let now = Date(timeIntervalSince1970: 1_000_000)
+        XCTAssertEqual(observerFixMaxAccuracyMeters, 250)
+        XCTAssertTrue(locationFixSupportsObserver(now, horizontalAccuracy: 0, now: now))
+        XCTAssertTrue(locationFixSupportsObserver(now, horizontalAccuracy: 250, now: now))
+        XCTAssertFalse(locationFixSupportsObserver(now, horizontalAccuracy: 250.001, now: now))
+        XCTAssertFalse(locationFixSupportsObserver(now, horizontalAccuracy: -1, now: now),
+                       "Core Location marks an invalid fix with a negative accuracy")
+        XCTAssertFalse(locationFixSupportsObserver(now, horizontalAccuracy: .nan, now: now))
+        // Coarser than a place mute may use, still fine for a pin: the two bars are different.
+        XCTAssertTrue(locationFixSupportsObserver(now, horizontalAccuracy: 120, now: now))
+        XCTAssertFalse(locationFixSupportsHere(now, horizontalAccuracy: 120, now: now))
+        // The age rule is the existing current-fix rule, both sides.
+        XCTAssertTrue(locationFixSupportsObserver(
+            now.addingTimeInterval(-currentLocationFixMaxAge), horizontalAccuracy: 10, now: now))
+        XCTAssertFalse(locationFixSupportsObserver(
+            now.addingTimeInterval(-currentLocationFixMaxAge - 0.001), horizontalAccuracy: 10, now: now))
+        XCTAssertFalse(locationFixSupportsObserver(nil, horizontalAccuracy: 10, now: now))
+    }
+
+    /// A place rule waiting for a usable fix still holds back the phone's alerts, as an active rule
+    /// does; every other state lets them through. Before this, only `.active` reached the alert
+    /// gate (activeIgnoredMacSet), so the `.currentLocationRequired` line below was false and a
+    /// device muted at home buzzed again indoors. TWIN: android AppReviewDataTest
+    /// placeRuleAlertGateCoversActiveAndFixRequired.
+    func testPlaceRuleWaitingForAFixStillSuppressesAlerts() {
+        XCTAssertTrue(placeRuleSuppressesAlerts(.active))
+        XCTAssertTrue(placeRuleSuppressesAlerts(.currentLocationRequired))
+        XCTAssertFalse(placeRuleSuppressesAlerts(.outsideRadius))
+        XCTAssertFalse(placeRuleSuppressesAlerts(.expired))
+        XCTAssertFalse(placeRuleSuppressesAlerts(.invalidPlace))
+        // End to end through the one rule reader: a place rule with no qualifying fix is the
+        // indoor case, and one evaluated outside its radius is not muted at all.
+        let home = IgnoredDevice(mac: base.mac, label: base.label,
+                                 latitude: 37.0, longitude: -122.0, radiusMeters: 50)
+        let now = Date(timeIntervalSince1970: 1_000_000)
+        XCTAssertTrue(placeRuleSuppressesAlerts(evaluateMuteRule(home, now: now, here: nil)))
+        XCTAssertFalse(placeRuleSuppressesAlerts(evaluateMuteRule(
+            home, now: now, here: CLLocation(latitude: 37.01, longitude: -122.0))))
+    }
+
     func testBoardListReconcilesFailedNonemptyWritesWithoutAuthorizingEmptyPhone() {
         XCTAssertEqual(boardListSyncAction(
             localCount: 2, boardCount: 1, clearPending: false), .pushList)

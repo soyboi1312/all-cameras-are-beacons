@@ -15,20 +15,23 @@ import CryptoKit
 /// the data with SHA-256 internally) is the exact inverse. Verified against the real staged
 /// artifact with `openssl dgst -sha256 -verify` before shipping this.
 ///
-/// Key rotation (2.0.7): the signing key moved from a development key to a production key whose
-/// private half lives offline. Every fielded board and app before 2.0.7 trusts only the
-/// development key, so 2.0.7 is signed with the development key while carrying the production
-/// key, and the apps accept EITHER key for that one release cycle. The board side of the
-/// rotation is documented in firmware/lib/acab_core/ota_pubkey.h.
+/// Key rotation (2.0.7): the signing key moved from a development key to a production key.
+/// Every fielded board and app before 2.0.7 trusts only the development key, so 2.0.7 is signed
+/// with the development key while carrying the production key, and the apps accept EITHER key for
+/// that one release cycle. The board side of the rotation is documented in
+/// firmware/lib/acab_core/ota_pubkey.h, and where each private key lives is under the list below.
 enum NrfDfuSignature {
     /// Trusted signing public keys (SubjectPublicKeyInfo / X.509, PEM), tried in this order:
     ///
     /// 1. PRODUCTION key, SPKI sha256 c5d86430652e...0399e9: the key pinned in the board's
     ///    ota_pubkey.h since 2.0.7 and the signer of every release after 2.0.7. Its private half
-    ///    is offline and is not in this tree.
+    ///    is the release signing key: the gitignored PEM that release.sh and web/build-flasher.sh
+    ///    sign with (firmware/tools/RELEASE.md, step 7 of a rotation, puts the new key there). It
+    ///    is not in git, but it IS on the release machine's disk, so for the nRF path this check is
+    ///    only as strong as that machine's custody of the key.
     /// 2. DEVELOPMENT key, SPKI sha256 39e03b1581db...6d3df1: signed every release through 2.0.6
-    ///    and the 2.0.7 transition package. Its private half is
-    ///    firmware/tools/ota_signing/beacon_ota_key.pem (gitignored). RETIRE this entry, and the
+    ///    and the 2.0.7 transition package. The rotation moved it out of the signing path, so no
+    ///    release tooling in this repo reads its private half any more. RETIRE this entry, and the
     ///    dev-signed vector in NrfDfuSignatureTests, once every fielded board and app has passed
     ///    2.0.7; from 2.0.8 on nothing is signed with it.
     ///

@@ -31,6 +31,12 @@ struct DiscoveredDevice: Identifiable {
 
 enum MuteScope: Equatable { case permanent, oneHour, oneDay, here }
 
+/// Why ignoreDevice refused a mute, so the mute sheet can say the one thing that helps. Read with
+/// BLEManager.muteRefusal(for:scope:) after ignoreDevice returned false. TWIN: MuteRefusal in
+/// AcabBleManager.kt (LIST_FULL, LOCATION_NEEDED, UNSTORABLE_ADDRESS, plus an Android-only
+/// SAVE_FAILED for a sealed list write that did not land; ignoreDevice here has no such refusal).
+enum MuteRefusal: Equatable { case listFull, locationNeeded, unstorableAddress }
+
 /// A device the user has chosen to silence. Optional fields preserve old permanent rows.
 struct IgnoredDevice: Codable, Identifiable, Equatable {
     let mac: String
@@ -108,6 +114,16 @@ func evaluateMuteRule(_ item: IgnoredDevice, now: Date, here: CLLocation?) -> Mu
     guard let here else { return .currentLocationRequired }
     return here.distance(from: CLLocation(latitude: lat, longitude: lon)) <= (item.radiusMeters ?? 50)
         ? .active : .outsideRadius
+}
+
+/// Does a rule in this state hold back this phone's alerts (the haptic and the notification)?
+/// Yes while it is active AND while a place rule waits for a fix that meets the 50 m bar. Indoors
+/// that wait is the normal state, and failing open there let a device muted at home vibrate and
+/// notify again whenever the fix degraded. Rows still follow `.active` alone (activeIgnoredMacSet),
+/// so the Log, the map and the dossier are unchanged. TWIN: placeRuleSuppressesAlerts in
+/// AcabBleManager.kt.
+func placeRuleSuppressesAlerts(_ status: MuteRuleStatus) -> Bool {
+    status == .active || status == .currentLocationRequired
 }
 
 /// "Heard recently enough to count as nearby now": the ONE iOS owner of that window. It is the
@@ -392,6 +408,23 @@ func locationFixSupportsHere(_ timestamp: Date?, horizontalAccuracy: Double, now
         && horizontalAccuracy.isFinite
         && horizontalAccuracy >= 0
         && horizontalAccuracy <= maxAccuracy
+}
+
+/// Widest fix an observer pin or the board's lat/lon uplink accepts, in meters. The first fix
+/// Core Location hands back after startUpdatingLocation can be a coarse cell or Wi-Fi estimate,
+/// and pinned it would put a detection somewhere the phone never was.
+/// TWIN: OBSERVER_FIX_MAX_ACCURACY_M (250f) in AcabBleManager.kt.
+let observerFixMaxAccuracyMeters: Double = 250
+
+/// The observer twin of locationFixSupportsHere: the same current-fix age rule, a valid accuracy
+/// (Core Location marks an invalid fix with a negative horizontalAccuracy) and no wider than
+/// observerFixMaxAccuracyMeters. freshCoord goes through it, so every observer pin and the board
+/// uplink (sendPhoneLocation) does. TWIN: locationFixSupportsObserver in AcabBleManager.kt.
+func locationFixSupportsObserver(_ timestamp: Date?, horizontalAccuracy: Double, now: Date,
+                                 maxAge: TimeInterval = currentLocationFixMaxAge,
+                                 maxAccuracy: Double = observerFixMaxAccuracyMeters) -> Bool {
+    locationFixSupportsHere(timestamp, horizontalAccuracy: horizontalAccuracy, now: now,
+                            maxAge: maxAge, maxAccuracy: maxAccuracy)
 }
 
 /// Reconcile any authoritative managed list, not just an empty-list clear. A failed nonempty
@@ -681,7 +714,77 @@ func performConfirmedPersistedDetectionDeletion(
     return !fileExists()
 }
 
+/// Move an unreadable detections file out of the next checkpoint's way, to
+/// "<name>.unreadable-<epoch ms>" beside it, never onto an existing file (a taken name gets a
+/// "-1", "-2" suffix, and moveItem itself refuses an existing target). Returns the kept URL, or nil
+/// when the rename failed, which leaves the file where it was. No automatic sweep touches these;
+/// only Clear Log deletes them (deletePersistedLogFiles): evidence this build could not read, kept
+/// for a later one, but it still holds MACs and GPS, so the user's own delete covers it.
+/// TWIN: setAsideUnreadableLog in AcabBleManager.kt.
+func setAsideUnreadableLog(_ store: URL, now: Date) -> URL? {
+    let dir = store.deletingLastPathComponent()
+    let name = "\(store.lastPathComponent).unreadable-\(Int64(now.timeIntervalSince1970 * 1000))"
+    var kept = dir.appendingPathComponent(name)
+    var n = 0
+    while FileManager.default.fileExists(atPath: kept.path) {
+        n += 1
+        kept = dir.appendingPathComponent("\(name)-\(n)")
+    }
+    return (try? FileManager.default.moveItem(at: store, to: kept)) != nil ? kept : nil
+}
+
+/// Clear Log's file half: delete `store` and every file setAsideUnreadableLog kept beside it. True
+/// only on confirmed absence of all of them. Caller serializes on persistQueue. TWIN:
+/// deletePersistedLogFiles in AcabBleManager.kt, which also deletes its checkpoint staging file
+/// (iOS has none of its own: the .atomic write stages and swaps it).
+func deletePersistedLogFiles(_ store: URL) -> Bool {
+    let fm = FileManager.default
+    let prefix = "\(store.lastPathComponent).unreadable-"
+    func files() -> [URL] {
+        [store] + ((try? fm.contentsOfDirectory(at: store.deletingLastPathComponent(),
+                                                includingPropertiesForKeys: nil)) ?? [])
+            .filter { $0.lastPathComponent.hasPrefix(prefix) }
+    }
+    return performConfirmedPersistedDetectionDeletion(
+        fileExists: { files().contains { fm.fileExists(atPath: $0.path) } },
+        remove: {
+            for f in files() where fm.fileExists(atPath: f.path) { try fm.removeItem(at: f) }
+        })
+}
+
 func persistedDetectionLoadAllowed(clearPending: Bool) -> Bool { !clearPending }
+
+/// What a detections checkpoint does once the demo and Clear-tombstone refusals have passed,
+/// decided before the whole-store snapshot is paid for. Pure, so PersistenceSafetyTests pins the
+/// order without touching disk.
+enum DetectionCheckpointStep: Equatable {
+    /// The launch load has not landed, so the store is not the whole log yet: a write now would
+    /// replace the file with the few live rows heard first. Refused; the caller re-runs one
+    /// checkpoint when the load lands.
+    case refuseUntilLoaded
+    /// Empty store: never overwrite a file with nothing (the confirmed Clear is the only delete).
+    case keepFile
+    /// The store has not changed since the last write that landed: the file already holds it.
+    case alreadySaved
+    case write
+}
+
+func detectionCheckpointStep(loadPending: Bool, storeIsEmpty: Bool,
+                             revision: UInt64, savedRevision: UInt64) -> DetectionCheckpointStep {
+    if loadPending { return .refuseUntilLoaded }
+    if storeIsEmpty { return .keepFile }
+    return revision == savedRevision ? .alreadySaved : .write
+}
+
+/// The live checkpoint's next step: nil = write now; otherwise re-arm the timer for that many
+/// seconds. A write still in flight re-arms (at least 1 s out) instead of dropping the checkpoint:
+/// the live path has no trailing write of its own until disconnect or background, so rows filed
+/// after the in-flight snapshot would otherwise stay RAM-only. Pure, so PersistenceSafetyTests
+/// pins it.
+func liveCheckpointDelay(elapsed: TimeInterval, interval: TimeInterval,
+                         writeInFlight: Bool) -> TimeInterval? {
+    elapsed >= interval && !writeInFlight ? nil : max(1, interval - elapsed)
+}
 
 enum PersistedDetectionClearCommit: Equatable {
     case durableTombstone
@@ -1208,8 +1311,8 @@ enum AlertModeOrigin {
     case app    // Desert's forced mute, or a restore the app is carrying out
 }
 
-/// What the connect path writes to the board's buzzer: the stored mode's buzzer state, or NOTHING
-/// when this phone holds no stored mode (a fresh install, a reinstall, cleared data, a second phone).
+/// What the connect path writes to the board's buzzer: a mute (false) when this phone stores a
+/// quiet mode, otherwise NOTHING. A connect never writes sound on by itself.
 ///
 /// WHY NOTHING AND NOT "SOUND ON" (security review 2026-09-29). The in-memory mode defaults to
 /// .buzzer when nothing is stored, and the connect path used to push that default. A board the
@@ -1217,9 +1320,17 @@ enum AlertModeOrigin {
 /// Desert included, with nobody tapping anything. Only the user changes whether the detector makes
 /// sound (see desertAlertModeTransition), so a phone with no stored mode mirrors the board instead
 /// (mirroredAlertMode) and writes nothing at connect until the user picks a mode.
-/// Android twin: connectBuzzerWrite in AcabBleManager.kt.
-func connectBuzzerWrite(hasStoredMode: Bool, mode: AlertMode) -> Bool? {
-    hasStoredMode ? mode == .buzzer : nil
+/// A STORED Buzzer writes nothing either (app review 2026-10-12): it used to write buzzer:true at
+/// every connect, so a board muted from a second phone or by hand sounded again. It now meets a
+/// muted board through the same mirror as no stored mode (reconcileBuzzer). The one exception is
+/// `pickOwed`: a pick the user made while no board was ready (the Desert restore offer is reachable
+/// from the connect screen) is a user action, so the next connect writes it, Buzzer included. A
+/// pick always stores its mode, so with nothing stored there is no pick to owe.
+/// Android twin: connectBuzzerWrite in AcabBleManager.kt, the same three arguments.
+func connectBuzzerWrite(hasStoredMode: Bool, mode: AlertMode, pickOwed: Bool = false) -> Bool? {
+    guard hasStoredMode else { return nil }
+    if pickOwed { return mode == .buzzer }
+    return mode == .buzzer ? nil : false
 }
 
 /// The alert mode a status frame puts on screen, or nil when this phone is holding a mode of its
@@ -1260,9 +1371,10 @@ func desertDisableConfig(restoreTo: AlertMode?) -> [String: Bool] {
 /// One-time upgrade rule for a mode stored by 2.1.0 and earlier, which stored EVERY mode it set,
 /// Desert's app-origin mute and restore included. Only BUZZER can be a mode nobody picked: the
 /// in-memory default was .buzzer, and nothing but a picker tap ever produced .vibrate.
-///  - A stored Buzzer may be Desert's restore rather than a pick, and kept, it would un-mute a
-///    board muted from another phone at every connect. It is dropped, and the phone mirrors the
-///    board until the user picks, the quiet direction.
+///  - A stored Buzzer may be Desert's restore rather than a pick. Kept, it un-muted a board muted
+///    from another phone at every connect until connectBuzzerWrite stopped writing sound
+///    (2026-10-12). It is dropped, and the phone mirrors the board until the user picks, the
+///    quiet direction.
 ///  - A stored mode beside a saved pre-Desert Buzzer (`desertSaved == .buzzer`) is dropped too.
 ///    That stored mode is Silent, Desert's forced mute (from 2.0.8 a hand pick empties the saved
 ///    mode; before it a hand-picked Silent could stay beside one, which is the same Silent). Kept,
@@ -1514,8 +1626,11 @@ final class BLEManager: NSObject, ObservableObject {
     /// AcabBleManager.PAIR_WINDOW_HINT_TEMPLATE: user-facing copy the two apps must not diverge.
     /// Render it with renderBoardCopy (ConnectView.pairWindowNote passes the screen kind). It shows
     /// under the hint in ConnectView's connectionFailurePanel, not on the idle screen, and only when
-    /// showsPairWindowNote accepts that hint's stage.
-    static let pairWindowHint = "turn the {noun} off and on, then connect within two minutes."
+    /// showsPairWindowNote accepts that hint's stage. It starts with the other phone's Bluetooth
+    /// because the board holds one link at a time (CONFIG_BT_NIMBLE_MAX_CONNECTIONS=1) and stops
+    /// advertising while it has one: a paired phone running Live Mode reconnects first after the
+    /// power cycle and the new phone never sees the board inside its window.
+    static let pairWindowHint = "turn off Bluetooth on any other phone that uses the {noun}, then turn the {noun} off and on and connect within two minutes."
     @Published private(set) var discovered: [DiscoveredDevice] = []
     /// The board the connect screen is about: set when a connect begins (a picker tap, or the
     /// auto-reconnect armed after a drop) and KEPT after that attempt ends, so a failure hint and
@@ -1730,10 +1845,12 @@ final class BLEManager: NSObject, ObservableObject {
     /// indefinite "Reconnecting…" wait, so a board that never returns can't trap the user on the
     /// connect screen with no way to scan for a different one. Kept in lockstep with reconnectTarget.
     @Published private(set) var isReconnecting = false
-    /// Hide detection counts on the Lock Screen banner (user setting, default OFF: counts are
-    /// visible on a fresh install, because most users never found the toggle). The nil-checked
-    /// load in init means only an explicitly stored choice overrides this default. The counts
-    /// always show in the Dynamic Island and in the app either way.
+    /// "Hide details on lock screen" (user setting, default OFF: counts are visible on a fresh
+    /// install, because most users never found the toggle). It hides the Live Activity's lock-screen
+    /// counts, posts every detection alert generic (DetectionNotifier.alertText) and puts the
+    /// home-screen widget on its "counts hidden" face (w_redact). The nil-checked load in init
+    /// means only an explicitly stored choice overrides this default. The counts always show in
+    /// the Dynamic Island and in the app either way.
     @Published var redactLockScreen = false {
         didSet {
             defaults.set(redactLockScreen, forKey: redactKey)
@@ -1783,8 +1900,11 @@ final class BLEManager: NSObject, ObservableObject {
     /// was unplugged / power-cycled. This is the fix for "the app won't come back after the board
     /// reboots." We must retain the CBPeripheral ourselves AND call central.connect(_, options: nil)
     /// with no timeout: CoreBluetooth parks that request indefinitely and fires didConnect the moment
-    /// the board re-advertises, in the foreground OR backgrounded (the app declares the
-    /// bluetooth-central UIBackgroundMode). Held here rather than in `peripheral` so the rest of the
+    /// the board re-advertises, in the foreground OR while the app is suspended in the background
+    /// (the app declares the bluetooth-central UIBackgroundMode). Suspended, not terminated: the
+    /// central has no restore identifier and there is no willRestoreState, so once iOS terminates
+    /// the process the parked connect goes with it until the user opens the app again.
+    /// Held here rather than in `peripheral` so the rest of the
     /// code keeps its "peripheral != nil means a live link" invariant while we wait. Nil whenever
     /// there's nothing to auto-reconnect: never connected, a user-initiated disconnect(), or the OTA
     /// reboot path (which reconnects via its own otaAwaitingReboot bookkeeping).
@@ -2054,16 +2174,21 @@ final class BLEManager: NSObject, ObservableObject {
     /// user pick, or a mode on a phone that already stores one, is ever stored (setAlertMode).
     /// Android twin: KEY_ALERT_MODE_ORIGIN_AWARE in AcabBleManager.kt.
     private let alertModeOriginAwareKey = "acab.alertModeOriginAware"
-    /// True once THIS phone stores an alert mode: the user picked one here, or one was already
-    /// stored at launch. setAlertMode is the only writer of alertModeKey, and it stores an
-    /// app-origin mode (Desert's mute or restore) only on a phone that already stores one. False on
-    /// a fresh install, a reinstall, cleared data and a second phone until the user picks; such a
-    /// phone mirrors the board and writes nothing at connect (connectBuzzerWrite, mirroredAlertMode).
+    /// The alert mode THIS phone stores: the user picked one here, or one was already stored at
+    /// launch. setAlertMode is the only writer of alertModeKey, and it stores an app-origin mode
+    /// (Desert's mute or restore) only on a phone that already stores one. Nil on a fresh install,
+    /// a reinstall, cleared data and a second phone until the user picks; such a phone mirrors the
+    /// board and writes nothing at connect (connectBuzzerWrite, mirroredAlertMode). Kept apart
+    /// from `alertMode` because a stored Buzzer mirrors a muted board in memory (reconcileBuzzer),
+    /// and that mirror must never become what a later connect asserts.
     /// Android twin: hasStoredAlertMode in AcabBleManager.
-    private var hasStoredAlertMode = false
-    /// An app-origin mode (Desert's mute or restore) set on a phone with NO stored mode. It holds for
-    /// THIS link only, so reconcileBuzzer keeps the board at that mode (and keeps re-sending a mute
-    /// the board has not taken), but it is never stored. It is cleared where every link STARTS
+    private var storedAlertMode: AlertMode?
+    private var hasStoredAlertMode: Bool { storedAlertMode != nil }
+    /// A mode this phone set on THIS link (setAlertMode, either origin). reconcileBuzzer keeps the
+    /// board at it (and keeps re-sending a mute the board has not taken) instead of mirroring. On a
+    /// phone with NO stored mode an app-origin mode (Desert's mute or restore) lives only here and
+    /// is never stored; a stored Buzzer this phone did not set on this link mirrors the board
+    /// (connectBuzzerWrite). It is cleared where every link STARTS
     /// (didConnect), and that clear is the guarantee: the first status frame of a link is
     /// reconciled before READY, and some teardowns reach neither didDisconnect nor clearConnection
     /// (disconnect() during setup nils the peripheral, so its didDisconnect is ignored as a stray;
@@ -2072,11 +2197,19 @@ final class BLEManager: NSObject, ObservableObject {
     /// connect: a Desert on-and-off from a second phone un-muted a board muted elsewhere
     /// (security review 2026-09-29, re-review). Android twin: appHeldAlertModeThisLink.
     private var appHeldAlertModeThisLink = false
+    /// A USER pick made while no board session was ready. The Desert restore offer is the control
+    /// that allows it: the connect screen and a locked Beacon page still draw it. Its own board
+    /// write had no link to ride, so the next READY writes it (connectTimeBuzzerWrite) and holds it
+    /// for that link; until then reconcileBuzzer treats it as held, so the link's first status
+    /// frame, reconciled before READY, cannot mirror it away. Cleared at READY.
+    private var alertModePickedWhileAway = false
 
-    /// What the connect path writes to the buzzer: see connectBuzzerWrite. A property, not an
-    /// expression at the call site, so BeaconsTests can pin exactly what the manager hands it.
+    /// What the connect path writes to the buzzer: see connectBuzzerWrite. The STORED mode, not
+    /// `alertMode`, which a mirror may have moved. A property, not an expression at the call site,
+    /// so BeaconsTests can pin exactly what the manager hands it.
     var connectTimeBuzzerWrite: Bool? {
-        connectBuzzerWrite(hasStoredMode: hasStoredAlertMode, mode: alertMode)
+        connectBuzzerWrite(hasStoredMode: hasStoredAlertMode, mode: storedAlertMode ?? alertMode,
+                           pickOwed: alertModePickedWhileAway)
     }
     private let lastSeqKey = "acab.lastSeq"   // persisted across disconnects; survives relaunch
     private let replayCursorKey = "acab.replayCursorV2" // one atomic "generation:sequence" tuple
@@ -2108,6 +2241,17 @@ final class BLEManager: NSObject, ObservableObject {
     // One-shot, published only when a drain finished with records buffered (n > 0). Drives
     // the transient count banner; cleared on view / dismiss. Not persisted across launches.
     @Published var offlineSyncBanner: OfflineSyncSummary?
+    // One-shot: unreadableLogNoticeText when the launch load found a saved log it could not decode
+    // and moved it aside (setAsideUnreadableLog) instead of letting the next checkpoint overwrite
+    // it. Nil otherwise. In memory only, and the renamed file is never read again (Clear Log
+    // deletes it, and clears this notice with it), so it is raised at most once per unreadable
+    // file. The Log renders it outside sample data and calls dismissUnreadableLogNotice.
+    // TWIN: unreadableLogNotice in AcabBleManager.kt.
+    @Published private(set) var unreadableLogNotice: String?
+    func dismissUnreadableLogNotice() { unreadableLogNotice = nil }
+    /// Android's UNREADABLE_LOG_NOTICE byte for byte. Lowercase-first body copy.
+    static let unreadableLogNoticeText =
+        "an earlier saved log could not be opened, so this phone kept it aside and started a new one."
 
     private var histReceived = 0                       // records counted this drain (filed OR ignored)
     private var lastGoodSeq: UInt32 = 0                // highest contiguous seq filed this drain
@@ -2163,15 +2307,18 @@ final class BLEManager: NSObject, ObservableObject {
     /// driveway, in the map and in the exported CSV both. CLLocationCoordinate2DIsValid can't catch
     /// it: a two-hour-old coordinate is a valid coordinate. Nor is a cold launch safe, since
     /// startUpdatingLocation delivers CoreLocation's own cached fix first and that can be any age.
-    /// 2 minutes matches Android's FIX_MAX_AGE_NANOS.
+    /// 2 minutes matches Android's FIX_MAX_AGE_NANOS. Accuracy is gated too
+    /// (locationFixSupportsObserver): an invalid fix, or one wider than
+    /// observerFixMaxAccuracyMeters, never becomes a pin, a breadcrumb or the board's lat/lon.
     private var freshCoord: CLLocationCoordinate2D? {
         guard locationAuthorized, let f = lastFix,
-              locationFixIsCurrent(f.timestamp, now: .now) else { return nil }
+              locationFixSupportsObserver(f.timestamp, horizontalAccuracy: f.horizontalAccuracy,
+                                          now: .now) else { return nil }
         return f.coordinate
     }
 
     /// Stricter coordinate for a 50-meter HERE rule. Observer geotagging can honestly retain a
-    /// coarser fresh fix with its normal accuracy semantics; a binary geofence cannot claim the
+    /// coarser fresh fix (up to observerFixMaxAccuracyMeters); a binary geofence cannot claim the
     /// phone is inside a radius smaller than the fix's uncertainty.
     private var freshHereCoord: CLLocationCoordinate2D? {
         guard locationAuthorized, let f = lastFix,
@@ -2226,6 +2373,10 @@ final class BLEManager: NSObject, ObservableObject {
     /// a managed rule, Location fix/authorization, or expiry boundary changes; the former computed
     /// array filtered all 256 rules on each hot-path lookup.
     private var activeIgnoredMacSet: Set<String> = []
+    /// MACs whose rule holds back this phone's alerts (placeRuleSuppressesAlerts): every active
+    /// rule plus a place rule still waiting for a usable fix. Built in the same pass as
+    /// activeIgnoredMacSet; read per live packet at the haptic and notification gate in ingest.
+    private var alertSuppressedMacSet: Set<String> = []
     private var watchedMacSet: Set<String> = []
     private var publishedActiveIgnoredMacs: Set<String> = []
     private var liveNearbyTimer: Timer?
@@ -2333,16 +2484,28 @@ final class BLEManager: NSObject, ObservableObject {
         // Checkpoint the live log on the way out. Backgrounding is when a session ends and when
         // the app is about to be jetsammed or force-quit (a swipe-away backgrounds first), and
         // the board buffers nothing while we're connected, so this is the last chance to get the
-        // drive onto disk. willTerminate is too late for an async write.
+        // drive onto disk. willTerminate is too late for an async write. With no live link and
+        // Live Mode off nothing keeps the process running once it is backgrounded, so the write
+        // runs under a background task that ends in its completion: a checkpoint suspended
+        // mid-encode is silently lost (the atomic write only keeps the old file intact).
         observe(UIApplication.didEnterBackgroundNotification) { [weak self] _ in
-            self?.checkpointLive()
+            guard let self else { return }
+            self.endCheckpointBackgroundTask()   // one still open from a quick background/foreground
+            let task = UIApplication.shared.beginBackgroundTask(withName: "acab.checkpoint") { [weak self] in
+                self?.endCheckpointBackgroundTask()
+            }
+            self.checkpointBackgroundTask = task
+            self.checkpointLive { [weak self] _ in
+                guard let self, self.checkpointBackgroundTask == task else { return }
+                self.endCheckpointBackgroundTask()
+            }
             // Park a running connect scan: nothing consumes its results while backgrounded, and
             // with the bluetooth-central background mode a service-filtered scan otherwise keeps
             // the radio lit for days ("board off, tapped Scan, pressed Home"). Stop the radio
             // work directly but LEAVE connectionState == .scanning as the resume flag; the
             // foreground observer below re-issues the scan. Auto-reconnect is unaffected: it
             // rides a parked central.connect, not a scan.
-            if self?.connectionState == .scanning { self?.central?.stopScan() }
+            if self.connectionState == .scanning { self.central?.stopScan() }
         }
         // Resume the parked connect scan when the user comes back to it.
         observe(UIApplication.willEnterForegroundNotification) { [weak self] _ in
@@ -2403,7 +2566,7 @@ final class BLEManager: NSObject, ObservableObject {
             defaults.set(true, forKey: alertModeOriginAwareKey)
         }
         alertMode = storedAlertMode ?? .buzzer   // shown until a status frame says otherwise
-        hasStoredAlertMode = storedAlertMode != nil
+        self.storedAlertMode = storedAlertMode
         // Republish a restore offer left over from a previous run, so a Desert run the board ended
         // behind our back does not become a silence with nothing on screen saying why. Assigning
         // the mirror directly, NOT through desertAlertModeState: this is a read of what is already
@@ -2454,8 +2617,9 @@ final class BLEManager: NSObject, ObservableObject {
     }
 
     /// Reads the mute and watch lists and the detection history, once. A lock-screen intent can
-    /// cold-launch the app while the phone is locked, when these completeFileProtection files
-    /// cannot be opened, and every load here treats an unreadable file like a missing one. The
+    /// cold-launch the app while the phone is locked, when these protected files (closed, under
+    /// completeFileProtectionUnlessOpen) cannot be opened, and every load here treats an unreadable
+    /// file like a missing one. The
     /// next save would then replace the real lists and the real history. So nothing is read, and
     /// initializeCentral creates no central, until protected data is available.
     /// TWIN: Android's managedListsReady gate.
@@ -2971,6 +3135,10 @@ final class BLEManager: NSObject, ObservableObject {
             // simply confirm absence again.
             _ = persistedDetectionClearTombstone.retire()
         }
+        // The set-aside unreadable logs go with the file (deletePersistedLogFiles), so the notice
+        // about one goes too. Real path only: a sample Clear leaves the kept file, and the notice.
+        // TWIN: Android clearLog.
+        unreadableLogNotice = nil
         // The log file is not the only copy. Delivered detection notifications carry device names
         // in Notification Center, and every Log export / contribution share left a CSV or GPX in
         // tmp. Real path only: a sample Clear must not touch real notifications or exports.
@@ -3022,6 +3190,7 @@ final class BLEManager: NSObject, ObservableObject {
         } else {
             redactLockScreen = value
         }
+        writeWidgetSummary(force: true)   // the widget's face follows the switch now (w_redact)
     }
 
     func setPhoneNotificationEnabled(_ enabled: Bool, for type: DeviceType) {
@@ -3369,7 +3538,8 @@ final class BLEManager: NSObject, ObservableObject {
     //
     // The WidgetKit widget runs in its own process and cannot read our @Published state, so
     // we mirror a tiny summary into the shared App Group defaults whenever it changes: today's
-    // detection count, the last detection (label + when), and whether the board is linked. The
+    // detection count, the last detection (label + when), whether the board is linked, and
+    // whether the lock-screen switch hides the counts (w_redact). The
     // widget reads these EXACT keys (see the widget data-sharing contract) and we nudge
     // WidgetKit to refresh. The recompute is NOT cheap - it walks every row first-seen today and
     // pays a store lookup plus a mute/watchlist test on each - which is why it is sampled instead
@@ -3419,7 +3589,7 @@ final class BLEManager: NSObject, ObservableObject {
     /// same" and a reload would be wasted budget. cats is ordered by WidgetCategory.allCases.
     private struct WidgetSummarySnapshot: Equatable {
         let day: Int; let count: Int; let lastType: String
-        let lastAt: Double; let connected: Bool; let cats: [Int]
+        let lastAt: Double; let connected: Bool; let cats: [Int]; let redact: Bool
     }
     #if DEBUG
     /// Peripherals already described by the scan trace, so it logs once each instead of once per
@@ -3521,14 +3691,20 @@ final class BLEManager: NSObject, ObservableObject {
         // because UserDefaults across an App Group is happiest with plain scalars and the widget
         // reads them individually anyway. Keys match DeviceType.widgetCategoryKey.
         let catCounts = WidgetCategory.allCases.map { cat[$0.rawValue] ?? 0 }
-        // Snapshot FIRST, then decide. Its fields are exactly the eleven values written below, so
+        // The lock-screen switch ("Hide details on lock screen") reaches the widget too: true draws
+        // its "counts hidden" face (DetectionsWidget reads w_redact). settingsRedactLockScreen, so
+        // the tour's preview switch drives the tour's widget and exitDemo's forced write puts the
+        // real value back.
+        let redact = settingsRedactLockScreen
+        // Snapshot FIRST, then decide. Its fields are exactly the twelve values written below, so
         // an unchanged snapshot proves every stored value is already current and every write would
         // be a no-op - the writes used to go out unconditionally and only the reload was gated.
         // The reload gate itself is unchanged and is the important one: reloading for identical
         // data is what used to exhaust WidgetKit's budget and freeze the glance until the widget
         // was removed and re-added.
         let snapshot = WidgetSummarySnapshot(day: day, count: todayCount, lastType: lastType,
-                                             lastAt: lastAt, connected: connected, cats: catCounts)
+                                             lastAt: lastAt, connected: connected, cats: catCounts,
+                                             redact: redact)
         guard force || snapshot != lastWidgetSnapshot else { return }
         lastWidgetSnapshot = snapshot
         d.set(todayCount, forKey: "w_countToday")
@@ -3536,6 +3712,7 @@ final class BLEManager: NSObject, ObservableObject {
         d.set(lastType,   forKey: "w_lastType")
         d.set(lastAt,     forKey: "w_lastAt")
         d.set(connected,  forKey: "w_connected")
+        d.set(redact,     forKey: "w_redact")
         for (c, n) in zip(WidgetCategory.allCases, catCounts) { d.set(n, forKey: c.defaultsKey) }
         reloadWidgetSoon(force: force)
     }
@@ -3704,8 +3881,16 @@ final class BLEManager: NSObject, ObservableObject {
         let here = ignored.contains(where: \.isPlaceScoped)
             ? currentLocationCoord.map { CLLocation(latitude: $0.latitude, longitude: $0.longitude) }
             : nil
-        activeIgnoredMacSet = Set(ignored.lazy.filter { evaluateMuteRule($0, now: now, here: here) == .active }
-            .map { $0.mac.lowercased() })
+        var active = Set<String>()
+        var alertsHeld = Set<String>()
+        for rule in ignored {
+            let status = evaluateMuteRule(rule, now: now, here: here)
+            let mac = rule.mac.lowercased()
+            if status == .active { active.insert(mac) }
+            if placeRuleSuppressesAlerts(status) { alertsHeld.insert(mac) }
+        }
+        activeIgnoredMacSet = active
+        alertSuppressedMacSet = alertsHeld
     }
 
     private var boardIgnoredMacs: [String] { ignored.filter(isBoardBackedMute).map(\.mac) }
@@ -3720,14 +3905,14 @@ final class BLEManager: NSObject, ObservableObject {
     /// Capped at the firmware's 256 like the bulk path: the board truncates the list, so a 257th
     /// entry would sit in the app looking silenced while the board kept alerting on it.
     ///
-    /// Returns false for THREE reasons and the caller can only tell two of them apart: the list is
-    /// already full and the device was NOT ignored; a `.here` scope with no fix to anchor it; or a
-    /// MAC the board could never store (see isBoardPushableMac). DetectionDetailView's mute sheet
-    /// has a two-branch else, so that third case shows the "the muted-device list is full" copy and
-    /// an instruction that can never help. Unreachable from genuine hardware - only a spoofed or
-    /// non-conforming peer advertises a MAC of that shape - and fixing it properly means a third
-    /// message in that sheet, not a change here. Android's ignoreDevice carries the same three
-    /// reasons and the same caller gap.
+    /// Returns false for THREE reasons, in this order: a MAC the board could never store (see
+    /// isBoardPushableMac; only a spoofed or non-conforming peer advertises one), a `.here` scope
+    /// with no fix to anchor it, or a full list (the device was NOT ignored). muteRefusal(for:scope:)
+    /// names which one, with the same guards in the same order, so the mute sheet can say the one
+    /// thing that helps. Android twin: ignoreDevice / muteRefusal in AcabBleManager.kt.
+    ///
+    /// A mute that lands also withdraws the device's delivered alert, which names it in
+    /// Notification Center (DetectionNotifier.removeDetectionNotifications(forMacs:)).
     @discardableResult
     func ignoreDevice(_ d: Detection, scope: MuteScope = .permanent) -> Bool {
         let mac = d.mac.lowercased()
@@ -3740,6 +3925,9 @@ final class BLEManager: NSObject, ObservableObject {
         if scope == .here, here == nil { return false }
         let index = ignored.firstIndex { $0.mac == mac }
         guard index != nil || ignored.count < 256 else { return false }
+        // Past every refusal, so the mute holds: the shade must not keep naming the device. Real
+        // alerts only; a sample-data mute leaves Notification Center alone, as a sample Clear does.
+        if !demoMode { notifier.removeDetectionNotifications(forMacs: [d.mac]) }
         let prior = index.map { ignored[$0] }
         let replacement = IgnoredDevice(
             mac: mac, label: prior?.label.isEmpty == false ? prior!.label : d.displayName,
@@ -3761,17 +3949,25 @@ final class BLEManager: NSObject, ObservableObject {
         return true
     }
 
+    /// Why ignoreDevice(d, scope:) refused: its three guards, in its order. Ask it only after a
+    /// refusal; a mute it would accept still reads `.listFull`, the last guard.
+    /// TWIN: muteRefusal in AcabBleManager.kt.
+    func muteRefusal(for d: Detection, scope: MuteScope) -> MuteRefusal {
+        if !isBoardPushableMac(d.mac.lowercased()) { return .unstorableAddress }
+        if scope == .here, currentLocationCoord == nil { return .locationNeeded }
+        return .listFull
+    }
+
     /// Silence several devices at once (the Log's select mode). One ignore-list
     /// push and one republish instead of one per row. The firmware accepts up to 256
     /// entries, so we cap the list there.
     ///
     /// A MAC the board could never store (isBoardPushableMac) IS counted in the return, because a
-    /// row the board cannot parse ends up muted nowhere. That shares the return's wording with the
-    /// list-full case, which stays a known gap. Same spoofed/non-conforming-peer envelope as
-    /// ignoreDevice's third false, and the honest repair is a second reason in the caller's message
-    /// rather than a bigger number out of here: today every unit of this return is worded as "the
-    /// muted-device list is full". Android twin: AcabBleManager.ignoreDevices, same rule and same
-    /// wording gap.
+    /// row the board cannot parse ends up muted nowhere. Same spoofed/non-conforming-peer envelope
+    /// as ignoreDevice's first refusal (MuteRefusal.unstorableAddress). The return mixes that
+    /// reason with the full list, so the caller's message names no reason ("N couldn't be muted");
+    /// a single mute from the detail screen says which. Android twin:
+    /// AcabBleManager.ignoreDevices, same rule and same wording.
     @discardableResult
     func ignoreDevices(_ list: [Detection]) -> Int {
         let previousBoardMacs = boardIgnoredMacSet
@@ -3822,6 +4018,11 @@ final class BLEManager: NSObject, ObservableObject {
         }
         if unstarred { watched = newWatched }
         if changed { ignored = newIgnored }
+        // Same withdrawal as ignoreDevice, for every device this call muted (or found muted).
+        if !demoMode {
+            notifier.removeDetectionNotifications(
+                forMacs: list.filter { accepted.contains($0.mac.lowercased()) }.map(\.mac))
+        }
         if changed { persistIgnored(); syncIgnoreListIfChanged(from: previousBoardMacs) }
         if unstarred { persistWatched(); sendWatchList() }
         if changed || unstarred { publishDetections() }
@@ -3890,10 +4091,14 @@ final class BLEManager: NSObject, ObservableObject {
         }
     }
 
-    /// Un-star a device.
+    /// Un-star a device, and withdraw its delivered alert: the user just said this one no longer
+    /// needs flagging, and the alert names it in Notification Center. One identifier per MAC, so
+    /// that is whatever alert it last posted, as on mute. TWIN: unwatch in android
+    /// AcabBleManager.kt (cancelPostedAlert), the same scope.
     func unwatch(_ mac: String) {
         watched.removeAll { $0.mac == mac.lowercased() }
         persistWatched(); sendWatchList()
+        if !demoMode { notifier.removeDetectionNotifications(forMacs: [mac]) }
     }
 
     /// Rename a starred device's label.
@@ -3958,21 +4163,29 @@ final class BLEManager: NSObject, ObservableObject {
 
     // MARK: - Seen watermark ("mark all seen")
 
-    /// Drop a "seen" baseline at now: everything currently in the log becomes "seen",
-    /// and the New-only filter then shows only what arrives after this.
+    /// Drop a "seen" baseline: everything currently in the log becomes "seen", and the New-only
+    /// filter then shows only what arrives after this. The live-axis baseline is the NEWEST
+    /// first-seen stamp among real rows (pseudo-band rows excluded), or now when there are none,
+    /// not the wall clock: a buffered record drained after the tap whose own time falls between
+    /// the newest row and the tap was never in front of the user, so it must read New. It is
+    /// capped at now, so a row stamped in the future (the phone clock moved back) cannot mark
+    /// later live rows seen. Mirrors Android's markAllSeen, the same filter on HIST_PSEUDO_BASE,
+    /// the same fallback and the same cap.
     func markAllSeen() {
         let now = Date()
-        seenWatermark = now
+        let newest = store.keys.compactMap { firstSeenAt[$0] }.filter { $0 > histPseudoBase }.max()
+        let mark = min(newest ?? now, now)
+        seenWatermark = mark
         // Baseline the pseudo band too, on its stable axis: the highest buffer seq among the
         // still-.unknown rows is the most recent undateable record, so anything the board hands
         // us beyond it is New. Without this second baseline a post-mark drain of records nothing
         // can date (pre-boot-counter firmware, or a drain that never closes) could never surface
         // in the New-only filter again: pseudo stamps sit just above the epoch, forever below any
-        // wall-clock watermark. Mirrors Android's approxWatermark.
+        // live-axis watermark. Mirrors Android's approxWatermark.
         let maxUnknownSeq = histBasis.values.filter { $0.basis == .unknown }.map(\.seq).max() ?? 0
         if maxUnknownSeq > approxSeenSeq { approxSeenSeq = maxUnknownSeq }
         guard seenWatermarkWritesAllowed(isDemoMode: demoMode) else { return }
-        defaults.set(now.timeIntervalSince1970, forKey: watermarkKey)
+        defaults.set(mark.timeIntervalSince1970, forKey: watermarkKey)
         defaults.set(Int(approxSeenSeq), forKey: approxSeenSeqKey)
     }
 
@@ -4041,9 +4254,10 @@ final class BLEManager: NSObject, ObservableObject {
 
     // MARK: whitelist / watchlist persistence (Application Support, file-protected)
     // The ignore + watch lists hold MACs plus the advertised NAMES of tracked surveillance gear,
-    // so they get the same at-rest posture as the detections store: a completeFileProtection file
-    // in Application Support, excluded from iCloud/iTunes backup. (Previously plaintext, backed-up
-    // UserDefaults, readable while the phone was locked and copied into device backups.)
+    // so they get the same at-rest posture as the detections store: a
+    // completeFileProtectionUnlessOpen file in Application Support, excluded from iCloud/iTunes
+    // backup. (Previously plaintext, backed-up UserDefaults, readable while the phone was locked
+    // and copied into device backups.)
     private var ignoreURL: URL? { appSupportFile("acab-ignored.json") }
     private var watchURL: URL? { appSupportFile("acab-watched.json") }
 
@@ -4054,9 +4268,14 @@ final class BLEManager: NSObject, ObservableObject {
         return dir.appendingPathComponent(name)
     }
 
+    /// .completeFileProtectionUnlessOpen, the detections store's class (see persistDetections):
+    /// a closed list still cannot be read on a locked phone, but .atomic writes a fresh file, so a
+    /// save that lands while locked succeeds. With plain .completeFileProtection a timed mute
+    /// expiring in a pocketed Live Mode session (pruneExpiredMutes off the minute timer) failed to
+    /// save and raised the managed-list error for a write the OS could never accept.
     private func writeProtectedList<T: Encodable>(_ value: T, to url: URL?) -> Bool {
         performProtectedManagedListWrite(value, to: url) { data, url in
-            try data.write(to: url, options: [.atomic, .completeFileProtection])
+            try data.write(to: url, options: [.atomic, .completeFileProtectionUnlessOpen])
             var v = URLResourceValues()
             v.isExcludedFromBackup = true
             var u = url
@@ -4066,7 +4285,7 @@ final class BLEManager: NSObject, ObservableObject {
 
     /// Complete an interrupted migration whose protected JSON landed but whose backup exclusion did
     /// not. The loaded protected value is authoritative; the legacy copy is only a privacy fallback.
-    /// Re-writing through writeProtectedList reasserts BOTH complete protection and exclusion after
+    /// Re-writing through writeProtectedList reasserts BOTH its file protection and exclusion after
     /// the atomic replacement, and the helper removes UserDefaults only after that full operation.
     private func reconcileLegacyAfterProtectedLoad<T: Encodable>(
         _ value: T, to url: URL, kind: ManagedListKind, legacyKey: String
@@ -4296,9 +4515,9 @@ final class BLEManager: NSObject, ObservableObject {
         }
     }
 
-    /// Push the store into the published feed immediately. Recomputes the per-category
-    /// counts (O(store), needed for the Live Activity), sorts most-recent-first, and
-    /// caps the array so a huge Desert-mode store doesn't hand SwiftUI thousands of rows.
+    /// Push the store into the published feed immediately. Sorts most-recent-first, caps the
+    /// array so a huge Desert-mode store doesn't hand SwiftUI thousands of rows, and, while Live
+    /// Mode runs, recomputes the per-category counts (O(store)) for the Live Activity.
     private func publishDetections() {
         publishTimer?.invalidate()
         publishTimer = nil
@@ -4357,9 +4576,12 @@ final class BLEManager: NSObject, ObservableObject {
                 isCurrentlyWatched: watchedMacSet.contains($0.loweredMac),
                 activeIgnoredMacs: muted)
         }
-        let liveChanged = recomputeLiveCounts(now: lastPublish)
         writeWidgetSummary()   // mirror today's count + last detection to the home widget (reload throttled)
-        if driveModeOn && liveChanged { liveActivity.update(liveState()) }
+        // liveCounts has one reader, liveState(), and only Live Mode reads it. Every path that
+        // turns Live Mode on recomputes first (beginDriveModeIfReady and the adopt arms), and the
+        // 5 s liveNearbyTimer keeps it current while it runs, so a second store walk per publish
+        // with Live Mode off bought nothing.
+        if driveModeOn, recomputeLiveCounts(now: lastPublish) { liveActivity.update(liveState()) }
     }
 
     /// Coalesced republish for the hot path. Publishes at most once per
@@ -5153,12 +5375,14 @@ final class BLEManager: NSObject, ObservableObject {
     ///     the board is audible and the user wanted quiet, keep trying to MUTE. Erring quiet is the
     ///     only safe direction here.
     ///  3. The correction was persisted, so one transient link fault could rewrite a stored
-    ///     preference. The correction is now in-memory for the session; the stored preference is
-    ///     re-asserted from scratch on the next launch.
+    ///     preference. The correction is now in-memory for the session; the stored preference
+    ///     comes back on the next launch (and connectTimeBuzzerWrite reads the stored mode, never
+    ///     a corrected or mirrored one).
     ///
     /// A LATER FIX (security review 2026-09-29): a phone with NO stored mode used to assert the
     /// in-memory default, .buzzer, and un-mute a board muted from another install or phone. Such a
-    /// phone now only mirrors the board (the hasStoredAlertMode guard below).
+    /// phone now only mirrors the board (the mirroredAlertMode call below), and since the app
+    /// review of 2026-10-12 so does a stored Buzzer this phone did not set on the current link.
     /// Latched view of the board's Desert state, so a `desert:false` frame can be told apart from
     /// "our enable write has not landed yet". Only flips true once the BOARD confirms Desert on.
     private var desertSeenOn = false
@@ -5254,8 +5478,12 @@ final class BLEManager: NSObject, ObservableObject {
         // connectBuzzerWrite). BEFORE the mesh bail, so a mesh board mirrors as .silent instead of
         // leaving the .buzzer placeholder for Desert to capture (see mirroredAlertMode). Guarded:
         // @Published republishes an equal value, and this runs on every status frame.
-        if let mirrored = mirroredAlertMode(hasStoredMode: hasStoredAlertMode,
-                                            heldThisLink: appHeldAlertModeThisLink, boardBuzzer: s.buzzer) {
+        // A stored BUZZER takes this same path (connectBuzzerWrite says why): only a stored quiet
+        // mode, or a mode set on this link or picked while away, is asserted against the board.
+        // The mirror moves alertMode alone; storedAlertMode keeps the pick.
+        if let mirrored = mirroredAlertMode(
+            hasStoredMode: storedAlertMode != nil && storedAlertMode != .buzzer,
+            heldThisLink: appHeldAlertModeThisLink || alertModePickedWhileAway, boardBuzzer: s.buzzer) {
             if alertMode != mirrored { alertMode = mirrored }
             buzzerReassertAttempts = 0
             lastBuzzerMuteWrite = .distantPast
@@ -5317,13 +5545,16 @@ final class BLEManager: NSObject, ObservableObject {
         // Stored only when a user picked it, or when this phone already stores a mode. An app-origin
         // mode on a phone with no stored mode holds for this link only (appHeldAlertModeThisLink):
         // Desert still mutes and restores the board, but the phone goes back to mirroring on the
-        // next connect instead of asserting a mode nobody picked here.
+        // next connect instead of asserting a mode nobody picked here. Every mode set here is held
+        // for the link, stored or not, so a pick of Buzzer is re-asserted on this link rather than
+        // mirrored back to a muted board's Silent; a user pick with no ready board also waits for
+        // the next READY (alertModePickedWhileAway).
         if origin == .user || hasStoredAlertMode {
             defaults.set(m.rawValue, forKey: alertModeKey)
-            hasStoredAlertMode = true
-        } else {
-            appHeldAlertModeThisLink = true
+            storedAlertMode = m
         }
+        appHeldAlertModeThisLink = true
+        if origin == .user, !sessionWasReady { alertModePickedWhileAway = true }
         // A user pick drops everything the app was holding on their behalf: the mode captured on
         // the way into Desert AND an offer still on screen. SILENT IS INCLUDED, which is the whole
         // point - choosing silence by hand is a choice, not a mute to undo later. An app-set mode
@@ -5443,8 +5674,8 @@ final class BLEManager: NSObject, ObservableObject {
                 if let statusKey = Self.demoStatusKeyByConfigKey[key] {
                     setDemoStatusValue(value, for: statusKey)
                 } else if key == "motorola" {
-                    // "moto" rides outside DeviceStatus (ingestStatus assigns motorolaOn from
-                    // the raw frame), so the canned re-decode cannot carry it; mirror directly.
+                    // motorolaOn is assigned only in ingestStatus, which the canned re-decode
+                    // never runs, so mirror the write directly.
                     motorolaOn = value as? Bool ?? motorolaOn
                 } else if !Self.demoInertConfigKeys.contains(key) {
                     print("[ACAB-demo] no status echo mapped for config key \"\(key)\"")
@@ -5950,9 +6181,30 @@ final class BLEManager: NSObject, ObservableObject {
     }
 
     private let persistQueue = DispatchQueue(label: "tech.acab.persist", qos: .utility)  // serial, off-main
-    /// Checkpoint the store to disk. `completion` runs on the main thread with whether the
-    /// write actually landed; anything that commits state the file is supposed to back (the
-    /// replay cursor) must wait for it rather than assume success.
+    /// Bumped on every change a checkpoint would store: each record ingestDetection files and each
+    /// history re-key (rekey). `savedStoreRevision` is the revision the last write that LANDED
+    /// snapshotted, so equal values mean the file already holds this store and a checkpoint skips
+    /// the whole-store encode. What it does not count, a reload recomputes: the load itself (the
+    /// store then IS the file), the cap eviction publishDetections repeats after any load, and the
+    /// basis applyLoadedRows derives for a pre-basis row (re-derived at the next load, no
+    /// narrower, until the next real change writes it).
+    private var storeRevision: UInt64 = 0
+    private var savedStoreRevision: UInt64 = 0
+    /// The load (launch, or exitDemo's reload) still on its way to applyLoadedRows: its gate token,
+    /// nil when none is pending. While set, persistDetections refuses. Only the load that set it
+    /// clears it (finishPersistedLoad), on every arm: rows applied, no file or an unreadable one, a
+    /// token a Clear invalidated, a pending tombstone.
+    private var persistedLoadPendingToken: UInt64?
+    /// A checkpoint the load barrier refused; the load's landing runs one checkpoint for it.
+    private var checkpointRefusedDuringLoad = false
+    /// Writes enqueued on persistQueue that have not reported back. The completion always
+    /// decrements, landed or not, so a failed write cannot wedge the skips that read it.
+    private var persistWritesInFlight = 0
+
+    /// Checkpoint the store to disk. `completion` runs on the main thread with whether the store is
+    /// on disk: the write landed, or the file already held this exact store. Anything that commits
+    /// state the file is supposed to back (the replay cursor) must wait for it rather than assume
+    /// success.
     private func persistDetections(completion: ((Bool) -> Void)? = nil) {
         guard let url = persistURL else { completion?(false); return }
         // The tour's sample hits live in the same store, so every checkpoint has to refuse while
@@ -5964,25 +6216,43 @@ final class BLEManager: NSObject, ObservableObject {
         guard persistedDetectionLoadAllowed(
             clearPending: persistedDetectionClearTombstone.isPending
         ) else { completion?(false); return }
+        switch detectionCheckpointStep(loadPending: persistedLoadPendingToken != nil,
+                                       storeIsEmpty: store.isEmpty,
+                                       revision: storeRevision, savedRevision: savedStoreRevision) {
+        case .refuseUntilLoaded:
+            // A remembered board can reconnect inside the launch load's window, and its first live
+            // row checkpoints at once (lastLiveCheckpoint starts at distantPast). Written now, the
+            // file would hold those rows alone until the next checkpoint, and a kill in between
+            // lost the saved history. finishPersistedLoad re-runs this once the load lands.
+            checkpointRefusedDuringLoad = true
+            completion?(false)
+            return
+        case .keepFile:
+            // Never let an empty store overwrite a non-empty file. An in-memory reset (exiting the
+            // tour, a radio teardown) must not be able to erase real history through the next
+            // checkpoint; deleting the log is the confirmed Clear-log path's job and nothing else's.
+            let exists = FileManager.default.fileExists(atPath: url.path)
+            completion?(!exists)   // nothing to write is only "saved" when there was nothing to lose
+            return
+        case .alreadySaved:
+            completion?(true)
+            return
+        case .write:
+            break
+        }
+        let revision = storeRevision
         // Snapshot on the main thread (cheap: just builds value structs from the store), then do the
         // JSON encode + atomic disk write on a background queue. Encoding thousands of rows + writing
         // a multi-MB file was the thing blocking the main thread during a big replay, freezing the log
         // scroll and the radar. `rows` is a value type, so handing it to the async closure is safe.
         let rows = store.values.map { checkpointRow(for: $0) }
-        // Never let an empty store overwrite a non-empty file. An in-memory reset (exiting the
-        // tour, a radio teardown) must not be able to erase real history through the next
-        // checkpoint; deleting the log is the confirmed Clear-log path's job and nothing else's.
-        if rows.isEmpty {
-            let exists = FileManager.default.fileExists(atPath: url.path)
-            completion?(!exists)   // nothing to write is only "saved" when there was nothing to lose
-            return
-        }
+        persistWritesInFlight += 1
         // .completeFileProtectionUnlessOpen: the detections file (MACs + phone GPS + timestamps)
         // still can't be read on a seized locked phone, but .atomic creates a fresh temp file per
         // write, so a checkpoint that lands while the phone is locked (pocketed mid-drive, which is
         // the offline buffer's whole scenario) succeeds instead of silently failing. Plain
         // .completeFileProtection makes every locked write fail.
-        persistQueue.async {
+        persistQueue.async { [weak self] in
             var ok = false
             do {
                 let data = try JSONEncoder().encode(rows)
@@ -6001,7 +6271,15 @@ final class BLEManager: NSObject, ObservableObject {
             } catch {
                 ok = false
             }
-            if let completion { DispatchQueue.main.async { completion(ok) } }
+            // Always back on main, completion or not: the in-flight count and the saved revision
+            // are main-confined like the store. persistQueue is serial, so these land in order.
+            DispatchQueue.main.async {
+                if let self {
+                    self.persistWritesInFlight -= 1
+                    if ok { self.savedStoreRevision = revision }
+                }
+                completion?(ok)
+            }
         }
     }
 
@@ -6013,31 +6291,39 @@ final class BLEManager: NSObject, ObservableObject {
     /// The cursor is captured at snapshot time, or we'd advance past rows that arrived during
     /// the async encode. On failure lastSeq stays put; the board re-sends and filing is
     /// idempotent by id, so a re-drain costs a little radio and nothing else.
-    /// Set while a checkpoint's encode + disk write is still on persistQueue. Mid-drain checkpoints
-    /// skip rather than pile up behind it (see the caller); the completion always clears it, on
-    /// both the success and failure paths, so a refused write (demo mode, missing URL) cannot wedge
-    /// checkpointing off for the rest of the session.
-    private var checkpointInFlight = false
-
-    private func checkpointHistory(finalizeGeneration: Bool = false) {
+    ///
+    /// `adoptsGeneration`: may this checkpoint make a CHANGED generation durable? Every caller
+    /// runs only after this drain's begin sentinel (historyEnvelopeAuthorizesCheckpoint), which is
+    /// the board naming the generation. The mid-drain checkpoint adopts it, so a disconnect partway
+    /// through a first sync or a post-Clear drain resumes from the cursor instead of the ring
+    /// floor. That is safe for the same write-ahead reason as the same-generation path: lastGoodSeq
+    /// only advances contiguously, it is captured before the snapshot, and the tuple is written only
+    /// after that snapshot landed, so it never names a row the file lacks. handleHistEnd adopts only
+    /// on a complete drain; at the retry cap (deferIncomplete) it keeps the old tuple unless a
+    /// mid-drain checkpoint already adopted the generation. Android twin: checkpointHistory in
+    /// AcabBleManager.kt, the same adoption at the same two sites.
+    private func checkpointHistory(adoptsGeneration: Bool) {
         let cursor = lastGoodSeq
         let generation = activeLogGeneration
         let cursorEpoch = replayCursorEpoch
-        checkpointInFlight = true
         persistDetections { [weak self] saved in
-            guard let self else { return }
-            self.checkpointInFlight = false
-            guard saved, cursorEpoch == self.replayCursorEpoch,
+            guard let self, saved, cursorEpoch == self.replayCursorEpoch,
                   generation == self.activeLogGeneration else { return }
             let persisted = self.persistedReplayCursor()
             if generation != persisted.generation {
-                guard finalizeGeneration, generation != 0 else { return }
+                guard adoptsGeneration, generation != 0 else { return }
             } else if cursor <= persisted.seq {
                 return
             }
             self.persistReplayCursor(seq: cursor, generation: generation)
         }
     }
+
+    /// A checkpoint's encode + disk write is still on persistQueue. Rather than queue a second
+    /// whole-store encode behind it, the mid-drain checkpoint skips (the drain's end checkpoints
+    /// again) and the live checkpoint re-arms (liveCheckpointDelay); the drain's end and the
+    /// disconnect and background checkpoints never skip.
+    private var checkpointInFlight: Bool { persistWritesInFlight > 0 }
 
     // Live-path disk checkpoint. The board only buffers while we're AWAY (it skips the buffer
     // entirely while a client is connected), so during a connected drive RAM is the only copy of
@@ -6053,25 +6339,36 @@ final class BLEManager: NSObject, ObservableObject {
 
     private func scheduleLiveCheckpoint() {
         guard liveCheckpointTimer == nil else { return }   // a trailing checkpoint is already queued
-        let elapsed = Date().timeIntervalSince(lastLiveCheckpoint)
-        if elapsed >= liveCheckpointInterval {
+        guard let delay = liveCheckpointDelay(elapsed: Date().timeIntervalSince(lastLiveCheckpoint),
+                                              interval: liveCheckpointInterval,
+                                              writeInFlight: checkpointInFlight) else {
             checkpointLive()
-        } else {
-            liveCheckpointTimer = Timer.scheduledTimer(withTimeInterval: liveCheckpointInterval - elapsed,
-                                                       repeats: false) { [weak self] _ in
-                self?.liveCheckpointTimer = nil
-                self?.checkpointLive()
-            }
+            return
+        }
+        // Not due yet, or due while a write is in flight: decide again when the timer fires.
+        liveCheckpointTimer = Timer.scheduledTimer(withTimeInterval: delay, repeats: false) { [weak self] _ in
+            self?.liveCheckpointTimer = nil
+            self?.scheduleLiveCheckpoint()
         }
     }
 
+    /// The background-time assertion the didEnterBackground checkpoint holds until its write
+    /// reports back (or iOS calls the expiration handler). `.invalid` when none is open.
+    private var checkpointBackgroundTask = UIBackgroundTaskIdentifier.invalid
+    private func endCheckpointBackgroundTask() {
+        guard checkpointBackgroundTask != .invalid else { return }
+        UIApplication.shared.endBackgroundTask(checkpointBackgroundTask)
+        checkpointBackgroundTask = .invalid
+    }
+
     /// Checkpoint the live session now. Safe to call from the teardown paths: the empty-store
-    /// and demo guards in persistDetections() keep it from destroying anything.
-    private func checkpointLive() {
+    /// and demo guards in persistDetections() keep it from destroying anything. `completion` is
+    /// persistDetections' (main thread, whether the store is on disk).
+    private func checkpointLive(completion: ((Bool) -> Void)? = nil) {
         liveCheckpointTimer?.invalidate()
         liveCheckpointTimer = nil
         lastLiveCheckpoint = Date()
-        persistDetections()
+        persistDetections(completion: completion)
     }
 
     /// Per-row tolerant wrapper for the load path. Decoding the store as a plain `[StoredRow]`
@@ -6092,6 +6389,7 @@ final class BLEManager: NSObject, ObservableObject {
             clearPending: persistedDetectionClearTombstone.isPending
         ) else { return }
         let loadToken = persistedDetectionLoadGate.beginLoad()
+        persistedLoadPendingToken = loadToken   // checkpoints wait for this load (persistDetections)
         // Decode + sort OFF the main thread, then populate the store back ON it. The file holds about
         // liveFeedCap (5000) rows / ~5MB (a checkpoint can overshoot until the next publish; see
         // NO CAP HERE below), so doing this inline in init() on the main thread is a
@@ -6100,9 +6398,32 @@ final class BLEManager: NSObject, ObservableObject {
         // store access main-confined and needs no locks. Routed through persistQueue so a load can't
         // race a checkpoint write of the same file. exitDemo() re-runs this after clearing the tour.
         persistQueue.async { [weak self] in
-            guard let self,
-                  let url = self.persistURL, let data = try? Data(contentsOf: url),
-                  let decoded = try? JSONDecoder().decode([LenientStoredRow].self, from: data) else { return }
+            guard let self else { return }
+            guard let url = self.persistURL, let data = try? Data(contentsOf: url) else {
+                // No file (a fresh install), or a read that failed outright (a decode failure is
+                // the arm below): nothing will land, so the store is all there is and checkpoints
+                // may go ahead.
+                DispatchQueue.main.async { self.finishPersistedLoad(loadToken) }
+                return
+            }
+            guard let decoded = try? JSONDecoder().decode([LenientStoredRow].self, from: data)
+            else {
+                // Present but not a row array at all (a bad row alone is skipped below, not this).
+                // This used to start fresh with the file left in place, and the next checkpoint
+                // overwrote it: evidence destroyed in silence. Move it aside instead, on this
+                // serial queue so no checkpoint lands in between, and say so once. A failed rename
+                // leaves the file and raises nothing, as does a token staled meanwhile (a Clear,
+                // which by then deleted the kept file, or a newer load). The barrier always lowers.
+                // TWIN: the setAsideUnreadableLog arm of Android loadPersistedDetections.
+                let kept = setAsideUnreadableLog(url, now: Date())
+                DispatchQueue.main.async {
+                    if kept != nil, self.persistedDetectionLoadGate.accepts(loadToken) {
+                        self.unreadableLogNotice = BLEManager.unreadableLogNoticeText
+                    }
+                    self.finishPersistedLoad(loadToken)
+                }
+                return
+            }
             let rows = decoded.compactMap(\.row)
             #if DEBUG
             // Skipped rows signal the on-disk shape drifted; surface the count (DEBUG only).
@@ -6118,6 +6439,7 @@ final class BLEManager: NSObject, ObservableObject {
             // dropped watched rows before older unwatched ones.
             let newest = rows.sorted { ($0.lastSeen ?? .distantPast) > ($1.lastSeen ?? .distantPast) }
             DispatchQueue.main.async {
+                defer { self.finishPersistedLoad(loadToken) }   // every arm, after the rows land
                 guard self.persistedDetectionLoadGate.accepts(loadToken),
                       persistedDetectionLoadAllowed(
                         clearPending: self.persistedDetectionClearTombstone.isPending
@@ -6126,6 +6448,30 @@ final class BLEManager: NSObject, ObservableObject {
             }
         }
     }
+
+    /// Lift the load barrier `token` raised (a no-op when a newer load owns it), then run the one
+    /// checkpoint it refused, against the now-complete store. MAIN THREAD.
+    private func finishPersistedLoad(_ token: UInt64) {
+        guard persistedLoadPendingToken == token else { return }
+        persistedLoadPendingToken = nil
+        guard checkpointRefusedDuringLoad else { return }
+        checkpointRefusedDuringLoad = false
+        checkpointLive()
+    }
+
+    #if DEBUG
+    /// Load-barrier hooks for PersistenceSafetyTests. `testCheckpointEmptyStore` runs a real
+    /// persistDetections ONLY while the store is empty, so with the barrier working it is refused
+    /// and with the barrier broken it stops at the empty-store guard: no test can write the host
+    /// app's log through it. Right after init(defaults:) the store is empty and the launch load has
+    /// not landed (it hops through persistQueue and back to main).
+    var testPersistedLoadPending: Bool { persistedLoadPendingToken != nil }
+    var testCheckpointRefusedDuringLoad: Bool { checkpointRefusedDuringLoad }
+    func testCheckpointEmptyStore(completion: @escaping (Bool?) -> Void) {
+        guard store.isEmpty else { completion(nil); return }
+        persistDetections { completion($0) }
+    }
+    #endif
 
     /// Checkpoint-boundary twin of the wire-side `at` clamp in Detection.init(from:). A file
     /// written by a build BEFORE that clamp can carry a poisoned Date (the wire `at` was decoded
@@ -6265,11 +6611,8 @@ final class BLEManager: NSObject, ObservableObject {
     /// block is queued. This method is main-thread-only at all call sites.
     private func deletePersistedDetectionsSynchronously() -> Bool {
         guard let url = persistURL else { return false }
-        return persistQueue.sync {
-            performConfirmedPersistedDetectionDeletion(
-                fileExists: { FileManager.default.fileExists(atPath: url.path) },
-                remove: { try FileManager.default.removeItem(at: url) })
-        }
+        // The set-aside unreadable logs go with the file (deletePersistedLogFiles).
+        return persistQueue.sync { deletePersistedLogFiles(url) }
     }
 
     /// Resolve a durable Clear intent on the real store. Called at the tap, before launch loading,
@@ -6378,7 +6721,9 @@ final class BLEManager: NSObject, ObservableObject {
             }
             return
         }
-        if !d.isHistory, isIgnored(d.mac) {
+        // The set lookup isIgnored makes, on the address Detection already lowercased at decode,
+        // so a busy feed does not build a lowercased String per packet.
+        if !d.isHistory, activeIgnoredMacSet.contains(d.loweredMac) {
             // Muted: a live frame files nothing and alerts on nothing. A replayed HISTORY record
             // is filed like any other (history never alerts). The board buffered it while the
             // phone was away, so no timed or place rule was in force then, and a record buffered
@@ -6391,6 +6736,7 @@ final class BLEManager: NSObject, ObservableObject {
         }
 
         let firstTime = store[d.id] == nil
+        storeRevision &+= 1   // every path below may change what a checkpoint stores (see storeRevision)
 
         // The sparkline keeps every sample independently of whether it carried a location. The
         // closest-approach peak below must never read this history as its baseline: an unlocated
@@ -6479,17 +6825,21 @@ final class BLEManager: NSObject, ObservableObject {
         // carried the Communication Notifications entitlement, Focus access was granted, Share
         // Focus Status was on and the app was not in that Focus's allowed list. Android's twin
         // gate, AcabBleManager.focusSuppressed, reads Do Not Disturb, which needs no capability.
-        if !d.isHistory, alertMode == .vibrate, hapticDue(d.mac) { alertHaptic(for: d.type) }
+        // A place rule waiting for a usable fix still holds back both phone alerts (the row above
+        // was filed and shows): see placeRuleSuppressesAlerts.
+        let alertsHeld = alertSuppressedMacSet.contains(d.loweredMac)
+        if !d.isHistory, !alertsHeld, alertMode == .vibrate, hapticDue(d.mac) { alertHaptic(for: d.type) }
         // Phone notification, per category, opt-in. Deliberately INDEPENDENT of alertMode: that
         // governs the board's buzzer, and choosing a silent board is not the same as choosing a
-        // silent phone. Ignored devices never reach here (dropped above), so one cannot notify.
+        // silent phone. Ignored devices never reach here (dropped above), so one cannot notify,
+        // and neither can a MAC in alertSuppressedMacSet.
         //
         // NOT gated on `firstTime`, deliberately. `firstTime` is `store[d.id] == nil`, and the store
         // is PERSISTED across launches, so a device seen in any previous session was never first
         // again and could never notify. The notifier owns the dedup via its per-device cooldown,
         // which is what the settings copy actually promises.
-        if !d.isHistory, DetectionNotifier.anyEnabled {
-            notifier.notifyIfNeeded(d)
+        if !d.isHistory, !alertsHeld, DetectionNotifier.anyEnabled {
+            notifier.notifyIfNeeded(d, redact: settingsRedactLockScreen)
         }
         // Drive mode: push the live count to the Dynamic Island / Lock Screen. History never
         // updates. A brand-new device escalates (immediate), but only for the categories that
@@ -6695,6 +7045,7 @@ final class BLEManager: NSObject, ObservableObject {
     /// touched: if the live path has since stamped the row, that stamp is a real clock reading and
     /// must survive untouched.
     private func rekey(_ id: String, from h: HistoryStamp, to key: Date, basis: TimeBasis) {
+        storeRevision &+= 1   // a re-key with no new record still changes the stored row
         if firstSeenAt[id] == h.stamp { firstSeenAt[id] = key }
         if lastSeen[id] == h.stamp { lastSeen[id] = key }
         histBasis[id] = HistoryStamp(stamp: key, boot: h.boot, seq: h.seq, basis: basis)
@@ -6776,6 +7127,8 @@ final class BLEManager: NSObject, ObservableObject {
         // The persisted resume cursor rides the SAME checkpoint (see checkpointHistory) so it can
         // never move ahead of the write it depends on; without any mid-drain checkpoint, lastSeq only
         // advances at a clean end and a disconnect partway through a long replay restarts the lot.
+        // It adopts a changed generation too (the begin sentinel named it), so that also holds on
+        // a first sync with a board and on the drain after a Clear.
         // Mid-drain checkpoint, guarded. Each one re-encodes the WHOLE store, so without a guard a
         // long replay queues N/200 whole-store encodes into a serial queue that cannot keep up, and
         // every pending block retains its own multi-MB rows array. Today's ring is tiny (Desert rows
@@ -6783,7 +7136,7 @@ final class BLEManager: NSObject, ObservableObject {
         // but that is a property of the current data, not of the code. Skip if one is still in
         // flight; handleHistEnd's final checkpoint is the one that has to be complete.
         if historyEnvelopeAuthorizesCheckpoint(beginSeen: histBeginSeen),
-           histReceived % 200 == 0, !checkpointInFlight { checkpointHistory() }
+           histReceived % 200 == 0, !checkpointInFlight { checkpointHistory(adoptsGeneration: true) }
     }
 
     /// End-of-drain sentinel. Verify we got every record the board promised; if a seq
@@ -6818,9 +7171,10 @@ final class BLEManager: NSObject, ObservableObject {
                 resolveBracketedHistory()
                 publishDetections()
                 // Persist the detection store first, then its generation+cursor tuple; see
-                // checkpointHistory. No begin means no generation authority: at the retry cap
-                // leave the durable tuple untouched so reconnect requests the envelope again.
-                checkpointHistory(finalizeGeneration: disposition == .complete)
+                // checkpointHistory. At the retry cap this checkpoint adopts no new generation,
+                // so reconnect requests the envelope again, unless a mid-drain checkpoint of this
+                // drain already adopted it (equally safe; checkpointHistory says why).
+                checkpointHistory(adoptsGeneration: disposition == .complete)
             }
             // Drain complete: land the final tally (the per-record mirror is coalesced, so
             // the last publish may not have caught it), drop the syncing indicator and, only
@@ -6860,6 +7214,15 @@ final class BLEManager: NSObject, ObservableObject {
 
     private func ingestStatus(_ data: Data) {
         if let s = try? JSONDecoder().decode(DeviceStatus.self, from: data) {
+            // "wiping" rides the frame while the board is still sweeping a deferred buffer erase
+            // (absent = idle); the UI shows a brief "clearing buffer" state instead of the
+            // about-to-be-zero count. "moto" is the broad Motorola-OUI sub-toggle. Absent =
+            // pre-split firmware, where the broad match had no switch of its own, so report it on
+            // but unsupported. Both are decoded with the rest of the frame (DeviceStatus), once.
+            bufferWiping = s.wiping
+            let moto = s.moto
+            motorolaSupported = moto != nil
+            motorolaOn = moto ?? true
             let previousEnabled = lastPushedEnabled
             status = s
             stampRememberedBoardKind(from: s)   // a prefix check per frame; writes once per board
@@ -6887,18 +7250,6 @@ final class BLEManager: NSObject, ObservableObject {
                 liveActivity.update(liveState())
             }
         }
-        // "wiping": true rides the status frame while the board is still sweeping a deferred buffer
-        // erase (absent = idle). It isn't part of DeviceStatus, so read it straight off the frame
-        // here; the UI shows a brief "clearing buffer" state instead of the about-to-be-zero count.
-        if let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
-            bufferWiping = (obj["wiping"] as? Bool) ?? false
-            // "moto" is the broad Motorola-OUI sub-toggle, read off the frame for the same
-            // reason: it isn't part of DeviceStatus. Absent = pre-split firmware, where the
-            // broad match had no switch of its own, so report it on but unsupported.
-            let moto = obj["moto"] as? Bool
-            motorolaSupported = moto != nil
-            motorolaOn = moto ?? true
-        }
     }
 
     #if DEBUG
@@ -6922,6 +7273,21 @@ final class BLEManager: NSObject, ObservableObject {
         debugRememberedBoard = RememberedBoard(
             id: UUID(uuidString: "00000000-0000-4000-8000-00000000B0A7")!,
             name: kind.advertisedName, kind: kind)
+    }
+
+    /// DEBUG `-demoStream`, with `-demo`: from 10 s after launch, re-hears one sample row every
+    /// 0.5 s and publishes, as a streaming board does. Sample data otherwise publishes once, so
+    /// without this the simulator cannot reproduce a bug that needs a live feed (2026-10-12: Log
+    /// tools > Category collapsed on every refresh while a board streamed; LogToolsMenuUITests
+    /// runs on it). The delay leaves time to open a menu before the feed starts. Sample data only.
+    func startDebugDemoStream() {
+        DispatchQueue.main.asyncAfter(deadline: .now() + 10) {
+            Timer.scheduledTimer(withTimeInterval: 0.5, repeats: true) { [weak self] _ in
+                guard let self, self.demoMode, let id = self.store.keys.min() else { return }
+                self.lastSeen[id] = Date()
+                self.publishDetections()
+            }
+        }
     }
     #endif
 
@@ -6999,7 +7365,7 @@ final class BLEManager: NSObject, ObservableObject {
         // dimmed - the demo forces motorolaSupported precisely to introduce that control, and a
         // dimmed sub-toggle under an off parent defeats the tour. Matches the Android seed.
         demoStatusPayload = [
-            "fw": "\(sampleBoardKind.sampleFirmwareLabel) 2.1.0", "up": 4920, "total": 6, "ble": true, "wifi": true,
+            "fw": "\(sampleBoardKind.sampleFirmwareLabel) 2.2.0", "up": 4920, "total": 6, "ble": true, "wifi": true,
             "axon": true, "tracker": true, "glasses": true, "ncam": true,
             "buzzer": true, "vol": 70, "gps": true, "bat": 82,
         ]
@@ -7732,11 +8098,14 @@ extension BLEManager: CBPeripheralDelegate {
         lastBuzzerMuteWrite = .distantPast       // and the slow mute retry starts over with it
         listPushAttempts.removeAll()             // and a fresh board gets a fresh convergence budget
         lastPushedEnabled = nil                  // force the next status frame to re-push the columns
-        // Only a phone that stores a mode writes the buzzer here. One that does not (fresh install,
-        // reinstall, second phone) mirrors the board from its first status frame instead, so a
-        // board muted elsewhere stays muted. See connectBuzzerWrite.
+        // Only a stored quiet mode (a mute) or a pick made while no board was ready writes the
+        // buzzer here. Every other phone (fresh install, reinstall, second phone, a stored Buzzer)
+        // mirrors the board from its first status frame instead, so a board muted elsewhere stays
+        // muted. See connectBuzzerWrite. The pick made while away is then held for this link like
+        // a pick made on it.
         appHeldAlertModeThisLink = false   // already cleared in didConnect; repeated at the session edge
         if let on = connectTimeBuzzerWrite { setBuzzerEnabled(on) }
+        if alertModePickedWhileAway { alertModePickedWhileAway = false; appHeldAlertModeThisLink = true }
         lastGpsSent = .distantPast; sendPhoneLocation()   // push an existing fix to the freshly-connected beacon
         // Background: keep the "latest"/OTA gate current. Hop to the main actor explicitly
         // (the store is @MainActor); CB callbacks already run on main, so this is immediate.

@@ -52,7 +52,7 @@ import tech.acab.app.ui.relativeAgo
 
 /** Responsive Glance widget for launcher home screens. The provider declares home_screen only:
  *  this face carries the TODAY count, the category strip and the last hit's category, none of
- *  which is gated on the "keep counts private on lock screen" switch, so keyguard hosting would
+ *  which is gated on the "Hide details on lock screen" switch, so keyguard hosting would
  *  disclose them on a locked phone. See widget_beacons_info.xml for the full note. */
 private class BeaconsGlanceWidget : GlanceAppWidget() {
     // LocalSize is used for real layout decisions below. The default Single mode freezes it at

@@ -1027,11 +1027,14 @@ private fun SeeHowItWorksButton(onClick: () -> Unit) {
  *  Deliberately says "already paired to another phone", not "your beacon": on a brand new board with
  *  no bonds the rule does not apply at all (the firmware admits any phone until the board has an
  *  owner), and telling a first-time customer to power-cycle would be a made-up ritual.
+ *  It also names a phone that forgot the board in its Bluetooth settings: from firmware 2.2.1 the
+ *  board refuses that phone's repeat pairing outside the window too (acabRepeatPairingAllowed in
+ *  acab_ble_service.cpp), so it is the same recovery. check-signature-drift.py pins both prefixes.
  *  Mirrors iOS ConnectView.pairWindowNote (plain dim text, leading aligned, no glyph). */
 @Composable
 private fun PairWindowNote(kind: BoardKind?) {
     Text(
-        "already paired to another phone? " + AcabBleManager.pairWindowHint(kind),
+        "already paired to another phone, or forgotten in this phone's Bluetooth settings? " + AcabBleManager.pairWindowHint(kind),
         modifier = Modifier.fillMaxWidth(),
         style = MaterialTheme.typography.bodySmall,
         color = MaterialTheme.colorScheme.onSurfaceVariant,

@@ -1,4 +1,5 @@
 import XCTest
+import UIKit
 @testable import Beacons
 
 final class PersistenceSafetyTests: XCTestCase {
@@ -405,5 +406,69 @@ final class BufferKeyDurabilityTests: XCTestCase {
             callbackService: freshService,
             currentService: freshService,
             error: nil), .accept)
+    }
+
+    // MARK: - Launch-load barrier and the unchanged-store skip (app review 2026-10-12, A.4 / C.2)
+
+    /// The checkpoint decision, in order. FAILS if the load barrier is dropped or ranked below the
+    /// empty-store guard (the first two lines read keepFile / write), if an unchanged store writes
+    /// (the alreadySaved line) or a changed one skips (the write line).
+    func testCheckpointStepRanksTheLoadBarrierFirstAndSkipsAnUnchangedStore() {
+        XCTAssertEqual(detectionCheckpointStep(loadPending: true, storeIsEmpty: true,
+                                               revision: 3, savedRevision: 0), .refuseUntilLoaded)
+        XCTAssertEqual(detectionCheckpointStep(loadPending: true, storeIsEmpty: false,
+                                               revision: 3, savedRevision: 0), .refuseUntilLoaded)
+        XCTAssertEqual(detectionCheckpointStep(loadPending: false, storeIsEmpty: true,
+                                               revision: 3, savedRevision: 0), .keepFile)
+        XCTAssertEqual(detectionCheckpointStep(loadPending: false, storeIsEmpty: true,
+                                               revision: 3, savedRevision: 3), .keepFile,
+                       "an empty store keeps the Clear semantics, changed or not")
+        XCTAssertEqual(detectionCheckpointStep(loadPending: false, storeIsEmpty: false,
+                                               revision: 3, savedRevision: 3), .alreadySaved)
+        XCTAssertEqual(detectionCheckpointStep(loadPending: false, storeIsEmpty: false,
+                                               revision: 4, savedRevision: 3), .write)
+    }
+
+    /// The live checkpoint writes only when due AND no write is in flight; otherwise it re-arms.
+    /// FAILS if a due checkpoint behind an in-flight write is dropped or written anyway (the
+    /// in-flight lines read nil instead of a 1 s re-arm), if the due edge moves (30 s writes, 29 s
+    /// waits) or if the 1 s floor goes (the 29.5 s line reads 0.5).
+    func testLiveCheckpointReArmsBehindAnInFlightWrite() {
+        XCTAssertNil(liveCheckpointDelay(elapsed: 30, interval: 30, writeInFlight: false))
+        XCTAssertNil(liveCheckpointDelay(elapsed: 95, interval: 30, writeInFlight: false))
+        XCTAssertEqual(liveCheckpointDelay(elapsed: 30, interval: 30, writeInFlight: true), 1)
+        XCTAssertEqual(liveCheckpointDelay(elapsed: 95, interval: 30, writeInFlight: true), 1)
+        XCTAssertEqual(liveCheckpointDelay(elapsed: 29, interval: 30, writeInFlight: false), 1)
+        XCTAssertEqual(liveCheckpointDelay(elapsed: 29.5, interval: 30, writeInFlight: false), 1)
+        XCTAssertEqual(liveCheckpointDelay(elapsed: 10, interval: 30, writeInFlight: false), 20)
+        XCTAssertEqual(liveCheckpointDelay(elapsed: 10, interval: 30, writeInFlight: true), 20)
+    }
+
+    /// The barrier on the real manager. init(defaults:) starts the launch load, which hops through
+    /// persistQueue and back to main, so right after init the barrier is up and the store is
+    /// empty: a checkpoint is refused (false, synchronously) and remembered. Once the load lands,
+    /// on whichever arm this host's file takes (rows, no file, unreadable), the barrier is down and
+    /// the remembered checkpoint has run. The hook checkpoints only an empty store, so even a
+    /// broken barrier writes nothing to the host app's log. FAILS if the load never raises the
+    /// barrier (first assertion), if persistDetections ignores it (the refused flag stays false),
+    /// if the arm this host takes never lowers it (the wait times out) or if the refused
+    /// checkpoint is not re-run (the last assertion).
+    func testLaunchLoadBarrierRefusesACheckpointUntilTheLoadLands() throws {
+        try XCTSkipUnless(UIApplication.shared.isProtectedDataAvailable,
+                          "the launch load waits for protected data")
+        let ble = BLEManager(defaults: isolatedDefaults())
+        XCTAssertTrue(ble.testPersistedLoadPending)
+        var called = false
+        var saved: Bool?
+        ble.testCheckpointEmptyStore { called = true; saved = $0 }
+        XCTAssertTrue(called, "a refused checkpoint answers at once")
+        XCTAssertEqual(saved, false)
+        XCTAssertTrue(ble.testCheckpointRefusedDuringLoad)
+        let deadline = Date().addingTimeInterval(5)
+        while ble.testPersistedLoadPending, Date() < deadline {
+            RunLoop.main.run(until: Date().addingTimeInterval(0.01))
+        }
+        XCTAssertFalse(ble.testPersistedLoadPending)
+        XCTAssertFalse(ble.testCheckpointRefusedDuringLoad, "the refused checkpoint ran once")
     }
 }

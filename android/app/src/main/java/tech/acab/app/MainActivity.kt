@@ -6,6 +6,7 @@ import android.content.pm.PackageManager
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
+import android.os.SystemClock
 import android.provider.Settings
 import androidx.activity.ComponentActivity
 import androidx.activity.SystemBarStyle
@@ -17,6 +18,7 @@ import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.setValue
 import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.LifecycleEventObserver
 import tech.acab.app.ble.BoardKind
 import tech.acab.app.ble.ConnState
 import tech.acab.app.ble.DetectionNotifier
@@ -41,7 +43,6 @@ class MainActivity : ComponentActivity() {
     // True from the moment requestOptionalLocation opens the system Location dialog until its
     // result arrives. AcabApp holds the Live rationale back while it is up (contracts 9.1).
     private var locationRequestOutstanding by mutableStateOf(false)
-    private var startDriveRequested = false
     private var defaultLiveStartPending = false
     private var scanAfterPermissionGrant = false
 
@@ -84,6 +85,23 @@ class MainActivity : ComponentActivity() {
             statusBarStyle = SystemBarStyle.dark(android.graphics.Color.TRANSPARENT),
             navigationBarStyle = SystemBarStyle.dark(android.graphics.Color.TRANSPARENT),
         )
+        // Recents shows a blank card instead of the last screen (Map pins, Log MACs, a dossier's
+        // LOCATION), the surface a seized-but-unlocked phone shows first. API 33+ only, and
+        // unconditional: the user's own screenshots still work, which FLAG_SECURE would block.
+        // No switch this round. iOS has no twin: nothing in the iOS app touches its app-switcher
+        // snapshot, so this is an Android-only protection, not a parity rule.
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) setRecentsScreenshotEnabled(false)
+        // The resume-gated starts run on the ON_RESUME EVENT, not from onResume(): the lifecycle
+        // dispatches ON_RESUME only after onResume() returns, so a RESUMED check made inside it
+        // always failed. The tile never started Live Mode, a grant never ran its scan, and the
+        // default Live Mode retry never ran. onResume() still refreshes permissionsGranted first.
+        lifecycle.addObserver(LifecycleEventObserver { _, event ->
+            if (event == Lifecycle.Event.ON_RESUME) {
+                maybeStartPermissionScan()
+                completeDefaultLiveStartIfPossible()
+                maybeStartRequestedDrive()
+            }
+        })
         defaultLiveStartPending = savedInstanceState?.getBoolean(KEY_DEFAULT_LIVE_PENDING) == true
         scanAfterPermissionGrant = savedInstanceState?.getBoolean(KEY_SCAN_AFTER_PERMISSION) == true
         liveNotificationDenied = savedInstanceState?.getBoolean(KEY_LIVE_NOTIFICATION_DENIED) == true
@@ -143,9 +161,6 @@ class MainActivity : ComponentActivity() {
         super.onResume()
         syncPermissionState()
         ContrastMode.syncSystem(this)
-        maybeStartPermissionScan()
-        maybeStartRequestedDrive()
-        completeDefaultLiveStartIfPossible()
     }
 
     override fun onDestroy() {
@@ -172,7 +187,8 @@ class MainActivity : ComponentActivity() {
      *  MainScreen consumes once it's on screen. The extra is stripped after reading so a
      *  recreation replaying the same intent doesn't re-trigger the jump; a launch from
      *  recents after process death re-delivers the original intent (extra intact), so the
-     *  HISTORY flag guards that replay too. */
+     *  HISTORY flag guards that replay too. The Live Mode tile does NOT come through here: see
+     *  [maybeStartRequestedDrive]. */
     private fun handleDeepLink(intent: Intent?) {
         if (intent == null) return
         if (intent.flags and Intent.FLAG_ACTIVITY_LAUNCHED_FROM_HISTORY != 0) return
@@ -180,20 +196,22 @@ class MainActivity : ComponentActivity() {
             openLogNew.value = true
             intent.removeExtra(EXTRA_OPEN_LOG_NEW)
         }
-        if (intent.getBooleanExtra(EXTRA_START_DRIVE, false)) {
-            startDriveRequested = true
-            intent.removeExtra(EXTRA_START_DRIVE)
-            maybeStartRequestedDrive()
-        }
     }
 
     /** A Quick Settings tile is a background service on Android 14 and newer, so it cannot start
      * a location foreground service under while-in-use permission. Apply its request only after
-     * this activity is actually visible. */
+     * this activity is actually visible.
+     *
+     * The request travels IN-PROCESS (AcabBleManager.tileDriveStartRequestedAt, set only by
+     * DriveModeTileService), never as an intent extra: this activity is exported, and an extra let
+     * any installed app start Live Mode and persist liveModeWanted (app review 2026-10-12 A.10).
+     * Called only from the ON_RESUME observer in onCreate, so the activity is RESUMED here, and
+     * onNewIntent is always followed by ON_RESUME. Consumed whatever its age; honoured only while
+     * [tileDriveRequestFresh], so a tap whose launch never resumed (an unlock abandoned at the lock
+     * screen) cannot start Live Mode on some later app open. */
     private fun maybeStartRequestedDrive() {
-        if (!startDriveRequested ||
-            !lifecycle.currentState.isAtLeast(Lifecycle.State.RESUMED)) return
-        startDriveRequested = false
+        val requestedAt = vm.ble.tileDriveStartRequestedAt.getAndSet(0L)
+        if (!tileDriveRequestFresh(requestedAt, SystemClock.elapsedRealtime())) return
         // Sample data seeds READY too, so the link check alone is not the honesty gate: a tile tap
         // under "Continue without pairing" would otherwise pin a real ongoing Live Mode
         // notification over canned rows, take location ownership into the background, and persist
@@ -342,9 +360,6 @@ class MainActivity : ComponentActivity() {
         /** Intent extra set by the drive-mode notification's contentIntent (AcabLinkService). */
         const val EXTRA_OPEN_LOG_NEW = "open_log_new"
 
-        /** Quick Settings intent consumed only after the activity is visible. */
-        const val EXTRA_START_DRIVE = "start_drive"
-
         /** Store-screenshot hook: "phone" opens the Beacon tab on its THIS PHONE segment; any
          *  other value, or no extra, opens BOARD. Parsed by [beaconSegmentExtra]. */
         const val EXTRA_BEACON_SEGMENT = "beacon_segment"
@@ -380,3 +395,14 @@ internal fun debugBoardKindExtra(value: String?): BoardKind? = BoardKind.fromRaw
 /** The Beacon segment named by [MainActivity.EXTRA_BEACON_SEGMENT]: "phone" gives PHONE, anything
  *  else (including no extra) gives BOARD. iOS twin: the `-beacon-segment phone` launch argument. */
 internal fun beaconSegmentExtra(value: String?): BeaconSegment = if (value == "phone") BeaconSegment.PHONE else BeaconSegment.BOARD
+
+/** How long a Live Mode tile tap stays a request: the tile collapses the shade and launches this
+ *  activity at once, so a minute covers an unlock at the lock screen without letting an abandoned
+ *  tap fire on a later open. */
+internal const val TILE_DRIVE_REQUEST_MAX_AGE_MS = 60_000L
+
+/** Is a tile tap stamped at [requestedAtMs] (elapsedRealtime; 0 = no request) still a request at
+ *  [nowMs]? Android only: the iOS Control Center toggle (ToggleDriveModeIntent) stores the Live
+ *  Mode preference and opens the app, so it carries no one-shot request to expire. */
+internal fun tileDriveRequestFresh(requestedAtMs: Long, nowMs: Long): Boolean =
+    requestedAtMs > 0L && nowMs - requestedAtMs in 0L..TILE_DRIVE_REQUEST_MAX_AGE_MS

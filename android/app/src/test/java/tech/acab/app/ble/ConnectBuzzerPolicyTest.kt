@@ -19,26 +19,42 @@ import org.junit.Test
  * WHAT THIS SUITE DOES NOT COVER. AcabBleManager needs a Context, so this side pins the pure rules
  * the manager calls (connectBuzzerWrite, mirroredAlertMode, desertEnableConfig, desertDisableConfig,
  * alertModeKeptFromLegacyStore), not the manager itself. In particular the init-time upgrade's key
- * removal and flag write, the per-link hold's clears, and the Config object setDesert actually
- * sends are not covered here. The iOS twin,
+ * removal and flag write, the per-link hold's clears, the stored-Buzzer mirror flag and the owed
+ * pick's bookkeeping, and the Config object setDesert actually sends are not covered here. The iOS twin,
  * ConnectBuzzerPolicyTests.swift, drives those through the real manager; the vectors below are its
  * pure-rule vectors, one for one.
  */
 class ConnectBuzzerPolicyTest {
 
-    /** No stored mode writes nothing, whatever mode is on screen; a stored mode writes exactly its
-     *  own buzzer state. Reverting to "write mode == BUZZER" fails the first two lines. */
+    /** A connect writes a stored QUIET mode and nothing else (app review 2026-10-12 A.7): no stored
+     *  mode writes nothing, and a stored BUZZER writes nothing either, so a board muted from
+     *  another phone stays muted. Reverting to "write mode == BUZZER" fails the first two lines;
+     *  the previous rule, `if (hasStoredMode) mode == BUZZER`, fails the third (it wrote true). */
     @Test
-    fun connectWritesOnlyAStoredMode() {
+    fun connectWritesOnlyAStoredQuietMode() {
         assertNull(connectBuzzerWrite(false, AlertMode.BUZZER))
         assertNull(connectBuzzerWrite(false, AlertMode.SILENT))
-        assertEquals(true, connectBuzzerWrite(true, AlertMode.BUZZER))
+        assertNull(connectBuzzerWrite(true, AlertMode.BUZZER))
         assertEquals(false, connectBuzzerWrite(true, AlertMode.VIBRATE))
         assertEquals(false, connectBuzzerWrite(true, AlertMode.SILENT))
     }
 
+    /** The one exception: a pick the user made while no board was connected (the restore offer on
+     *  the pre-connect screen) is still written at connect, BUZZER included. With nothing stored
+     *  there is no pick to owe, so it stays a mirror. Dropping the pickOwed arm fails the first
+     *  line (null, not true). */
+    @Test
+    fun aPickOwedFromWhileDisconnectedIsWrittenAtConnect() {
+        assertEquals(true, connectBuzzerWrite(true, AlertMode.BUZZER, pickOwed = true))
+        assertEquals(false, connectBuzzerWrite(true, AlertMode.SILENT, pickOwed = true))
+        assertEquals(false, connectBuzzerWrite(true, AlertMode.VIBRATE, pickOwed = true))
+        assertNull(connectBuzzerWrite(false, AlertMode.BUZZER, pickOwed = true))
+    }
+
     /** A phone with no mode mirrors: sound on reads BUZZER, muted reads SILENT (never VIBRATE).
-     *  A stored mode or an app-held mode on this link turns the mirror off. */
+     *  A stored mode or an app-held mode on this link turns the mirror off. A stored BUZZER that
+     *  wrote nothing at connect reaches this rule as hasStoredMode = false (reconcileBuzzer,
+     *  storedModeMirrorsThisLink), so it mirrors a muted board as SILENT by the second line. */
     @Test
     fun mirrorRule() {
         assertEquals(AlertMode.BUZZER, mirroredAlertMode(false, false, true))

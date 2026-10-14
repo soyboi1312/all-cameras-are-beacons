@@ -38,6 +38,13 @@ struct DashboardView: View {
     /// stuck hardest during a drive or Desert mode, which is exactly when a row that went quiet
     /// has to age off instead of holding the radar at "SEEN < 45s".
     @State private var staleTick = Timer.publish(every: 1, on: .main, in: .common).autoconnect()
+    /// The tick only advances while this screen is on screen and has rows (review C.1). Each
+    /// advance re-runs body, and body's dashboardSnapshot walks every row in `ble.detections`, so
+    /// a tick while another tab is selected or Help is pushed over Status was pure cost, and an
+    /// empty store has nothing to age off. onAppear advances it at once, so the first frame back
+    /// does not age rows against the instant the screen was left. Android's StatusScreen tick
+    /// lives in a LaunchedEffect, so it runs only while that screen is composed.
+    @State private var onScreen = false
 
     /// A starred row keeps its real category type, so the gold comes from the sighting's watched
     /// flag and not from the type (Android StatusScreen.kt's RadarScope dot loop draws it the
@@ -185,8 +192,10 @@ struct DashboardView: View {
             .background(ACABTheme.bg)
             // One header row: "Status" leading, help trailing (TabHeader, M2).
             .tabHeader("Status") { helpButton }
+            .onAppear { onScreen = true; tick = Date() }
+            .onDisappear { onScreen = false }
         }
-        .onReceive(staleTick) { tick = $0 }
+        .onReceive(staleTick) { if onScreen && !ble.detections.isEmpty { tick = $0 } }
     }
 
     // MARK: Header

@@ -7,8 +7,8 @@
      updates on every detection and on connect/disconnect (AcabBleManager.updateWidget), so the
      30-min tick only keeps the relative "ago" honest when the app is not running.
      widgetCategory stays home_screen ONLY. The face renders the TODAY count, the per-category
-     strip and the last hit's category, and nothing in this package reads the "keep counts private
-     on lock screen" switch, so a keyguard-hosted instance would disclose all three on a locked
+     strip and the last hit's category, and nothing in this package reads the "Hide details on
+     lock screen" switch, so a keyguard-hosted instance would disclose all three on a locked
      (possibly seized) phone with the switch ON. Adding keyguard back means gating the content on
      that switch first, via the host category in AppWidgetManager.getAppWidgetOptions. iOS ships no
      lock-screen family either (DetectionsWidget supportedFamilies is systemSmall/systemMedium). -->

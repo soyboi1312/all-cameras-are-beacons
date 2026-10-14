@@ -33,8 +33,9 @@ final class DetectionsViewGateTests: XCTestCase {
     }
 
     func testVisitEndsOnlyWhenTheWatermarkMovesUnderIt() {
-        // Leaving the Log tab calls markAllSeen (MainTabView.onChange(of: tab)), which stamps a
-        // new Date. The next ordinary open is then outside the visit and baselines normally.
+        // Leaving the Log tab calls markAllSeen (MainTabView.onChange(of: tab)), which moves the
+        // watermark when a newer real row arrived (the newest first-seen stamp, capped at now).
+        // The next ordinary open is then outside the visit and baselines normally.
         XCTAssertTrue(logFirstOpenBaselineRuns(deepLinkNew: false, hasVisit: true,
                                                visitWatermark: mark, current: later))
     }

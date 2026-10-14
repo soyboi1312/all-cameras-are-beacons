@@ -288,7 +288,8 @@ final class ALPRDatasetTests: XCTestCase {
             retiredCompletionRan = true
         }) else { return XCTFail("first fetch did not start") }
 
-        await fulfillment(of: [firstStarted], timeout: 1)
+        // 5 s, like ExportTests: 1 s left no margin on a loaded CI simulator (review D.7).
+        await fulfillment(of: [firstStarted], timeout: 5)
         XCTAssertTrue(slot.isRunning)
         slot.cancel()
         XCTAssertFalse(slot.isRunning)
@@ -298,7 +299,7 @@ final class ALPRDatasetTests: XCTestCase {
             replacementFinished = true
         }) else { return XCTFail("cancelled slot did not accept a replacement") }
         await replacement.value
-        await fulfillment(of: [firstCancelled], timeout: 1)
+        await fulfillment(of: [firstCancelled], timeout: 5)
         await first.value
 
         XCTAssertTrue(replacementFinished)

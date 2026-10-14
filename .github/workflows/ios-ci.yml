@@ -120,7 +120,7 @@ jobs:
       # intermittently upstream (actions/runner-images issue 12777), and every report there passed on
       # a re-run of the same image. a real test failure fails both attempts; each attempt keeps its
       # own result bundle because xcodebuild refuses to overwrite one.
-      - name: Run unit tests
+      - name: Run unit and UI tests
         working-directory: ios
         run: |
           set -o pipefail

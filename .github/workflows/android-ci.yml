@@ -41,11 +41,14 @@ jobs:
     steps:
       - uses: actions/checkout@v5
 
-      - name: Set up JDK 17
+      # JetBrains Runtime 21, the exact JVM android/gradle/gradle-daemon-jvm.properties asks the
+      # Gradle daemon for. With Temurin here, Gradle fetched a JBR 21 through api.foojay.io on
+      # every run, unpinned, and that JVM ran the whole build (and, for releases, the signing).
+      - name: Set up JDK 21 (JetBrains Runtime)
         uses: actions/setup-java@v5
         with:
-          distribution: temurin
-          java-version: '17'
+          distribution: jetbrains
+          java-version: '21'
           cache: gradle
 
       # UNIT TESTS FIRST: they are the reason this workflow exists, and a lint failure must not

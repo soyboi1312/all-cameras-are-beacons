@@ -27,7 +27,7 @@ packages:
 
 settings:
   base:
-    MARKETING_VERSION: "2.2.0"
+    MARKETING_VERSION: "2.2.1"
     # The build number RESTARTS AT 0 for each new MARKETING_VERSION, and only climbs when a SECOND
     # build of the SAME version has to go up. App Store Connect requires the build to be unique
     # within a version string, NOT across the app, so 0 is always free on a version that has never
@@ -43,8 +43,8 @@ settings:
     # clobbered by the next `xcodegen generate` AND it only touches the app target, leaving
     # BeaconsWidget behind -> "extension version must match parent app". Both targets read
     # $(CURRENT_PROJECT_VERSION), so setting it HERE and regenerating keeps them in lockstep.
-    CURRENT_PROJECT_VERSION: "0"   # 2.2.0 build 0, set 2026-10-05: a new MARKETING_VERSION restarts at 0
-                                   # (the rule above). The last 2.1.1 build set here was 0.
+    CURRENT_PROJECT_VERSION: "0"   # 2.2.1 build 0, set 2026-10-11: a new MARKETING_VERSION restarts at 0
+                                   # (the rule above). The last 2.2.0 build set here was 0.
     SWIFT_VERSION: "5.0"
     CODE_SIGN_STYLE: Automatic
     DEVELOPMENT_TEAM: "49B9T69XPF"        # baked in so `xcodegen generate` keeps signing
@@ -139,11 +139,12 @@ targets:
         PRODUCT_BUNDLE_IDENTIFIER: tech.beacons.app
         GENERATE_INFOPLIST_FILE: NO
 
-  # Logic tests for the pure model code. Today that is the follow-evidence parity fixtures, which
-  # are the mechanism holding this app and the Android app to ONE set of thresholds: both sides
-  # ship separate implementations of the same document, and a band boundary that lands differently
-  # on each phone is invisible without them. Hosted by the app target rather than compiling the
-  # model sources a second time, so the tests always exercise the code that actually ships.
+  # Logic tests for the app's pure rules and the manager seams that expose them, including the
+  # parity fixtures that hold this app and the Android app to ONE set of thresholds (a band
+  # boundary that lands differently on each phone is invisible without them). Every file in
+  # BeaconsTests is picked up; the suite grows, so this comment names no count or list. Hosted by
+  # the app target rather than compiling the model sources a second time, so the tests always
+  # exercise the code that actually ships.
   BeaconsTests:
     type: bundle.unit-test
     platform: iOS
@@ -154,6 +155,21 @@ targets:
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: tech.beacons.app.tests
+        GENERATE_INFOPLIST_FILE: YES
+
+  # UI tests: behaviour only a running app shows, driven through the Debug build's sample data
+  # (the DEBUG `-demo` and `-demoStream` launch arguments). Every file in BeaconsUITests is
+  # picked up.
+  BeaconsUITests:
+    type: bundle.ui-testing
+    platform: iOS
+    sources:
+      - BeaconsUITests
+    dependencies:
+      - target: Beacons
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: tech.beacons.app.uitests
         GENERATE_INFOPLIST_FILE: YES
 
   # Widget extension: hosts the Live Activity (Dynamic Island + Lock Screen counter).
@@ -204,3 +220,4 @@ schemes:
     test:
       targets:
         - BeaconsTests
+        - BeaconsUITests

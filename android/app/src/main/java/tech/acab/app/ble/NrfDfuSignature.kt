@@ -36,16 +36,19 @@ object NrfDfuSignature {
     /** PRODUCTION signing key (SubjectPublicKeyInfo / X.509 DER, base64). Byte-identical to the
      *  ACAB_OTA_PUBKEY_DER bytes in firmware/lib/acab_core/ota_pubkey.h (SPKI sha256
      *  c5d86430652e89c02dc357a1ee15601f95ea18726dbeed486d9b98f57c0399e9; NrfDfuSignatureTest pins
-     *  it). Its private half lives offline and is NOT in this tree. Signs every package from
-     *  2.0.8 on. */
+     *  it). Its private half is firmware/tools/ota_signing/beacon_ota_key.pem: gitignored, so not
+     *  in the repository, but present in the working tree of the machine that builds releases,
+     *  where firmware/tools/release.sh and web/build-flasher.sh sign with it (its public half
+     *  hashes to the sha256 above, checked 2026-10-12). Signs every package from 2.0.8 on. */
     private const val PRODUCTION_SPKI_B64 =
         "MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEFEq4RVNjVdfIjwut9is8gNotnXIB" +
         "hKUau6b6c4OCbHSP7Sl/2RTMkPnIE+qzPZaRb4xjLsAbtNKoPGUzpfH5hA=="
 
     /** DEVELOPMENT signing key, same encoding (SPKI sha256
      *  39e03b1581db574822be12631df557ac136a3c5b9c00b8e32e07dc4a9b6d3df1). Signed every package
-     *  through 2.0.6 and the 2.0.7 transition package. Pairs with
-     *  firmware/tools/ota_signing/beacon_ota_key.pem (gitignored). RETIRE this entry, together with
+     *  through 2.0.6 and the 2.0.7 transition package. Its private half is NOT
+     *  firmware/tools/ota_signing/beacon_ota_key.pem, which holds the production key above.
+     *  RETIRE this entry, together with
      *  the dev-signed vector in NrfDfuSignatureTest, once every fielded board and app has passed
      *  2.0.7; until then a 2.0.7 package would be refused without it. */
     private const val DEVELOPMENT_SPKI_B64 =

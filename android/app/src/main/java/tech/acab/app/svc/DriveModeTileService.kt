@@ -5,6 +5,7 @@ import android.app.PendingIntent
 import android.content.Intent
 import android.graphics.drawable.Icon
 import android.os.Build
+import android.os.SystemClock
 import android.service.quicksettings.Tile
 import android.service.quicksettings.TileService
 import kotlinx.coroutines.CoroutineScope
@@ -22,8 +23,9 @@ import tech.acab.app.ble.ConnState
 /**
  * Quick Settings "Live Mode" tile (F28), the Android analog of the iOS Control Center toggle
  * (DriveModeControl.swift). Turning it on does not start Live Mode here: Android 14 does not let
- * a background tile service start a location foreground service, so onClick hands the request to
- * MainActivity, which applies it once resumed (maybeStartRequestedDrive).
+ * a background tile service start a location foreground service, so onClick stamps the in-process
+ * AcabBleManager.tileDriveStartRequestedAt and brings MainActivity forward, which applies it once
+ * resumed and only within a minute of the tap (maybeStartRequestedDrive).
  */
 class DriveModeTileService : TileService() {
 
@@ -94,6 +96,7 @@ class DriveModeTileService : TileService() {
             // manager's driveMode flag; clear it first so startDriveMode can't early-return
             // on a stale true.
             ble.suspendDriveMode()
+            ble.tileDriveStartRequestedAt.set(SystemClock.elapsedRealtime())
             requestDriveStartInForeground()
             // Android 14 does not allow a background tile service to create a location foreground
             // service with only while-in-use location permission. Keep the tile inactive until
@@ -109,11 +112,12 @@ class DriveModeTileService : TileService() {
     }
 
     /** Bring the app to the foreground before starting Drive mode. This preserves normal
-     * while-in-use location semantics instead of silently requiring background location. */
+     * while-in-use location semantics instead of silently requiring background location. The
+     * intent carries no request: the stamp set in onClick is the request, so no other app can forge
+     * one through the exported activity. */
     @SuppressLint("StartActivityAndCollapseDeprecated")
     private fun requestDriveStartInForeground() {
         val launch = Intent(this, MainActivity::class.java)
-            .putExtra(MainActivity.EXTRA_START_DRIVE, true)
             .addFlags(
                 Intent.FLAG_ACTIVITY_NEW_TASK or
                     Intent.FLAG_ACTIVITY_CLEAR_TOP or
