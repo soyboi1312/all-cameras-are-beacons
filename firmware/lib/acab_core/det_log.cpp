@@ -3,8 +3,9 @@
  *
  * Storage: a raw esp_partition ring over the 1.5MB "spiffs" data partition (NOT a
  * LittleFS file - LittleFS's copy-on-write fights fixed-offset slots). 64B slots,
- * slot index = (seq-1) % gSlots. APPEND-ONLY: each device is captured once per boot
- * (its true first sighting), so slots are never rewritten in place.
+ * slot index = (seq-1) % gSlots. APPEND-ONLY: each device is captured once per capture
+ * generation (its first sighting since the scanner last re-armed its dedup capture at an
+ * app disconnect, acabScannerReArmCapture), so slots are never rewritten in place.
  *
  * Erase granularity is a 4KB sector (64 slots). When the write cursor enters a new
  * sector it erases it, evicting the oldest 64 records at once - acceptable for a
@@ -24,6 +25,7 @@
 #include <mbedtls/aes.h>
 #include <mbedtls/md.h>
 #include <esp_random.h>
+#include <esp_system.h>         // esp_reset_reason(): which boots count toward the auto-wipe
 #include <freertos/FreeRTOS.h>
 #include <freertos/semphr.h>
 #include <string.h>
@@ -45,9 +47,18 @@ static const size_t   ENC_LEN    = SLOT - ENC_OFF;           // 52 encrypted byt
 // reader for that ambiguity, so an absent/older marker durably condemns and erases the ring before
 // format 2 is published; rows are never guessed across the migration boundary.
 static const uint8_t  RING_FORMAT = 2;
-// Boot-based auto-wipe: if the buffer sits across this many reboots without the app
-// ever connecting to drain it, erase it (a board out of its owner's hands self-cleans).
-// This is a no-RTC proxy for the "N hours" decision; an epoch-time refinement is a TODO.
+// Auto-wipe: if the buffer sits undrained across this many PHYSICAL STARTS without the app ever
+// connecting to drain it, erase it (a board out of its owner's hands self-cleans when booted). A
+// start counts only when esp_reset_reason() evidences a person or a new possession: POWERON, EXT
+// (reset pin) or DEEPSLEEP (on the beacon board every deep-sleep entry, powerOffDeepSleep, commits
+// OFF first, so a wake that reaches detLogBegin passed the hold/switch/cell gate; mesh-detect's
+// acabPhysicalStart call treats a deep-sleep wake the same way). SW (OTA, ESP.restart fatal paths),
+// PANIC, the watchdogs, BROWNOUT, SDIO and UNKNOWN are the board restarting itself: a sagging cell
+// or a remotely induced crash loop must not count down the owner's own evidence. The count lives
+// in NVS "pboot" (gPossessionBoots), SEPARATE from the boot id `boot`, which still advances on
+// every boot because anchors and the AES-CTR nonce key off it: two physical boots sharing one id
+// would date the second boot's rows against the first boot's millis() anchor and present that as
+// measured. This is a no-RTC proxy for the "N hours" decision; an uptime refinement is a TODO.
 static const uint32_t WIPE_AFTER_BOOTS = 6;
 
 // ---- state ----
@@ -110,11 +121,12 @@ static bool              gExplicitClearPending = false;
 static const uint32_t    WIPE_BLOCK   = 64 * 1024; // one flash block erase (~100-250ms) per tick
 
 // A retained IDF core dump is a second sensitive flash surface: its task stacks can contain the
-// at-rest key, decrypted rows, and the phone's coordinates. User-driven destructive actions carry
-// a SEPARATE, persisted generation token instead of being inferred from gWipePending: that level
-// is shared with boot-count auto-wipes, remains high across an in-flight sweep, and is restored
-// already-high after a power loss. A generation (rather than a bool) also makes completion safe
-// when another explicit request arrives while an erase is waiting or in flight.
+// at-rest key, decrypted rows, and the phone's coordinates. Every wipe of the log (clearlog, a key
+// change, buffer:false, and since 2026-10-11 the boot-count auto-wipe) carries a SEPARATE,
+// persisted generation token instead of being inferred from gWipePending: that level remains high
+// across an in-flight sweep and is restored already-high after a power loss. A generation (rather
+// than a bool) also makes completion safe when another request arrives while an erase is waiting
+// or in flight.
 static uint32_t          gSensitiveEraseGen = 0;      // 0 = no pending request
 static uint32_t          gSensitiveEraseCounter = 0;  // last issued generation; remains after ack
 // If NVS temporarily rejects a NEW request, retain the desired generation in RAM and retry it
@@ -221,6 +233,9 @@ static uint32_t gStartupPendingEpoch = 0;
 static uint32_t gStartupPendingEpochAtMs = 0;
 static bool     gStartupPendingEpochValid = false;
 static uint32_t gLastConnBoot = 0; // loaded at boot; also used if the ring scan is NVS-deferred
+// Physical starts since the app last synced (NVS "pboot"), the auto-wipe's count. See
+// WIPE_AFTER_BOOTS for which reset reasons advance it; zeroed wherever lastconn is rewritten.
+static uint32_t gPossessionBoots = 0;
 static bool     gLastConnWritePending = false;
 static bool     gDrainStartPending = false;
 static uint32_t gPendingDrainCursor = 0;
@@ -924,6 +939,7 @@ static bool restoreStartupConfigLocked() {
     // reuse nonce boot IDs on an otherwise empty ring. Treat every non-sentinel value as a lower
     // bound before selecting the next boot.
     const uint32_t lastConn = p.getUInt("lastconn", 0);
+    const uint32_t possessionBase = p.getUInt("pboot", 0);
     uint32_t bootBase = p.getUInt("boot", 0);
     if (lastConn != 0xFFFFFFFFu && lastConn > bootBase) bootBase = lastConn;
     if (gMaxScannedBoot > bootBase) bootBase = gMaxScannedBoot;
@@ -937,9 +953,14 @@ static bool restoreStartupConfigLocked() {
         return false;
     }
     const uint32_t boot = bootBase + 1;
-    // Missing is not "connected this boot". Defaulting to the freshly incremented counter would
-    // refresh the seizure timer on every reboot and let an undrained ring live forever. Zero is a
-    // conservative monotonic baseline; auto-wipe still requires an actually nonempty ring.
+    // The auto-wipe count (WIPE_AFTER_BOOTS). Only a start that evidences a person or a new
+    // possession advances it; a board rebooting itself keeps the stored count, and a missing key
+    // (a fielded board's first boot on this firmware) starts from zero, which only delays the wipe.
+    const esp_reset_reason_t resetReason = esp_reset_reason();
+    const bool possessionStart = resetReason == ESP_RST_POWERON ||
+                                 resetReason == ESP_RST_EXT ||
+                                 resetReason == ESP_RST_DEEPSLEEP;
+    const uint32_t possession = possessionBase + (possessionStart ? 1u : 0u);
     // `on=false` is the durable disable marker and `keydrop=true` is the equivalent marker for an
     // enabled key rotation (persistKeyRemovalLocked). If power died between either commit and the
     // key removal, finish forgetting the residual key before this boot becomes ready.
@@ -999,6 +1020,16 @@ static bool restoreStartupConfigLocked() {
         latchFaultLocked(DET_LOG_FAULT_NVS);
         return false;
     }
+    // AFTER the boot id, so a retry of this transaction can never count one start twice: if this
+    // put fails, the retry re-reads the stored count and the already-committed `boot` merely skips
+    // a number, which nothing depends on (ids need only stay monotonic). Skipped when nothing
+    // changed, so a self-reboot costs no NVS write.
+    if (possessionStart && p.putUInt("pboot", possession) != sizeof(uint32_t)) {
+        p.end();
+        gStartupConfigPending = true;
+        latchFaultLocked(DET_LOG_FAULT_NVS);
+        return false;
+    }
     p.end();
 
     gEnabled = enabled;
@@ -1013,6 +1044,7 @@ static bool restoreStartupConfigLocked() {
     if (haveKeyFp) memcpy(gKeyFp, keyFp, sizeof(gKeyFp));
     gHaveKeyFp = haveKeyFp;
     gBoot = boot;
+    gPossessionBoots = possession;
     gLogGeneration = logGeneration;
     memcpy(gCryptoDomain, cryptoDomain, sizeof(gCryptoDomain));
     if (generationRecoveryWipe) {
@@ -1205,13 +1237,18 @@ static bool persistLastConnectionLocked() {
         latchFaultLocked(DET_LOG_FAULT_NVS);
         return false;
     }
-    const bool stored = p.putUInt("lastconn", gBoot) == sizeof(uint32_t);
+    // Count first, marker second. A power loss between them leaves a zeroed count beside a stale
+    // lastconn, which only delays the next auto-wipe; the reverse order could leave the old count
+    // armed against rows the app has just received.
+    const bool stored = p.putUInt("pboot", 0) == sizeof(uint32_t) &&
+                        p.putUInt("lastconn", gBoot) == sizeof(uint32_t);
     p.end();
     if (!stored) {
         gLastConnWritePending = true;
         latchFaultLocked(DET_LOG_FAULT_NVS);
         return false;
     }
+    gPossessionBoots = 0;
     gLastConnBoot = gBoot;
     gLastConnWritePending = false;
     return true;
@@ -1311,7 +1348,8 @@ static bool persistRingWipeArmLocked() {
         p.putBytes("cryptdom", gWipeTargetCryptoDomain,
                    sizeof(gWipeTargetCryptoDomain)) == sizeof(gWipeTargetCryptoDomain);
     const bool lastConnStored = cryptoStored &&
-                                p.putUInt("lastconn", gWipeArmBoot) == sizeof(uint32_t);
+                                p.putUInt("lastconn", gWipeArmBoot) == sizeof(uint32_t) &&
+                                p.putUInt("pboot", 0) == sizeof(uint32_t);
     // The flood marker describes the generation this arm condemns.
     const bool rateLimitStored = lastConnStored &&
                                  p.putBool("bufrl", false) == sizeof(bool);
@@ -1332,6 +1370,7 @@ static void publishRingWipeArmLocked() {
     gLogGeneration = gWipeTargetGeneration;
     memcpy(gCryptoDomain, gWipeTargetCryptoDomain, sizeof(gCryptoDomain));
     gLastConnBoot = gBoot;
+    gPossessionBoots = 0;
     // A clear is a logical encryption generation, not a physical reboot: millis() and the current
     // app epoch remain in the same clock domain. Clone that anchor to the new boot id so rows
     // written after clear/key rotation do not become approximate for the rest of this power cycle.
@@ -1628,10 +1667,18 @@ static uint32_t scanRingLocked() {
 }
 
 static void maybeAutoWipeLocked(uint32_t maxSeq) {
-    if (maxSeq > 0 && (gBoot - gLastConnBoot) >= WIPE_AFTER_BOOTS) {
-        // This self-clean is not a new user erase request. Preserve a just-reported crash dump for
-        // diagnosis; only explicit clear/key-change/disable actions arm its durable erase token.
-        clearLocked(false);
+    if (maxSeq > 0 && gPossessionBoots >= WIPE_AFTER_BOOTS) {
+        // One serial line BEFORE the clear resets the cursors, so a later serial read can tell
+        // "erased" from "never captured" (the app only ever sees buf=0). No wire key: nothing in
+        // either app would render one. "erasing", not "erased": the sweep itself runs from loop().
+        Serial.printf("[buf] auto-wipe: erasing %u row(s) after %u physical starts without the "
+                      "app\n", (unsigned)countLocked(), (unsigned)gPossessionBoots);
+        // Privacy over post-mortems: the self-clean arms the retained core dump's durable erase
+        // token exactly as clearlog does. The board this wipe exists for is out of its owner's
+        // hands, and that dump (NimBLE host stack: at-rest key, decrypted rows, phone lat/lon) is
+        // the one surface the ring wipe alone would leave behind. The serial boot report, printed
+        // before any erase, is the diagnostic copy (coredump_report.h).
+        clearLocked(true);
     }
 }
 
@@ -1761,7 +1808,8 @@ void detLogBegin() {
     // from that conservative RAM block before the retry has positively read the durable latch.
     if (anchorsLoadLocked() && !gWipeLoadPending) restoreStartupConfigLocked();
 
-    // Auto-wipe: undrained across WIPE_AFTER_BOOTS reboots -> erase.
+    // Auto-wipe: undrained across WIPE_AFTER_BOOTS physical starts -> erase (runAutoWipeCheckLocked;
+    // detLogEraseTick re-runs it when the ring scan or the NVS config restore was deferred).
     if (ioLock()) {
         runAutoWipeCheckLocked();
         ioUnlock();
@@ -2383,8 +2431,8 @@ DetLogDrainStartResult detLogStartDrain(uint32_t lastSeq, uint32_t clientLogGene
 
     // A sync is not accepted until its auto-wipe reset is durable. Otherwise the app can receive
     // a complete replay, reboot the board, and still have the supposedly-drained generation
-    // erased because lastconn silently retained an older boot. A transient failure is retried by
-    // detLogEraseTick; disconnect/stop cancels the deferred arm.
+    // erased because the possession count silently kept its old value. A transient failure is
+    // retried by detLogEraseTick; disconnect/stop cancels the deferred arm.
     gPendingDrainCursor = lastSeq;
     gPendingDrainLogGeneration = clientLogGeneration;
     gDrainStartPending = true;
@@ -2800,9 +2848,10 @@ void detLogEraseTick() {
     }
     if (!retryConfigPersistenceLocked()) { ioUnlock(); return; }
 
-    // Retry the accepted-sync persistence before the deferred auto-wipe decision. Once lastconn
-    // commits, this boot is no longer stale and a successful replay cannot be followed by an
-    // erase caused solely by the formerly old marker. A disconnect clears the pending arm.
+    // Retry the accepted-sync persistence before the deferred auto-wipe decision. Once the sync
+    // marker commits (lastconn plus a zeroed possession count), this boot is no longer stale and a
+    // successful replay cannot be followed by an erase caused solely by the formerly old count. A
+    // disconnect clears the pending arm.
     if (gDrainStartPending && gHaveKey && gAnchorsReady && !gAnchorsSavePending &&
         !gAnchorsLoadPending && !gEnableTransitionPending &&
         !gKeyPersistencePending && !gKeyRemovalPending && gRingScanReady &&
@@ -3071,6 +3120,7 @@ void detLogHostResetRuntime() {
     gStartupPendingEpochAtMs = 0;
     gStartupPendingEpochValid = false;
     gLastConnBoot = 0;
+    gPossessionBoots = 0;
     gLastConnWritePending = false;
     gDrainStartPending = false;
     gPendingDrainCursor = 0;

@@ -49,7 +49,9 @@
 // body cams. 4C:CC:34 x15, 10:74:6F x10, B8:E2:8C x2, all fixed ceiling/infrastructure gear.
 // Two consequences, neither of which is "the OUIs are wrong" - vendor attribution is still
 // correct, and these blocks stay:
-//   1. The detector is now OPT-IN on every board (default flipped in beacon-board/main.cpp).
+//   1. The broad Motorola OUI match is now OPT-IN on every board (the "motorola" sub-toggle,
+//      policeRestoreEnabled(false) in both mains); the body-cam category itself stays on by
+//      default (axonRestoreEnabled(true)).
 //   2. Read the 2026-07-18 observation above with suspicion. "3 distinct MACs at one site"
 //      is the same signature a bank of fixed cameras leaves, so it probably was not evidence
 //      of body cams either. It shows the vendor is DETECTABLE, not that it is body-worn.
@@ -78,10 +80,10 @@ static const size_t POLICE_OUI_COUNT = sizeof(POLICE_OUI) / sizeof(POLICE_OUI[0]
 //
 // Promoted from the field-validation queue below in 2.1.0, by owner decision on 2026-10-01, on
 // own capture (table in docs/signatures.md, "WatchGuard Video 00:1D:96"):
-//   - 8 WiFi MACs, 00:1D:96:28:9B:AC to 00:1D:96:29:2D:40, every frame a probe request for the
+//   - 8 WiFi MACs on OUI 00:1D:96 (app CSV exports), every frame a probe request for the
 //     same two SSIDs (drives on 2026-09-07, 09-13, 09-19 and 09-27). One fleet with one
 //     configuration. No owner marker came near any of them.
-//   - 1 BLE MAC, 00:1D:96:E7:97:4F (2026-10-01), 10 s before an owner ground-truth marker for law
+//   - 1 BLE MAC on OUI 00:1D:96 (2026-10-01 drive), 10 s before an owner ground-truth marker for law
 //     enforcement on scene, in the same window as an agency-named Cradlepoint (VCSO 3425).
 // The bar the queue note sets ("a capture pins it to a device somebody actually saw") is met at
 // the SCENE level only: the owner saw law enforcement, not the device. And the queue's first

@@ -37,7 +37,9 @@ int main() {
 
     // ---- admission decision (acabPairAdmit) --------------------------------------------------
     printf("\n  -- connect-gate admission --\n");
-    // The ONLY rejection there is. Every other combination admits.
+    // The ONLY rejection there is. Every other combination admits. "owned" is the sticky flag
+    // (ever held a bond), not the live bond count: an owned board with an emptied store still
+    // refuses a stranger.
     chk("owned board + stranger + window closed -> REJECT",
         acabPairAdmit(true, false, false), false);
     chk("owned board + stranger + window OPEN -> admit",
@@ -46,10 +48,48 @@ int main() {
     chk("owned board + the owner + window closed -> admit",
         acabPairAdmit(true, true, false), true);
     // Out of the box: a unit that shipped weeks ago must connect on the first try, no ritual.
-    chk("UNOWNED board + new phone + window closed -> admit (out-of-box)",
+    chk("NEVER-OWNED board + new phone + window closed -> admit (out-of-box)",
         acabPairAdmit(false, false, false), true);
-    chk("UNOWNED board + new phone + window open -> admit",
+    chk("NEVER-OWNED board + new phone + window open -> admit",
         acabPairAdmit(false, false, true), true);
+
+    // ---- authentication-complete admission (acabAuthAdmit) -------------------------------------
+    // Args: (boardOwned, knownAtConnect, freshPairing, windowOpen, encrypted, bonded).
+    // The rule the connect gate cannot express: a peer whose address resolved to the owner's bond
+    // is "known", but if it then PAIRED afresh (NimBLE REPEAT_PAIRING, which replaces the bond) it
+    // is a new owner, and a new owner needs the window. The old service rule, secure = encrypted
+    // && (bonded || known) plus acabPairAdmit(owned, known, window), admitted that peer at any
+    // time: a stranger replaying the owner phone's address could take the bond over.
+    printf("\n  -- auth-complete admission --\n");
+    chk("THE HOLE: owned + known + FRESH pairing + window closed + enc + bonded -> REJECT",
+        acabAuthAdmit(true, true, true, false, true, true), false);
+    chk("owned + known + fresh pairing + window closed + enc + NOT bonded -> REJECT",
+        acabAuthAdmit(true, true, true, false, true, false), false);
+    // The owner's phone restoring its existing LTK: nobody else holds that key.
+    chk("owned + known + LTK restore + window closed + enc + bonded -> admit",
+        acabAuthAdmit(true, true, false, false, true, true), true);
+    chk("owned + known + LTK restore + window closed + enc + bonded=0 -> admit (restore path)",
+        acabAuthAdmit(true, true, false, false, true, false), true);
+    // The owner re-pairs a phone that forgot the beacon: power cycle, then pair inside the window.
+    chk("owned + known + fresh pairing + window OPEN + enc + bonded -> admit",
+        acabAuthAdmit(true, true, true, true, true, true), true);
+    // A peer unknown at connect can only have encrypted by pairing now: fresh, flag or no flag.
+    chk("owned + stranger (no repeat flag) + window closed + enc + bonded -> REJECT",
+        acabAuthAdmit(true, false, false, false, true, true), false);
+    chk("owned + new phone + window OPEN + enc + bonded -> admit",
+        acabAuthAdmit(true, false, false, true, true, true), true);
+    chk("owned + new phone + window OPEN + enc + NOT bonded -> REJECT (no bond left behind)",
+        acabAuthAdmit(true, false, false, true, true, false), false);
+    // Out of the box.
+    chk("never-owned + new phone + window closed + enc + bonded -> admit",
+        acabAuthAdmit(false, false, false, false, true, true), true);
+    chk("never-owned + new phone + window closed + enc + NOT bonded -> REJECT",
+        acabAuthAdmit(false, false, false, false, true, false), false);
+    // Encryption is required whoever you are.
+    chk("owned + known + LTK restore + NOT encrypted -> REJECT",
+        acabAuthAdmit(true, true, false, false, false, true), false);
+    chk("never-owned + new phone + window open + NOT encrypted -> REJECT",
+        acabAuthAdmit(false, false, false, true, false, false), false);
 
     // A raw GAP link is not an authenticated app session. A stranger admitted while the physical
     // window is open must finish encrypted bonding before either the window or the auth deadline

@@ -73,6 +73,9 @@ CANARIES = {
     # every production image). Once in each of the five local 2.2.0 builds, absent from the
     # published 2.1.0 DIY images (2026-10-05).
     "2.2.0": ["restart refused (normal while a link opens)"],
+    # 2.2.1: the repeat-pairing refusal, new in acab_ble_service.cpp's acabRepeatPairingAllowed. The
+    # patched NimBLEServer.cpp calls it, so every production image links it.
+    "2.2.1": ["repeat pairing refused (window closed)"],
 }
 
 HERE = os.path.dirname(os.path.abspath(__file__))

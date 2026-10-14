@@ -21,8 +21,11 @@
  * When it is absent, shared corporate IDs (Quest / TCL-phone overlap) do NOT emit at
  * all in shipped builds: a Quest advertises from a rotating private address, so a bare
  * shared-ID match re-alerts on every rotation and the exact-MAC Ignore can never
- * silence it. CAPTURE-PENDING: the token's on-wire framing is unverified, so it is
- * only ever a confidence bump, never a standalone match.
+ * silence it. CAPTURE-PENDING: the token's on-wire framing is unverified. Note what it
+ * does and does not do: it never matches without a Meta company ID in the same 0xFF record,
+ * but it is not merely a bump either. The token alone UN-GATES the shared 0x058E: a 0x058E
+ * record carrying it emits at 72 with nothing else in the advert (the tokenConfirmed bypass
+ * of the sharedId gate below), where the bare ID would have stayed silent.
  */
 #include "glasses_detect.h"
 #include "glasses_signatures.h"
@@ -187,7 +190,7 @@ bool glassesClassifyBLE(const uint8_t mac[6], const uint8_t* adv, size_t advLen,
 
         // Score against the UUID surfaces rather than overwriting them: the token-confirmed
         // tier (72) must be able to beat a 45-confidence member-UUID hit on the same advert,
-        // and an eyewear-only company ID (70) must not be demoted by one either.
+        // and an eyewear-registrant company ID (49) must not be demoted by one either.
         const uint8_t conf = tokenConfirmed ? GLASSES_META_CONFIRMED_CONF : s.confidence;
         if ((int)conf <= bestConf) continue;
         acabInit(&best, ACAB_GLASSES, SRC_BLE, mac, (int16_t)rssi);

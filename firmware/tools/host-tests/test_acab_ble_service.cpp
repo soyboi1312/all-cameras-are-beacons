@@ -499,7 +499,7 @@ int main() {
         // never passed the encrypted-bond check must return before the session teardown, which
         // wipes the retained away-row fix and re-arms capture.
         const size_t secureCheck = auth == std::string::npos ? auth :
-            src.find("if (!secure || !stillAdmitted)", auth);
+            src.find("if (!acabAuthAdmit(", auth);
         const size_t securedMark = auth == std::string::npos ? auth :
             src.find("gLinkSecured = true;", auth);
         const size_t teardownStart = disconnect == std::string::npos ? disconnect :
@@ -764,47 +764,82 @@ int main() {
         };
         ok("beacon-board probes the coredump once, before its wipe tick", probeArmsWipe(boardFlat));
         ok("mesh-detect probes the coredump once, before its wipe tick", probeArmsWipe(meshFlat));
-        ok("connect, authentication and pre-auth gates all consult the window",
-           flat.find("!acabPairAdmit(boardHadBond, known, acabBlePairWindowOpen())") != std::string::npos &&
-           flat.find("acabPairAdmit(gBoardHadBondAtConnect, gPeerKnownAtConnect, "
-                     "acabBlePairWindowOpen());") != std::string::npos &&
-           flat.find("!acabPairPreAuthMayContinue(gBoardHadBondAtConnect, gPeerKnownAtConnect, "
-                     "acabBlePairWindowOpen(), elapsed, AUTH_TIMEOUT_MS)") != std::string::npos);
-        // The pins above match only the CALL text, so a gate wrapped in an opt-in #ifdef (the old
-        // P1-1 shape), short-circuited, left without its disconnect/return, or fed a bond count or
-        // "known" that admits everyone would still pass. Pin each enforcement block whole.
+        // The decisions themselves are pure and truth-tabled in test_pair_window.cpp. Here, ONE pin
+        // per call site (the inputs it is fed and the call), plus structure: no early return or
+        // #if in front of the connect gate (the old P1-1 shape), and the refusal branches really
+        // disconnect before the link is marked secured.
         const size_t cbStart = flat.find("void connectBody(NimBLEServer* srv, ble_gap_conn_desc* d) {");
-        const size_t cbGate = flat.find("bool known = false; const bool boardHadBond", cbStart);
+        const size_t cbGate = flat.find("bool known = false;", cbStart);
         const std::string cbPre = cbStart == std::string::npos || cbGate == std::string::npos ? "#if return"
             : flat.substr(cbStart, cbGate - cbStart);
-        ok("connect gate is enforced whole: owned + stranger + closed window disconnects and returns",
+        const size_t cbCall = flat.find(
+            "const bool boardOwned = gBoardOwned.on || acabBleBondCount() > 0; if (d) { "
+            "known = NimBLEDevice::isBonded(NimBLEAddress(d->peer_id_addr)) || "
+            "NimBLEDevice::isBonded(NimBLEAddress(d->peer_ota_addr)); "
+            "if (!acabPairAdmit(boardOwned, known, acabBlePairWindowOpen())) {", cbGate);
+        const size_t cbLinkUp = flat.find("gLinkConnected = true;", cbCall);
+        ok("connect gate: sticky owned flag or live store, both peer addresses, refusal returns",
            cbPre.find("return") == std::string::npos && cbPre.find("#if") == std::string::npos &&
-           flat.find("bool known = false; const bool boardHadBond = acabBleBondCount() > 0; if (d) { "
-                     "known = NimBLEDevice::isBonded(NimBLEAddress(d->peer_id_addr)) || "
-                     "NimBLEDevice::isBonded(NimBLEAddress(d->peer_ota_addr)); if (!acabPairAdmit("
-                     "boardHadBond, known, acabBlePairWindowOpen())) { Serial.println(\"[pair] window "
-                     "CLOSED and peer is not bonded -> rejecting. \" \"Power-cycle the board to open a "
-                     "fresh 2-minute window.\"); if (srv) srv->disconnect(d->conn_handle); return; } } "
-                     "gLinkConnected = true; gConnected = false; gConnHandle = d ? d->conn_handle : "
-                     "0xffff; gAuthStartedMs = millis(); gPeerKnownAtConnect = known; "
-                     "gBoardHadBondAtConnect = boardHadBond;") != std::string::npos &&
+           cbCall != std::string::npos && cbLinkUp != std::string::npos &&
+           flat.find("srv->disconnect(d->conn_handle); return;", cbCall) < cbLinkUp &&
+           flat.find("gBoardOwnedAtConnect = boardOwned; gFreshPairingOnLink = false;", cbLinkUp) !=
+               std::string::npos &&
            flat.find("int acabBleBondCount() { return NimBLEDevice::getNumBonds(); }") != std::string::npos);
-        ok("auth re-check and pre-auth tick disconnect a stranger whose window closed",
-           flat.find("if (!secure || !stillAdmitted) { Serial.println(!secure ? \"[ACAB] pairing failed to "
-                     "establish an encrypted bond; disconnecting\" : \"[ACAB] pairing window closed before "
-                     "stranger authenticated; disconnecting\"); if (gServer && gConnHandle != 0xffff) "
-                     "gServer->disconnect(gConnHandle); return; } gLinkSecured = true;") != std::string::npos &&
+        const size_t authCall = flat.find(
+            "if (!acabAuthAdmit(gBoardOwnedAtConnect, gPeerKnownAtConnect, gFreshPairingOnLink, "
+            "acabBlePairWindowOpen(), desc->sec_state.encrypted, desc->sec_state.bonded)) {");
+        const size_t authSecured = flat.find("gLinkSecured = true;", authCall);
+        // The delete is the store primitive, not NimBLEDevice::deleteBond: on NimBLE 2.x (the C5
+        // envs) deleteBond is ble_gap_unpair, which returns BLE_HS_EBUSY without touching the store
+        // while the on-chip scan runs, and the scan runs through every connection there. The
+        // refusal line names the phone-side step, because the owner's own late re-pair lands here.
+        ok("auth gate is acabAuthAdmit; a refused fresh bond is deleted, then the link dropped",
+           authCall != std::string::npos && authSecured != std::string::npos &&
+           flat.find("const bool freshBond = desc->sec_state.encrypted && desc->sec_state.bonded;",
+                     authCall) < authSecured &&
+           flat.find("pairing finished after the window closed; its bond is dropped. Forget the",
+                     authCall) < authSecured &&
+           flat.find("if (freshBond) { const int rc = ble_store_util_delete_peer(&desc->peer_id_addr); "
+                     "if (rc != 0) Serial.printf(\"[ACAB] refused fresh bond NOT deleted (rc=%d)\\n\", rc); }",
+                     authCall) < authSecured &&
+           flat.find("NimBLEDevice::deleteBond") == std::string::npos &&
+           flat.find("gServer->disconnect(gConnHandle); return; }", authCall) < authSecured &&
+           flat.find("if (desc->sec_state.bonded && gBoardOwned.set(true))", authCall) < authSecured &&
+           // the takeover rule must not come back beside the new one
+           flat.find("(desc->sec_state.bonded || gPeerKnownAtConnect)") == std::string::npos);
+        ok("pre-auth tick disconnects a stranger whose window closed",
            flat.find("if (gLinkConnected && !gConnected) { const uint32_t elapsed = (uint32_t)(millis() - "
-                     "gAuthStartedMs); if (!acabPairPreAuthMayContinue(gBoardHadBondAtConnect, "
+                     "gAuthStartedMs); if (!acabPairPreAuthMayContinue(gBoardOwnedAtConnect, "
                      "gPeerKnownAtConnect, acabBlePairWindowOpen(), elapsed, AUTH_TIMEOUT_MS)) { "
                      "Serial.println(elapsed >= AUTH_TIMEOUT_MS ? \"[ACAB] BLE authentication timed out; "
                      "disconnecting\" : \"[ACAB] pairing window closed before authentication; "
                      "disconnecting\"); if (gServer && gConnHandle != 0xffff) "
                      "gServer->disconnect(gConnHandle); } }") != std::string::npos);
+        // REPEAT_PAIRING. The pinned hosts never hand that event to the GAP listener
+        // (ble_gap_repeat_pairing_event calls only the server callback), so the one application
+        // hook is the library case that tools/patch_nimble_repeat_pairing.py rewrites to call
+        // acabRepeatPairingAllowed first. Pin: the hook refuses and drops the link while the
+        // window is closed and flags a fresh pairing while it is open; it is not weak; the dead
+        // listener case stays deleted; the pre-build patch is wired into every env; and odid-sim,
+        // which links the patched library without acab_core, defines the symbol too.
+        const std::string ini = slurp("../../platformio.ini");
+        const std::string odidFlat = codeFlat(slurp("../../src/odid-sim/main.cpp"));
+        ok("repeat pairing is refused outside the window from the library's hook, non-weak, and wired",
+           flat.find("extern \"C\" bool acabRepeatPairingAllowed(void) { if (!acabBlePairWindowOpen()) { "
+                     "Serial.println(\"[ACAB] repeat pairing refused (window closed)\"); "
+                     "if (gConnHandle != 0xffff) ble_gap_terminate(gConnHandle, BLE_ERR_REM_USER_CONN_TERM); "
+                     "return false; } gFreshPairingOnLink = true;") != std::string::npos &&
+           src.find("weak)) bool acabRepeatPairingAllowed") == std::string::npos &&
+           src.find("case BLE_GAP_EVENT_REPEAT_PAIRING") == std::string::npos &&
+           ini.find("pre:tools/patch_nimble_repeat_pairing.py") != std::string::npos &&
+           ini.find("post:tools/stamp_app_desc.py") != std::string::npos &&
+           odidFlat.find("extern \"C\" bool acabRepeatPairingAllowed(void) { return true; }") !=
+               std::string::npos);
         ok("status pairw and the [diag] pairw read the same 64-bit helper",
            flat.find("if (uint32_t rem = acabBlePairWindowRemainingMs()) doc[\"pairw\"] = rem / 1000;") !=
                std::string::npos &&
-           boardFlat.find("acabBleBondCount(), (unsigned long)(acabBlePairWindowRemainingMs() / 1000));") !=
+           // Not anchored on the closing ");": the [diag] line grows (sinkdrop= rides after pairw=).
+           boardFlat.find("acabBleBondCount(), (unsigned long)(acabBlePairWindowRemainingMs() / 1000),") !=
                std::string::npos);
         // A production build that claims to be a bench build opens the window on every warm boot.
         ok("beacon-board is a bench build only under ACAB_BENCH_NO_SLEEP",

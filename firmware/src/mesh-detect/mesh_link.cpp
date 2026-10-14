@@ -13,12 +13,28 @@
  */
 #include "mesh_link.h"
 #include <Arduino.h>
+#include <freertos/FreeRTOS.h>
+#include <freertos/semphr.h>
 
 static MeshLinkConfig gCfg;
 static HardwareSerial gMeshSerial(1);   // UART1 to the Heltec node
 static uint32_t       gLastSend = 0;
 
+// Serialises whole lines/frames onto the Heltec UART. meshLinkSendText runs on two tasks: the
+// scanner sink task (detections) and the loop task (meshLinkBootPing). The Arduino HAL locks each
+// write() call on its own, but println() is two writes (text, then "\r\n"), so without this a
+// TEXT-mode detection line and the ping could fuse into one mesh message.
+static StaticSemaphore_t gTxMutexStorage;
+static SemaphoreHandle_t gTxMutex = nullptr;
+
 #define PORTNUM_TEXT_MESSAGE_APP 1
+
+// THE ONE OWNER of "does this uplink reach only our own nodes". MESH_TEXT always lands on the
+// primary channel (Meshtastic's TEXTMSG Serial Module ignores the index), and PROTO on index 0 is
+// that same public LongFast channel. Only PROTO on a secondary index is encrypted to our key.
+static bool meshLinkPrivate() {
+    return gCfg.transport == MESH_PROTO && gCfg.channelIndex != 0;
+}
 
 MeshLinkConfig meshLinkDefaults() {
     MeshLinkConfig c;
@@ -29,7 +45,7 @@ MeshLinkConfig meshLinkDefaults() {
     c.uartBaud      = 115200;
     c.uartRxPin     = 6;    // GPIO6 <- Heltec Serial TXD (GPIO20). Pins match the stock
     c.uartTxPin     = 5;    // GPIO5 -> Heltec Serial RXD (GPIO19). Mesh-Detect wiring.
-    c.includeGPS    = true;
+    c.includeGPS    = true; // phone fix on the line, but only when meshLinkPrivate() (buildText)
     c.minIntervalMs = 3000; // go easy on the LoRa duty cycle
     return c;
 }
@@ -39,6 +55,7 @@ uint8_t meshLinkChannel() { return gCfg.channelIndex; }
 // Store config and open the UART to the Heltec node.
 void meshLinkBegin(const MeshLinkConfig& cfg) {
     gCfg = cfg;
+    if (!gTxMutex) gTxMutex = xSemaphoreCreateMutexStatic(&gTxMutexStorage);
     gMeshSerial.begin(cfg.uartBaud, SERIAL_8N1, cfg.uartRxPin, cfg.uartTxPin);
     Serial.printf("[ACAB-mesh] uplink %s, channel %u, %lu baud (RX=%d TX=%d)\n",
                   cfg.transport == MESH_PROTO ? "PROTO" : "TEXT",
@@ -93,6 +110,13 @@ static size_t buildProtoFrame(uint8_t* out, size_t outCap, uint8_t channel, cons
 }
 
 // Build the human-readable line. Always starts with "<Label> detected".
+//
+// LOCATION PRIVACY GATE. A non-drone row's lat/lon is the OWNER'S phone fix (mesh-detect
+// main.cpp onDetection fills it from acabBleGetPhoneGps), so it is where the owner is standing.
+// It never goes out on the public primary channel, whatever includeGPS says: LongFast's key is
+// public and MQTT gateways republish it. includeGPS only applies on a private channel. A drone
+// row is different: its lat/lon is the aircraft's own position, which the aircraft broadcast
+// itself in its Remote ID frame, so relaying it tells nobody where the owner is.
 static void buildText(const AcabDetection& d, char* buf, size_t cap) {
     char mac[18]; acabFormatMac(d.mac, mac);
     int n = snprintf(buf, cap, "%s detected | %s | rssi %d | %s",
@@ -106,16 +130,18 @@ static void buildText(const AcabDetection& d, char* buf, size_t cap) {
             n += snprintf(buf + n, cap - n, " | https://maps.google.com/?q=%.5f,%.5f", d.lat, d.lon);
         if (d.altitude && (size_t)n < cap)
             n += snprintf(buf + n, cap - n, " | alt %ldm", (long)d.altitude);
-    } else if (gCfg.includeGPS && (d.lat || d.lon) && (size_t)n < cap) {
+    } else if (meshLinkPrivate() && gCfg.includeGPS && (d.lat || d.lon) && (size_t)n < cap) {
         n += snprintf(buf + n, cap - n, " | https://maps.google.com/?q=%.5f,%.5f", d.lat, d.lon);
     }
 }
 
 // Send any text line over the mesh, using the configured transport + channel. No
 // dedup or rate-limit - used by detections (via meshLinkSend) and the boot
-// self-test ping.
+// self-test ping (meshLinkBootPing). One whole line (TEXT, two writes) or one frame (PROTO, one
+// write) per call; its UART write(s) run under gTxMutex.
 void meshLinkSendText(const char* text) {
     Serial.printf("[ACAB-mesh] -> %s\n", text);
+    if (gTxMutex) xSemaphoreTake(gTxMutex, portMAX_DELAY);
     if (gCfg.transport == MESH_TEXT) {
         gMeshSerial.println(text);               // Serial Module TEXTMSG mode
     } else {
@@ -124,6 +150,15 @@ void meshLinkSendText(const char* text) {
         if (len) gMeshSerial.write(frame, len);  // Serial Module PROTO mode
     }
     gLastSend = millis();
+    if (gTxMutex) xSemaphoreGive(gTxMutex);
+}
+
+// Boot self-test ping, private channel only. On the public channel it would announce a
+// counter-surveillance unit to everyone on LongFast, so there the end-to-end test is a
+// triggered detection (docs/mesh-setup.md, "Test it").
+void meshLinkBootPing() {
+    if (!meshLinkPrivate()) return;
+    meshLinkSendText("mesh-detect ACAB online");
 }
 
 // Rate-limited scanner sink: skip repeats and respect the LoRa duty-cycle floor.

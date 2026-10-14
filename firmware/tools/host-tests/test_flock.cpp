@@ -227,7 +227,8 @@ int main() {
         {0x46,0x33,0x44,0x55,0x66,0x77},
         {0x00,0x11,0x22,0x33,0x44,0x55},
     };
-    const char* names[] = { "FS-100", "Penguin-0123456789", "FS-BEC46A", "Flock Beacon" };
+    // "FS-ABCD" is exactly FLOCK_HEX_TAIL_MIN digits: the floor itself must still match.
+    const char* names[] = { "FS-ABCD", "Penguin-0123456789", "FS-BEC46A", "Flock Beacon" };
     for (const auto& mac : nameMacs) {
         char label[112];
         for (const char* name : names) {
@@ -260,10 +261,20 @@ int main() {
       chk("'FS-' + non-hex tail -> no hit", runBLE(MAC_RANDOM, a, &d), false); }
     { std::vector<uint8_t> a; addName(a, "0102000000");
       chk("bare 10-digit name -> no hit (removed)", runBLE(MAC_RANDOM, a, &d), false); }
-    // CONCERN, asserted as-is: "FS-100" is a common white-label speaker/model name and its tail is
-    // valid hex, so it still matches at hint grade. The 70 cap is the mitigation, not a fix.
+    // The hex FLOOR (FLOCK_HEX_TAIL_MIN, 2026-10-11). "FS-100" is a common white-label speaker /
+    // model name; its tail is valid hex but only three digits, so it no longer matches at all. The
+    // one own capture (FS-BEC46A) has six. Below the floor the name adds nothing, so the advert
+    // falls through to whatever else it carries: with 0x09C8 that is the 45 mfg-only hint.
     { std::vector<uint8_t> a; addName(a, "FS-100");
-      chk("'FS-100' consumer gadget still hints at 70", runBLE(MAC_RANDOM, a, &d), true, d.confidence, 70, d.detail); }
+      chk("'FS-100' (3 hex) -> NO hit (was 70)", runBLE(MAC_RANDOM, a, &d), false); }
+    { std::vector<uint8_t> a; addName(a, "FS-ABC");
+      chk("'FS-ABC' (3 hex) -> no hit", runBLE(MAC_RANDOM, a, &d), false); }
+    { std::vector<uint8_t> a; addName(a, "FS-100"); addMfg(a, 0x09C8);
+      chk("'FS-100' + 0x09C8 -> mfg-only 45, not name 80", runBLE(MAC_RANDOM, a, &d), true, d.confidence, 45, d.detail, "mfg 0x09C8"); }
+    chkInt("  ...method is M_MFG_ID (name did not match)", d.method, M_MFG_ID);
+    { std::vector<uint8_t> a; addName(a, "FS-ABCD");
+      chk("'FS-ABCD' (4 hex, the floor) -> 70", runBLE(MAC_RANDOM, a, &d), true, d.confidence, 70, d.detail, ""); }
+    chkInt("  ...method is M_NAME", d.method, M_NAME);
     // Name outranks the mfg-id hint: a named Flock beacon must report the strong signal, not 45.
     { std::vector<uint8_t> a; addMfg(a, 0x09C8); addName(a, "Flock Beacon");
       chk("name beats mfg-id even when mfg parses first", runBLE(MAC_RANDOM, a, &d), true, d.confidence, 80, d.detail); }
@@ -411,6 +422,25 @@ int main() {
       chk("lowercase 'flock-' -> NO hit (case sensitive)", runWiFi(f, &d), false); }
     { std::vector<uint8_t> f = mgmt(0x8, MAC_PUBLIC, MAC_PUBLIC); addSSID(f, "MyFlock-a1b2c3");
       chk("'Flock-' not at the start -> no hit", runWiFi(f, &d), false); }
+    // STRUCTURE, not prefix (2026-10-11, flockSsidForm). The documented form is "Flock-<partial
+    // MAC>", so the tail must be hex only and at least FLOCK_HEX_TAIL_MIN digits. Before this a
+    // hotspot named "Flock-Party" was an ALPR camera at 88 from any address, including a rotating
+    // one the exact-MAC Ignore can never silence. The probe-request regrade shares the same test.
+    { std::vector<uint8_t> f = mgmt(0x8, MAC_PUBLIC, MAC_PUBLIC); addSSID(f, "Flock-Party");
+      chk("'Flock-Party' beacon -> NO hit (was 88)", runWiFi(f, &d), false); }
+    { std::vector<uint8_t> f = mgmt(0x4, MAC_RANDOM, BCAST); addSSID(f, "Flock-Party");
+      chk("'Flock-Party' probe request -> no hit (was 72)", runWiFi(f, &d), false); }
+    { std::vector<uint8_t> f = mgmt(0x8, MAC_PUBLIC, MAC_PUBLIC); addSSID(f, "Flock-A1B2C3");
+      chk("'Flock-A1B2C3' (upper hex) beacon = 88", runWiFi(f, &d), true, d.confidence, 88, d.detail, ""); }
+    chkInt("  ...method is M_SSID", d.method, M_SSID);
+    { std::vector<uint8_t> f = mgmt(0x8, MAC_PUBLIC, MAC_PUBLIC); addSSID(f, "Flock-ABCD");
+      chk("'Flock-ABCD' (4 hex, the floor) = 88", runWiFi(f, &d), true, d.confidence, 88, d.detail); }
+    { std::vector<uint8_t> f = mgmt(0x8, MAC_PUBLIC, MAC_PUBLIC); addSSID(f, "Flock-ABC");
+      chk("'Flock-ABC' (3 hex) -> no hit", runWiFi(f, &d), false); }
+    { std::vector<uint8_t> f = mgmt(0x8, MAC_PUBLIC, MAC_PUBLIC); addSSID(f, "Flock-A1B2C3 ");
+      chk("hex tail + trailing space -> no hit", runWiFi(f, &d), false); }
+    { std::vector<uint8_t> f = mgmt(0x8, MAC_PUBLIC, MAC_PUBLIC); addSSID(f, "Flock-");
+      chk("'Flock-' with an empty tail -> no hit", runWiFi(f, &d), false); }
     // The "*-FALCON" SSID rule is RETIRED to ext=1 (2026-08-25) and compiled out: its evidence was
     // the firmware's own "PROBE-FALCON"/"DATA-FALCON" diagnostic label read back out of a capture
     // as though it were a broadcast SSID. These three assert that NOTHING on the air reaches the
@@ -428,9 +458,11 @@ int main() {
       chk("'Atlanta-Falcons' -> no hit", runWiFi(f, &d), false); }
     { std::vector<uint8_t> f = mgmt(0x8, MAC_PUBLIC, MAC_PUBLIC); addSSID(f, "Millennium Falcon");
       chk("'Millennium Falcon' -> no hit", runWiFi(f, &d), false); }
+    // The SSID is clamped to 32 bytes before the structural test, so the tail it sees is the
+    // first 26 digits of this one: still all hex, still a match.
     { std::vector<uint8_t> f = mgmt(0x8, MAC_PUBLIC, MAC_PUBLIC);
       addSSID(f, "Flock-0123456789012345678901234567890123456789");
-      chk("44-char SSID still matches the prefix", runWiFi(f, &d), true, d.confidence, 88, d.detail); }
+      chk("44-char hex SSID still matches (clamped to 32)", runWiFi(f, &d), true, d.confidence, 88, d.detail); }
     chkInt("  ...SSID truncated at 32 bytes", (long)strlen(d.name), 32);
 
     // -- WiFi: Falcon probe-request OUI --------------------------------------

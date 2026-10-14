@@ -9,6 +9,8 @@
  *
  * OTA (firmware update, all writes require the bonded/encrypted link):
  *   control rides the Config characteristic as an {"ota":{...}} object -
+ *     {"ota":{"sig":"<hex DER>"}}  the detached ECDSA-P256 signature; NOT optional, otaFinish
+ *                              fails closed without one (both apps send it before begin)
  *     {"ota":{"begin":true,"size":1069573,"crc":"a1b2c3d4","ver":"2.0.1"}}  open a session
  *     ...then stream the raw image bytes to the OTA characteristic (write-no-response)...
  *     {"ota":{"end":true}}     finalize + reboot into the new image
@@ -17,8 +19,10 @@
  *   the board notifies progress/results on the OTA characteristic:
  *     {"ota":"ready","size":N} {"ota":"prog","rx":B,"pct":P} {"ota":"done"}
  *     {"ota":"ok"} {"ota":"err","e":"crc"}
- *   crc is a standard zlib CRC-32 (hex) over the whole image; ver must be newer than the
- *   running firmware (send "force":true to override). On the dual board the S3 image carries NO
+ *   crc is a standard zlib CRC-32 (hex) over the whole image; ver must be strictly newer than the
+ *   running firmware. "force":true only relaxes that to the SAME version (a re-flash), never a
+ *   downgrade: otaBegin's gate is `force ? (nv < cur) : (nv <= cur)`. The full sequence, with the
+ *   sig/begin/end order, is docs/ble-protocol.md "Firmware update (OTA)". On the dual board the S3 image carries NO
  *   nRF payload and there is no SWD path (that was abandoned 2026-07-21 and the code deleted):
  *   the S3 only forwards a "DFU" trigger over UART, the nRF reboots into its Adafruit/Seeed
  *   bootloader, and the PHONE drives the nRF update over Nordic BLE DFU. See main.cpp's header
@@ -41,8 +45,9 @@
  *                      and WatchGuard Video's, which it owns) - a SUB-toggle
  *                      of the body-cam category, so the conf-90 Axon BWCDEVICE tag keeps
  *                      running. Absent key on old firmware = the two were one switch.
- *   {"buzzer":false}   mute detection/session sounds (physical power cues remain)
- *   {"lat":32.79,"lon":-116.94}  push the phone's GPS (Mesh-Detect tags its uplink)
+ *   {"buzzer":false}   mute every board sound (the power cues included; the LED paths stay)
+ *   {"lat":32.79,"lon":-116.94}  push the phone's GPS (a private-channel Mesh-Detect uplink
+ *                      tags it; the public build never does)
  *
  * Status record (fw string is "<label> <version>", e.g. beacon board reports "beacon board"):
  *   {"fw":"ACAB-ouispy 2.0.0","up":12345,"total":42,"ble":true,"wifi":true,
@@ -125,8 +130,8 @@ void acabBleNotifyDetection(const AcabDetection& d, bool isNew);
 // ---------------------------------------------------------------------------
 // Pairing window
 // ---------------------------------------------------------------------------
-// A NEW phone may only bond during a short window after the board powers on. Already-bonded
-// phones reconnect whenever they like; the window governs FIRST contact only.
+// A phone may only PAIR during a short window after the board powers on: a NEW phone, and a known
+// phone that forgot the beacon and pairs again. Already-bonded phones reconnect whenever they like.
 //
 // The threat this closes: without it, anyone within radio range of an unattended board can pair to
 // it and read the log. The recovery is deliberately something a user can be told in one sentence
@@ -134,13 +139,16 @@ void acabBleNotifyDetection(const AcabDetection& d, bool isNew);
 // QR-secret / challenge-response ownership scheme did not: no secret to lose, no server, nothing
 // per-device to provision, and nothing to transfer when the board changes hands.
 //
-// WHY THE GATE IS AT CONNECT AND NOT AT PAIRING. NimBLE-Arduino 1.4.3 has onSecurityRequest
-// commented out (NimBLEServer.h), so there is no hook to refuse an SMP request once it starts, and
-// this version can DELETE an existing bond while servicing a repeat pairing. Rejecting at connect,
-// before any SMP traffic, is therefore the only placement that cannot cost the legitimate owner
-// their bond. See ServerCb::onConnect.
+// TWO GATES. A stranger is refused at CONNECT, before any SMP traffic (ServerCb::connectBody,
+// acabPairAdmit). A peer whose address resolves to a bond passes that gate as known; if it then
+// asks to PAIR again instead of restoring its LTK, NimBLE's REPEAT_PAIRING handler would delete the
+// existing bond and accept the new pairing. tools/patch_nimble_repeat_pairing.py patches the pinned
+// library on every build so that handler asks acabRepeatPairingAllowed first, which refuses (and
+// drops the link) while the window is closed; authBody then admits only through acabAuthAdmit,
+// which treats a fresh pairing on an owned board as a new owner needing the window. Until
+// 2026-10-11 a peer replaying the owner phone's address could take the bond over this way.
 //
-// The window length (ACAB_PAIR_WINDOW_MS) and the deadline arithmetic live in pair_window.h, where
+// The window length (ACAB_PAIR_WINDOW_MS) and the admission rules live in pair_window.h, where
 // they are host-tested.
 
 // Enforcement is unconditional: on every boot strangers are refused on an owned board and bonded
@@ -154,9 +162,16 @@ bool acabBlePairWindowOpen();
 // Milliseconds left, 0 when closed. For the status JSON so the app can say how long is left.
 uint32_t acabBlePairWindowRemainingMs();
 // How many phones the BOARD still has bonded. A phone forgetting its side of the pairing does NOT
-// remove ours, which is why a previously-bonded phone can still reconnect (and re-pair) outside the
-// window: the connect gate sees a known address. Surfaced on the [diag] serial line.
+// remove ours: that phone still passes the connect gate as known, but its re-pairing is refused
+// outside the window (acabRepeatPairingAllowed), so it needs the same power cycle as a new phone.
+// Surfaced on the [diag] serial line. Ownership is a sticky NVS flag ORed with this count
+// (boardOwned in acab_ble_service.cpp's connectBody): the flag is what makes it sticky, the count
+// can only add protection, so an emptied store cannot reopen the board.
 int acabBleBondCount();
+// Called by the patched NimBLE-Arduino REPEAT_PAIRING handler (tools/patch_nimble_repeat_pairing.py)
+// before it deletes a bond. True only while the window is open; false also drops the link. Defined
+// NON-weak in acab_ble_service.cpp, and in src/odid-sim/main.cpp for the simulator.
+extern "C" bool acabRepeatPairingAllowed(void);
 
 void acabBleUpdateStatus();
 

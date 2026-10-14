@@ -15,7 +15,7 @@
  *
  * SAFETY (must-dos from the roadmap):
  *  - build guard: otaBegin rejects an image whose declared version is not newer than the
- *    running one (no accidental downgrade / re-flash), unless force=true.
+ *    running one; force=true admits only the same version (a re-flash), never an older one.
  *  - integrity: the whole payload is CRC32'd (standard zlib CRC-32) and compared, on top of
  *    the Update library's own image-magic + SHA-256 validation.
  *  - rollback arming: otaFinish arms a boot-attempt counter; if the freshly-flashed image
@@ -33,7 +33,7 @@
 enum OtaResult {
     OTA_OK = 0,
     OTA_ERR_BUSY,        // a session is already open
-    OTA_ERR_VERSION,     // declared version not newer than the running one (build guard)
+    OTA_ERR_VERSION,     // declared version refused by the build guard (not newer; with force, older)
     OTA_ERR_SIZE,        // size 0, mismatched total, or larger than the target slot
     OTA_ERR_BEGIN,       // Update.begin failed (no OTA slot / no room)
     OTA_ERR_WRITE,       // a flash write failed
@@ -49,8 +49,9 @@ const char* otaResultStr(OtaResult r);
 // Set by the BLE service; may be null.
 void otaSetNotifier(void (*fn)(const char* json));
 
-// Open a session. newVer must be strictly newer than the running ACAB_FW_VERSION unless
-// force. expectCrc32 is a standard zlib/PKZIP CRC-32 over the whole image (0 = skip check).
+// Open a session. newVer must be strictly newer than the running ACAB_FW_VERSION; with force
+// it may equal it, never be older. expectCrc32 is a standard zlib/PKZIP CRC-32 over the whole
+// image (0 = skip check).
 OtaResult otaBegin(uint32_t imageSize, uint32_t expectCrc32, const char* newVer, bool force);
 // Feed one chunk in arrival order. A failure aborts the session.
 OtaResult otaWrite(const uint8_t* data, size_t len);

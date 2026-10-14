@@ -49,7 +49,8 @@ void alertsSetLedEnabled(bool on) {
 // Meshtastic channel we transmit on. 0 = primary/public, sent as a TextMessage
 // (matches the stock Mesh-Detect Heltec config, so your node stays on the public
 // LongFast mesh). Set a secondary index (e.g. -DACAB_MESH_CHANNEL=1) to send
-// detections privately over PROTO instead.
+// detections privately over PROTO instead. The phone's fix and the boot ping go out on a
+// private channel only (buildText / meshLinkBootPing in mesh_link.cpp).
 #ifndef ACAB_MESH_CHANNEL
 #define ACAB_MESH_CHANNEL 0
 #endif
@@ -74,6 +75,8 @@ static void onDetection(const AcabDetection& d0, bool isNew) {
     // pre-populated non-drone coordinate here. Re-acquire a fix that is both attached
     // to the current connection and at most 60 seconds old. Drone coordinates remain
     // untouched because they are broadcast by the aircraft, not supplied by the phone.
+    // The fix is for the owner's own app (BLE notify); the mesh side attaches it only on
+    // a private channel and drops it on the public primary (buildText in mesh_link.cpp).
     if (d.type != ACAB_DRONE) {
         d.lat = 0; d.lon = 0; d.gpsAgeMs = 0;
         if (acabBleClientConnected())
@@ -125,8 +128,9 @@ void setup() {
     meshLinkBegin(mesh);
 
     // Run the same GATT service oui-spy does, so the app can connect to a Mesh-Detect
-    // board too: see detections, configure it, and push the phone's GPS (which we tag
-    // onto the mesh uplink). acabBleBegin inits NimBLE; the scanner then reuses it.
+    // board too: see detections, configure it, and push the phone's GPS (tagged onto the
+    // mesh uplink on a private channel only). acabBleBegin inits NimBLE; the scanner then
+    // reuses it.
     //
     // The fw label is channel-specific so an OTA can't cross-flash the public build onto a
     // private-channel board: the app matches the manifest OTA entry by exact fw label, and the
@@ -142,9 +146,10 @@ void setup() {
     // Stays off air until the pairing window is decided below (same ordering as beacon-board).
     acabBleBegin("ACAB-mesh", fwLabel);
 
-    // Pairing window. Once the board holds a bond, the BLE service refuses any new phone unless
-    // this window is open (acabPairAdmit), because a bonded stranger reaches the whole config
-    // surface: {"clearlog":true} erases
+    // Pairing window. Once the board has ever held a bond (sticky owned flag), the BLE service
+    // refuses any new phone, and any re-pairing of a known one, unless this window is open
+    // (acabPairAdmit, acabAuthAdmit, acabRepeatPairingAllowed), because a bonded stranger reaches
+    // the whole config surface: {"clearlog":true} erases
     // the offline buffer, a new {"key":...} triggers the mismatch wipe, and every detector toggle
     // can be switched off. The window only opens on a PHYSICAL start. This build has no slide
     // switch, button, or battery cell (XIAO on USB power), so the inputs mirror the slim SKU:
@@ -265,10 +270,12 @@ void loop() {
     }
 
     // One-time boot self-test: announce on the mesh ~10s after power-up, once the
-    // Heltec is up, to check the send path without waiting for a detection.
+    // Heltec is up, to check the send path without waiting for a detection. Private
+    // channel only; on channel 0 meshLinkBootPing is a no-op, so the public build stays
+    // silent until it has something to report.
     if (!bootPinged && now > 10000) {
         bootPinged = true;
-        meshLinkSendText("mesh-detect ACAB online");
+        meshLinkBootPing();
     }
 
     if (now - lastBeat > 60000) {

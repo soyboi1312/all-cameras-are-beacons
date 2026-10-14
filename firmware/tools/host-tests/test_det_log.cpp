@@ -4,9 +4,11 @@
 #include <Preferences.h>
 #include <esp_partition.h>
 #include <esp_random.h>
+#include <esp_system.h>
 #include <freertos/semphr.h>
 #include <mbedtls/aes.h>
 #include <mbedtls/md.h>
+#include <unistd.h>
 #include <atomic>
 #include <condition_variable>
 #include <cstddef>
@@ -98,6 +100,34 @@ static void fresh(size_t partitionBytes = 8192) {
 
 static void appendRange(uint32_t first, uint32_t last) {
     for (uint32_t n = first; n <= last; n++) detLogAppend(detection(n));
+}
+
+// Run `fn` with stdout captured and hand back what it printed. The host Serial sink is stdout, and
+// the auto-wipe's boot-report line is a behaviour this suite has to be able to fail on, so one
+// check reads the line back instead of trusting that the printf is reached.
+static std::string withStdoutCaptured(void (*fn)()) {
+    std::fflush(stdout);
+    FILE* capture = std::tmpfile();
+    if (!capture) return "";
+    const int saved = dup(fileno(stdout));
+    dup2(fileno(capture), fileno(stdout));
+    fn();
+    std::fflush(stdout);
+    dup2(saved, fileno(stdout));
+    close(saved);
+    std::rewind(capture);
+    std::string out;
+    char line[512];
+    while (std::fgets(line, sizeof(line), capture)) out += line;
+    std::fclose(capture);
+    return out;
+}
+
+// One simulated boot: the runtime forgets everything, the host NVS and flash survive.
+static void rebootAs(esp_reset_reason_t reason) {
+    acabHostResetReason = reason;
+    detLogHostResetRuntime();
+    detLogBegin();
 }
 
 static uint32_t savedUInt(const char* key) {
@@ -928,16 +958,18 @@ int main() {
     check("restoring the key replays the untouched first sequence",
           detLogPeekForDrain(&keylessReplay) && keylessReplay.seq == 1);
 
-    // A sync also resets the undrained-reboot timer. That write is part of accepting the sync,
-    // not advisory bookkeeping: if it silently fails one boot before the threshold, a fully sent
-    // row is condemned on the next reboot. Keep the drain unarmed until lastconn is durable, then
-    // prove the following boot retains the row instead of auto-wiping it.
+    // A sync also resets the possession count (pboot=0 beside lastconn). That write is part of
+    // accepting the sync, not advisory bookkeeping: if it silently fails one start before the
+    // threshold, a fully sent row is condemned on the next physical start. Keep the drain unarmed
+    // until that write is durable, then prove the following boot retains the row instead of
+    // auto-wiping it.
     fresh();
     detLogAppend(detection(1));
     detLogHostResetRuntime();
     seedUInt("boot", 5);
     seedUInt("lastconn", 1);
-    detLogBegin();                       // boot 6: still one short of the six-boot wipe threshold
+    seedUInt("pboot", 4);
+    detLogBegin();                       // fifth physical start: one short of the wipe threshold
     check("lastconn regression begins one boot short without erasing the row",
           detLogCount() == 1 && !detLogWipePending());
     Preferences::failNextPutUInt("acab-buf", "lastconn");
@@ -956,6 +988,42 @@ int main() {
     detLogBegin();
     check("reboot after the accepted replay cannot auto-wipe from the stale marker",
           detLogCount() == 1 && !detLogWipePending());
+
+    // ---- the auto-wipe counts physical starts, not reboots ----------------------------------
+    // WIPE_AFTER_BOOTS counts starts that evidence a person or a new possession (power-on, reset
+    // pin, deep-sleep wake). A brownout loop on a sagging cell, a panic loop, a watchdog or an OTA
+    // restart is the board rebooting itself, and six of those used to erase the owner's own
+    // undrained evidence. The count also has to survive the self-reboots in between.
+    fresh();
+    detLogAppend(detection(1));
+    for (int i = 0; i < 6; i++) rebootAs(ESP_RST_BROWNOUT);
+    check("six brownout reboots leave the undrained ring intact",
+          detLogCount() == 1 && !detLogWipePending() && detLogSensitiveErasePending() == 0);
+    for (int i = 0; i < 5; i++) rebootAs(ESP_RST_POWERON);
+    rebootAs(ESP_RST_PANIC);
+    rebootAs(ESP_RST_SW);
+    check("a panic and an OTA restart after five power-ons do not complete the count",
+          detLogCount() == 1 && !detLogWipePending());
+    acabHostResetReason = ESP_RST_DEEPSLEEP;
+    detLogHostResetRuntime();
+    const std::string autoWipeBootReport = withStdoutCaptured([] { detLogBegin(); });
+    check("the sixth physical start erases the ring", detLogCount() == 0 && detLogWipePending());
+    check("the auto-wipe arms the retained-coredump erase token like an explicit clear",
+          detLogSensitiveErasePending() != 0);
+    check("the boot report says what the auto-wipe erased and why",
+          autoWipeBootReport.find("[buf] auto-wipe: erasing 1 row(s) after 6 physical starts "
+                                  "without the app") != std::string::npos);
+    acabHostResetReason = ESP_RST_POWERON;
+
+    // A sync restarts the count, so five further power-ons keep the row and the sixth erases it.
+    fresh();
+    detLogAppend(detection(1));
+    for (int i = 0; i < 5; i++) rebootAs(ESP_RST_POWERON);
+    detLogStartDrain(0);                     // the app's sync: lastconn plus a zeroed count
+    for (int i = 0; i < 5; i++) rebootAs(ESP_RST_POWERON);
+    check("a sync restarts the possession count", detLogCount() == 1 && !detLogWipePending());
+    rebootAs(ESP_RST_POWERON);
+    check("six power-ons after the sync erase the ring", detLogCount() == 0 && detLogWipePending());
 
     // A deferred start belongs to the connection that requested it. Disconnect/stop must cancel
     // both the cursor and the lastconn retry; a later loop pass may not resurrect a drain whose
@@ -1300,7 +1368,8 @@ int main() {
     detLogBegin();
     const uint32_t generationBeforeRepeatedClearRotation = detLogGeneration();
     Preferences::failNextPutUInt("acab-buf", "loggen");
-    detLogAppend(detection(1));                     // auto-wipe arm has no coredump token
+    detLogAppend(detection(1));                     // head-wrap clear (not the boot-count
+                                                    // auto-wipe) arms no coredump token
     Preferences::failNextPutUInt("acab-buf", "cdwipe");
     detLogSetKey(otherKey, true);
     detLogClear();                                  // new token lands; arm must remain deferred

@@ -24,26 +24,30 @@
  *
  * THIS PARTITION IS A SECOND AT-REST SURFACE. det_log builds a deliberate posture around its
  * 64 B ring: opt-in and off by default, AES-CTR at rest, key removal on disable, a boot-count
- * auto-wipe so a board out of its owner's hands self-cleans, and a power-loss-resumable erase.
+ * auto-wipe that fires only when the unit is booted, and a power-loss-resumable erase.
  * A retained dump needs its own erase state because it is a different partition. An IDF ELF
  * dump captures each task's LIVE STACK, and the stack that matters is the NimBLE host task's: it
  * decodes the at-rest key into a local buffer, parses the phone's {"lat","lon"} on the same
  * stack, and unpacks decrypted records there during a replay. So a panic can persist an in-flight
  * detection - MAC plus phone-pushed coordinates - on a board that never opted into the buffer at
- * all, and it survives {"clearlog"} and the auto-wipe, both of which report success. DRAM capture
+ * all, and without the erase token below it would survive {"clearlog"} and the auto-wipe while
+ * both report success. DRAM capture
  * is off, so this is only what happened to be on a live frame at the panic, but that is exactly
  * the material the rest of the design goes to lengths to protect.
  *
- * EXPLICIT INTENT IS DURABLE AND INDEPENDENT. `clearlog`, an at-rest key change, and every
- * `buffer:false` write advance an NVS-backed erase-generation token in det_log. So does the first
- * authenticated phone link of every boot, with the buffer on or off: detLogPrepareConfigSession()
- * pre-arms one generation before any config write is admitted, and det_log's
- * gSensitiveStackExposedThisBoot then refuses its completion for the rest of that boot. The token
- * is independent of the ring's shared `wipe` level, survives power loss, and is cleared only after
- * this partition is erased (or positively found empty). A new request supersedes an in-flight
- * generation without being acknowledged by the older completion. This closes both historical
- * gaps: an explicit clear while a ring sweep was already pending, and a crash/power loss between
- * the ring and dump erases. The boot-count auto-wipe does NOT create this token.
+ * ERASE INTENT IS DURABLE AND INDEPENDENT. `clearlog`, an at-rest key change, every
+ * `buffer:false` write, and the boot-count auto-wipe (det_log's maybeAutoWipeLocked) advance an
+ * NVS-backed erase-generation token in det_log. So does the first authenticated phone link of
+ * every boot, with the buffer on or off: detLogPrepareConfigSession() pre-arms one generation
+ * before any config write is admitted, and det_log's gSensitiveStackExposedThisBoot then refuses
+ * its completion for the rest of that boot. The token is independent of the ring's shared `wipe`
+ * level, survives power loss, and is cleared only after this partition is erased (or positively
+ * found empty). A new request supersedes an in-flight generation without being acknowledged by the
+ * older completion. This closes both historical gaps: an explicit clear while a ring sweep was
+ * already pending, and a crash/power loss between the ring and dump erases. The auto-wipe arms it
+ * too (2026-10-11; before that it deliberately kept the dump for diagnosis): the board it exists
+ * for is out of its owner's hands, which is exactly where a retained dump holding phone
+ * coordinates matters most. Privacy over post-mortems; the serial boot report is the copy.
  *
  * SO A RETAINED DUMP IS SHORT-LIVED ON ANY BOARD A PHONE USES. acabCoredumpWipeTick() erases it on
  * the first loop pass that finds the token pending (a pending ring sweep can defer it, bounded; see
@@ -119,8 +123,9 @@ void acabCoredumpPrint();
 bool acabCoredumpErase();
 
 /// Pump the erase from loop(), once per pass, on the LOOP TASK. Consumes det_log's NVS-backed
-/// explicit erase generation, including one restored after power loss; no inference from the
-/// shared ring-wipe edge is involved. It waits for the ring sweep so one pass does not take two
+/// erase generation (explicit clears and the boot-count auto-wipe alike), including one restored
+/// after power loss; no inference from the shared ring-wipe edge is involved. It waits for the
+/// ring sweep so one pass does not take two
 /// 64 KB erases, but the wait is bounded (see kRingSweepWaitMs): a missing/stalled ring cannot
 /// strand the dump. A failed dump erase keeps the token for a reboot retry (or a newer explicit
 /// request) without hammering the flash each pass. On the ordinary no-token path this costs one

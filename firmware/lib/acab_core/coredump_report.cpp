@@ -120,9 +120,10 @@ bool acabCoredumpErase() {
 #endif
 }
 
-// Consume det_log's durable EXPLICIT erase token, so "erase what this board stored" reaches both
-// at-rest surfaces even when the ring wipe was already pending or power failed between the two
-// erases. Call once per loop pass from the LOOP TASK (see the cache-off note in the header).
+// Consume det_log's durable erase token (explicit clears and the boot-count auto-wipe), so "erase
+// what this board stored" reaches both at-rest surfaces even when the ring wipe was already pending
+// or power failed between the two erases. Call once per loop pass from the LOOP TASK (see the
+// cache-off note in the header).
 void acabCoredumpWipeTick() {
     if (!gProbed) return;
     const uint32_t generation = detLogSensitiveErasePending();
@@ -166,7 +167,7 @@ void acabCoredumpWipeTick() {
     sWaitingGeneration = 0;
     if (erased) detLogSensitiveEraseComplete(generation);
     Serial.println(erased
-                   ? "[coredump] retained dump erased for explicit sensitive-data wipe"
+                   ? "[coredump] retained dump erased for a sensitive-data wipe"
                    : "[coredump] retained dump erase FAILED - request retained for reboot/retry");
 }
 

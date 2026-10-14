@@ -67,10 +67,12 @@ static const FalconWifiOui FALCON_WIFI_OUI[] = {
     // trip cannot be made again. Behaviour of these rows is unchanged, and always was; only
     // the story above them was wrong. Do not re-split the four on the strength of that story - the
     // evidence behind them is one batch, so grade them together or not at all.
-    {{0xD8,0xF3,0xBC}, 0},  // D8:F3:BC:7D:D4:CF               own capture at a DeFlock-confirmed Falcon
-    {{0xC0,0x35,0x32}, 0},  // C0:35:32:AF:A3:7D               own capture at a DeFlock-confirmed Falcon
-    {{0x24,0xB2,0xB9}, 0},  // 24:B2:B9:F5:D0:43               own capture at a DeFlock-confirmed Falcon
-    {{0xF4,0x6A,0xDD}, 0},  // F4:6A:DD:62:38:5D / :5E:3A:F3   own capture at a DeFlock-confirmed Falcon
+    // OUI only here (privacy rule: no full field MAC in the tree); the capture ID is the commit
+    // above, ca44071, which is the only place these rows were ever sourced from.
+    {{0xD8,0xF3,0xBC}, 0},  // OUI D8:F3:BC, one station,  capture ca44071 (DeFlock-confirmed Falcon site)
+    {{0xC0,0x35,0x32}, 0},  // OUI C0:35:32, one station,  capture ca44071 (DeFlock-confirmed Falcon site)
+    {{0x24,0xB2,0xB9}, 0},  // OUI 24:B2:B9, one station,  capture ca44071 (DeFlock-confirmed Falcon site)
+    {{0xF4,0x6A,0xDD}, 0},  // OUI F4:6A:DD, two stations, capture ca44071 (DeFlock-confirmed Falcon site)
 };
 static const size_t FALCON_WIFI_OUI_COUNT = sizeof(FALCON_WIFI_OUI) / sizeof(FALCON_WIFI_OUI[0]);
 
@@ -78,10 +80,18 @@ static const size_t FALCON_WIFI_OUI_COUNT = sizeof(FALCON_WIFI_OUI) / sizeof(FAL
 // WiFi SSID prefix
 // ---------------------------------------------------------------------------
 // Falcon cameras stand up a setup/health AP named "Flock-<partial MAC>". This is
-// the strong WiFi signature (far better than an OUI). Add a prefix test on the
-// SSID IE in flockClassifyWiFi; it replaces the dropped OUI-superset matches.
+// the strong WiFi signature (far better than an OUI). flockClassifyWiFi matches the
+// STRUCTURE, not just the prefix: the tail after "Flock-" must be hex digits only and at
+// least FLOCK_HEX_TAIL_MIN of them (flockSsidForm), so a hotspot someone named "Flock-Party"
+// is not an ALPR camera at 88. Neither source pins the tail length, so the floor is 4, not a
+// MAC width, and the tail is NOT cross-checked against the BSSID: which octets the camera
+// encodes is undocumented and no capture here has ever held a "Flock-" SSID to learn it from.
 //   src: ryanohoro "Spotting Flock Safety's Falcon Cameras"; GainSec WiFi research.
 #define FLOCK_SSID_PREFIX  "Flock-"
+// Minimum hex digits after an anchored prefix ("Flock-" SSID, "FS-" BLE name) before the
+// structural form counts. One own capture (FS-BEC46A, six hex) sits above it; "FS-100" and
+// "Flock-ABC" sit below it. Shared by both so the two forms cannot drift apart.
+#define FLOCK_HEX_TAIL_MIN 4
 
 // NON-SHIPPING CANDIDATE (ext=1), retired 2026-08-25. Same tier as an ext=1 OUI row: kept as a
 // provenance record, compiled out of every build. falconSsidSuffix() in flock_detect.cpp is the
@@ -117,7 +127,8 @@ static const uint8_t FLOCK_SSID_FALCON_SUFFIX_EXT = 1;
 //   FLOCK_NAME_LITERAL       case-insensitive substring; specific enough to rank
 //                            strong (80) on its own
 //   FLOCK_NAME_PREFIX_DIGITS name starts with the pattern + a 1+ decimal-digit tail
-//   FLOCK_NAME_PREFIX_HEX    name starts with the pattern + a 1+ hex-digit tail
+//   FLOCK_NAME_PREFIX_HEX    name starts with the pattern + a hex-only tail of at least
+//                            FLOCK_HEX_TAIL_MIN digits ("FS-100" is three, so it no longer matches)
 //   FLOCK_NAME_PREFIX        name starts with the pattern (no structural tail)
 // The PREFIX forms rank strong (80) only with the 0x09C8 mfg co-signal and stay
 // hint-grade (70) otherwise, regardless of address bytes. A public address adds
@@ -125,8 +136,10 @@ static const uint8_t FLOCK_SSID_FALCON_SUFFIX_EXT = 1;
 // the existing name+mfg tier. See flockClassifyBLE in flock_detect.cpp.
 //   "FS Ext Battery"             -> ryanohoro (external-battery health beacons)
 //   "Penguin-" + digits          -> ryanohoro (Penguin-##########)
-//   "FS-" + hex                  -> own field capture (FS-BEC46A, 2026-06; one capture,
-//                                   so the tail requires hex but not a fixed length)
+//   "FS-" + hex                  -> own field capture (FS-BEC46A, 2026-06; one capture, so
+//                                   the tail requires >= FLOCK_HEX_TAIL_MIN hex digits, not
+//                                   the captured six: a floor under the one sample, not a
+//                                   fixed length)
 //   "Flock" prefix               -> brand string, public; loosest of the four
 // (A bare 10-digit name is a documented post-Mar-2025 Flock pattern but is NOT
 // matched here: in the field it false-positived on phones broadcasting placeholder

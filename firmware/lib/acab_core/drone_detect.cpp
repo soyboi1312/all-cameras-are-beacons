@@ -69,8 +69,12 @@ void droneOuiRestoreEnabled(bool defaultEnabled) { gEnabledOui.restore(defaultEn
 // detection we emit holds everything seen so far.
 //
 // Once a BasicID arrives we key the track by UAS-ID (survives MAC rotation, spans
-// BLE + WiFi); before that, by MAC. Both radio tasks decode, so a spinlock guards
-// the table - same as the scanner's dedup table.
+// BLE + WiFi); before that, by MAC. One track per transmitter: F3411 lets a drone
+// broadcast two BasicIDs (a serial number plus a CAA registration or session ID),
+// so a track holds two IDs, like the decoder's ODID_UAS_Data, and the second ID
+// joins the MAC's existing track instead of opening a flickering twin. The id we
+// emit is the serial once one is seen, else the first ID. Both radio tasks decode,
+// so a spinlock guards the table - same as the scanner's dedup table.
 // ---------------------------------------------------------------------------
 #define DRONE_TRACK_MAX  16
 #define DRONE_TRACK_TTL  60000UL          // forget a track after 60 s of silence
@@ -78,7 +82,9 @@ void droneOuiRestoreEnabled(bool defaultEnabled) { gEnabledOui.restore(defaultEn
 struct DroneTrack {
     bool     used;
     uint8_t  mac[6];                       // most recent transmitter MAC
-    char     uasId[ODID_ID_SIZE + 1];      // stable identity once a BasicID arrives
+    char     uasId[ODID_ID_SIZE + 1];      // emitted identity once a BasicID arrives (serial first)
+    char     uasId2[ODID_ID_SIZE + 1];     // the drone's other BasicID, matched but not emitted
+    bool     uasIdSerial;                  // uasId is an ODID_IDTYPE_SERIAL_NUMBER
     uint32_t lastSeen;
     bool     haveLoc, haveOp, haveOpId;
     double   lat, lon;  int32_t alt;
@@ -92,8 +98,14 @@ struct DroneTrack {
 static DroneTrack    gTracks[DRONE_TRACK_MAX];
 static portMUX_TYPE  gTrackMux = portMUX_INITIALIZER_UNLOCKED;
 
-// Find this frame's track, creating/evicting as needed. Caller holds gTrackMux.
-static DroneTrack* trackFind(const uint8_t mac[6], const char* uasId, uint32_t now) {
+static bool trackHasId(const DroneTrack* t, const char* id) {
+    return id[0] && (strcmp(t->uasId, id) == 0 || strcmp(t->uasId2, id) == 0);
+}
+
+// Find this frame's track, creating/evicting as needed. idA/idB are the frame's BasicIDs
+// (empty strings when absent). Caller holds gTrackMux.
+static DroneTrack* trackFind(const uint8_t mac[6], const char* idA, const char* idB,
+                             uint32_t now) {
     // TTL means forget, not merely "this slot may be reused". Expire first so a
     // location-only frame cannot inherit an old UAS ID, operator fix, or telemetry
     // just because it arrived from the same transmitter address after a long gap.
@@ -101,20 +113,14 @@ static DroneTrack* trackFind(const uint8_t mac[6], const char* uasId, uint32_t n
         if (gTracks[i].used && now - gTracks[i].lastSeen > DRONE_TRACK_TTL)
             memset(&gTracks[i], 0, sizeof(gTracks[i]));
     }
-    if (uasId && uasId[0]) {
-        // match by UAS-ID
-        for (int i = 0; i < DRONE_TRACK_MAX; i++)
-            if (gTracks[i].used && gTracks[i].uasId[0] &&
-                strcmp(gTracks[i].uasId, uasId) == 0) return &gTracks[i];
-        // first BasicID for a drone we'd been tracking by MAC: adopt that track
-        for (int i = 0; i < DRONE_TRACK_MAX; i++)
-            if (gTracks[i].used && !gTracks[i].uasId[0] &&
-                memcmp(gTracks[i].mac, mac, 6) == 0) return &gTracks[i];
-    } else {
-        // no BasicID yet, so correlate by MAC
-        for (int i = 0; i < DRONE_TRACK_MAX; i++)
-            if (gTracks[i].used && memcmp(gTracks[i].mac, mac, 6) == 0) return &gTracks[i];
-    }
+    // match by UAS-ID: either ID this frame carries against either ID a track holds
+    for (int i = 0; i < DRONE_TRACK_MAX; i++)
+        if (gTracks[i].used && (trackHasId(&gTracks[i], idA) || trackHasId(&gTracks[i], idB)))
+            return &gTracks[i];
+    // otherwise by MAC: a frame with no BasicID yet, the first BasicID for a drone we had
+    // been tracking by MAC, or a second ID type from a transmitter we already track
+    for (int i = 0; i < DRONE_TRACK_MAX; i++)
+        if (gTracks[i].used && memcmp(gTracks[i].mac, mac, 6) == 0) return &gTracks[i];
     // need a slot: take a free or stale one, otherwise evict the oldest
     DroneTrack* oldest = nullptr;
     for (int i = 0; i < DRONE_TRACK_MAX; i++) {
@@ -129,23 +135,54 @@ static DroneTrack* trackFind(const uint8_t mac[6], const char* uasId, uint32_t n
     return oldest;
 }
 
+static void idCopy(char dst[ODID_ID_SIZE + 1], const char* src) {
+    strncpy(dst, src, ODID_ID_SIZE);
+    dst[ODID_ID_SIZE] = 0;
+}
+
+// Record one of the frame's BasicIDs on its track. The serial number is the emitted id
+// whenever one is known, so a serial that arrives after a CAA/session ID takes over
+// the primary slot and the earlier ID moves to the secondary. Caller holds gTrackMux.
+// ponytail: two IDs per track, like ODID_UAS_Data; a third distinct ID overwrites the secondary.
+static void trackAddId(DroneTrack* t, const char* id, bool serial) {
+    if (!id[0] || trackHasId(t, id)) return;
+    if (!t->uasId[0]) { idCopy(t->uasId, id); t->uasIdSerial = serial; return; }
+    if (serial && !t->uasIdSerial) {
+        idCopy(t->uasId2, t->uasId);
+        idCopy(t->uasId, id);
+        t->uasIdSerial = true;
+        return;
+    }
+    idCopy(t->uasId2, id);
+}
+
 // Merge one decoded frame into its track, then fill `out` from the accumulated
 // track. Returns false if the frame carried nothing useful.
 static bool fillFromODID(const ODID_UAS_Data* uas, const uint8_t mac[6],
                          int rssi, AcabSource src, AcabDetection* out) {
-    bool useful = uas->BasicIDValid[0] || uas->LocationValid ||
-                  uas->SystemValid     || uas->OperatorIDValid;
-    if (!useful) return false;
-
     // Pull this frame's fields out before locking - keep string work off the lock.
-    char frameId[ODID_ID_SIZE + 1] = {0};
-    if (uas->BasicIDValid[0])
-        acabSanitizeAscii(frameId, (const uint8_t*)uas->BasicID[0].UASID, ODID_ID_SIZE, sizeof(frameId));   // clamp UAS-ID on ingest
+    // A message pack can carry both BasicIDs at once; a legacy advert carries one.
+    // The decoder NUL-terminates UASID, so sanitise only the ID's own bytes: sanitising
+    // the full ODID_ID_SIZE field turned a short ID's padding into trailing dots.
+    char frameId[ODID_BASIC_ID_MAX_MESSAGES][ODID_ID_SIZE + 1] = {{0}};
+    bool frameSerial[ODID_BASIC_ID_MAX_MESSAGES] = {false};
+    bool anyId = false;
+    for (int i = 0; i < ODID_BASIC_ID_MAX_MESSAGES; i++) {
+        if (!uas->BasicIDValid[i]) continue;
+        anyId = true;
+        const char* s = uas->BasicID[i].UASID;
+        acabSanitizeAscii(frameId[i], (const uint8_t*)s, strnlen(s, ODID_ID_SIZE), sizeof(frameId[i]));   // clamp UAS-ID on ingest
+        uint8_t ty; memcpy(&ty, &uas->BasicID[i].IDType, 1);   // raw wire nibble, not the enum (see ridStatus)
+        frameSerial[i] = ty == ODID_IDTYPE_SERIAL_NUMBER;
+    }
+    bool useful = anyId || uas->LocationValid || uas->SystemValid || uas->OperatorIDValid;
+    if (!useful) return false;
 
     char opDetail[48] = {0};
     if (uas->OperatorIDValid) {
         char op[ODID_ID_SIZE + 1] = {0};
-        acabSanitizeAscii(op, (const uint8_t*)uas->OperatorID.OperatorId, ODID_ID_SIZE, sizeof(op));   // clamp operator id on ingest
+        const char* s = uas->OperatorID.OperatorId;
+        acabSanitizeAscii(op, (const uint8_t*)s, strnlen(s, ODID_ID_SIZE), sizeof(op));   // clamp operator id on ingest
         snprintf(opDetail, sizeof(opDetail), "op %s", op);
     }
 
@@ -155,10 +192,10 @@ static bool fillFromODID(const ODID_UAS_Data* uas, const uint8_t mac[6],
 
     uint32_t now = millis();
     portENTER_CRITICAL(&gTrackMux);
-    DroneTrack* t = trackFind(mac, frameId, now);
+    DroneTrack* t = trackFind(mac, frameId[0], frameId[ODID_BASIC_ID_MAX_MESSAGES - 1], now);
     memcpy(t->mac, mac, 6);          // track follows the latest MAC
     t->lastSeen = now;
-    if (frameId[0]) { strncpy(t->uasId, frameId, ODID_ID_SIZE); t->uasId[ODID_ID_SIZE] = 0; }
+    for (int i = 0; i < ODID_BASIC_ID_MAX_MESSAGES; i++) trackAddId(t, frameId[i], frameSerial[i]);
     if (uas->LocationValid) {
         // Reject out-of-range coords before they reach the wire / raw log: the ODID decoder maps a
         // garbage int32 to as much as +/-214 deg, and a bogus pin freezes the app map (MapKit /
@@ -254,7 +291,7 @@ static bool droneRidBLE(const uint8_t mac[6], const uint8_t* payload, size_t len
 
         const uint8_t* msg    = payload + i + 6;     // past type + UUID(2) + appcode + counter
         const int      msgLen = (int)adLen - 5;
-        if (msgLen < (int)sizeof(ODID_BasicID_encoded)) return false;
+        if (msgLen < (int)sizeof(ODID_BasicID_encoded)) continue;   // too short: try the next AD
 
         ODID_UAS_Data uas;
         memset(&uas, 0, sizeof(uas));
@@ -262,7 +299,8 @@ static bool droneRidBLE(const uint8_t mac[6], const uint8_t* payload, size_t len
             odid_message_process_pack(&uas, (uint8_t*)msg, msgLen);
         else
             decodeOpenDroneID(&uas, (uint8_t*)msg);
-        return fillFromODID(&uas, mac, rssi, SRC_REMOTEID, out);
+        if (fillFromODID(&uas, mac, rssi, SRC_REMOTEID, out)) return true;
+        // nothing decoded from this element: keep walking rather than hide a later one
     }
     return false;
 }
@@ -286,8 +324,11 @@ bool droneClassifyBLE(const uint8_t mac[6], const uint8_t* payload, size_t len,
 // ---------------------------------------------------------------------------
 // Remote ID comes in two public ASTM F3411 frame types: a NAN action frame (fixed
 // multicast destination 51:6f:9a:01:00:00) and a beacon carrying an ODID vendor
-// IE (90:3a:e6, Parrot SA's OUI borrowed by the French DRI scheme, or fa:0b:bc, CEN's
-// CID). Both hand their ODID payload to the Apache-licensed decoder.
+// IE (90:3a:e6, Parrot SA's own IEEE OUI, or fa:0b:bc, ASD-STAN's CID: the two OUIs the
+// opendroneid Wireshark dissector lists, either one with OUI type 0x0D, which that dissector
+// also requires). Both hand their ODID payload to the Apache-licensed decoder. The French DRI
+// IE (6a:5c:35, type 0x01 in upstream frdid_wifi_build_beacon_frame, absent from the vendored
+// wifi.c) is not decoded.
 static const uint8_t kNanDest[6] = {0x51, 0x6f, 0x9a, 0x01, 0x00, 0x00};
 static bool droneRidWiFi(const uint8_t* frame, size_t len, int rssi,
                          AcabDetection* out) {
@@ -307,19 +348,24 @@ static bool droneRidWiFi(const uint8_t* frame, size_t len, int rssi,
     // Beacon (type/subtype byte 0x80): scan its tagged parameters for an ODID vendor IE.
     if (frame[0] == 0x80) {
         for (size_t off = 36; off + 2 < len; off += 2u + frame[off + 1]) {
-            const bool odidVendor =
-                frame[off] == 0xdd && off + 5 < len &&
-                ((frame[off+2]==0x90 && frame[off+3]==0x3a && frame[off+4]==0xe6) ||
-                 (frame[off+2]==0xfa && frame[off+3]==0x0b && frame[off+4]==0xbc));
-            if (!odidVendor) continue;
+            const size_t ieLen = frame[off + 1];
+            // OUI(3) + OUI type + message counter precede the pack; the whole IE must fit.
+            if (frame[off] != 0xdd || ieLen < 5 || off + 2 + ieLen > len) continue;
+            const bool odidOui =
+                (frame[off+2]==0x90 && frame[off+3]==0x3a && frame[off+4]==0xe6) ||
+                (frame[off+2]==0xfa && frame[off+3]==0x0b && frame[off+4]==0xbc);
+            // OUI type 0x0D is Remote ID under either OUI (the vendored encoder writes it, the
+            // opendroneid Wireshark dissector requires it). Parrot gear carries other 90:3a:e6
+            // IEs, so without this check a decoy IE ahead of the real one hid it.
+            if (!odidOui || frame[off + 5] != 0x0D) continue;
 
-            const size_t msg = off + 7;                  // past tag + len + OUI(3) + type
-            if (msg < len) {
-                ODID_UAS_Data uas;
-                memset(&uas, 0, sizeof(uas));
-                odid_message_process_pack(&uas, (uint8_t*)(frame + msg), (int)(len - msg));
-                return fillFromODID(&uas, frame + 10, rssi, SRC_REMOTEID, out);
-            }
+            ODID_UAS_Data uas;
+            memset(&uas, 0, sizeof(uas));
+            // Decode only this IE's bytes, past tag + len + OUI(3) + type + counter. A failed
+            // decode or an empty record moves on to the next IE instead of ending the walk.
+            if (odid_message_process_pack(&uas, (uint8_t*)(frame + off + 7), ieLen - 5) >= 0 &&
+                fillFromODID(&uas, frame + 10, rssi, SRC_REMOTEID, out))
+                return true;
         }
     }
     return false;
@@ -336,8 +382,8 @@ bool droneClassifyWiFi(const uint8_t* frame, size_t len, int rssi,
     if (!gEnabled.on || !droneOuiIsEnabled()) return false;
     // AP frames only (beacon 0x80, probe response 0x50) or a NAN frame the RID decoder rejected:
     // a Wi-Fi drone runs as the AP, and a MAC that only probes or associates is a client. Every
-    // Parrot hit in the field logs was a probing client (90:3a:e6:15:b9:e3 at the owner's home,
-    // three 90:03:b7 MACs); a captured ANAFI Thermal beacons from 90:3a:e6.
+    // Parrot hit in the field logs was a probing client (one OUI 90:3A:E6 device, captures
+    // 911.log/913.log; three 90:03:b7 MACs); a captured ANAFI Thermal beacons from 90:3a:e6.
     if (frame && len >= 16 &&
         (frame[0] == 0x80 || frame[0] == 0x50 || memcmp(frame + 4, kNanDest, 6) == 0))
         if (const char* v = droneVendorOui(frame + 10))

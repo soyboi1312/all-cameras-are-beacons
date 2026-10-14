@@ -98,8 +98,8 @@ struct NetcamPrefix {
 // Arlo Technology. These blocks were heard in our own captures, but remain validated=0
 // (see below). The 2026-07-24 A/B drive logged TWELVE
 // distinct Arlo-OUI devices spread across the route (compare-devices-dual.csv), all three
-// blocks firing, and THREE of them named themselves in the SSID: A4:11:62:0B:2D:62,
-// A4:11:62:6C:8F:24 and FC:9C:98:B4:E5:18 were beaconing "ARLO_VMB_<digits>" (see
+// blocks firing, and THREE of them named themselves in the SSID: two on OUI A4:11:62 and one on
+// FC:9C:98 (capture compare-devices-dual.csv) were beaconing "ARLO_VMB_<digits>" (see
 // NETCAM_SSID_ARLO_PREFIX below - that rule is the stronger half of this signature).
 // Until now every one of those hits fell through to a bare "Nearby device", conf 0.
 //
@@ -107,7 +107,7 @@ struct NetcamPrefix {
 // confirmed a real camera BY EYE" (see NetcamOui). We have the first half only. The SSID
 // proves the hardware is genuinely Arlo; it does not prove anyone stood at that address and
 // saw a camera, which is what the Axon 75 tier was earned by. Promote these to 1 only after
-// an eyeball pass - the three SSID-named hub MACs above are the ones to go looking for.
+// an eyeball pass - the three SSID-named hubs above are the ones to go looking for.
 //
 // WHAT A HIT REALLY IS: usually the SmartHub/base station, not a lens. Arlo base stations are
 // mains-powered 802.11 APs that beacon continuously, while the battery cameras sleep with the
@@ -164,7 +164,7 @@ struct NetcamPrefix {
 // 2026-09-01 REFRESH. Added Ezviz 38:F2:5D and Uniview 14:BA:88 from IEEE MA-L,
 // and Amcrest 3446632, Wyze A4DA222, Swann 0C0EC14 from IEEE MA-M. The latter three
 // retain all 28 registered bits in CAMERA_VENDOR_PREFIX. All five remain validated=0.
-// camarillo_drive.log contains A4:DA:22:2E:FE:07 and A4:DA:22:2E:A7:BE,
+// camarillo_drive.log contains two addresses on OUI A4:DA:22,
 // so the Wyze block is field-observed, but the log does not identify a camera model or
 // record visual confirmation. An observed address does not earn the validated tier.
 //

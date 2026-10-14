@@ -1,11 +1,14 @@
 // Host regression for the beacon-board's real alert implementation.
 //
-// Alert mode and Desert mode both persist buzzer=false. That must silence detection/session
-// sounds - INCLUDING the boot jingle on every start, physical or warm (2026-08-24: on button-less
-// deploys a power restore reads as ESP_RST_POWERON, so a mute bypass there would let an unattended
-// outage voice a muted covert board) - without erasing the explicit-user-action power cues (the
-// hold-to-start ack, the app-driven shutdown) on a battery unit. Include the real implementation
-// so the test observes actual PWM decisions rather than a copied policy function.
+// Alert mode and Desert mode both persist buzzer=false. That must silence EVERY sound the board
+// can make: detection/session patterns, the boot jingle (2026-08-24: on button-less deploys a
+// power restore reads as ESP_RST_POWERON, so a mute bypass there would let an unattended outage
+// voice a muted covert board) and, since 2026-10-11, the power cues too (the hold-to-start ack
+// and the slide/button/app shutdown motif used to bypass mute, which voiced a muted board on its
+// way off). The boot jingle additionally plays on a PHYSICAL start only, so a warm reboot (panic,
+// watchdog, brownout, OTA) is silent even unmuted, and the idle LED heartbeat stays dark until
+// the soft-power gate commits. Include the real implementation so the test observes actual PWM
+// and GPIO decisions rather than a copied policy function.
 //
 // TWO HALVES, observed two ways. The mute/volume/LED policy above plays straight through the tone
 // helpers, so those cases assert on the PWM and GPIO spies. The four PRODUCT entry points
@@ -17,6 +20,7 @@
 #include "../../src/beacon-board/alerts.cpp"
 
 #include <cstdio>
+#include <string>
 
 static int gFail = 0;
 static int gRun = 0;
@@ -58,14 +62,31 @@ int main() {
     check("unmuted physical start still voices the startup jingle",
           acabHostNonzeroPwmWrites > 0 && acabHostLastPwmDuty == 0);
 
+    // A warm continuation is nothing the user did: no sound AND no light, whatever the mute state,
+    // so a crash loop or a radio-induced panic cannot make the board announce itself.
+    resetAudio(true, 80);
+    alertsBootJingle(false);
+    check("unmuted warm restart (panic, WDT, brownout, OTA) plays and lights nothing",
+          acabHostNonzeroPwmWrites == 0 && acabHostLedLowWrites == 0);
+
     resetAudio(false, 80);
     playPowerOnAck();
-    check("muted hold-to-start acknowledgement still sounds",
+    check("muted hold-to-start ack is LED-only: zero PWM, one LED flash",
+          acabHostNonzeroPwmWrites == 0 && acabHostLedLowWrites == 1);
+
+    resetAudio(true, 80);
+    playPowerOnAck();
+    check("unmuted hold-to-start ack still sounds (anti-vacuity)",
           acabHostNonzeroPwmWrites > 0 && acabHostLastPwmDuty == 0);
 
     resetAudio(false, 80);
     alertsPowerDown();
-    check("muted deliberate shutdown still voices the power-down jingle",
+    check("muted shutdown (slide off, button hold, app power-off) stays silent",
+          acabHostNonzeroPwmWrites == 0);
+
+    resetAudio(true, 80);
+    alertsPowerDown();
+    check("unmuted deliberate shutdown voices the power-down jingle",
           acabHostNonzeroPwmWrites > 0 && acabHostLastPwmDuty == 0);
     // Band, not an exact melody sum: the cue must audibly play (>= 300 ms)
     // yet finish inside 1000 ms so deep sleep entry never clips it.
@@ -103,8 +124,22 @@ int main() {
 
     resetAudio(false, 80);
     alertsPowerDown();
-    check("a forced power cue never changes the alert-mute state",
+    check("a muted shutdown cue never changes the alert-mute state",
           !alertsBuzzerEnabled());
+
+    // ---- idle LED heartbeat vs the soft-power gate ------------------------------------------
+    // heartbeatPulse is the exact branch alertTask runs on its queue timeout. The task is created
+    // in alertsInit, BEFORE the gate (the gate needs the queue for its ack chirp), so a pocket-bump
+    // wake or a charge-while-off boot sits in the park handshake for seconds with the task running:
+    // it must produce no LED write until main.cpp arms it at the gate's commit.
+    resetAudio(true, 80);
+    heartbeatPulse();
+    check("idle heartbeat stays dark before the soft-power gate commits",
+          acabHostLedLowWrites == 0);
+    alertsArmHeartbeat();
+    heartbeatPulse();
+    check("idle heartbeat pulses once the gate has committed (anti-vacuity)",
+          acabHostLedLowWrites == 1);
 
     // ---- queued dispatch: reveal arming and per-type burst coalescing ----------------------
     // Nothing below touches the PWM spies: alertsSignal() hands the alert task a type and returns,
@@ -158,6 +193,28 @@ int main() {
     check("the hold-to-start ack rides the queue as its own sentinel",
           nextQueued(&queued) && queued == ACAB_ALERT_POWER_ON);
     check("nothing else was queued along the way", acabHostQueueDepth(gAlertQ) == 0);
+
+    // ---- the [diag] line renders the sink-drop counters ------------------------------------
+    // acabScannerSinkDropsFirehose/Signature exist for the serial [diag] line and nothing else
+    // (acab_scanner.h), so a main.cpp that stops printing them from that printf leaves the one
+    // telemetry item they feed written but never rendered. Text pin on the real source, read
+    // relative to firmware/tools/host-tests like test_acab_ble_service.cpp's lifecycle pins; an
+    // unreadable file fails the check rather than passing it.
+    {
+        std::string m;
+        if (FILE* f = fopen("../../src/beacon-board/main.cpp", "rb")) {
+            char b[8192]; size_t n;
+            while ((n = fread(b, 1, sizeof(b), f)) > 0) m.append(b, n);
+            fclose(f);
+        }
+        const size_t at  = m.find("\"[diag] wifi_seen=");
+        const size_t end = at == std::string::npos ? at : m.find(");", at);
+        const std::string stmt = end == std::string::npos ? std::string() : m.substr(at, end - at);
+        check("beacon-board [diag] renders both sink-drop counters (sinkdrop=f/s)",
+              stmt.find("sinkdrop=%lu/%lu") != std::string::npos &&
+              stmt.find("acabScannerSinkDropsFirehose()") != std::string::npos &&
+              stmt.find("acabScannerSinkDropsSignature()") != std::string::npos);
+    }
 
     printf(gFail ? "\n  REGRESSION DETECTED (%d failure%s of %d)\n\n"
                  : "\n  all good (0 failures of %d)\n\n",

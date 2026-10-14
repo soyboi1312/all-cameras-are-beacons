@@ -48,6 +48,10 @@ for t in test_*.cpp; do
         # file-private tone helpers with host PWM/GPIO spies. Do not compile a second source copy.
         src=""
         extra_flags="-DACAB_HOST_TEST"
+    elif [ "$stem" = "mesh_link" ]; then
+        # Same shape for the mesh-detect uplink: the test includes the real mesh_link.cpp so it
+        # can drive the file-private buildText and read a host UART spy. No second source copy.
+        src=""
     elif [ ! -f "$src" ]; then
         # HEADER-ONLY SUITE. Not every testable unit is a classifier with a matching
         # <name>_detect.cpp: sink_claim.h is a pure decision extracted from acab_scanner.cpp

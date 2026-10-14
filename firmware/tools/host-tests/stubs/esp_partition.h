@@ -18,6 +18,7 @@ static const int ESP_PARTITION_SUBTYPE_DATA_COREDUMP = 3;
 
 struct esp_partition_t {
     size_t size;
+    uint32_t address;   // app slots only (esp_ota_ops.h): the OTA trial record keys on it
 };
 
 enum AcabHostFlashOp {

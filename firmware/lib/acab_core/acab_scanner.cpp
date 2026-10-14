@@ -2,11 +2,16 @@
  * ACAB - Unified scanner implementation.
  *
  * Concurrency (same WiFi-promiscuous + NimBLE combo sky-spy proved out on the
- * XIAO ESP32-S3):
- *   - BLE scan runs in its own FreeRTOS task (bleScanTask).
- *   - The WiFi promiscuous RX callback runs in the WiFi driver task.
- *   - Both funnel through handleDetection(), which grabs a short critical
- *     section just to touch the dedup table, then calls the sink outside it.
+ * XIAO ESP32-S3). Three ingest contexts, none of which may block:
+ *   - wifiRxCallback runs on the Wi-Fi driver task (esp_wifi_set_promiscuous_rx_cb).
+ *   - AcabAdvCallbacks::onResult runs on the NimBLE host task: NimBLEScan::handleGapEvent
+ *     (NimBLEScan.cpp, BLE_GAP_EVENT_DISC) calls it directly, so it shares the task that serves
+ *     GATT config writes. bleScanTask only restarts the scan windows. Single-radio builds only.
+ *   - The dual-radio board's nRF forward line is parsed on the loop task (uartIngestPoll in
+ *     beacon-board/main.cpp) and enters at acabScannerIngestBLE.
+ *   All three funnel through handleDetection(), which grabs a short critical section just to
+ *   touch the dedup table, then hands off to sinkTask with a zero-wait xQueueSend. The heavy work
+ *   (flash append, BLE notify, serial, mesh UART) runs only on sinkTask.
  */
 #include "acab_scanner.h"
 #include "flock_detect.h"
@@ -22,6 +27,7 @@
 #include "mark_table.h"  // marker-window accounting (pure, host-tested)
 #include "sink_claim.h"   // acabClaimRollbackAllowed: the ABA-safe rollback decision
 #include "dedup_key.h"    // acabDedupKey: ONE derivation, shared with the host tests
+#include "dedup_evict.h"  // acabDedupEvictRank: eviction tenure tiers (pure, host-tested)
 #include "acab_ble_service.h"
 #ifdef ACAB_CAPTURE_BUILD
 #include "alpr_candidates.h"  // exact-width registered-prefix watchlist; never a classifier
@@ -50,6 +56,7 @@
 #include <Preferences.h>
 #include <freertos/queue.h>
 #include <freertos/semphr.h>
+#include <esp_task_wdt.h>   // sinkTask subscribes itself; the mains size the timeout (30 s)
 #include <atomic>
 #include <stdlib.h>   // qsort for the sorted ignore/watch lists
 
@@ -67,6 +74,12 @@ static portMUX_TYPE       gDedupMux = portMUX_INITIALIZER_UNLOCKED;
 static std::atomic<uint32_t> gTotal{0};      // both radios write it, so atomic
 static std::atomic<uint32_t> gBleSeen{0};    // raw BLE adverts seen (diagnostic)
 static std::atomic<uint32_t> gWifiSeen{0};   // raw 802.11 mgmt frames seen (diagnostic)
+// Sink-queue drops since boot, split so a saturated sink can be told from a quiet feed on the serial
+// [diag] line. Firehose = ACAB_NEARBY_DEVICE / ACAB_NETCAM items refused by the headroom reserve
+// (acabSinkAdmitsFirehose) or a full queue; signature = every other type that found the queue full.
+// Nothing dropped here is lost for good: the buffer claim rolls back and the `new` edge re-arms.
+static std::atomic<uint32_t> gSinkDropFirehose{0};
+static std::atomic<uint32_t> gSinkDropSignature{0};
 #define ACAB_SINK_Q_LEN 32   // sink queue depth; SinkItem below carries its heap budget
 static volatile bool      gBleEnabled = true;   // app-toggleable BLE scan
 static volatile bool      gWifiEnabled = true;  // app-toggleable WiFi scan
@@ -90,6 +103,7 @@ struct DedupEntry {
     uint32_t      loggedGen;   // capture generation this entry last buffered in (0 = never)
     uint32_t      logClaim;    // token of the claim that set loggedGen (see sink_claim.h)
     bool          alerted;     // tracker capture debounce: has the post-debounce `new` edge fired
+    bool          pendingNew;  // a sighting carrying isNew failed to enqueue: the next one re-fires the edge
     int16_t       hnext;       // next entry index in this slot's hash bucket chain (-1 = end)
 };
 // NOT sized to hold every device Desert mode sees, and it cannot be: entries are only ever
@@ -299,6 +313,21 @@ static bool rollbackBufferClaim(const AcabSinkClaim& claim) {
     return restored;
 }
 
+// A sighting that carried isNew failed to reach the sink. Re-arm the edge on the entry it came
+// from, so the device's NEXT sighting goes out as new instead of reading as a repeat for
+// DEDUP_WINDOW_MS: that was a lost first-sighting alert (buzzer, wire `new`) for a camera, drone or
+// body cam heard once. dedupLookup, never dedupFind: recovery must not create or evict. One bit is
+// the smaller of the two race-safe options (rolling lastSeen/count/firstSeen back would need its own
+// token, like logClaim). If the slot was evicted meanwhile the lookup misses and nothing is needed:
+// a re-created entry starts at count 0 and reads as new anyway. If the same device was evicted and
+// re-admitted inside the window, the bit lands on its new entry and the worst case is one duplicate
+// `new` edge, which is the right failure direction. The next sighting consumes it under this lock.
+static void rearmNewEdge(AcabDeviceType type, const uint8_t key[6], uint32_t bucket) {
+    portENTER_CRITICAL(&gDedupMux);
+    if (DedupEntry* e = dedupLookup(type, key, bucket)) e->pendingNew = true;
+    portEXIT_CRITICAL(&gDedupMux);
+}
+
 static DedupEntry* dedupFind(AcabDeviceType type, const uint8_t mac[6], uint32_t bucket,
                              uint32_t now) {
     // fast path: already tracked -> walk just this bucket's chain
@@ -306,12 +335,17 @@ static DedupEntry* dedupFind(AcabDeviceType type, const uint8_t mac[6], uint32_t
         DedupEntry* e = &gDedup[i];
         if (e->type == type && memcmp(e->mac, mac, 6) == 0) return e;
     }
-    // not tracked yet: take a free slot, else evict the least-recently-seen entry. A signature
-    // match outranks Desert's ACAB_NEARBY_DEVICE for tenure: Desert keys every phone in range
-    // and each MAC rotation mints a fresh key, so an unfiltered LRU would spend the whole table
-    // on one-shot phone entries and keep re-admitting (and so re-arming) the cameras/trackers
-    // this exists to track. Evict the oldest NEARBY_DEVICE first, and only fall back to the
-    // oldest entry overall once the table holds nothing but real matches.
+    // not tracked yet: take a free slot, else evict by TENURE TIER, oldest within the tier. The
+    // tiers are acabDedupEvictRank (dedup_evict.h): ACAB_NEARBY_DEVICE first, then ACAB_TRACKER,
+    // then everything else. Desert keys every phone in range and each MAC rotation mints a fresh
+    // key, so an unfiltered LRU would spend the whole table on one-shot phone entries and keep
+    // re-admitting (and so re-arming) the cameras/trackers this exists to track. Trackers sit in
+    // the middle tier because their keys rotate too (Tile, SmartTag, separated Find My) and a
+    // crowd can hold more than ACAB_DEDUP_MAX of them: ranked beside cameras, that crowd evicted a
+    // real camera between its own sightings (re-alerting it and re-buffering it with loggedGen
+    // reset) and re-admitted every tracker before its TRACKER_ALERT_DEBOUNCE_MS dwell completed,
+    // so the `alerted` edge never fired. A non-tracker signature entry is never evicted while a
+    // tracker entry exists, and a tracker never while a nearby-device entry does.
     //
     // "Oldest" is measured as ELAPSED AGE (now - lastSeen), never by comparing the raw stamps.
     // millis() wraps every ~49.7 days and this table has NO time-based expiry - entries leave
@@ -324,17 +358,19 @@ static DedupEntry* dedupFind(AcabDeviceType type, const uint8_t mac[6], uint32_t
     // refills with duplicates of one device and wraps away the evidence). The unsigned subtraction
     // below is wrap-correct, matching the `now - e->lastSeen > DEDUP_WINDOW_MS` test in
     // handleDetection that already gets this right.
-    int freeIdx = -1, oldestIdx = -1, oldestNearbyIdx = -1;
-    uint32_t oldestAge = 0, oldestNearbyAge = 0;
+    int freeIdx = -1, victim = -1;
+    uint8_t  victimRank = 0;
+    uint32_t victimAge  = 0;
     for (int i = 0; i < ACAB_DEDUP_MAX; i++) {
         DedupEntry* e = &gDedup[i];
         if (!e->used) { freeIdx = i; break; }
-        const uint32_t age = now - e->lastSeen;
-        if (oldestIdx < 0 || age > oldestAge) { oldestIdx = i; oldestAge = age; }
-        if (e->type == ACAB_NEARBY_DEVICE &&
-            (oldestNearbyIdx < 0 || age > oldestNearbyAge)) { oldestNearbyIdx = i; oldestNearbyAge = age; }
+        const uint8_t  rank = acabDedupEvictRank(e->type);
+        const uint32_t age  = now - e->lastSeen;
+        if (victim < 0 || rank < victimRank || (rank == victimRank && age > victimAge)) {
+            victim = i; victimRank = rank; victimAge = age;
+        }
     }
-    int idx = (freeIdx >= 0) ? freeIdx : (oldestNearbyIdx >= 0 ? oldestNearbyIdx : oldestIdx);
+    int idx = (freeIdx >= 0) ? freeIdx : victim;
     DedupEntry* slot = &gDedup[idx];
     if (slot->used) {                                   // evicting: unlink from its old bucket chain
         uint32_t ob = dedupHash(slot->type, slot->mac) & (ACAB_DEDUP_BUCKETS - 1);
@@ -350,14 +386,15 @@ static DedupEntry* dedupFind(AcabDeviceType type, const uint8_t mac[6], uint32_t
     slot->count = 0;
     slot->loggedGen = 0;   // a reused slot re-arms capture for the new device
     slot->alerted = false; // and re-arms the tracker dwell gate
+    slot->pendingNew = false;   // count 0 already reads as new; a stale re-arm must not carry over
     slot->hnext = gDedupBucket[bucket];                 // link at the head of its bucket
     gDedupBucket[bucket] = (int16_t)idx;
     return slot;
 }
 
 // The sink runs on its own task so heavy work (serial, BLE notify, mesh UART) never runs
-// inside the WiFi driver callback or the BLE scan task - the radios just enqueue and move
-// on. The offline-buffer flash write rides the same task (PERF-2): its 4KB sector erase
+// on the Wi-Fi driver task, the NimBLE host task or the loop task's UART ingest (file header) -
+// the radios just enqueue and move on. The offline-buffer flash write rides the same task (PERF-2): its 4KB sector erase
 // every 64 records used to run INLINE on the radio path and stall scanning, so it moved
 // here. `buffer` = append this record to det_log; `deliver` = call the firmware sink. The two
 // are separate flags because they gate on different things. This comment used to claim they
@@ -406,10 +443,31 @@ static void deliverSinkItem(void* raw) {
     context->sink(*context->detection, context->isNew);
 }
 
+// TASK WATCHDOG. Every detection, BLE notify and det_log append runs here, so a wedged sink is "it
+// stopped detecting" while loop() keeps petting the TWDT and status reads healthy. This task
+// subscribes itself. The add is retried until it succeeds because both mains size the TWDT (30 s,
+// panic) only AFTER acabScannerBegin returns: esp_task_wdt_add fails with ESP_ERR_INVALID_STATE
+// until the TWDT exists (the S3 framework sdkconfig initialises it at startup, CONFIG_ESP_TASK_WDT
+// with a 5 s timeout; the retry is for a build that does not). The mains then retime it in place:
+// IDF 4 esp_task_wdt_init on an initialised TWDT "will update the timeout period and panic
+// configurations instead", IDF 5 esp_task_wdt_reconfigure "reconfigures the running TWDT" (both
+// esp_task_wdt.h), so a subscription made before the retime stays. The receive is bounded so an
+// idle sink still pets every ACAB_SINK_WDT_PET_MS.
+// MARGIN against the 30 s the mains set: the longest legitimate block found on this path is a USB
+// CDC print with no host reading, ~2 s per print on Arduino 3 before main.cpp's setTxTimeoutMs(0),
+// and on Arduino 2 the tx_lock take plus up to tx_timeout_ms of 1 ms retries, about 200 ms per
+// write (tx_timeout_ms = 100, HWCDC::write). The flash waits are shorter: detLogAppendClaimed waits
+// on det_log's gIoMutex for at most one WIPE_BLOCK erase (64 KB, ~100-250 ms, one per
+// detLogEraseTick pass on the loop task) or prepareSlotLocked's own 4 KB sector erase. 30 s is more
+// than 10x the worst of those.
+#define ACAB_SINK_WDT_PET_MS 1000
 static void sinkTask(void*) {
     SinkItem it;
+    bool onWdt = false;
     for (;;) {
-        if (xQueueReceive(gSinkQ, &it, portMAX_DELAY) != pdTRUE) continue;
+        if (!onWdt) onWdt = esp_task_wdt_add(NULL) == ESP_OK;
+        else        esp_task_wdt_reset();
+        if (xQueueReceive(gSinkQ, &it, pdMS_TO_TICKS(ACAB_SINK_WDT_PET_MS)) != pdTRUE) continue;
         // flash write happens HERE, off both radio tasks. det_log no-ops when the app is
         // connected / buffering is disabled / no key - same guards as before, just now
         // evaluated on the sink task a beat later than at ingest.
@@ -503,7 +561,10 @@ static void handleDetection(AcabDetection& d) {
 
     portENTER_CRITICAL(&gDedupMux);
     DedupEntry* e = dedupFind(d.type, key, bucket, now);
-    isNew = (e->count == 0) || (now - e->lastSeen > DEDUP_WINDOW_MS);
+    // pendingNew: an earlier sighting's `new` edge never reached the sink (rearmNewEdge), so this
+    // sighting carries it. Consumed here, under the lock, whatever the tracker gate below decides.
+    isNew = (e->count == 0) || (now - e->lastSeen > DEDUP_WINDOW_MS) || e->pendingNew;
+    e->pendingNew = false;
     if (e->count == 0) e->firstSeen = now;
     e->lastSeen = now;
     if (e->count < 0xFFFF) e->count++;
@@ -611,9 +672,9 @@ static void handleDetection(AcabDetection& d) {
     //      ELSE, so it goes into bufGps rather than into d.
     //
     //      IT IS NOT ENOUGH TO GUARD THE NOTIFY. `d` is the same object sinkTask hands to gSink,
-    //      and buffering and delivery are decided here but happen there: a buffer-bearing item
-    //      takes ~10 ms of deliberate backpressure while the sink is mid flash-erase, a phone can
-    //      finish connecting inside that window, and then detLogAppend correctly REFUSES the row
+    //      and buffering and delivery are decided here but happen there: an item can sit in the
+    //      sink queue while the sink is mid flash-erase, a phone can finish connecting inside
+    //      that window, and then detLogAppend correctly REFUSES the row
     //      (the ring only accepts while the app is away) while the notify goes out anyway. That
     //      notify could carry previous-session coordinates across an owner handoff. The final
     //      owner-admission guard now drops the whole stale SinkItem too; keeping the fix out of `d`
@@ -664,21 +725,26 @@ static void handleDetection(AcabDetection& d) {
     // (PERF-2) and calls the firmware sink. Only queue when there is something to do.
     if (gSinkQ && (deliver || shouldBuffer)) {
         SinkItem it{d, isNew, deliver, shouldBuffer, bufGps, claim};
-        // buffer-bearing items get brief backpressure (~10ms) rather than a silent drop: shouldBuffer
-        // committed loggedGen at ingest, so a dropped buffer item would be a non-retryable evidence
-        // loss for this capture generation. deliver-only items still drop on overflow (a missed live
-        // notify just re-arrives). the block only bites while the sink task is mid flash-erase.
-        if (xQueueSend(gSinkQ, &it, shouldBuffer ? pdMS_TO_TICKS(10) : 0) != pdTRUE && shouldBuffer) {
-            // THE FIX. Undo the claim so this device buffers again later in this same capture
-            // generation, instead of being silently marked done with nothing written. Guarded
-            // against the ABA race by the claim token - see sink_claim.h for why every
-            // condition is load-bearing. dedupLookup, never dedupFind: recovery must not
-            // create or evict.
-            // The rollback owns this: it takes ONLY the claim object, which carries the key
-            // copied at claim time. There is no AcabDetection in its scope, so reaching for
-            // d.mac here (the shipped bug, which made the rollback a no-op for every Remote ID
-            // drone) is now a compile error rather than a judgement call. See sink_claim.h.
-            rollbackBufferClaim(claim);
+        // ZERO WAIT, for every item. This runs on the Wi-Fi driver task, the NimBLE host task or
+        // the loop task (file header), and buffer-bearing items used to block here for 10 ms while
+        // the sink was mid flash-erase: 802.11 RX buffers dropped and GATT writes waited on a
+        // flash erase. A drop is cheap instead: the claim rolls back (so the device buffers on its
+        // next sighting) and the `new` edge re-arms (so a first-sighting alert is not spent on a
+        // notify that never left). The two firehoses are admitted only while the queue keeps
+        // ACAB_SINK_Q_RESERVE slots free, so a Desert or netcam burst cannot fill the queue under
+        // a Flock, drone or body cam.
+        const bool admit = !firehose || acabSinkAdmitsFirehose(uxQueueSpacesAvailable(gSinkQ));
+        const bool sent  = admit && xQueueSend(gSinkQ, &it, 0) == pdTRUE;
+        if (!sent) {
+            (firehose ? gSinkDropFirehose : gSinkDropSignature)++;
+            // Undo the claim so this device buffers again later in this same capture generation,
+            // instead of being silently marked done with nothing written. Guarded against the ABA
+            // race by the claim token - see sink_claim.h for why every condition is load-bearing.
+            // The rollback takes ONLY the claim object, which carries the key copied at claim
+            // time; there is no AcabDetection in its scope, so reaching for d.mac (the shipped
+            // bug, which made the rollback a no-op for every Remote ID drone) is a compile error.
+            if (shouldBuffer) rollbackBufferClaim(claim);
+            if (isNew) rearmNewEdge(d.type, key, bucket);
         }
     }
 }
@@ -812,7 +878,7 @@ static const uint32_t VENDOR_LOG_EVERY_MS = 5000;
 // NO EVICTION IS STILL THE RULE, and widening is not a substitute for it. First-fit with no ageing
 // is what keeps captures comparable across a drive, and it is also why arrival order decides who
 // gets a row: a device heard late is refused however close it passes. On 2026-09-19 that cost the
-// day's strongest 0x087F sighting (-80 dBm, ca:ba:18:bb:d8:0c, refused ninth). Widening buys
+// day's strongest 0x087F sighting (-80 dBm, OUI CA:BA:18, capture los_angeles, refused ninth). Widening buys
 // headroom, not fairness; if the family keeps growing, the next lever is the reservation argument
 // itself, not another literal bump.
 //     counts: docs/captures/vendor-cid-087f-2026-09-04.txt
@@ -2007,6 +2073,8 @@ void acabScannerSetWatchList(const uint8_t macs[][6], int count) {
 uint32_t acabScannerTotalDetections() { return gTotal; }
 uint32_t acabScannerBleSeen()  { return gBleSeen; }
 uint32_t acabScannerWifiSeen() { return gWifiSeen; }
+uint32_t acabScannerSinkDropsFirehose()  { return gSinkDropFirehose; }
+uint32_t acabScannerSinkDropsSignature() { return gSinkDropSignature; }
 
 // Co-processor (nRF) stats, fed by the dual-radio UART path.
 static std::atomic<uint32_t> gCoAdv{0}, gCoFwd{0};
@@ -2186,8 +2254,12 @@ void acabScannerBegin(const AcabScannerConfig& cfg, AcabDetectionSink sink) {
 #else
         gScan->setActiveScan(false);
 #endif
-        gScan->setInterval(131);  // ~82 ms, prime to dodge sync; ~51% duty (down from 97/69%)
-        gScan->setWindow(67);     // so WiFi promiscuous isn't starved on the shared radio
+        // MILLISECONDS, not 0.625 ms controller units: NimBLE-Arduino 1.4.x setInterval/setWindow
+        // divide by 0.625 (NimBLEScan.cpp), and the 2.x API on beacon-c5 multiplies by 16/10. So
+        // this is a 131 ms interval with a 67 ms window, ~51% duty, the 67/131 that
+        // docs/radio-coverage.md states. 131 is prime to dodge sync with advertisers.
+        gScan->setInterval(131);
+        gScan->setWindow(67);     // leaves the shared radio time for WiFi promiscuous RX
         if (xTaskCreatePinnedToCore(bleScanTask, "acabBleScan", 12288, nullptr, 1,
                                     nullptr, portNUM_PROCESSORS - 1) != pdPASS) {
             Serial.println("[fatal] BLE scan task create failed - restarting");

@@ -13,8 +13,8 @@
  *
  * WHY THE OBVIOUS ROLLBACK IS WRONG. "Put loggedGen back if the entry still matches type+key and
  * still reads as claimed" has an ABA hole. Between the claim and the failed send the slot can be
- * evicted (dedupFind evicts the least-recently-seen entry under table pressure, which is the
- * normal case in Desert mode), the SAME device can be re-admitted into a fresh slot, and that new
+ * evicted (dedupFind evicts under table pressure, by tenure tier and then age - dedup_evict.h -
+ * which is the normal case in Desert mode), the SAME device can be re-admitted into a fresh slot, and that new
  * sighting can make its own successful claim in the same generation. The late failure then rolls
  * back a claim that belongs to a record which IS safely queued, so that device buffers twice and
  * the ring - the scarce resource this all protects - carries a duplicate.
@@ -130,6 +130,20 @@ inline bool acabSinkClaimRollback(const AcabSinkClaim& claim, const AcabClaimTab
     if (!acabClaimRollbackAllowed(chk)) return false;
     table.restore(table.ctx, claim.priorLoggedGen);
     return true;
+}
+
+// ---------------------------------------------------------------------------
+// Sink-queue headroom for the per-frame firehoses
+// ---------------------------------------------------------------------------
+// Desert's ACAB_NEARBY_DEVICE and the netcam opt-in's ACAB_NETCAM share the ACAB_SINK_Q_LEN-slot
+// sink queue with every signature detection. In a dense scene they filled it, and a Flock, drone or
+// body-cam item then found no slot: a deliver-only item vanished and its `new` edge was spent. Admit
+// a firehose item only while more than ACAB_SINK_Q_RESERVE slots are free, so the last slots are
+// always there for a signature type. acab_scanner.cpp passes uxQueueSpacesAvailable(gSinkQ). Pure
+// so the boundary is pinned off-target (test_sink_claim.cpp).
+#define ACAB_SINK_Q_RESERVE 8
+inline bool acabSinkAdmitsFirehose(unsigned spacesAvailable) {
+    return spacesAvailable > ACAB_SINK_Q_RESERVE;
 }
 
 #endif // ACAB_SINK_CLAIM_H

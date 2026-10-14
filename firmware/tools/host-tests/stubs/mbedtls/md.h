@@ -39,3 +39,38 @@ inline int mbedtls_md(const mbedtls_md_info_t* info, const unsigned char* input,
     }
     return 0;
 }
+
+// Streaming form of the same stand-in, for ota_update.cpp's running image digest. Any chunking
+// of the input yields the 32 bytes mbedtls_md() above gives for the whole input; test_ota_update.cpp
+// checks that equivalence at startup before it relies on it.
+struct mbedtls_md_context_t {
+    uint32_t hash;
+    bool setup;
+};
+
+inline void mbedtls_md_init(mbedtls_md_context_t* c) { if (c) { c->hash = 2166136261u; c->setup = false; } }
+inline void mbedtls_md_free(mbedtls_md_context_t* c) { mbedtls_md_init(c); }
+inline int mbedtls_md_setup(mbedtls_md_context_t* c, const mbedtls_md_info_t* info, int /*hmac*/) {
+    if (!c || !info) return -1;
+    c->setup = true;
+    return 0;
+}
+inline int mbedtls_md_starts(mbedtls_md_context_t* c) {
+    if (!c || !c->setup) return -1;
+    c->hash = 2166136261u;
+    return 0;
+}
+inline int mbedtls_md_update(mbedtls_md_context_t* c, const unsigned char* input, size_t length) {
+    if (!c || !c->setup || (!input && length)) return -1;
+    for (size_t i = 0; i < length; i++) c->hash = (c->hash ^ input[i]) * 16777619u;
+    return 0;
+}
+inline int mbedtls_md_finish(mbedtls_md_context_t* c, unsigned char output[32]) {
+    if (!c || !c->setup || !output) return -1;
+    uint32_t hash = c->hash;
+    for (size_t i = 0; i < 32; i++) {
+        hash = hash * 1664525u + 1013904223u;
+        output[i] = (uint8_t)(hash >> 24);
+    }
+    return 0;
+}

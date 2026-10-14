@@ -16,6 +16,11 @@
  * Every message names the unit: "ALPR camera detected", "Flock Raven detected",
  * "Body camera detected", "Drone detected" (labels come from acabTypeLabel in
  * lib/acab_core/detection.h).
+ *
+ * Location: the owner's phone fix rides on a non-drone line only over MESH_PROTO on a
+ * secondary channel index. On the public primary (channel 0 or MESH_TEXT) it is never
+ * attached, and the boot ping is not sent. A drone line carries the aircraft's own Remote ID
+ * position on every channel (the aircraft broadcast it). Rule: buildText in mesh_link.cpp.
  */
 #ifndef ACAB_MESH_LINK_H
 #define ACAB_MESH_LINK_H
@@ -30,7 +35,7 @@ struct MeshLinkConfig {
     uint32_t      uartBaud;        // match the Heltec Serial Module baud
     int           uartRxPin;       // XIAO RX  <- Heltec TX
     int           uartTxPin;       // XIAO TX  -> Heltec RX
-    bool          includeGPS;      // append lat,lon when we have it
+    bool          includeGPS;      // append the phone's lat,lon when we have it; private channel only
     uint32_t      minIntervalMs;   // min gap between mesh sends (LoRa duty cycle)
 };
 
@@ -45,5 +50,9 @@ void meshLinkSend(const AcabDetection& d, bool isNew);
 // Send a raw text line over the mesh (configured transport + channel). Used by
 // detections and by the boot self-test ping.
 void meshLinkSendText(const char* text);
+
+// Boot self-test ping ("mesh-detect ACAB online"). Sends only on a private channel; a no-op
+// on the public primary. Call once from loop() after the Heltec has had time to boot.
+void meshLinkBootPing();
 
 #endif // ACAB_MESH_LINK_H

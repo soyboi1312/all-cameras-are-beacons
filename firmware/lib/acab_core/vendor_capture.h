@@ -112,13 +112,14 @@ static constexpr VendorBleId VENDOR_BLE_ID[] = {
     // The 0x09 length byte settles the varying-byte count at FOUR (1 type + 2 company ID + 2
     // lead-in + 4 = 9). Shape A carries the PCAM_ name in 12 of 12 cases; shape B carries the
     // other name families. The bytes are NOT byte-identical across sightings, not even within one
-    // device: EF:19:4C:DE:76:BF sent 0A 01 27 1B 67 16 and then 0A 01 28 1B 67 16 within a second.
+    // device: one PCAM_ unit (capture aug-9-drive2.log) sent 0A 01 27 1B 67 16 and then
+    // 0A 01 28 1B 67 16 within a second.
     //
     // EVIDENCE BASE: 24 distinct MACs across the three logs that record advert bytes
     // (drive_home_9-4 holds 19 of them, aug-9-drive2 and compare-dual the rest). camarillo_drive
     // and santabarbara are PRODUCT-image logs with no adv= hex at all, so they can only ever have
     // matched the name string and cannot support a byte-level claim. Best sighting -56 dBm,
-    // CC:FE:BA:21:16:72, on a six-sighting ramp from -93 over 13 seconds.
+    // a PCAM_ unit in capture drive_home_9-4.log, on a six-sighting ramp from -93 over 13 seconds.
     //
     // EVERY ADDRESS SEEN SO FAR IS BLE RANDOM-STATIC (top two bits set), 24 of 24, so there is no
     // OUI to take and no registry lookup to run on the address. The company ID is the only durable

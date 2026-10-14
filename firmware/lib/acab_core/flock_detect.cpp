@@ -77,6 +77,24 @@ static const char* ciPrefix(const char* name, const char* prefix) {
     return *b ? NULL : a;
 }
 
+// Structural tail shared by the "FS-" BLE name and the "Flock-" SSID: hex digits only, at least
+// FLOCK_HEX_TAIL_MIN of them, nothing after. The floor is what keeps "FS-100" (three) and
+// "Flock-ABC" out while the one own capture (FS-BEC46A, six) stays in.
+static bool hexTail(const char* t) {
+    size_t n = 0;
+    for (; *t; t++, n++) if (!isxdigit((unsigned char)*t)) return false;
+    return n >= FLOCK_HEX_TAIL_MIN;
+}
+
+// The documented "Flock-<partial MAC>" AP name: case-sensitive prefix (strncmp, the one
+// case-sensitive comparison in this file) plus a hexTail. A hotspot named "Flock-Party" fails
+// here and reaches no SSID branch at all; see FLOCK_SSID_PREFIX for why the tail is not
+// cross-checked against the BSSID.
+static bool flockSsidForm(const char* ssid) {
+    size_t pfxLen = strlen(FLOCK_SSID_PREFIX);
+    return strncmp(ssid, FLOCK_SSID_PREFIX, pfxLen) == 0 && hexTail(ssid + pfxLen);
+}
+
 // case-insensitive suffix test (e.g. an SSID ending in "-FALCON")
 static bool ciEndsWith(const char* s, const char* suf) {
     if (!s || !suf) return false;
@@ -100,9 +118,10 @@ static bool falconSsidSuffix(const char* ssid) {
 // Anchored name matching (see FLOCK_NAME_PATTERNS in flock_signatures.h).
 //   NM_NONE     no pattern hit
 //   NM_LITERAL  "FS Ext Battery" - specific enough to rank strong on its own
-//   NM_ANCHORED "Penguin-"+digits / "FS-"+hex - the documented structural forms, but
-//               generic enough ("FS-100" is common white-label naming) that ranking
-//               strong needs a co-signal; hint-grade otherwise
+//   NM_ANCHORED "Penguin-"+digits / "FS-"+hex (>= FLOCK_HEX_TAIL_MIN digits) - the documented
+//               structural forms. The hex floor drops "FS-100" (three digits, common
+//               white-label naming), but "FS-1234" still clears it, so the form stays generic
+//               enough that ranking strong needs a co-signal; hint-grade otherwise
 //   NM_LOOSE    bare "Flock" prefix - hint-grade unless a co-signal backs it
 // The substring-anywhere matching this replaces flagged any "FS-100" speaker or a
 // phone named "penguins fan" as a strong ALPR hit.
@@ -126,11 +145,7 @@ static int nameMatch(const char* name) {
             }
             case FLOCK_NAME_PREFIX_HEX: {
                 const char* t = ciPrefix(name, p.pat);
-                if (t && *t) {
-                    bool ok = true;
-                    for (; *t; t++) if (!isxdigit((unsigned char)*t)) { ok = false; break; }
-                    if (ok) return NM_ANCHORED;
-                }
+                if (t && hexTail(t)) return NM_ANCHORED;
                 break;
             }
             case FLOCK_NAME_PREFIX:
@@ -368,7 +383,10 @@ bool flockClassifyWiFi(const uint8_t* frame, size_t len, int rssi,
 
     // --- Primary: the "Flock-<partial MAC>" AP name is the strong WiFi signature
     //     (src: ryanohoro / GainSec). Match it directly with no OUI gate, since a
-    //     camera's WiFi MAC belongs to the module maker, not Flock's own OUI. ---
+    //     camera's WiFi MAC belongs to the module maker, not Flock's own OUI. The STRUCTURE
+    //     is required (flockSsidForm: prefix + hex tail), not the prefix alone: until
+    //     2026-10-11 any "Flock-" tail scored 88, so a "Flock-Party" hotspot on a rotating
+    //     MAC was an ALPR camera the exact-MAC Ignore could never silence. ---
     // SELF-ATTESTATION ONLY (beacon 0x8 / probe-response 0x5). Corrected 2026-08-05; this is the
     // same defect netcam_detect.cpp fixed in the same round. On a probe REQUEST the SSID IE is the
     // network being SEARCHED FOR and addr2 is the searching station, so the frame attests nothing
@@ -378,8 +396,7 @@ bool flockClassifyWiFi(const uint8_t* frame, size_t len, int rssi,
     // acabApplyDurability's randomized-address down-cap (which only touches M_OUI), so nothing
     // downstream caught it. The probe-borne form is already graded lower at M_PROBE 72/78 below.
     const bool selfAttested = (subtype == 0x5 || subtype == 0x8);
-    size_t pfxLen = strlen(FLOCK_SSID_PREFIX);
-    if (selfAttested && sawSSID && !emptySSID && strncmp(ssid, FLOCK_SSID_PREFIX, pfxLen) == 0) {
+    if (selfAttested && sawSSID && !emptySSID && flockSsidForm(ssid)) {
         acabInit(out, ACAB_FLOCK_CAMERA, SRC_WIFI, addr2, (int16_t)rssi);
         out->method = M_SSID;
         out->confidence = 88;
@@ -412,9 +429,10 @@ bool flockClassifyWiFi(const uint8_t* frame, size_t len, int rssi,
     // below, with a detail that says which it is. Sits after the two self-attestation branches so
     // a beacon/probe-response can never land here.
     // The "*-FALCON" half rides the same ext=1 gate as the branch above, so today only the
-    // "Flock-" prefix can reach this tier.
+    // "Flock-" form can reach this tier, and it is the same structural test (flockSsidForm) as
+    // the 88 branch: a laptop asking for "Flock-Party" is not probing for a Flock network.
     if (subtype == 0x4 && sawSSID && !emptySSID &&
-        (strncmp(ssid, FLOCK_SSID_PREFIX, pfxLen) == 0 || falconSsidSuffix(ssid))) {
+        (flockSsidForm(ssid) || falconSsidSuffix(ssid))) {
         acabInit(out, ACAB_FLOCK_CAMERA, SRC_WIFI, addr2, (int16_t)rssi);
         out->method = M_PROBE;
         out->confidence = 72;

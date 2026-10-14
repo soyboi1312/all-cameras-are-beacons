@@ -21,6 +21,17 @@ inline SemaphoreHandle_t xSemaphoreCreateMutexStatic(StaticSemaphore_t* storage)
     return storage;
 }
 
+// Heap form, for modules that create their mutex lazily once and never delete it (ota_update.cpp's
+// gOtaMux). The one allocation per process is deliberate; run.sh --sanitize runs with leak
+// detection off.
+inline SemaphoreHandle_t xSemaphoreCreateMutex() {
+    if (acabHostSemaphoreCreateFailures != 0) {
+        acabHostSemaphoreCreateFailures--;
+        return nullptr;
+    }
+    return new StaticSemaphore_t();
+}
+
 inline BaseType_t xSemaphoreTake(SemaphoreHandle_t semaphore, TickType_t) {
     if (!semaphore) return pdFALSE;
     if (acabHostSemaphoreTakeFailures != 0) {

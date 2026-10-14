@@ -14,6 +14,7 @@
 #include "detect_elide.h"   // live-notify field elision order (small-MTU links)
 #include "gps_age.h"        // 64-bit monotonic age; retained fixes must not revive at millis wrap
 #include "pair_window.h"    // window clock + admission rules (host-tested)
+#include "acab_nvs_toggle.h" // the sticky "owned" flag (acabPairAdmit's boardOwned)
 #include "replay_session.h" // generation-bound begin/record/end transport state (host-tested)
 #include "link_action_lease.h" // check->physical-action ownership across loop/host tasks
 #include <atomic>
@@ -276,8 +277,20 @@ static volatile bool         gSessionKeyReplacementApproved = false;
 static volatile uint16_t     gConnHandle = 0xffff;
 static volatile uint32_t     gAuthStartedMs = 0;
 static volatile bool         gPeerKnownAtConnect = false;
-static volatile bool         gBoardHadBondAtConnect = false;
+static volatile bool         gBoardOwnedAtConnect = false;
+// The stack ran a pairing on THIS link against an existing bond (REPEAT_PAIRING, allowed only
+// while the window is open: acabRepeatPairingAllowed). authBody then treats the link as a fresh
+// pairing, not as the owner restoring an LTK. Per link: cleared at connect and disconnect.
+static volatile bool         gFreshPairingOnLink = false;
 static const uint32_t        AUTH_TIMEOUT_MS = 30000;
+// Has this board EVER held a bond: the sticky half of acabPairAdmit's boardOwned, which connectBody
+// ORs with the live bond count (pair_window.h says why the flag, not the count, carries
+// ownership). Set once, on the first bonded authentication, and in acabBleBegin when the
+// bond store is already non-empty, so every fielded board becomes owned on its first boot of this
+// build. Nothing in the firmware empties the bond store on purpose (authBody deletes only a bond a
+// refused fresh pairing just wrote), so nothing clears this: a full flash erase, which also empties
+// the bond store, is the one reset, and that board is out of the box again.
+static AcabNvsToggle         gBoardOwned{"acab-ble", "owned", false};
 
 static bool nrfDfuMayArmNow() {
     return acabLegacyDfuMayArm(gConnected, acabBlePairWindowOpen());
@@ -293,10 +306,10 @@ static bool nrfDfuMayArmNow() {
 // four rounds of hypothesis. setCustomGapHandler registers through ble_gap_event_listener_register,
 // which is the same dispatch the wrapper sits on, so it sees the RAW event with .status intact.
 //
-// It also catches REPEAT_PAIRING, which is the trap: NimBLE-Arduino's stock handler DELETES the
-// existing bond ("sacrifices security for convenience", NimBLEServer.cpp) and re-pairs. That path
-// reports encrypted=1 bonded=1, so it reads as a SUCCESS in every other log line here while
-// actually being a bond loss, and it lets any stranger evict the owner's bond.
+// It does NOT see REPEAT_PAIRING. In both pinned hosts (1.4.3 and 2.x, nimble/host/src/ble_gap.c)
+// ble_gap_repeat_pairing_event calls only ble_gap_call_conn_event_cb, the server callback, and
+// never ble_gap_event_listener_call; a REPEAT_PAIRING case here would be a branch that never runs
+// (one sat here until 2026-10-11). That event is handled in acabRepeatPairingAllowed below.
 static int acabGapTap(ble_gap_event* ev, void*) {
     switch (ev->type) {
     case BLE_GAP_EVENT_ENC_CHANGE:
@@ -307,21 +320,41 @@ static int acabGapTap(ble_gap_event* ev, void*) {
         Serial.printf("[ACAB] disconnect reason=%d (0x%02x)\n",
                       ev->disconnect.reason, ev->disconnect.reason & 0xff);
         break;
-    case BLE_GAP_EVENT_REPEAT_PAIRING:
-        // OBSERVE ONLY, WE CANNOT STOP IT. NimBLE-Arduino's stock handler deletes the existing
-        // bond and re-pairs ("sacrifices security for convenience", NimBLEServer.cpp), which is
-        // both a silent bond-loss route and a downgrade: any peer that triggers repeat pairing
-        // evicts the owner's bond. It cannot be overridden from here, because
-        // ble_gap_event_listener_call iterates listeners and returns 0 unconditionally, so this
-        // handler's return value is discarded and only NimBLEServer's reply is honoured. Changing
-        // it means patching the pinned library, which a clean checkout would silently undo. So the
-        // best available move is to make it VISIBLE: without this line a bond deletion looks
-        // identical to a successful re-pair in every other log the board emits.
-        Serial.println("[ACAB] REPEAT_PAIRING: the stack is about to DELETE the existing bond");
-        break;
     default: break;
     }
     return 0;
+}
+
+// REPEAT PAIRING: a peer the board already holds a bond for is asking to pair AGAIN, i.e. it has no
+// LTK for us. That is the owner's phone after it forgot the beacon, or a stranger replaying the
+// owner phone's address (the controller's resolving list accepts any address ever derived from
+// that IRK, however old). NimBLE-Arduino's stock BLE_GAP_EVENT_REPEAT_PAIRING handler deletes the
+// existing bond and lets the new pairing through ("sacrifices security for convenience",
+// NimBLEServer.cpp), which let a replayer evict the owner's bond and Just-Works pair in its place.
+//
+// tools/patch_nimble_repeat_pairing.py patches that handler on every build to call this first and
+// return BLE_GAP_REPEAT_PAIRING_IGNORE when it says no, BEFORE the delete; the SM then drops the
+// pairing request without touching the store (ble_sm_chk_repeat_pairing). This is the application's
+// only hook for the event (see acabGapTap), so it also drops the link, else the refused peer holds
+// the single connection slot (CONFIG_BT_NIMBLE_MAX_CONNECTIONS=1) until the pre-auth timeout. The
+// handle is the one connectBody recorded: one slot, one link. ble_gap_terminate is legal here, the
+// server callback runs with the host lock released (ble_gap_call_event_cb asserts it).
+//
+// With the window open the re-pair is the owner's choice (a person just power-cycled the board,
+// which is the same ritual a new phone goes through), so the bond IS about to be replaced: flag
+// the link, and authBody admits it only if the window still covers the completed pairing.
+//
+// extern "C" and NON-weak on purpose: a weak default is a fail-open the linker can pick silently.
+// odid-sim, which links the patched library without this file, defines its own in its main.cpp.
+extern "C" bool acabRepeatPairingAllowed(void) {
+    if (!acabBlePairWindowOpen()) {
+        Serial.println("[ACAB] repeat pairing refused (window closed)");
+        if (gConnHandle != 0xffff) ble_gap_terminate(gConnHandle, BLE_ERR_REM_USER_CONN_TERM);
+        return false;
+    }
+    gFreshPairingOnLink = true;
+    Serial.println("[ACAB] repeat pairing allowed: the existing bond is replaced (window open)");
+    return true;
 }
 
 // Re-arm advertising after the stack preempts it.
@@ -711,25 +744,27 @@ class ServerCb : public NimBLEServerCallbacks {
                              d->peer_id_addr.val[1], d->peer_id_addr.val[0]);
         // ---- PAIRING WINDOW GATE -------------------------------------------------------------
         // A peer we have never bonded with may only proceed while the post-power-on window is open.
-        // Rejecting HERE is the point of the whole design: this runs before any SMP traffic, so the
-        // stranger never reaches the pairing exchange that NimBLE-Arduino 1.4.3 can service by
-        // DELETING the legitimate owner's bond. Refusing later, at authentication-complete, would
-        // be too late to protect it. See the pairing-window notes in acab_ble_service.h.
+        // Rejecting HERE, before any SMP traffic, is the first line: a stranger never reaches the
+        // pairing exchange at all. The second line is acabRepeatPairingAllowed, for a peer whose
+        // address resolves to a bond (so it passes here as known) and then asks to pair again. See
+        // the pairing-window notes in acab_ble_service.h.
         //
         // Both addresses are checked because a bonded phone can present either: peer_id_addr is the
         // resolved identity once the controller matched its IRK, peer_ota_addr is what is on air
         // (still the rotating RPA when resolution has not happened). Treating "known" as the OR of
         // the two is what lets an existing iPhone reconnect outside the window.
         bool known = false;
-        const bool boardHadBond = acabBleBondCount() > 0;
+        // The sticky flag, OR the live store: the store can only ADD protection here (a bond the
+        // flag somehow missed), never remove it, so an emptied store leaves an owned board owned.
+        const bool boardOwned = gBoardOwned.on || acabBleBondCount() > 0;
         if (d) {
             known = NimBLEDevice::isBonded(NimBLEAddress(d->peer_id_addr)) ||
                     NimBLEDevice::isBonded(NimBLEAddress(d->peer_ota_addr));
             // See acabPairAdmit for what each input means and why. Short version: the only peer
             // ever refused is a stranger, outside the window, on a board that ALREADY has an owner.
-            // A board with no bonds pairs freely, so an out-of-box unit never makes the customer
+            // A board never owned pairs freely, so an out-of-box unit never makes the customer
             // learn the recovery step on their very first connect.
-            if (!acabPairAdmit(boardHadBond, known, acabBlePairWindowOpen())) {
+            if (!acabPairAdmit(boardOwned, known, acabBlePairWindowOpen())) {
                 Serial.println("[pair] window CLOSED and peer is not bonded -> rejecting. "
                                "Power-cycle the board to open a fresh 2-minute window.");
                 // Disconnect, and do NOT touch the bond store: the existing owner's bond is
@@ -743,7 +778,8 @@ class ServerCb : public NimBLEServerCallbacks {
         gConnHandle = d ? d->conn_handle : 0xffff;
         gAuthStartedMs = millis();
         gPeerKnownAtConnect = known;
-        gBoardHadBondAtConnect = boardHadBond;
+        gBoardOwnedAtConnect = boardOwned;
+        gFreshPairingOnLink = false;
         gPeerMtu = 23;   // reset to the BLE default; the MTU exchange bumps it right after connect
         gIgnoreStageN = 0; gWatchStageN = 0;   // fresh connection: drop any half-staged chunk sequence
         gIgnoreHadContent = false; gWatchHadContent = false;   // and this peer has proved nothing yet
@@ -770,19 +806,47 @@ class ServerCb : public NimBLEServerCallbacks {
                       desc->peer_id_addr.val[1], desc->peer_id_addr.val[0]);
         // No-I/O Just Works pairing does not provide MITM authentication, so `authenticated` is
         // expected to be false. The security boundary this product can enforce is encryption plus
-        // a persistent bond. A previously known bonded peer is accepted on an encrypted reconnect.
-        const bool secure = desc->sec_state.encrypted &&
-                            (desc->sec_state.bonded || gPeerKnownAtConnect);
-        const bool stillAdmitted = acabPairAdmit(gBoardHadBondAtConnect,
-                                                  gPeerKnownAtConnect,
-                                                  acabBlePairWindowOpen());
-        if (!secure || !stillAdmitted) {
-            Serial.println(!secure
-                ? "[ACAB] pairing failed to establish an encrypted bond; disconnecting"
-                : "[ACAB] pairing window closed before stranger authenticated; disconnecting");
+        // a persistent bond, and acabAuthAdmit (pair_window.h, truth-table tested) says who gets
+        // in: the owner restoring an LTK at any time; a FRESH pairing only inside the window on an
+        // owned board. The old rule here (encrypted && (bonded || known)) admitted a fresh pairing
+        // from any peer whose address matched the owner's, which was the bond-takeover hole.
+        if (!acabAuthAdmit(gBoardOwnedAtConnect, gPeerKnownAtConnect, gFreshPairingOnLink,
+                           acabBlePairWindowOpen(), desc->sec_state.encrypted,
+                           desc->sec_state.bonded)) {
+            // An encrypted AND bonded link that was still refused is a fresh pairing on an owned
+            // board outside the window (acabAuthAdmit admits every LTK restore), so the bond under
+            // peer_id_addr is the one this pairing just wrote: delete it, or the peer comes back
+            // as "known" and restores it at leisure. A stranger that connected inside the window
+            // and stalled SMP past its close used to leave exactly that bond behind. The owner's
+            // EXISTING bond is never on this path, but the owner's late re-pair is: a person who
+            // tapped the phone's pairing prompt after the window ran out loses this new bond on
+            // the board while the phone keeps its half, so the phone must forget the beacon
+            // before the next window. The line below says so; the connect-gate line already says
+            // power-cycle.
+            //
+            // ble_store_util_delete_peer (host/ble_store.h, the primitive the library's own
+            // REPEAT_PAIRING case uses), not NimBLEDevice::deleteBond: on the C5 envs deleteBond
+            // is NimBLE 2.x ble_gap_unpair, which returns BLE_HS_EBUSY before touching the store
+            // whenever the bond carries an IRK (phones distribute one) and a scan or advert is
+            // active, and acab_scanner's bleScanTask keeps the on-chip scan running through the
+            // connection, so there it deleted nothing. The resolving-list entry the primitive
+            // leaves behind is harmless: that RPA then resolves to an identity with no bond,
+            // isBonded says false, and the connect gate treats the peer as a stranger.
+            const bool freshBond = desc->sec_state.encrypted && desc->sec_state.bonded;
+            Serial.println(freshBond
+                ? "[ACAB] pairing finished after the window closed; its bond is dropped. Forget the "
+                  "beacon in the phone's Bluetooth settings, power-cycle, then pair within two minutes"
+                : "[ACAB] pairing failed to establish an encrypted bond; disconnecting");
+            if (freshBond) {
+                const int rc = ble_store_util_delete_peer(&desc->peer_id_addr);
+                if (rc != 0) Serial.printf("[ACAB] refused fresh bond NOT deleted (rc=%d)\n", rc);
+            }
             if (gServer && gConnHandle != 0xffff) gServer->disconnect(gConnHandle);
             return;
         }
+        // First bond ever: the board is owned from here on, whatever later happens to the store.
+        if (desc->sec_state.bonded && gBoardOwned.set(true))
+            Serial.println("[pair] board is now owned: a new phone needs the power-cycle window");
         gLinkSecured = true;   // every later failure below needs the full disconnect teardown
         // Close offline append admission BEFORE clearing prior-session GPS or entering the NVS
         // pre-arm. gConnected intentionally remains false until that work succeeds, so without this
@@ -838,13 +902,15 @@ class ServerCb : public NimBLEServerCallbacks {
         // full teardown below must not run for it: it wiped the retained away-row fix and re-armed
         // capture (duplicate rows that drain the flood bucket) on every unauthenticated attempt.
         // Keyed on gLinkSecured, not gLinkConnected: a peer replaying the owner phone's RPA
-        // passes the gate as known and still fails encryption.
+        // passes the gate as known, fails encryption (no LTK), and its re-pairing is refused by
+        // acabRepeatPairingAllowed outside the window.
         if (!gLinkSecured) {
             gLinkConnected = false;
             gConnHandle = 0xffff;
             gAuthStartedMs = 0;
             gPeerKnownAtConnect = false;
-            gBoardHadBondAtConnect = false;
+            gBoardOwnedAtConnect = false;
+            gFreshPairingOnLink = false;
             Serial.println("[ACAB] unauthenticated BLE link closed; session state untouched");
             advStart(NimBLEDevice::getAdvertising());
             return;
@@ -874,7 +940,8 @@ class ServerCb : public NimBLEServerCallbacks {
         gConnHandle = 0xffff;
         gAuthStartedMs = 0;
         gPeerKnownAtConnect = false;
-        gBoardHadBondAtConnect = false;
+        gBoardOwnedAtConnect = false;
+        gFreshPairingOnLink = false;
         // The live fix always ends with its authenticated connection. The retained half may feed
         // only encrypted away-window rows, and only if this session proved the key for the current
         // log generation. A mismatched/no-key phone's location must never be stamped onto rows the
@@ -1185,7 +1252,8 @@ class CfgCb : public NimBLECharacteristicCallbacks {
                 statusDirty = true;   // "wat" moved; a staging chunk above deliberately does not
             }
         }
-        // Phone GPS from the app: where we are, stamped onto detections + the mesh line.
+        // Phone GPS from the app: where we are, stamped onto detections, and onto the mesh line on
+        // a private channel only (buildText in mesh_link.cpp).
         if (doc["lat"].is<float>() && doc["lon"].is<float>()) {
             double la = doc["lat"].as<double>(), lo = doc["lon"].as<double>();
             if (la >= -90.0 && la <= 90.0 && lo >= -180.0 && lo <= 180.0) {
@@ -1322,6 +1390,11 @@ void acabBleBegin(const char* deviceName, const char* fwLabel) {
 #endif
     NimBLEDevice::init(deviceName ? deviceName : "ACAB");
     NimBLEDevice::setCustomGapHandler(acabGapTap);   // raw reason codes, see acabGapTap
+    // Sticky ownership (see gBoardOwned). The bond store is readable once init has synced the
+    // host; a fielded board with bonds becomes owned here on its first boot of this build.
+    gBoardOwned.restore(false);
+    if (!gBoardOwned.on && acabBleBondCount() > 0 && gBoardOwned.set(true))
+        Serial.printf("[pair] board owned: bond store holds %d phone(s)\n", acabBleBondCount());
 
     NimBLEDevice::setMTU(512);   // roomy ATT payload: the status + rich drone JSON outgrew 247 (see NOTIFY_MAX)
     // Encrypted, bonded link for the whole service, so a stranger can't silence the
@@ -1627,7 +1700,7 @@ void acabBleDrainTick() {
     // later. Offline logging continues throughout this state because gConnected remains false.
     if (gLinkConnected && !gConnected) {
         const uint32_t elapsed = (uint32_t)(millis() - gAuthStartedMs);
-        if (!acabPairPreAuthMayContinue(gBoardHadBondAtConnect,
+        if (!acabPairPreAuthMayContinue(gBoardOwnedAtConnect,
                                         gPeerKnownAtConnect,
                                         acabBlePairWindowOpen(),
                                         elapsed, AUTH_TIMEOUT_MS)) {
@@ -2053,7 +2126,7 @@ void acabBleUpdateStatus() {
     // Companion nRF app version, for the app's "nRF update available" check (BLE DFU). Emit only
     // once heard (>=0) so single-radio builds and a not-yet-announced nRF never send a stray -1.
     // Capped at 9999 (4 digits): the value originates as atoi of an UNTRUSTED UART line, and the
-    // real domain is a small monotonic int (currently 2). parseAdvLine (beacon-board main.cpp)
+    // real domain is a small monotonic int (currently 3). parseAdvLine (beacon-board main.cpp)
     // already clamps what it stores; this re-cap makes the host-test budget's 4-digit "nrfv"
     // width provable from THIS file alone, whatever a future board's acabNrfVersion returns.
     { int nrfv = acabNrfVersion(); if (nrfv > 9999) nrfv = 9999; if (nrfv >= 0) doc["nrfv"] = nrfv; }
@@ -2170,9 +2243,9 @@ bool acabBleGetPhoneGps(double* lat, double* lon, uint32_t maxAgeMs, uint32_t* a
 // stamp in handleDetection does NOT set d.lat/d.lon from this: it fills a DetLogGpsStamp that
 // rides beside the record on the sink queue, and only detLogAppend reads it. Setting it on the
 // detection would have been a transmissible shape - the SAME AcabDetection is both buffered and
-// delivered, the buffer-bearing item deliberately holds under ~10 ms of backpressure while the
-// sink is mid flash-erase, and a phone connecting inside that window makes detLogAppend refuse the
-// row (it only accepts while the app is away) while the sink still notifies it. The coordinate
+// delivered, a buffer-bearing item can sit in the sink queue while the sink is mid flash-erase,
+// and a phone connecting inside that window makes detLogAppend refuse the row (it only accepts
+// while the app is away) while the sink still notifies it. The coordinate
 // could otherwise have gone to a later phone. The queue's owner-admission epoch now independently
 // drops the whole stale delivery at its final sink boundary; keeping the retained fix out of the
 // live detection remains structural defense in depth.

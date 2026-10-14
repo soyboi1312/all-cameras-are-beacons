@@ -1,9 +1,9 @@
 /*
  * ACAB - new-phone pairing window (pure decision, no platform deps).
  *
- * A phone that has never bonded may only pair during a short window after power-on. Already-bonded
- * phones reconnect whenever they like; this governs FIRST contact only. Recovery is one sentence:
- * turn the beacon off and on, then connect within two minutes.
+ * A phone may only PAIR during a short window after power-on: first contact, and a known phone that
+ * forgot the beacon and pairs again. Already-bonded phones reconnect whenever they like. Recovery
+ * is one sentence: turn the beacon off and on, then connect within two minutes.
  *
  * WHY THIS AND NOT AN OWNERSHIP SCHEME. A QR secret / challenge-response design was considered and
  * rejected: it needs a secret the user can lose, per-device provisioning, and a transfer story when
@@ -45,20 +45,26 @@ inline uint32_t acabPairWindowRemainingMsAt(uint64_t nowUs, uint64_t untilUs) {
 ///
 /// Three inputs, and each rejection reason is a distinct product decision:
 ///
-///   boardHasBond - does the board already have an owner. A board with ZERO bonds pairs freely,
-///                  which is the whole out-of-box experience: a unit that shipped weeks ago, or sat
-///                  in a drawer, must connect on the customer's first try with no ritual. There is
-///                  also nothing to protect yet - an unowned board holds no log worth stealing.
+///   boardOwned   - has the board EVER held a bond. A sticky NVS flag in the service, set on the
+///                  first bonded authentication and, on the first boot of this build, whenever the
+///                  bond store is non-empty. The service passes it ORed with the live bond
+///                  count: the flag is what makes ownership sticky and the count can only add
+///                  protection, so an emptied or corrupted store cannot reopen an owned board to
+///                  anyone. A board
+///                  that was never owned pairs freely, which is the whole out-of-box experience: a
+///                  unit that shipped weeks ago, or sat in a drawer, must connect on the
+///                  customer's first try with no ritual. There is also nothing to protect yet - an
+///                  unowned board holds no log worth stealing. Only a full flash erase clears it.
 ///   known        - is this peer already bonded to the board. Owners reconnect whenever they like;
-///                  the window governs FIRST contact only.
+///                  whether a known peer may PAIR again is acabAuthAdmit's question below.
 ///   windowOpen   - the post-power-on window.
 ///
 /// So the ONLY rejection is: an owned board, a stranger, outside the window. That is exactly the
 /// threat (someone in radio range pairing to an unattended board that already has a log on it) and
 /// nothing else.
-inline bool acabPairAdmit(bool boardHasBond, bool known, bool windowOpen) {
-    if (!boardHasBond) return true;   // unowned board: first pairing always works
-    if (known)         return true;   // the owner, reconnecting
+inline bool acabPairAdmit(bool boardOwned, bool known, bool windowOpen) {
+    if (!boardOwned) return true;     // never-owned board: first pairing always works
+    if (known)       return true;     // the owner, reconnecting
     return windowOpen;                // a stranger: only during the window
 }
 
@@ -67,11 +73,40 @@ inline bool acabPairAdmit(bool boardHasBond, bool known, bool windowOpen) {
 /// Admission is re-evaluated because a stranger can connect during the physical pairing window
 /// and then deliberately stall SMP until after it closes. The elapsed-time check is deliberately
 /// subtraction based, so it remains correct when millis() rolls over.
-inline bool acabPairPreAuthMayContinue(bool boardHadBondAtConnect,
+inline bool acabPairPreAuthMayContinue(bool boardOwnedAtConnect,
                                        bool knownAtConnect, bool windowOpen,
                                        uint32_t elapsedMs, uint32_t timeoutMs) {
     if (elapsedMs >= timeoutMs) return false;
-    return acabPairAdmit(boardHadBondAtConnect, knownAtConnect, windowOpen);
+    return acabPairAdmit(boardOwnedAtConnect, knownAtConnect, windowOpen);
+}
+
+/// Is this authenticated link an app session? Decided at onAuthenticationComplete, after the
+/// connect gate above, from the link's security state plus what the service learned on the way.
+///
+///   knownAtConnect - acabPairAdmit's `known`, as read at connect.
+///   freshPairing   - the stack ran a pairing on this link against an EXISTING bond for this peer
+///                    (NimBLE's REPEAT_PAIRING, which the service only allows while the window is
+///                    open: acabRepeatPairingAllowed). The owner's phone after it forgot the
+///                    beacon, or a peer replaying the owner phone's address (the resolving list
+///                    accepts any address ever derived from the phone's IRK, however old).
+///   encrypted/bonded - the link's sec_state.
+///
+/// The rule. A peer that merely RESTORED its existing LTK is the owner's phone: nobody else holds
+/// that key, so it is admitted at any time. A FRESH pairing is a new owner, and on an owned board
+/// a new owner needs the physical window, whatever the peer's address resolved to: the old rule
+/// (encrypted && (bonded || known)) admitted a fresh pairing from any peer whose address matched,
+/// which is the bond-takeover hole. A peer unknown at connect can only have reached encryption by
+/// pairing now, so it is fresh whether or not the stack flagged a repeat (REPEAT_PAIRING needs an
+/// existing bond to repeat). A fresh pairing that left no bond is nobody's phone. Just Works adds
+/// no MITM protection to any of this; the window is the physical-presence proof.
+inline bool acabAuthAdmit(bool boardOwned, bool knownAtConnect, bool freshPairing,
+                          bool windowOpen, bool encrypted, bool bonded) {
+    if (!encrypted) return false;
+    const bool fresh = freshPairing || !knownAtConnect;
+    if (!fresh)      return true;     // the owner's phone restored its LTK
+    if (!bonded)     return false;    // a fresh pairing that left no bond
+    if (!boardOwned) return true;     // out of the box
+    return windowOpen;                // fresh pairing on an owned board: only after a power cycle
 }
 
 /// May this session arm the legacy nRF bootloader?

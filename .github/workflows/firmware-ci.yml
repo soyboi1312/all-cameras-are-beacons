@@ -19,7 +19,7 @@ on:
 # LEAST PRIVILEGE. This was the only workflow in the repo declaring no permissions at all, so it
 # ran with the repo default - which is `write` on a repo that publishes signed firmware. Every job
 # here opens with a checkout, and checkout persists that token into .git/config for the whole job,
-# next to `pip install --upgrade platformio` and a full `pio run`. Nothing here writes:
+# next to `pip install platformio==...` and a full `pio run`. Nothing here writes:
 # check-signature-drift.py reads one PUBLIC releases endpoint, and the token it is handed only
 # raises the api.github.com rate limit.
 permissions:
@@ -44,6 +44,13 @@ jobs:
           python-version: '3.11'
 
       # PlatformIO's package cache is the slow part, not the compile.
+      #
+      # NO restore-keys, ON PURPOSE. A partial-key fallback hands this job the packages an OLDER
+      # platformio.ini (or an older pinned core, below) resolved, and PlatformIO is happy to build
+      # with them: the run goes green on a toolchain the ini no longer names. A miss costs one
+      # cold fetch; a stale hit costs a false pass on the component that ships signed images.
+      # The key also hashes this workflow, because the core version pinned below decides part of
+      # what lands under ~/.platformio.
       - name: Cache PlatformIO
         uses: actions/cache@v5
         with:
@@ -51,11 +58,14 @@ jobs:
             ~/.platformio
             ~/.platformio-c5
             firmware/.pio
-          key: pio-${{ runner.os }}-${{ hashFiles('firmware/platformio.ini') }}
-          restore-keys: pio-${{ runner.os }}-
+          key: pio-${{ runner.os }}-${{ hashFiles('firmware/platformio.ini', '.github/workflows/firmware-ci.yml') }}
 
+      # Pinned to the core the owner's release machine runs (`pio --version` there), so CI
+      # resolves platforms and packages the way the shipped images were built. Bump the two
+      # together. The C5 platform in platformio.ini stays a plain URL: PlatformIO has no
+      # integrity-hash field for a platform archive, so only vendoring the zip could pin its bytes.
       - name: Install PlatformIO
-        run: pip install --upgrade platformio
+        run: pip install platformio==6.2.0
 
       # ALL envs, not just the product one. The rev-B and channel-1 variants are exactly the
       # targets a local `pio run` forgets, because nobody builds them by hand day to day.
@@ -98,6 +108,13 @@ jobs:
       - name: Release tooling tests
         working-directory: firmware/tools
         run: python3 -m unittest discover -s tests -p 'test_*.py' -v
+
+      # The REPEAT_PAIRING guard is applied to the pinned NimBLE-Arduino by a pre-build script
+      # (firmware/tools/patch_nimble_repeat_pairing.py), so a stock library can never ship. Its
+      # self-test proves the patcher still recognises both pinned stock bodies, is idempotent and
+      # fails closed on any other text, which is what a library bump would present.
+      - name: NimBLE repeat-pairing patcher self-test
+        run: python3 -I firmware/tools/patch_nimble_repeat_pairing.py --selftest
 
   # The repo has a public/private split (firmware/nrf-ble-scan/, firmware/OTA.md and the whole
   # hardware/ tree are gitignored), which is precisely the condition that produces links pointing

@@ -139,8 +139,10 @@ struct AcabDetection {
     // scan on the single-radio boards passes NimBLEAdvertisedDevice::getAddressType() into
     // acabScannerIngestBLE, which sets this true when the controller reported RANDOM. It never
     // clears it: a public address with the 0x02 bit set is locally administered and still owns
-    // no IEEE OUI. The dual-radio nRF forward line carries no type (the co-processor image is
-    // pinned at v2 and the line format cannot grow), so on the beacon board a BLE address with
+    // no IEEE OUI. The dual-radio nRF forward line carries no type (fielded co-processor images are
+    // v2 and the "A" line is fixed; the link grows only by new line prefixes or trailing fields,
+    // which both ends ignore when unknown, as the "D" line did on 2026-10-11), so on the beacon
+    // board a BLE address with
     // the bit clear stays UNKNOWN and this field stays false; desertClassifyBLE labels that case
     // "OUI unknown" rather than claiming an OUI it cannot see.
     //

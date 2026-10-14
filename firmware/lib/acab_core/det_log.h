@@ -11,19 +11,31 @@
  *     a new at-rest exposure, so it is off until the user opts in.
  *   - ENCRYPTED AT REST: the sensitive payload is AES-CTR encrypted with a 32-byte key
  *     the app pushes on connect. The key is PERSISTED to NVS while buffering is enabled
- *     (and erased when it's turned off), so a deploy-and-leave board keeps buffering
- *     across reboots instead of going keyless. TRADEOFF: a seized board's flash now
- *     yields the key, so the at-rest buffer is decryptable - it is NOT ciphertext-only.
- *     The remaining guards are the opt-in default (off) + the auto-wipe of records left
- *     undrained across reboots; flash-encryption / encrypted NVS would restore the
- *     seized-board protection.
- *   - AUTO-WIPE: records left undrained past a threshold are really erased, so a
- *     board out of its owner's hands self-cleans (clearlog needs the bonded phone in
- *     hand, which you do not have during a seizure).
+ *     (and removed from NVS when it's turned off), so a deploy-and-leave board keeps
+ *     buffering across reboots instead of going keyless. TRADEOFF, stated plainly: the key
+ *     sits in PLAINTEXT NVS beside the ring, and no production build enables flash or NVS
+ *     encryption (platformio.ini sets neither, and the pinned frameworks' prebuilt sdkconfig
+ *     leaves CONFIG_FLASH_ENCRYPTION_ENABLED and CONFIG_NVS_ENCRYPTION off), so a seized
+ *     board's flash yields the key and the at-rest buffer is decryptable - it is NOT
+ *     ciphertext-only. "Removed from NVS" on buffer:false
+ *     is an NVS erase-mark, not a physical erase: ESP-IDF NVS marks the entry erased and the
+ *     bytes stay in their page until garbage collection (ESP-IDF NVS behaviour, unconfirmed
+ *     on this board). Flash encryption plus encrypted NVS is the upgrade path that restores
+ *     the seized-board property; until then the guards are the opt-in default (off) and the
+ *     auto-wipe below, within its stated limit.
+ *   - AUTO-WIPE: a ring left undrained across WIPE_AFTER_BOOTS physical starts (power-on,
+ *     reset pin, deep-sleep wake; NOT a panic, watchdog, brownout or OTA restart, which the
+ *     board does to itself) is really erased, and the retained core dump's erase token is
+ *     armed with it. It runs ONLY when this firmware boots, so it protects against someone
+ *     who BOOTS the unit, not against flash imaging over USB/JTAG or a chip reader, which
+ *     never runs this code. clearlog needs the bonded phone in hand, which you do not have
+ *     during a seizure.
  *   - RAW esp_partition RING (not a LittleFS file - LittleFS's copy-on-write fights
- *     fixed-offset slots): fixed 64B slots, slot = seq % N, APPEND-ONLY (one record
- *     per device per boot, gated on true first sighting, not on isNew which re-fires
- *     every 60s dedup gap).
+ *     fixed-offset slots): fixed 64B slots, slot = (seq-1) % N (slotOf), APPEND-ONLY (one
+ *     record per device per capture generation, re-armed at each app disconnect
+ *     (acabScannerReArmCapture bumps the scanner's capture generation; authentication
+ *     publishes a new admission epoch without re-arming), gated on true first sighting, not
+ *     on isNew which re-fires every 60s dedup gap).
  *
  * The append hook lives in the shared scanner funnel (acab_scanner.cpp
  * handleDetection), NOT in either build's onDetection, so it covers oui-spy AND
@@ -81,7 +93,7 @@ static const uint32_t DET_LOG_GPS_MAX_AGE_MS = 0xFFFFu * 1000u;   // 65535 s ~ 1
 // owner is away is the retained phone fix (acabBleGetLastPhoneGps), and that fix must never ride
 // the object the sink hands to the BLE notify path. The SAME AcabDetection is both delivered live
 // and buffered, and the two happen on opposite sides of a connect: a row stamped while
-// disconnected can sit in the sink queue under backpressure, a phone can connect in that window,
+// disconnected can sit in the sink queue, a phone can connect in that window,
 // the append is then refused (this ring only accepts rows while the app is away) and the live
 // notify goes out carrying the coordinate anyway - to a phone that, after a re-pair, need not even
 // be the one that supplied it. Carrying it out of band makes that shape unrepresentable instead of
@@ -134,7 +146,8 @@ enum DetLogFault : uint32_t {
 
 // --- lifecycle ---
 void     detLogBegin();             // mount ring, scan for head (generation window),
-                                    // bump+persist bootCount, run auto-wipe of stale records
+                                    // bump+persist bootCount (every boot) and the possession
+                                    // count (physical starts only), run auto-wipe of stale records
 void     detLogSetEnabled(bool on); // opt-in master switch (persisted); false also durably requests
                                     // retained-coredump erasure, even when already disabled
 bool     detLogEnabled();
@@ -142,8 +155,9 @@ bool     detLogEnabled();
 // --- at-rest key: app-pushed on connect. Held in RAM, and persisted to NVS while buffering
 // is enabled so a deploy-and-leave board survives a reboot (the TRADEOFF above). A truncated
 // SHA-256 of it is persisted UNCONDITIONALLY: buffered records outlive the key (a disable
-// erases the key but not the ring), and the fingerprint is what detects a different phone's
-// key arriving for them, which would otherwise decrypt them to noise that passes the CRC. ---
+// removes the key from NVS but not the ring), and the fingerprint is what detects a different
+// phone's key arriving for them, which would otherwise decrypt them to noise that passes the
+// CRC. ---
 // Result of offering an at-rest key for the current authenticated config session. A key is
 // ACCEPTED only after its fingerprint is verified and it is either installed or safely staged
 // behind an already-authorized transaction. PENDING means startup/raw geometry is not authoritative
@@ -241,10 +255,10 @@ inline bool detLogAppendReleasesClaim(DetLogAppendResult result) {
 // reaches storage. Each stored row spends one token. shouldBuffer never admits an
 // ACAB_NEARBY_DEVICE row, so every row that reaches this bucket is a signature row.
 //
-// THE NUMBERS, from the densest real signature scenes committed to the repo:
-//   - docs/captures/lvt-2026-08-03-summary.txt, netcam ON, residential streets (Ring, Swann, Wyze,
-//     Reolink, eufy OUIs). Unique signature first sightings, which is what the ring stores: 83 in
-//     one 47-minute segment, at most 34 in any 10 minutes, 10 in any 60 s, 4 in any 1 s.
+// THE NUMBERS, from the densest real signature scenes on record:
+//   - own capture lvt-2026-08-03 (not published), netcam ON, residential streets (Ring, Swann,
+//     Wyze, Reolink, eufy OUIs). Unique signature first sightings, which is what the ring stores:
+//     83 in one 47-minute segment, at most 34 in any 10 minutes, 10 in any 60 s, 4 in any 1 s.
 //   - docs/radio-coverage.md, the c5-lvt capture: 67 camera-vendor MACs in ~27 minutes, 48 of them
 //     heard only on 2.4 GHz (the only band an S3 build hears).
 //   - docs/captures/drive-to-camarillo-2026-09-07.txt: 45 detections in 2h28m, netcam off.
@@ -267,8 +281,10 @@ inline bool detLogAppendReleasesClaim(DetLogAppendResult result) {
 // FAIRNESS: one-shot random identities must not starve a real device. The last
 // DET_LOG_RATE_RESERVE tokens are spendable only by a PERSISTENT row (detLogRatePersistent: seen
 // at least twice, first-to-last sighting at least DET_LOG_RATE_PERSIST_MS apart). A real camera
-// keeps refreshing its dedup entry, and dedupFind evicts least-recently-seen first, so it survives
-// a fresh-identity flood that recycles the table; a one-shot identity is never seen twice. A flood
+// keeps refreshing its dedup entry, and dedupFind evicts nearby-device and tracker entries before
+// any other signature entry (acabDedupEvictRank, dedup_evict.h), least-recently-seen within a
+// tier, so it survives a fresh-identity flood that recycles the table; a one-shot identity is
+// never seen twice. A flood
 // of fresh identities therefore drains the bucket only down to the reserve, and a real device that
 // was refused while fresh is admitted from the reserve as soon as it has dwelt 10 s. An attacker
 // can also make identities persistent by repeating them; that buys them the reserve, and then
@@ -365,9 +381,10 @@ bool     detLogWipePending();
 uint32_t detLogDrainFrom();
 
 // A retained IDF core dump is a second sensitive at-rest surface: task stacks can contain the
-// buffer key, a decrypted record, or phone coordinates. User-driven destructive actions therefore
-// persist an independent erase-generation token instead of asking coredump_report to infer intent
-// from the shared ring-wipe level (which also represents auto-wipes and resumed sweeps). The token
+// buffer key, a decrypted record, or phone coordinates. Every wipe of the log (clearlog, a key
+// change, buffer:false, and the boot-count auto-wipe) therefore persists an independent
+// erase-generation token instead of asking coredump_report to infer intent from the shared
+// ring-wipe level (which also represents resumed sweeps and head-wrap clears). The token
 // survives power loss; completion clears it only if no newer request superseded `generation`.
 // Production callers are coredump_report.cpp only. Exposed here so the host persistence suite can
 // prove the contract against the real Preferences-backed implementation.

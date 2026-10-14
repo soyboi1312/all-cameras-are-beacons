@@ -48,6 +48,14 @@ struct AcabHostSerialSink {
 };
 inline AcabHostSerialSink Serial;
 
+// ESP.restart() must not end the host process. ota_update.cpp reboots from otaWrite when a
+// deferred finish completes; the suite counts the call instead.
+struct AcabHostEsp {
+    uint32_t restarts = 0;
+    void restart() { restarts++; }
+};
+inline AcabHostEsp ESP;
+
 // ---------------------------------------------------------------------------
 // GPIO + LEDC output spies
 // ---------------------------------------------------------------------------

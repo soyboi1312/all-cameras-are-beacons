@@ -127,6 +127,14 @@ uint32_t acabScannerTotalDetections();
 uint32_t acabScannerBleSeen();
 uint32_t acabScannerWifiSeen();
 
+// Sink-queue drops since boot, split by class. Firehose = ACAB_NEARBY_DEVICE / ACAB_NETCAM items
+// refused by the headroom reserve (acabSinkAdmitsFirehose, sink_claim.h) or a full queue; signature
+// = every other type that found the queue full. Nothing dropped is lost for good (the buffer claim
+// rolls back and the device's `new` edge re-arms for its next sighting), but signature > 0 says the
+// sink is saturated and live alerts are arriving late. For the serial [diag] line, not a status key.
+uint32_t acabScannerSinkDropsFirehose();
+uint32_t acabScannerSinkDropsSignature();
+
 // Co-processor (dual-radio nRF) stats, mirrored up over UART for the two-radio
 // "is it working?" diagnostic. hasCoProc stays false on a single-board build.
 void     acabScannerSetCoProcStats(uint32_t advSeen, uint32_t forwarded, bool scanning);

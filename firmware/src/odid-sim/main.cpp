@@ -53,6 +53,12 @@ extern "C" {
 #include "opendroneid.h"
 }
 
+// tools/patch_nimble_repeat_pairing.py patches NimBLE-Arduino's REPEAT_PAIRING handler to ask the
+// application before it deletes a bond, so every image that links the library must define this
+// (acab_ble_service.cpp does for the products; this env lib_ignores acab_core). The simulator is
+// a non-connectable broadcaster with no bonds to protect, so it keeps the library's stock answer.
+extern "C" bool acabRepeatPairingAllowed(void) { return true; }
+
 // --- baked-in identity / telemetry -----------------------------------------
 static const char*  kUasId          = "SIM-OP-TEST-00000001";   // exactly 20 chars
 static const double kDroneLat       =   32.91570;

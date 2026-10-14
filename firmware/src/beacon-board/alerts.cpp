@@ -23,6 +23,11 @@
 
 static QueueHandle_t gAlertQ = nullptr;
 static TaskHandle_t  gAlertTask = nullptr;   // kept so shutdown can suspend it and own the buzzer alone
+// False until the soft-power gate commits to staying on (alertsArmHeartbeat). The alert task is
+// created before that gate, and its idle timeout must not pulse the LED on a boot that is only
+// awake to conclude it should sleep (a pocket bump, a charge-while-off plug-in): the owner
+// believes that unit is off, and a flash from a pocket says otherwise.
+static volatile bool    gHeartbeatArmed = false;
 static volatile bool    gBuzzer = true;
 static volatile uint8_t gVolume = 80;   // 0..100
 // Onboard LED master. On = idle heartbeat + detection flashes + boot sweep; "lights out" = false.
@@ -41,11 +46,6 @@ static const AcabDeviceType ACAB_ALERT_TEST    = (AcabDeviceType)0xFE;   // volu
 static const AcabDeviceType ACAB_ALERT_CONNECT = (AcabDeviceType)0xFD;   // app linked
 static const AcabDeviceType ACAB_ALERT_REVEAL  = (AcabDeviceType)0xFC;   // first catch of a session
 static const AcabDeviceType ACAB_ALERT_POWER_ON = (AcabDeviceType)0xFB;  // button-hold accepted
-
-// Alert mode controls detection/session noise, not deliberate on/off feedback. Keep that choice
-// explicit per call instead of temporarily flipping gBuzzer: the alert task runs concurrently,
-// and a global override could let a queued detection sound during a power cue.
-enum class AudioPurpose : uint8_t { UserAlert, PowerState };
 
 // Armed at boot and on each app connection; the next NEW detection plays the "reveal"
 // sting in place of its class pattern, so the first catch of a session lands like the
@@ -123,13 +123,12 @@ static void buzzerFreq(int freq) { ledcSetup(BUZZER_LEDC_CHANNEL, freq, BUZZER_L
 static void buzzerOff() { buzzerDuty(0); }
 
 // Start a tone at `freq`, scaled to the current volume, then by an optional per-call scale
-// (0-100%, default full). Power-state cues bypass the detection-alert mute so a battery unit can
-// always confirm a deliberate on/off action. Volume 0 remains absolute silence for users who need
-// it, and LED output stays independently governed by the lights-out setting.
-static void buzzerTone(int freq, int scalePct = 100,
-                       AudioPurpose purpose = AudioPurpose::UserAlert) {
-    bool mutedAlert = !gBuzzer && purpose == AudioPurpose::UserAlert;
-    if (mutedAlert || gVolume == 0 || freq <= 0) { buzzerOff(); return; }
+// (0-100%, default full). Mute wins here for EVERY caller, the power cues included (2026-10-11;
+// until then PowerState cues bypassed it, so a muted board voiced its 0.7 s power-down motif on
+// slide-off, button-hold off and app power-off). Volume 0 is the same silence, and LED output
+// stays independently governed by the lights-out setting.
+static void buzzerTone(int freq, int scalePct = 100) {
+    if (!gBuzzer || gVolume == 0 || freq <= 0) { buzzerOff(); return; }
     // ledcSetup, NEVER ledcWriteTone. ledcWriteTone hard-codes duty_resolution = 10 and stamps
     // channels_resolution[chan] = 10 (framework-arduinoespressif32 3.20017,
     // cores/esp32/esp32-hal-ledc.c:118-148), so it silently retimed this channel to 10-bit behind
@@ -145,9 +144,8 @@ static void buzzerTone(int freq, int scalePct = 100,
     buzzerDuty(duty);
 }
 
-static void beep(int freq, int durMs, int scalePct = 100,
-                 AudioPurpose purpose = AudioPurpose::UserAlert) {
-    buzzerTone(freq, scalePct, purpose);
+static void beep(int freq, int durMs, int scalePct = 100) {
+    buzzerTone(freq, scalePct);
     ledOn();
     vTaskDelay(pdMS_TO_TICKS(durMs));
     ledOff();
@@ -156,8 +154,7 @@ static void beep(int freq, int durMs, int scalePct = 100,
 
 // Harsh descending sweep - the crow "caw" used for Flock. scalePct softens it for the boot
 // whoosh only (Flock passes 100 by default, so its loudness is unchanged).
-static void caw(int startF, int endF, int durMs, int scalePct = 100,
-                AudioPurpose purpose = AudioPurpose::UserAlert) {
+static void caw(int startF, int endF, int durMs, int scalePct = 100) {
     int steps = durMs / 8;
     if (steps < 1) steps = 1;
     float fStep = (float)(endF - startF) / steps;
@@ -165,7 +162,7 @@ static void caw(int startF, int endF, int durMs, int scalePct = 100,
     for (int i = 0; i < steps; i++) {
         int f = startF + (int)(fStep * i);
         if (f < 100) f = 100;
-        buzzerTone(f, scalePct, purpose);
+        buzzerTone(f, scalePct);
         vTaskDelay(pdMS_TO_TICKS(8));
     }
     buzzerOff();
@@ -174,14 +171,13 @@ static void caw(int startF, int endF, int durMs, int scalePct = 100,
 
 // KITT "voice modulator": wobble the pitch fast around a center. A vibrato the piezo
 // can actually voice (one tone, just modulated), LED steady on through the wobble.
-static void warble(int centerF, int depth, int cycles, int halfMs, int scalePct = 100,
-                   AudioPurpose purpose = AudioPurpose::UserAlert) {
+static void warble(int centerF, int depth, int cycles, int halfMs, int scalePct = 100) {
     if (halfMs < 1) halfMs = 1;
     ledOn();
     for (int i = 0; i < cycles; i++) {
-        buzzerTone(centerF + depth, scalePct, purpose);
+        buzzerTone(centerF + depth, scalePct);
         vTaskDelay(pdMS_TO_TICKS(halfMs));
-        buzzerTone(centerF - depth, scalePct, purpose);
+        buzzerTone(centerF - depth, scalePct);
         vTaskDelay(pdMS_TO_TICKS(halfMs));
     }
     buzzerOff();
@@ -211,10 +207,11 @@ static void playReveal() {
     ledOff();
 }
 
-// Immediate confirmation that the rev-B hold-to-start gate committed to ON. This is separate from
-// the volume-preview beep, which must remain silent when detection alerts are muted.
+// Immediate confirmation that the rev-B hold-to-start gate committed to ON. Same note as the
+// volume preview, kept as its own sentinel so the queue reads honestly; while muted this is the
+// LED flash alone, which is the finger-on-the-button feedback a muted user still gets.
 static void playPowerOnAck() {
-    beep(3000, 130, 100, AudioPurpose::PowerState);
+    beep(3000, 130);
 }
 
 // A different sound per target class.
@@ -261,10 +258,20 @@ static void playPattern(AcabDeviceType type) {
     }
 }
 
+// One idle heartbeat: a brief flash, then back to dark. Nothing at all until the soft-power gate
+// has committed (alertsArmHeartbeat), so a boot that parks again never lights up. ledOn respects
+// the master flag, so "lights out" leaves the pulse dark too. Split out of alertTask so the host
+// suite can call the exact branch the task runs on its timeout.
+static void heartbeatPulse() {
+    if (!gHeartbeatArmed) return;
+    ledOn();
+    vTaskDelay(pdMS_TO_TICKS(25));
+    ledOff();
+}
+
 // FreeRTOS task: drain the alert queue and play patterns, off the callers' path. When the
 // queue is idle it wakes on a timeout to pulse the LED, a slow "alive" heartbeat so a running
-// board never looks dead (the fix for first-timer "is it even on?"). ledOn respects the master
-// flag, so "lights out" leaves the pulse dark.
+// board never looks dead (the fix for first-timer "is it even on?").
 static void alertTask(void*) {
     AcabDeviceType type;
     for (;;) {
@@ -275,11 +282,17 @@ static void alertTask(void*) {
             else if (type == ACAB_ALERT_POWER_ON) playPowerOnAck();
             else                                  playPattern(type);
         } else {
-            ledOn();                          // idle heartbeat: a brief flash, then back to dark
-            vTaskDelay(pdMS_TO_TICKS(25));
-            ledOff();
+            heartbeatPulse();
         }
     }
+}
+
+void alertsArmHeartbeat() { gHeartbeatArmed = true; }
+
+void alertsQuiesce() {
+    if (gAlertTask) vTaskSuspend(gAlertTask);
+    buzzerOff();
+    ledOff();
 }
 
 // Set up the LED pin, the LEDC PWM for the buzzer, and the alert task.
@@ -317,23 +330,24 @@ void alertsBootJingle(bool physicalStart) {
     // ~0.9s total (the whoosh was ~2.8s - snappier fits the character). Cues at 60% scale
     // (30 -> 60 2026-07-26, user wanted it louder); detection alerts untouched. Band stays
     // 500-2500 Hz, below the piezo's shrieky ~4k resonance - never above ~2500 (whoosh-era rule).
-    // MUTE ALWAYS WINS HERE (2026-08-24). An earlier draft let physicalStart bypass alert mute as
-    // a PowerState cue, but physicalStart counts EVERY ESP_RST_POWERON as deliberate - and on the
-    // button-less deploys (slim always-on SKU, USB wall power, covert installs) an unattended
-    // power interruption and restore is indistinguishable from a hand on the plug, so a MUTED
-    // board would have announced itself at the saved volume at 3am. A muted board never plays the
-    // boot jingle. The PowerState bypass stays reserved for cues that always follow an explicit
-    // user action (the hold-to-start ack, the app-driven shutdown). physicalStart still feeds the
-    // pairing window in setup(); for audio it is deliberately unused.
-    (void)physicalStart;
-    constexpr AudioPurpose purpose = AudioPurpose::UserAlert;
-    caw(500, 1050, 140, 60, purpose);                 // 1. servo "vwip"
+    // PHYSICAL START ONLY (2026-10-11). A warm continuation (OTA restart, panic, task watchdog,
+    // brownout on a sagging cell) is nothing the user did, so it plays nothing and lights nothing:
+    // otherwise a crash loop, or anything able to induce a crash from radio range, made an
+    // unmuted board announce itself over and over. The app's reconnect chirp already confirms a
+    // recovery. physicalStart is the same acabPhysicalStart decision the pairing gate consumes.
+    // MUTE ALWAYS WINS ON TOP OF THAT (2026-08-24, now the rule for every sound in buzzerTone).
+    // physicalStart counts EVERY ESP_RST_POWERON as deliberate - and on the button-less deploys
+    // (slim always-on SKU, USB wall power, covert installs) an unattended power interruption and
+    // restore is indistinguishable from a hand on the plug, so a MUTED board would otherwise have
+    // announced itself at the saved volume at 3am. A muted board never plays the boot jingle.
+    if (!physicalStart) return;
+    caw(500, 1050, 140, 60);                 // 1. servo "vwip"
     vTaskDelay(pdMS_TO_TICKS(40));
-    beep(1150, 60, 60, purpose); vTaskDelay(pdMS_TO_TICKS(30));   // 2. da
-    beep(1450, 60, 60, purpose); vTaskDelay(pdMS_TO_TICKS(30));   //    da
-    beep(1850, 95, 60, purpose); vTaskDelay(pdMS_TO_TICKS(50));   //    DEE
-    warble(1700, 220, 3, 22, 60, purpose);            // 3. head-cock trill
-    caw(1500, 2500, 170, 60, purpose);                // 4. "...alive?" - ends high, never resolves down
+    beep(1150, 60, 60); vTaskDelay(pdMS_TO_TICKS(30));   // 2. da
+    beep(1450, 60, 60); vTaskDelay(pdMS_TO_TICKS(30));   //    da
+    beep(1850, 95, 60); vTaskDelay(pdMS_TO_TICKS(50));   //    DEE
+    warble(1700, 220, 3, 22, 60);            // 3. head-cock trill
+    caw(1500, 2500, 170, 60);                // 4. "...alive?" - ends high, never resolves down
 }
 
 void alertsPowerDown() {
@@ -343,22 +357,22 @@ void alertsPowerDown() {
     // that follows would keep beeping AFTER the cue, so it would not be the last thing heard. Suspend
     // the alert task and clear whatever it left mid-pattern, so the descending "off" motif plays clean
     // and is the final sound. We only get here on a committed power-off, so the task never resumes.
-    if (gAlertTask) vTaskSuspend(gAlertTask);
-    buzzerOff();
-    ledOff();
+    alertsQuiesce();
     // Johnny Five going back to sleep. The EXACT inverse of the boot jingle above: where boot steps
     // UP (da-da-DEE) and ends on a rising, unresolved "...alive?", this steps DOWN and settles to the
     // floor - the ear reads "off" the moment it resolves low. Same 500-2500 Hz band and 60% scale as
     // boot; and it still obeys the whoosh-era rule that nothing SWEEPS BACK UP (a symmetric up/down
-    // pair reads as a siren) - this only ever descends. The LED master still governs the light,
-    // but detection-alert mute does not suppress this deliberate off confirmation. Volume 0 is
-    // still fully silent. ~0.7s, before the nRF park handshake, so deep sleep never clips it.
-    constexpr AudioPurpose purpose = AudioPurpose::PowerState;
-    beep(1850, 90, 60, purpose); vTaskDelay(pdMS_TO_TICKS(30));   // DEE   - boot's top note, now the START
-    beep(1450, 70, 60, purpose); vTaskDelay(pdMS_TO_TICKS(30));   //  da   - stepping down (boot stepped up)
-    beep(1150, 70, 60, purpose); vTaskDelay(pdMS_TO_TICKS(40));   //   da
-    warble(950, 160, 3, 26, 60, purpose);                          // slowing "spin-down" wobble, lower + lazier
-    caw(1400, 500, 220, 60, purpose);                              // settle: sweep DOWN to the floor, ends low = off
+    // pair reads as a siren) - this only ever descends. The LED master still governs the light, and
+    // detection-alert mute silences this like every other sound (2026-10-11; it used to bypass mute
+    // as a "deliberate" cue, which voiced a muted board on slide-off, button-hold off and app
+    // power-off): a muted board goes off silently, and the switch position or the app's
+    // {"pwr":"off"} notify is its confirmation. ~0.7s, before the nRF park handshake, so deep
+    // sleep never clips it.
+    beep(1850, 90, 60); vTaskDelay(pdMS_TO_TICKS(30));   // DEE   - boot's top note, now the START
+    beep(1450, 70, 60); vTaskDelay(pdMS_TO_TICKS(30));   //  da   - stepping down (boot stepped up)
+    beep(1150, 70, 60); vTaskDelay(pdMS_TO_TICKS(40));   //   da
+    warble(950, 160, 3, 26, 60);                          // slowing "spin-down" wobble, lower + lazier
+    caw(1400, 500, 220, 60);                              // settle: sweep DOWN to the floor, ends low = off
 }
 
 void alertsPowerOnAck() {

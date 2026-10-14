@@ -8,15 +8,23 @@
  * in the PAYLOAD, so it survives the BLE MAC randomization that breaks OUI matching -
  * which is the whole point of keying on it. See docs/signatures.md.
  *
- * CONFIDENCE is graded by how eyewear-specific the registrant is:
- *   - Luxottica / Snapchat only ship eyewear (or, for Snap, only Spectacles), so a hit
- *     is glasses with high confidence.
+ * CONFIDENCE follows the project's own ladder (bodycam_vendor_signatures.h): one SIG company
+ * ID names the VENDOR, never the device type, so every bare company-ID row here sits below
+ * the apps' weak-match line (50) and its detail names the vendor, not "recording glasses":
+ *   - Luxottica / Snapchat / Vuzix (0x0D53 / 0x03C2 / 0x060C) are eyewear-leaning registrants,
+ *     but no capture here has ever heard any of them, and the one capture that COULD have
+ *     (2026-07-31, three Meta glasses worn, below) heard 0x0D53 zero times. Until a worn-unit
+ *     capture exists they are capped at 49 with "<vendor> device, possible glasses" wording,
+ *     which is still above the captured-but-shared 0x01AB at 45. Shipping them at 70 (as this
+ *     table did until 2026-10-11) ranked an unheard ID above the one ID real glasses proved.
  *   - The Meta corporate IDs are SHARED across Meta's whole hardware line, most notably
  *     the Meta Quest VR headset. A passer-by carrying a Quest advertises the SAME
  *     company ID as the Ray-Ban / Oakley Meta glasses, so those IDs are only WEAK
  *     evidence and the detail string must say "may be a Quest, not glasses".
  *   - TCL ships phones, tablets and TVs as well as the RayNeo AR-glasses sub-brand, so
  *     its ID is the weakest signal here.
+ * Only two rows rank above 50, and neither is a bare company ID: the META_RB_GLASS token
+ * (GLASSES_META_CONFIRMED_CONF, 72) and the HeyCyan SDK UUID (GLASSES_HEYCYAN_CONF, 68).
  *
  * SHARED-ID GATE (sharedId flag): the shared IDs 0x058E, 0x0BC6 and 0x05D6 DO NOT match in
  * shipped builds. The first two are the Quest / TCL-phone overlap described below; 0x05D6 is
@@ -53,11 +61,12 @@
  * under the shared 0x058E ID. We check for it (GLASSES_META_TOKEN below) and, when
  * present, upgrade a Meta-ID hit to a confirmed-glasses confidence and drop the Quest
  * caveat. The exact on-wire framing is UNVERIFIED here.
- *   CAPTURE-PENDING: confirm the glasses actually advertise their company ID (and the
- *   META_RB_GLASS token) while WORN in the field, and confirm the token's byte framing,
- *   before trusting these confidences. The advertised device NAME also identifies the
- *   glasses but is generally only exposed during pairing, so it is rarely visible in the
- *   field and is deliberately not matched here.
+ *   CAPTURE-PENDING: confirm Luxottica, Snap and Vuzix units actually advertise their company
+ *   ID while WORN in the field (none has been heard yet; that is why those rows sit at 49 and
+ *   name the vendor, not the type), and confirm the META_RB_GLASS token's byte framing. A
+ *   worn-unit capture is the bar for lifting a row above 50. The advertised device NAME also
+ *   identifies the glasses but is generally only exposed during pairing, so it is rarely
+ *   visible in the field and is deliberately not matched here.
  *   src: Bluetooth SIG assigned-numbers company-identifier registry; Help Net Security /
  *   "nearby glasses" (nearbyglasses) reporting on the Meta-ID Quest overlap.
  */
@@ -70,34 +79,40 @@
 // One BLE manufacturer company ID we treat as a recording-glasses signal.
 struct GlassesSig {
     uint16_t    companyId;    // BLE SIG company identifier (little-endian on the wire)
-    uint8_t     confidence;   // 0..100, graded by how eyewear-specific the registrant is
+    uint8_t     confidence;   // 0..100; every bare company-ID row is below 50 (CONFIDENCE, header)
     bool        sharedId;     // true = ID shared with non-glasses hardware (Quest/TCL): bare match gated OFF
     bool        metaShared;   // true = corporate Meta ID (META_RB_GLASS token can confirm glasses)
-    const char* detail;       // vendor + "possible recording glasses" (+ Quest caveat), <= 47 chars
+    const char* detail;       // vendor name first, lowercase-first after it; the type stays hedged
+                              // ("possible glasses", "possible recording glasses", "type unknown")
+                              // and the Meta rows add the Quest caveat; <= 47 chars
 };
 
-// The verified table. Confidences: eyewear-only registrants (Luxottica/Snap) high;
-// the shared corporate IDs (Meta/TCL) below 50 so that even a build that re-enables
-// them lands in the apps' weak-match "verify this" band, never a calm partial match.
+// The verified table. Every bare company-ID row is below 50 (see the CONFIDENCE ladder in the
+// header): the uncaptured eyewear registrants at 49, the captured-but-shared 0x01AB at 45, the
+// gated shared IDs at 49/45/40 so that even a build that re-enables them lands in the apps'
+// weak-match "verify this" band, never a calm partial match.
 static const GlassesSig GLASSES_SIGS[] = {
-    // 0x0D53  Luxottica Group S.p.A  - eyewear-ONLY registrant (Luxottica / EssilorLuxottica),
+    // 0x0D53  Luxottica Group S.p.A  - eyewear registrant (Luxottica / EssilorLuxottica),
     //   associated with the Ray-Ban Meta frames. Confirmed present in the Nordic SIG mirror.
-    //   Eyewear-specific, so no payload discriminator is needed. Highest of the glasses tier,
-    //   but CAPTURE-PENDING, so still below the field-validated Axon OUI (75).
+    //   CAPTURE-PENDING, and the evidence so far runs the other way: the 2026-07-31 capture
+    //   (header) heard it ZERO times while three Ray-Ban / Oakley Meta glasses were worn. Capped
+    //   at 49 until a worn unit is heard on it; the detail names the vendor, not the type.
     //   src: Bluetooth SIG company-identifier registry.
-    { 0x0D53, 70, false, false, "Luxottica: possible recording glasses" },
+    { 0x0D53, 49, false, false, "Luxottica device, possible glasses" },
 
-    // 0x03C2  Snapchat Inc  - Snap Spectacles camera glasses. Snap's only BLE hardware is
-    //   Spectacles, so this is effectively eyewear-only for detection. HIGHER confidence.
+    // 0x03C2  Snapchat Inc  - Snap's only BLE hardware is Spectacles, so a hit LEANS eyewear,
+    //   but a company ID still names the vendor, not the device, and no capture here has ever
+    //   heard this ID. Capped at 49 until a worn Spectacles unit is captured on it.
     //   src: Bluetooth SIG company-identifier registry.
-    { 0x03C2, 70, false, false, "Snap Spectacles: recording glasses" },
+    { 0x03C2, 49, false, false, "Snap device, possible glasses" },
 
-    // 0x060C  Vuzix Corporation  - AR-eyewear-ONLY maker whose products (Blade, M400,
-    //   Shield, Z100) carry on-board cameras. No phones / VR headsets / shared hardware
-    //   line, so a hit is glasses with no Quest-style caveat. Eyewear-specific = HIGHER
-    //   confidence, no payload discriminator needed. Not shared, not Meta.
+    // 0x060C  Vuzix Corporation  - enterprise AR-eyewear maker. Blade, M400 and Shield carry
+    //   on-board cameras; the Z100 is a camera-less waveguide display, so even a confirmed
+    //   Vuzix hit is NOT automatically a recording device, and no capture here has ever heard
+    //   the ID at all. Capped at 49 with type-unknown wording until a worn unit is captured.
+    //   Not shared, not Meta.
     //   src: Bluetooth SIG company-identifier registry.
-    { 0x060C, 70, false, false, "Vuzix: possible recording glasses" },
+    { 0x060C, 49, false, false, "Vuzix equipment, type unknown" },
 
     // 0x058E  Meta Platforms Technologies, LLC  - Ray-Ban / Oakley Meta AI glasses AND the
     //   Meta Quest VR headset (former Oculus / Facebook Technologies). SHARED hardware ID =
@@ -202,9 +217,10 @@ static const GlassesSvcUuid GLASSES_SVC_UUIDS[] = {
     { 0xFEB8, 45, false, "Meta: possible recording glasses or Quest" },
     // Same registrant as company ID 0x058E (the Quest). Gated for the same reason.
     { 0xFD5F, 49, true,  "Meta: possible recording glasses or Quest" },
-    // Snapchat's member UUID, the service-UUID twin of company ID 0x03C2. Snap's only BLE
-    // hardware is Spectacles, so eyewear-only = same high confidence as its company ID.
-    { 0xFE45, 70, false, "Snap Spectacles: recording glasses" },
+    // Snapchat's member UUID, the service-UUID twin of company ID 0x03C2: same registrant, same
+    // never-captured state, so the same 49 cap and vendor-not-type wording (an equal grade is
+    // also what keeps the documented FE45 + 0x03C2 tie resolving to M_SERVICE_UUID).
+    { 0xFE45, 49, false, "Snap device, possible glasses" },
 };
 static const size_t GLASSES_SVC_UUID_COUNT =
     sizeof(GLASSES_SVC_UUIDS) / sizeof(GLASSES_SVC_UUIDS[0]);
@@ -212,7 +228,10 @@ static const size_t GLASSES_SVC_UUID_COUNT =
 // ASCII token the Ray-Ban / Oakley Meta glasses are reported to carry in their
 // manufacturer data, used to tell them apart from a Meta Quest under the shared Meta
 // IDs. CAPTURE-PENDING (byte framing unverified) - matched in both byte orders via
-// acabBytesContainAscii, and only used as a confidence bump, never a standalone match.
+// acabBytesContainAscii. It only ever rides inside a Meta (metaShared) 0xFF record, so it is
+// not a match without a Meta company ID, but it is more than a bump: with the token present
+// the otherwise-gated shared 0x058E emits at GLASSES_META_CONFIRMED_CONF with nothing else
+// in the advert (glasses_detect.cpp, the tokenConfirmed gate bypass).
 #define GLASSES_META_TOKEN  "META_RB_GLASS"
 
 // Confidence a Meta-ID hit is upgraded to once the META_RB_GLASS token confirms glasses

@@ -15,29 +15,51 @@
 // HOW THE ODID DECODER GETS HERE: run.sh compiles this file plus drone_detect.cpp and nothing
 // else, but the decode lives in the vendored opendroneid library (Apache-2.0). Rather than fake
 // the decoder and end up asserting against our own fake, we #include the vendored opendroneid.c
-// into this translation unit, so every Remote ID assertion below runs the REAL decoder over REAL
-// wire bytes produced by the REAL encoder. Its sibling wifi.c cannot be compiled on a laptop (it
-// wants <byteswap.h> and the ESP32 Arduino headers), so the two entry points that live there are
-// defined below: odid_message_process_pack mirrors the vendored body over the real decodeMessagePack,
-// and the NAN action-frame parser is an explicit test-controlled fake. See their comments.
+// AND its sibling wifi.c into this translation unit, so every Remote ID assertion below runs the
+// REAL decoder and the REAL 802.11 pack/NAN parser (both LOCAL SECURITY PATCHes included) over
+// REAL wire bytes produced by the REAL encoder. wifi.c wants <byteswap.h>, which macOS lacks;
+// stubs/byteswap.h supplies the three macros. The one seam is the NAN receive shim below.
 #include "drone_detect.h"
 #include "drone_signatures.h"
 
 // Pulled in BEFORE the extern "C" block on purpose: opendroneid.c includes <math.h> and <stdio.h>,
-// and dragging a system header into a C-linkage block is how you get a mystery build failure on a
-// different libc. Their include guards make the ones inside the block no-ops.
+// wifi.c <errno.h> and <time.h>, and dragging a system header into a C-linkage block is how you
+// get a mystery build failure on a different libc. Their include guards make the ones inside the
+// block no-ops.
+#include <errno.h>
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <stddef.h>
 #include <stdint.h>
+#include <time.h>
 #include <vector>
 #include <Arduino.h>   // the host stub's deterministic millis(), for the track-TTL test
 
 extern "C" {
 #include "opendroneid/opendroneid.h"
 #include "opendroneid/opendroneid.c"   // the real Apache-2.0 decoder, not a stand-in
+// The real wifi.c defines the NAN receive entry point drone_detect.cpp links against. Rename that
+// one definition so the shim below can own the public name and forward to it.
+#define odid_wifi_receive_message_pack_nan_action_frame acabRealNanReceive
+// wifi.c is C: its pack builder hands (void *) to the typed encode* functions, which C++ rejects.
+// These add the cast at those call sites only. They sit after opendroneid.c so they cannot touch
+// the definitions there, and are undefined again right after wifi.c.
+#define encodeBasicIDMessage(e, d)    encodeBasicIDMessage((ODID_BasicID_encoded*)(e), (d))
+#define encodeLocationMessage(e, d)   encodeLocationMessage((ODID_Location_encoded*)(e), (d))
+#define encodeAuthMessage(e, d)       encodeAuthMessage((ODID_Auth_encoded*)(e), (d))
+#define encodeSelfIDMessage(e, d)     encodeSelfIDMessage((ODID_SelfID_encoded*)(e), (d))
+#define encodeSystemMessage(e, d)     encodeSystemMessage((ODID_System_encoded*)(e), (d))
+#define encodeOperatorIDMessage(e, d) encodeOperatorIDMessage((ODID_OperatorID_encoded*)(e), (d))
+#include "opendroneid/wifi.c"          // the real pack + NAN parser, with the local bounds patches
+#undef encodeBasicIDMessage
+#undef encodeLocationMessage
+#undef encodeAuthMessage
+#undef encodeSelfIDMessage
+#undef encodeSystemMessage
+#undef encodeOperatorIDMessage
+#undef odid_wifi_receive_message_pack_nan_action_frame
 }
 
 // ---------------------------------------------------------------------------
@@ -52,43 +74,18 @@ bool desertIsEnabled(void) { return gDesert; }
 // acabSanitizeAscii is NOT defined here: it is inline in acab_scanner.h, so every string the drone
 // detector emits (UAS ID, operator ID) goes through the real clamp.
 
-extern "C" {
-// Faithful host copy of the vendored wifi.c body (that file cannot be compiled here). It does the
-// same two bounds checks and then hands off to the REAL decodeMessagePack from opendroneid.c, so
-// the packed-message path below is a real decode rather than a scripted answer.
-int odid_message_process_pack(ODID_UAS_Data* uas, uint8_t* pack, size_t buflen) {
-    ODID_MessagePack_encoded* enc = (ODID_MessagePack_encoded*)pack;
-    if (buflen < offsetof(ODID_MessagePack_encoded, Messages)) return -1;
-    size_t size = sizeof(*enc) - ODID_MESSAGE_SIZE * (ODID_PACK_MAX_MESSAGES - enc->MsgPackSize);
-    if (size > buflen) return -1;
-    odid_initUasData(uas);
-    if (decodeMessagePack(uas, enc) != ODID_SUCCESS) return -1;
-    return (int)size;
-}
-
-// EXPLICIT FAKE: the only piece of real parsing logic this file stands in for. The NAN action-frame
-// parser lives in wifi.c and cannot be built on a laptop. That is fine for what the WiFi NAN
-// tests are actually about, which is OUR routing and not Intel's parser: that a frame carrying the
-// multicast destination reaches the parser at all, that a parse failure suppresses the detection
-// (and hands over to the OUI fallback), and that the emitted MAC comes from addr2 rather than from
-// the parser's out-param. Test drives it through the two globals below.
-static int  gNanRc    = 0;              // what the vendored parser "returns"; 0 = parsed
+// ROUTING SHIM over the real NAN parser. Every frame goes to acabRealNanReceive unless a test
+// scripts a failure through gNanRc, which is what the routing tests need: that a parse failure
+// suppresses the detection (and hands over to the OUI fallback), and that the frame reached the
+// parser at all (gNanCalls). The parsing itself is never faked.
+static int  gNanRc    = 0;              // nonzero: pretend the vendored parser rejected the frame
 static int  gNanCalls = 0;              // proves the frame reached the parser
-static char gNanUasId[ODID_ID_SIZE + 1] = "NANDRONE0000000000AA";
-int odid_wifi_receive_message_pack_nan_action_frame(ODID_UAS_Data* uas, char* mac,
-                                                   uint8_t* buf, size_t buf_size) {
-    (void)buf; (void)buf_size;
+extern "C" int odid_wifi_receive_message_pack_nan_action_frame(ODID_UAS_Data* uas, char* mac,
+                                                              uint8_t* buf, size_t buf_size) {
     gNanCalls++;
     if (gNanRc != 0) return gNanRc;
-    odid_initUasData(uas);
-    uas->BasicID[0].IDType = ODID_IDTYPE_SERIAL_NUMBER;
-    uas->BasicID[0].UAType = ODID_UATYPE_HELICOPTER_OR_MULTIROTOR;
-    memcpy(uas->BasicID[0].UASID, gNanUasId, ODID_ID_SIZE);
-    uas->BasicIDValid[0] = 1;
-    if (mac) memset(mac, 0x77, 6);      // the real one fills 6 bytes here; the caller ignores them
-    return 0;
+    return acabRealNanReceive(uas, mac, buf, buf_size);
 }
-} // extern "C"
 
 // ---------------------------------------------------------------------------
 // Assertion helpers. failures, chk_impl and the chk macro (and why it must stay a macro) come from
@@ -106,14 +103,17 @@ static bool nearly(double a, double b) { return fabs(a - b) < 1e-6; }
 // ODID message builders. These run the vendored ENCODER, so the bytes handed to the classifier are
 // the same bytes a drone puts on the air - the test cannot pass by agreeing with itself.
 // ---------------------------------------------------------------------------
-static void mkBasicID(uint8_t msg[ODID_MESSAGE_SIZE], const char* uasId) {
+static void mkBasicIDT(uint8_t msg[ODID_MESSAGE_SIZE], const char* uasId, ODID_idtype_t idType) {
     ODID_BasicID_data b; odid_initBasicIDData(&b);
-    b.IDType = ODID_IDTYPE_SERIAL_NUMBER;
+    b.IDType = idType;
     b.UAType = ODID_UATYPE_HELICOPTER_OR_MULTIROTOR;
     strncpy(b.UASID, uasId, sizeof(b.UASID) - 1);
     ODID_BasicID_encoded e; memset(&e, 0, sizeof(e));
     if (encodeBasicIDMessage(&e, &b) != ODID_SUCCESS) { printf("  !! BasicID builder failed\n"); failures++; }
     memcpy(msg, &e, ODID_MESSAGE_SIZE);
+}
+static void mkBasicID(uint8_t msg[ODID_MESSAGE_SIZE], const char* uasId) {
+    mkBasicIDT(msg, uasId, ODID_IDTYPE_SERIAL_NUMBER);
 }
 // Same message, but the ID bytes are written raw so a test can put hostile non-ASCII in there
 // (the encoder's strncpy would stop at the first NUL).
@@ -201,24 +201,73 @@ static void addFlags(std::vector<uint8_t>& a) {
 }
 
 // ---- 802.11 frame builders ----
-static std::vector<uint8_t> mkBeacon(const uint8_t addr2[6], const uint8_t oui[3],
-                                     const uint8_t* pack, size_t packLen) {
+// Hand-built beacon: header + fixed params, then one vendor IE [dd][len][OUI][type][counter][pack].
+// ouiType 0x0D is Remote ID (what the vendored encoder writes); the tests pass other values to
+// prove the type gate.
+static std::vector<uint8_t> mkBeaconT(const uint8_t addr2[6], const uint8_t oui[3], uint8_t ouiType,
+                                      const uint8_t* pack, size_t packLen) {
     std::vector<uint8_t> f(36, 0);          // 24-byte mgmt header + 12 bytes of fixed params
     f[0] = 0x80;                            // type/subtype: beacon
     memcpy(&f[10], addr2, 6);               // addr2 = transmitter
     f.push_back(0xdd);                      // vendor-specific IE
     f.push_back((uint8_t)(4 + 1 + packLen));
     f.push_back(oui[0]); f.push_back(oui[1]); f.push_back(oui[2]);
-    f.push_back(0x13);                      // ODID IE type
+    f.push_back(ouiType);
     f.push_back(0x01);                      // message counter
     for (size_t i = 0; i < packLen; i++) f.push_back(pack[i]);
     return f;
 }
+static std::vector<uint8_t> mkBeacon(const uint8_t addr2[6], const uint8_t oui[3],
+                                     const uint8_t* pack, size_t packLen) {
+    return mkBeaconT(addr2, oui, 0x0D, pack, packLen);
+}
+// Bare action frame with the NAN destination and nothing valid behind it: for the routing tests,
+// which only care whether drone_detect hands the frame to the parser.
 static std::vector<uint8_t> mkNan(const uint8_t addr2[6], const uint8_t dest[6]) {
     std::vector<uint8_t> f(64, 0);
     f[0] = 0xd0;                            // action frame
     memcpy(&f[4], dest, 6);                 // addr1 = the NAN multicast destination
     memcpy(&f[10], addr2, 6);
+    return f;
+}
+// Frames from the vendored ENCODER (wifi.c), so the real NAN and beacon parsers see the bytes a
+// drone's Wi-Fi radio puts on the air. caa may be null; lat 0 means no Location message.
+static void mkUas(ODID_UAS_Data& u, const char* serial, const char* caa, double lat, double lon) {
+    odid_initUasData(&u);
+    int n = 0;
+    if (serial) {
+        u.BasicID[n].IDType = ODID_IDTYPE_SERIAL_NUMBER;
+        u.BasicID[n].UAType = ODID_UATYPE_HELICOPTER_OR_MULTIROTOR;
+        strncpy(u.BasicID[n].UASID, serial, ODID_ID_SIZE);
+        u.BasicIDValid[n++] = 1;
+    }
+    if (caa) {
+        u.BasicID[n].IDType = ODID_IDTYPE_CAA_REGISTRATION_ID;
+        u.BasicID[n].UAType = ODID_UATYPE_HELICOPTER_OR_MULTIROTOR;
+        strncpy(u.BasicID[n].UASID, caa, ODID_ID_SIZE);
+        u.BasicIDValid[n++] = 1;
+    }
+    if (lat != 0.0) {
+        u.Location.Status    = ODID_STATUS_AIRBORNE;
+        u.Location.Latitude  = lat;
+        u.Location.Longitude = lon;
+        u.LocationValid = 1;
+    }
+}
+static std::vector<uint8_t> mkRealNan(const uint8_t addr2[6], ODID_UAS_Data& u) {
+    char mac[6]; memcpy(mac, addr2, 6);
+    std::vector<uint8_t> f(512, 0);
+    int n = odid_wifi_build_message_pack_nan_action_frame(&u, mac, 1, f.data(), f.size());
+    if (n <= 0) { printf("  !! NAN frame builder failed (%d)\n", n); failures++; n = 0; }
+    f.resize((size_t)n);
+    return f;
+}
+static std::vector<uint8_t> mkRealBeacon(const uint8_t addr2[6], ODID_UAS_Data& u) {
+    char mac[6]; memcpy(mac, addr2, 6);
+    std::vector<uint8_t> f(512, 0);
+    int n = odid_wifi_build_message_pack_beacon_frame(&u, mac, "RID", 3, 100, 1, f.data(), f.size());
+    if (n <= 0) { printf("  !! beacon frame builder failed (%d)\n", n); failures++; n = 0; }
+    f.resize((size_t)n);
     return f;
 }
 
@@ -359,13 +408,12 @@ int main() {
       ok("adopt: BasicID takes over the MAC-keyed track",
          hit && strcmp(d.id, "ADOPTDRONE0000000001") == 0 && nearly(d.lat, 33.20)); }
 
-    // Operator ID lands in `detail`, prefixed "op ". Note the dot padding: the operator ID is
-    // sanitized over all 20 ODID bytes, so a shorter ID keeps its NUL padding as dots. That is
-    // what the app shows today; asserted as-is rather than as what it ought to be.
+    // Operator ID lands in `detail`, prefixed "op ". A short ID arrives NUL-padded to 20 bytes
+    // and the sanitizer used to turn that padding into dots ("op FAA-OP-777..........").
     { std::vector<uint8_t> a; mkOperatorID(msg, "FAA-OP-777"); addOdid(a, msg, sizeof(msg));
       hit = runBLE(macOp, a, &d);
-      chk("OperatorID -> detail \"op <id>\"", hit, true, d.confidence, 99, d.detail,
-          "op FAA-OP-777.........."); }
+      chk("OperatorID -> detail \"op <id>\", no dot padding", hit, true, d.confidence, 99, d.detail,
+          "op FAA-OP-777"); }
 
     // System message = where the PILOT is standing. This is the part that had never been seen
     // against a real flight until 2026-07-23, and it is a separate field from the aircraft fix.
@@ -388,12 +436,57 @@ int main() {
       ok("  ... both messages decoded from one advert",
          strcmp(d.id, "PACKEDDRONE000000001") == 0 && nearly(d.lat, 34.05)); }
 
-    // A short serial keeps its NUL padding as dots, because the sanitizer is handed the full
-    // 20-byte ODID field. CONCERN, locked in as-is: the app displays "DRONE1..............".
+    // A short serial is emitted as sent. The sanitizer used to be handed the full 20-byte ODID
+    // field, so the app showed "DRONE1.............." and the ID matched no registry lookup.
     { std::vector<uint8_t> a; mkBasicID(msg, "DRONE1"); addOdid(a, msg, sizeof(msg));
       hit = runBLE(macShort, a, &d);
-      ok("short UAS ID is dot-padded to 20 (current behaviour)",
-         hit && strcmp(d.id, "DRONE1..............") == 0); }
+      ok("short UAS ID is not dot-padded", hit && strcmp(d.id, "DRONE1") == 0); }
+
+    // One drone, two BasicIDs (F3411 allows a serial plus a CAA registration or session ID; EU
+    // class-marked aircraft do this). Both must land on ONE track: the second ID used to open a
+    // twin track, so the CAA frame emitted the CAA id with no position and the row flickered.
+    { const uint8_t macDual[6] = {0x60, 0x60, 0x1f, 0x33, 0x44, 0x03};
+      std::vector<uint8_t> a; mkBasicID(msg, "DUALSERIAL0000000001"); addOdid(a, msg, sizeof(msg));
+      hit = runBLE(macDual, a, &d);
+      ok("dual ID: serial BasicID first", hit && strcmp(d.id, "DUALSERIAL0000000001") == 0);
+      std::vector<uint8_t> b; mkLocation(msg2, 33.50, -117.50, true); addOdid(b, msg2, sizeof(msg2));
+      hit = runBLE(macDual, b, &d);
+      ok("dual ID: Location joins the serial track", hit && nearly(d.lat, 33.50));
+      std::vector<uint8_t> c; mkBasicIDT(msg, "FAA-REG-0001", ODID_IDTYPE_CAA_REGISTRATION_ID);
+      addOdid(c, msg, sizeof(msg));
+      hit = runBLE(macDual, c, &d);
+      ok("dual ID: CAA BasicID keeps the serial id and the position",
+         hit && strcmp(d.id, "DUALSERIAL0000000001") == 0 && nearly(d.lat, 33.50));
+      hit = runBLE(macDual, b, &d);
+      ok("dual ID: next Location still carries the serial id",
+         hit && strcmp(d.id, "DUALSERIAL0000000001") == 0 && nearly(d.lat, 33.50)); }
+    // Reverse order: the CAA id is emitted until the serial shows up, then the serial takes over
+    // for good (serial first), and the position collected meanwhile stays with the track.
+    { const uint8_t macDual2[6] = {0x60, 0x60, 0x1f, 0x33, 0x44, 0x04};
+      std::vector<uint8_t> a; mkBasicIDT(msg, "FAA-REG-0002", ODID_IDTYPE_CAA_REGISTRATION_ID);
+      addOdid(a, msg, sizeof(msg));
+      hit = runBLE(macDual2, a, &d);
+      ok("dual ID reversed: CAA id first", hit && strcmp(d.id, "FAA-REG-0002") == 0);
+      std::vector<uint8_t> b; mkLocation(msg2, 33.60, -117.60, true); addOdid(b, msg2, sizeof(msg2));
+      hit = runBLE(macDual2, b, &d);
+      std::vector<uint8_t> c; mkBasicID(msg, "DUALSERIAL0000000002"); addOdid(c, msg, sizeof(msg));
+      hit = runBLE(macDual2, c, &d);
+      ok("dual ID reversed: serial takes over, position persists",
+         hit && strcmp(d.id, "DUALSERIAL0000000002") == 0 && nearly(d.lat, 33.60));
+      hit = runBLE(macDual2, a, &d);
+      ok("dual ID reversed: a repeat CAA frame does not flip the id back",
+         hit && strcmp(d.id, "DUALSERIAL0000000002") == 0 && nearly(d.lat, 33.60)); }
+    // A pack carrying both BasicIDs, CAA first: the decoder puts the CAA in BasicID[0] and the
+    // serial in BasicID[1]. Only slot 0 used to be read, so the emitted id was the CAA one.
+    { const uint8_t macDual3[6] = {0x60, 0x60, 0x1f, 0x33, 0x44, 0x05};
+      uint8_t caa[ODID_MESSAGE_SIZE], ser[ODID_MESSAGE_SIZE];
+      mkBasicIDT(caa, "FAA-REG-0003", ODID_IDTYPE_CAA_REGISTRATION_ID); mkBasicID(ser, "DUALSERIAL0000000003");
+      memcpy(two, caa, ODID_MESSAGE_SIZE); memcpy(two + ODID_MESSAGE_SIZE, ser, ODID_MESSAGE_SIZE);
+      size_t n = mkPack(pack, two, 2);
+      std::vector<uint8_t> a; addOdid(a, pack, n);
+      hit = runBLE(macDual3, a, &d);
+      ok("dual ID in one pack, CAA first: the serial is the id",
+         hit && strcmp(d.id, "DUALSERIAL0000000003") == 0); }
 
     // Hostile ID bytes must not reach the app as control characters: iOS silently drops invalid
     // JSON, which would suppress the live alert entirely. Every byte outside printable ASCII
@@ -418,7 +511,7 @@ int main() {
       std::vector<uint8_t> a; addOdid(a, msg, sizeof(msg));
       hit = runBLE(macNul, a, &d);
       ok("bytes after an embedded NUL never reach the app",
-         hit && strcmp(d.id, "DJI.................") == 0); }
+         hit && strcmp(d.id, "DJI") == 0); }
 
     // A garbage int32 in the encoded latitude decodes to as much as +/-214 degrees, and a
     // non-finite Mercator projection freezes the map in both apps. The fix keeps the detection but
@@ -469,13 +562,18 @@ int main() {
       addOdidLike(a, 0xFA, 0xFF, 0x0C, msg, sizeof(msg));
       hit = runBLE(macPhone, a, &d);
       chk("app code 0x0C instead of 0x0D -> no hit", hit, false); }
-    // Truncated ODID message: shorter than one 25-byte record. Note droneRidBLE RETURNS here
-    // rather than continuing the walk, so a truncated block also hides any later ODID block.
+    // Truncated ODID message: shorter than one 25-byte record.
     { std::vector<uint8_t> a; a.push_back(20); a.push_back(0x16); a.push_back(0xFA);
       a.push_back(0xFF); a.push_back(0x0D); a.push_back(0x01);
       for (int i = 0; i < 15; i++) a.push_back(0x00);
       hit = runBLE(macPhone, a, &d);
-      chk("ODID block too short for one message -> no hit", hit, false); }
+      chk("ODID block too short for one message -> no hit", hit, false);
+      // ... and the walk goes on: droneRidBLE used to RETURN on the short block, so it hid any
+      // later ODID block. (Needs more than 31 bytes, so extended advertising in practice.)
+      mkBasicID(msg, "AFTERSHORTBLOCK00001"); addOdid(a, msg, sizeof(msg));
+      hit = runBLE(macPhone, a, &d);
+      chk("too-short ODID element then a valid one -> hit", hit, true, d.confidence, 99, d.detail);
+      ok("  ... the later element's ID decoded", strcmp(d.id, "AFTERSHORTBLOCK00001") == 0); }
     // A well-formed advert carrying a message type the decoder rejects: nothing useful decoded,
     // so fillFromODID must decline rather than emit an empty confidence-99 drone.
     { std::vector<uint8_t> a; memset(msg, 0, sizeof(msg)); msg[0] = 0x70;   // reserved type 7
@@ -630,20 +728,32 @@ int main() {
       hit = runWiFi(f, &d);
       chk("frame shorter than an 802.11 header -> no hit", hit, false); }
 
-    { const uint8_t nanDest[6] = {0x51, 0x6f, 0x9a, 0x01, 0x00, 0x00};
-      const uint8_t addr2[6]   = {0x34, 0xd2, 0x62, 0x55, 0x66, 0x01};
-      strncpy(gNanUasId, "NANDRONE000000000001", ODID_ID_SIZE);
+    // NAN action frame from the vendored encoder, through the REAL vendored parser (wifi.c, with
+    // its two local bounds patches). Two BasicIDs plus a Location in one pack.
+    { const uint8_t addr2[6] = {0x34, 0xd2, 0x62, 0x55, 0x66, 0x01};
+      ODID_UAS_Data u; mkUas(u, "NANDRONE000000000001", "FAA-REG-NAN1", 32.95, -117.15);
+      std::vector<uint8_t> f = mkRealNan(addr2, u);
       gNanCalls = 0; gNanRc = 0;
-      std::vector<uint8_t> f = mkNan(addr2, nanDest);
       hit = runWiFi(f, &d);
       chk("NAN action frame (multicast 51:6f:9a:01:00:00)", hit, true, d.confidence, 99, d.detail);
       ok("  ... reached the ODID parser exactly once", gNanCalls == 1);
       ok("  ... MAC taken from addr2, source SRC_REMOTEID",
          memcmp(d.mac, addr2, 6) == 0 && d.src == SRC_REMOTEID);
-      droneSetEnabled(false); gDesert = true; gNanRc = 0;
+      ok("  ... serial id and position out of the real parser",
+         strcmp(d.id, "NANDRONE000000000001") == 0 && nearly(d.lat, 32.95) && nearly(d.lon, -117.15));
+      droneSetEnabled(false); gDesert = true;
       hit = runWiFi(f, &d);
       chk("Desert overrides the master toggle on WiFi too", hit, true, d.confidence, 99, d.detail);
-      droneSetEnabled(true); gDesert = false; }
+      droneSetEnabled(true); gDesert = false;
+      // Every truncation of that frame is rejected by the real parser. The second LOCAL SECURITY
+      // PATCH is what keeps a short frame from underflowing the pack length; under --sanitize a
+      // regression here reads past the buffer and fails the run.
+      bool anyHit = false;
+      for (size_t n = 24; n < f.size(); n++) {
+          std::vector<uint8_t> g(f.begin(), f.begin() + (long)n);   // exact-size copy, no slack
+          if (runWiFi(g, &d)) anyHit = true;
+      }
+      ok("every truncated NAN frame -> no hit", !anyHit); }
 
     { const uint8_t nearDest[6] = {0x51, 0x6f, 0x9a, 0x01, 0x00, 0x01};   // one off the multicast
       const uint8_t addr2[6]    = {0x34, 0xd2, 0x62, 0x55, 0x66, 0x02};
@@ -700,6 +810,68 @@ int main() {
       hit = runWiFi(f, &d);
       chk("beacon with a near-miss vendor OUI -> no hit", hit, false); }
 
+    // Beacon from the vendored encoder (fa:0b:bc, OUI type 0x0D, after SSID and rates IEs),
+    // through the real parser, then every truncation of it.
+    { const uint8_t addr2[6] = {0xe4, 0x7a, 0x2c, 0x55, 0x66, 0x07};
+      ODID_UAS_Data u; mkUas(u, "ENCBEACON00000000001", nullptr, 32.96, -117.16);
+      std::vector<uint8_t> f = mkRealBeacon(addr2, u);
+      hit = runWiFi(f, &d);
+      chk("encoder-built beacon through the real parser", hit, true, d.confidence, 99, d.detail);
+      ok("  ... id and position decoded",
+         strcmp(d.id, "ENCBEACON00000000001") == 0 && nearly(d.lat, 32.96) && nearly(d.lon, -117.16));
+      bool anyHit = false;
+      for (size_t n = 24; n < f.size(); n++) {
+          std::vector<uint8_t> g(f.begin(), f.begin() + (long)n);
+          if (runWiFi(g, &d)) anyHit = true;
+      }
+      ok("every truncated beacon -> no hit", !anyHit); }
+
+    // The OUI-type gate. 90:3a:e6 is Parrot SA's corporate OUI, so Parrot gear carries other
+    // vendor IEs under it; the walk used to match on the OUI alone and return after the first one,
+    // so a decoy IE ahead of the real Remote ID IE hid the drone.
+    { uint8_t bid[ODID_MESSAGE_SIZE];
+      mkBasicID(bid, "DECOYIE0000000000001");
+      size_t n = mkPack(pack, bid, 1);
+      const uint8_t wfaOui[3] = {0x90, 0x3a, 0xe6};
+      const uint8_t addr2[6]  = {0xe4, 0x7a, 0x2c, 0x55, 0x66, 0x08};
+      std::vector<uint8_t> f = mkBeacon(addr2, wfaOui, pack, n);
+      const uint8_t decoy[8]  = {0xdd, 0x06, 0x90, 0x3a, 0xe6, 0x01, 0xaa, 0xbb};   // 8-byte IE, type 0x01
+      f.insert(f.begin() + 36, decoy, decoy + sizeof(decoy));
+      hit = runWiFi(f, &d);
+      chk("decoy 90:3a:e6 IE ahead of the real ODID IE -> still hits", hit, true, d.confidence, 99, d.detail);
+      ok("  ... decoded from the second IE", strcmp(d.id, "DECOYIE0000000000001") == 0);
+      std::vector<uint8_t> g = mkBeaconT(addr2, wfaOui, 0x13, pack, n);   // 0x13: wifi.c's NAN type, not Remote ID
+      hit = runWiFi(g, &d);
+      chk("ODID pack under 90:3a:e6 with OUI type 0x13 -> no hit", hit, false); }
+
+    // The decode is bounded to the IE. A pack header claiming two messages inside an IE that holds
+    // one used to be decoded against the rest of the frame, so whatever followed the IE (here a
+    // Location message, on the air the FCS or another IE) became the drone's second message.
+    { uint8_t bid[ODID_MESSAGE_SIZE], loc[ODID_MESSAGE_SIZE];
+      mkBasicID(bid, "BOUNDEDIE00000000001"); mkLocation(loc, 33.70, -117.70, true);
+      size_t n = mkPack(pack, bid, 1);
+      pack[2] = 2;                                                       // MsgPackSize: claims 2, IE holds 1
+      const uint8_t astmOui[3] = {0xfa, 0x0b, 0xbc};
+      const uint8_t addr2[6]   = {0xe4, 0x7a, 0x2c, 0x55, 0x66, 0x09};
+      std::vector<uint8_t> f = mkBeacon(addr2, astmOui, pack, n);
+      for (size_t i = 0; i < ODID_MESSAGE_SIZE; i++) f.push_back(loc[i]);   // trailing bytes after the IE
+      hit = runWiFi(f, &d);
+      chk("pack claiming more messages than its IE holds -> no hit", hit, false); }
+
+    // Header-only ODID IEs at the very end of the frame: zero or one pack byte. The first LOCAL
+    // SECURITY PATCH in wifi.c rejects these before reading MsgPackSize; under --sanitize a
+    // regression reads past the buffer.
+    { const uint8_t astmOui[3] = {0xfa, 0x0b, 0xbc};
+      const uint8_t addr2[6]   = {0xe4, 0x7a, 0x2c, 0x55, 0x66, 0x0a};
+      bool anyHit = false;
+      for (size_t packLen = 0; packLen < 3; packLen++) {
+          const uint8_t stub[2] = {0xf2, 0x19};                          // looks like a pack header start
+          std::vector<uint8_t> f = mkBeacon(addr2, astmOui, stub, packLen);
+          std::vector<uint8_t> g(f.begin(), f.end());                    // exact-size copy, no slack
+          if (runWiFi(g, &d)) anyHit = true;
+      }
+      ok("ODID IE shorter than a pack header -> no hit", !anyHit); }
+
     // Hostile IE length: the tagged-parameter walk must run off the end rather than into it.
     { std::vector<uint8_t> f(36, 0); f[0] = 0x80;
       f.push_back(0xdd); f.push_back(200);                               // claims 200 bytes, has 4
@@ -739,10 +911,10 @@ int main() {
     droneSetEnabled(true);
     droneOuiSetEnabled(false);
 
-    // A Parrot-block WiFi CLIENT is not an aircraft (the owner's 90:3a:e6:15:b9:e3 only probed,
-    // 911.log/913.log). As an AP (the ANAFI Thermal shape) it is Parrot gear, but only with the
-    // opt-in on: Desert alone does not force the fallback.
-    { const uint8_t parrot[6] = {0x90, 0x3a, 0xe6, 0x15, 0xb9, 0xe3};
+    // A Parrot-block WiFi CLIENT is not an aircraft (the one OUI 90:3A:E6 device in captures
+    // 911.log/913.log only probed). As an AP (the ANAFI Thermal shape) it is Parrot gear, but only
+    // with the opt-in on: Desert alone does not force the fallback.
+    { const uint8_t parrot[6] = {0x90, 0x3a, 0xe6, 0x01, 0x02, 0x04};
       for (int desert = 0; desert < 2; desert++) for (int oui = 0; oui < 2; oui++) {
         if (!desert && !oui) continue;
         gDesert = desert; droneOuiSetEnabled(oui);

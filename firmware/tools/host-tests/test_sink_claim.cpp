@@ -259,13 +259,22 @@ int main() {
       chk("a non-buffering detection never even looks the table up",
           !acabSinkClaimRollback(c, api) && !t.lookupCalled, true); }
 
-    // ---- what may claim at all ----------------------------------------------------------------
-    // The ring is FIFO and type-blind, so shouldBuffer's type term is the ONLY thing that keeps
-    // Desert's ACAB_NEARBY_DEVICE flood from wrapping away the signature rows, and det_log's flood
-    // limit assumes it (det_log.h). The tracker debounce term keeps tags you merely pass out of the
-    // ring. acab_scanner.cpp is not host-compiled, so pin the WHOLE statement in its source, with
-    // line comments stripped and whitespace collapsed: a substring pin passed with the type term
-    // commented out or with an `|| ...` added beside it.
+    // ---- sink-queue headroom for the firehoses ------------------------------------------------
+    // Desert's nearby rows and the netcam opt-in share the sink queue with every signature hit. The
+    // reserve is what keeps a dense scene from filling the queue under a Flock, drone or body cam.
+    printf("\n  -- firehose headroom --\n");
+    chk("firehose admitted only with MORE than ACAB_SINK_Q_RESERVE slots free",
+        acabSinkAdmitsFirehose(ACAB_SINK_Q_RESERVE + 1) && !acabSinkAdmitsFirehose(ACAB_SINK_Q_RESERVE),
+        true);
+    chk("a full queue refuses a firehose item", acabSinkAdmitsFirehose(0), false);
+    chk("the reserve keeps 8 of the 32 slots for signature types", ACAB_SINK_Q_RESERVE == 8, true);
+
+    // ---- acab_scanner.cpp wiring (source pins) ------------------------------------------------
+    // acab_scanner.cpp is not host-compiled, so the statements that wire these decisions in are
+    // pinned in its source text, line comments stripped and whitespace collapsed. A pin is the
+    // WHOLE statement, not a substring of it: a substring pin passed with the type term commented
+    // out or with an `|| ...` added beside it.
+    printf("\n  -- acab_scanner.cpp wiring (source pins) --\n");
     {
         std::string src;
         if (std::FILE* f = std::fopen("../../lib/acab_core/acab_scanner.cpp", "rb")) {
@@ -280,13 +289,61 @@ int main() {
             if (!std::isspace((unsigned char)ch)) flat += ch;
             else if (!flat.empty() && flat.back() != ' ') flat += ' ';
         }
-        const size_t sb = flat.find("bool shouldBuffer =");
-        const std::string stmt = sb == std::string::npos ? "" : flat.substr(sb, flat.find(';', sb) + 1 - sb);
+        // The statement that starts with `head`, through its ';'. Empty when absent.
+        auto stmt = [&flat](const char* head) -> std::string {
+            const size_t at = flat.find(head);
+            if (at == std::string::npos) return "";
+            const size_t end = flat.find(';', at);
+            return end == std::string::npos ? "" : flat.substr(at, end + 1 - at);
+        };
+        auto has = [&flat](const char* text) { return flat.find(text) != std::string::npos; };
+        chk("acab_scanner.cpp was read", !flat.empty(), true);
+
+        // The ring is FIFO and type-blind, so shouldBuffer's type term is the ONLY thing that keeps
+        // Desert's ACAB_NEARBY_DEVICE flood from wrapping away the signature rows, and det_log's
+        // flood limit assumes it (det_log.h). The tracker debounce term keeps tags you merely pass
+        // out of the ring.
         chk("shouldBuffer refuses debouncing trackers and every Desert row",
-            stmt == "bool shouldBuffer = !debouncing && d.type != ACAB_NEARBY_DEVICE"
-                    " && (e->loggedGen != gCaptureGen)"
-                    " && (detLogRatePersistent(e->count, now - e->firstSeen)"
-                    " ? rateGate.persistentOpen : rateGate.freshOpen);", true);
+            stmt("bool shouldBuffer =") ==
+                "bool shouldBuffer = !debouncing && d.type != ACAB_NEARBY_DEVICE"
+                " && (e->loggedGen != gCaptureGen)"
+                " && (detLogRatePersistent(e->count, now - e->firstSeen)"
+                " ? rateGate.persistentOpen : rateGate.freshOpen);", true);
+
+        // The enqueue. Zero wait on every item, because it runs on the Wi-Fi driver task, the
+        // NimBLE host task or the loop task; the headroom reserve above is what the firehoses pass
+        // through; and a refused item is counted, releases its claim and re-arms its `new` edge
+        // instead of silently spending a first-sighting alert.
+        chk("firehose items pass acabSinkAdmitsFirehose on the live queue depth",
+            stmt("const bool admit =") ==
+                "const bool admit = !firehose || acabSinkAdmitsFirehose(uxQueueSpacesAvailable(gSinkQ));",
+            true);
+        chk("the sink send never waits (timeout 0 on every item)",
+            stmt("const bool sent =") == "const bool sent = admit && xQueueSend(gSinkQ, &it, 0) == pdTRUE;",
+            true);
+        chk("a refused item is counted, releases its claim and re-arms its new edge",
+            has("if (!sent) { (firehose ? gSinkDropFirehose : gSinkDropSignature)++; "
+                "if (shouldBuffer) rollbackBufferClaim(claim); if (isNew) rearmNewEdge(d.type, key, bucket); }"),
+            true);
+        chk("a re-armed new edge fires on the next sighting and is consumed there",
+            has("isNew = (e->count == 0) || (now - e->lastSeen > DEDUP_WINDOW_MS) || e->pendingNew; "
+                "e->pendingNew = false;"), true);
+        chk("a reused dedup slot does not inherit a pending new edge",
+            has("slot->alerted = false; slot->pendingNew = false; slot->hnext = gDedupBucket[bucket];"), true);
+
+        // Eviction order is acabDedupEvictRank (dedup_evict.h, its own suite); this pins that
+        // dedupFind compares the rank first and elapsed age second.
+        chk("dedupFind evicts by acabDedupEvictRank tier, oldest within the tier",
+            has("const uint8_t rank = acabDedupEvictRank(e->type); const uint32_t age = now - e->lastSeen; "
+                "if (victim < 0 || rank < victimRank || (rank == victimRank && age > victimAge)) {"), true);
+
+        // The sink task is where every detection, notify and flash append runs, so it must be on
+        // the task watchdog and must never park on the queue forever (an idle sink still pets).
+        chk("sinkTask subscribes to the task watchdog and bounds its queue wait",
+            has("static void sinkTask(void*) { SinkItem it; bool onWdt = false; for (;;) { "
+                "if (!onWdt) onWdt = esp_task_wdt_add(NULL) == ESP_OK; else esp_task_wdt_reset(); "
+                "if (xQueueReceive(gSinkQ, &it, pdMS_TO_TICKS(ACAB_SINK_WDT_PET_MS)) != pdTRUE) continue;"),
+            true);
     }
 
     printf(gFail ? "\n  REGRESSION DETECTED (%d failure%s of %d)\n\n" : "\n  all good (0 failures of %d)\n\n",

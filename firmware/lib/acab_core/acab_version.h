@@ -27,6 +27,47 @@
 // field above 1023 is therefore un-shippable over the air: the apps compare unclamped, would keep offering
 // the update, and the board would refuse it forever. Bump the MINOR when the patch field runs out.
 //
+// 2.2.1: fixes from the 2026-10-11 firmware review. No partition, fw label, OTA receiver, signing
+//        key, BLE proto, RING_FORMAT or NVS-key change: every fielded board takes it over the air
+//        and keeps its bonds, settings and offline log. The two NVS keys it adds are new
+//        ("acab-ble"/"owned", "acab-buf"/"pboot") and read with defaults.
+//        SECURITY FIX, EVERY BUILD: a peer replaying a bonded phone's address could start a repeat
+//        pairing, and the pinned NimBLE-Arduino's stock REPEAT_PAIRING handler deleted the owner's
+//        bond and paired the peer in its place, at any time. tools/patch_nimble_repeat_pairing.py
+//        now patches the library at build time (both 1.4.3 and 2.x; the build aborts on unknown
+//        text) so a repeat pairing is refused and the link dropped unless the two-minute pairing
+//        window is open (acabRepeatPairingAllowed). Auth admission is the pure acabAuthAdmit
+//        (pair_window.h, truth-table tested), a refused fresh bond is deleted, and a sticky NVS
+//        "owned" flag keeps a board that has held a bond closed to new phones if its bond store
+//        empties. USER-VISIBLE: a phone that forgets the beacon must power-cycle it and pair within
+//        two minutes, like a new phone.
+//        PRODUCTION, EVERY BUILD: (1) the offline buffer's 6-boot auto-wipe counts only physical
+//        starts (reset reason POWERON, EXT or DEEPSLEEP); panic, watchdog, brownout and OTA restarts
+//        no longer advance it. A wipe also arms the retained core dump's erase and prints
+//        "[buf] auto-wipe: ..." on serial. (2) The sink queue never blocks a radio task (zero-wait
+//        enqueue for every item), a lost first-sighting edge re-arms, Desert and network-camera rows
+//        are admitted only with more than 8 free slots, refusals are counted, and the sink task is
+//        on the task watchdog. (3) Dedup eviction tiers: Desert rows first, then trackers, then
+//        everything else (dedup_evict.h). (4) Remote ID over Wi-Fi checks the OUI type (0x0D),
+//        decodes within the vendor IE, and skips a non-Remote-ID IE instead of stopping there; one
+//        track per MAC across two BasicIDs; short IDs are no longer dot-padded. (5) A "Flock-" SSID
+//        needs a hex tail of 4+ digits and an "FS-" name 4+ hex digits; the uncaptured glasses
+//        company IDs (Luxottica, Snap, Vuzix, and Snap's 0xFE45) report at 49 as vendor-only.
+//        beacon-board/main.cpp builds (beacon, oui-spy, beacon-c5): mute silences every cue,
+//        including the power-down motif and the rev-B hold-to-start beep (LED flash only); the boot
+//        jingle plays only on a physical start; the idle LED heartbeat starts after the soft-power
+//        gate commits; otaBootCheck runs before the core-dump probe.
+//        Dual-radio beacon only: a stranded nRF is held in reset through deep sleep; the USB
+//        "nrfdfu" command needs the pairing window; a 'D' heartbeat whose scan flag disagrees is
+//        corrected (scanfix= on [diag]); UART overruns discard to the next newline and are counted
+//        (ovf=); an advert line whose AD lengths do not tile its payload is rejected; [diag] adds
+//        sinkdrop=. nRF co-processor app v3 (its own image, BLE DFU): a 16-slot bounded dedup probe
+//        with age-based eviction (nrf_dedup.h), a per-MAC Remote ID bypass limit, the 'D' line
+//        appends the ignore count and the Remote ID forward count after its fixed 0, overruns
+//        discard to the newline, the unused 'RS' command is gone.
+//        mesh-detect only: no phone-derived coordinates and no boot ping on the public channel 0;
+//        the mesh UART write is serialised.
+//        beacon-board: RAM 78796 bytes (+432 vs 2.2.0), flash 1033281 bytes (+3124).
 // 2.2.0: NEW BOARD env:beacon-c5: one Seeed XIAO ESP32-C5 (Bluetooth plus 2.4 and 5 GHz Wi-Fi on
 //        one radio, no nRF) on pioarduino (Arduino 3.3.12 / ESP-IDF 5.5.5, NimBLE-Arduino 2.5.1);
 //        S3 envs stay on Arduino 2.0.17 / NimBLE 1.4.3 and the shared core carries version guards.
@@ -263,7 +304,7 @@
 // 2.0.0: the Colonel Panic builds pick up the full v2 detection set the beacon board ships
 // with (offline buffer, watchlist/custom category, ignore list, refreshed OUIs, glasses).
 #ifndef ACAB_FW_VERSION
-#define ACAB_FW_VERSION "2.2.0"
+#define ACAB_FW_VERSION "2.2.1"
 #endif
 
 #endif // ACAB_VERSION_H
