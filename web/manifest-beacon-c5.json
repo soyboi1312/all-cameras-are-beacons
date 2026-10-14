@@ -1,6 +1,6 @@
 {
   "name": "ACAB beacon c5 (All Cameras Are Beacons), Seeed XIAO ESP32-C5",
-  "version": "2.2.0",
+  "version": "2.2.1",
   "funding_url": "",
   "new_install_prompt_erase": true,
   "builds": [
