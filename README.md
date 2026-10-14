@@ -26,7 +26,7 @@ every board runs the same detector engine and the same per-category settings. th
 | **the beacon** (slim model: rev-A; battery model: rev-B) | nRF52840 dedicated to Bluetooth scanning; ESP32-S3 for Wi-Fi and the app link | phone app, onboard buzzer, optional encrypted offline log |
 | **OUI-Spy** | Seeed XIAO ESP32-S3, one radio shared between Wi-Fi and Bluetooth | phone app, onboard buzzer, optional encrypted offline log |
 | **Mesh-Detect** | the same XIAO build, plus a wired Heltec V3 running Meshtastic | phone app and mesh alerts (your phone's location only on a private channel, while connected), and an optional encrypted offline log |
-| **ESP32-C5** (DIY) | Seeed XIAO ESP32-C5, or Espressif's ESP32-C5-DevKitC-1 with 8 MB flash (N8R4 or N8R8, community-tested); one radio shared between Bluetooth and 2.4 and 5 GHz Wi-Fi | phone app, a buzzer if you wire one, optional encrypted offline log; updates are USB reflashes from the DIY flasher |
+| **ESP32-C5** (DIY) | Seeed XIAO ESP32-C5, or Espressif's ESP32-C5-DevKitC-1 with 8 MB flash (N8R4 or N8R8; community-tested on an N8R8); one radio shared between Bluetooth and 2.4 and 5 GHz Wi-Fi | phone app, a passive piezo if you wire one (D2 on the XIAO, GPIO23 on the DevKitC-1, each to GND), optional encrypted offline log; updates are USB reflashes from the DIY flasher |
 
 the beacon is about the size of an AirPods case and runs on USB-C power; the battery model charges through the same port. retail units come pre-flashed. pair one with the app to choose detector categories, alerts, and optional location or offline logging. firmware updates come through the app, and USB recovery is specific to each board revision (see [production beacon](#production-beacon)).
 
