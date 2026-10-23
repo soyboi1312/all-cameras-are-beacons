@@ -421,7 +421,7 @@ final class ALPRStore: ObservableObject {
 
     /// The camera points inside `region`, capped so a zoomed-out view never tries to draw the
     /// whole set. Returns [] past the cap (caller shows a "zoom in" hint instead).
-    func nodes(in region: MKCoordinateRegion, cap: Int = 500) -> [(id: String, coord: CLLocationCoordinate2D, maker: String, tier: UInt8, confirmed: Bool)] {
+    func nodes(in region: MKCoordinateRegion, cap: Int = 500) -> [(id: String, coord: CLLocationCoordinate2D, maker: String, tier: UInt8, confirmed: Bool, directionCdeg: UInt16?)] {
         guard !nodes.isEmpty else { return [] }
         let query = Self.indexedNodeIndices(
             coordinates: nodes,
@@ -443,7 +443,8 @@ final class ALPRStore: ObservableObject {
                 coord: coordinate,
                 maker: index < nodeMakers.count ? nodeMakers[index] : "",
                 tier: tier,
-                confirmed: isConfirmed
+                confirmed: isConfirmed,
+                directionCdeg: metadata?.directionCdeg
             )
         }
     }
@@ -1037,6 +1038,21 @@ enum ALPRAttribution {
         case 2: return "legacy-tag community automatic license plate reader candidate\(suffix)"
         default: return "canonical community-mapped automatic license plate reader camera without structured manufacturer attribution\(suffix)"
         }
+    }
+
+    private static let compass = ["north", "northeast", "east", "southeast",
+                                  "south", "southwest", "west", "northwest"]
+
+    /// The mapped direction in words, "faces northeast (45°)", or nil when none is mapped.
+    /// BYTE-IDENTICAL to Android alprDirectionText (MapAlpr.kt); both suites pin the same table.
+    /// Integer math on the wire's hundredths of a degree, so the two apps cannot round apart:
+    /// eight 45-degree sectors centred on the compass points, whole degrees rounded half up.
+    static func direction(cdeg: UInt16?) -> String? {
+        guard let cdeg, cdeg <= 35_999 else { return nil }
+        let c = Int(cdeg)
+        let sector = (c + 2_250) % 36_000 / 4_500
+        let degrees = (c + 50) / 100 % 360
+        return "faces \(compass[sector]) (\(degrees)°)"
     }
 }
 

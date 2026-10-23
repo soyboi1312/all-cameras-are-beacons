@@ -909,7 +909,7 @@ private fun verdictLabel(pct: Int): String = when {
 /** What actually matched, in plain language, composed from the method and OUI vendor.
  *  Copy mirrors iOS matchExplainer word for word. */
 private fun plainMatchLine(d: Detection): AnnotatedString = buildAnnotatedString {
-    // Body cam covers five signatures of very different weight under one label, so the
+    // Body cam covers six signatures of very different weight under one label, so the
     // generic per-method line is too vague here (and its "shared chipset" wording is
     // wrong for a vendor's own OUI block). Name the signature that fired instead.
     val sig = d.bodyCamSigDetail
@@ -1038,18 +1038,19 @@ internal fun dossierHeroSubtitle(node: String, makerOrVendor: String, headline: 
  *  pilot coordinate (the operator marker on the thumbnail). TWIN: iOS droneOperatorCaption. */
 internal const val DRONE_OPERATOR_CAPTION = "operator position, from the drone's Remote ID"
 
-/** The firmware detail strings for the five body-cam signatures, exactly as axon_detect.cpp
+/** The firmware detail strings for the six body-cam signatures, exactly as axon_detect.cpp
  *  and police_detect.cpp write them. Membership selects a per-signature explainer
  *  below. */
 private val BODY_CAM_SIGNATURES =
-    setOf("BWC DEVICE", "Axon OUI", "Utility BodyWorn", "Motorola Solutions OUI", "WatchGuard Video OUI")
+    setOf("BWC DEVICE", "Axon OUI", "Axon Bluetooth ID", "Utility BodyWorn", "Motorola Solutions OUI",
+          "WatchGuard Video OUI")
 
 /** The body-cam signature behind this hit, when the board reported one. Null for every other
  *  category, and for a buffered record (the offline store keeps no detail field). */
 private val Detection.bodyCamSigDetail: String?
     get() = detail?.takeIf { type == DeviceType.BODY_CAM && it in BODY_CAM_SIGNATURES }
 
-/** Which body-cam signature fired, and how much weight it carries. The five sources under
+/** Which body-cam signature fired, and how much weight it carries. The six sources under
  *  this one category range from Axon's own broadcast identifier to a vendor-block proxy, and
  *  without this they all read as "Body camera". Says nothing about the numbers: the verdict
  *  and percentage on the confidence row above already carry the strength. Copy mirrors iOS
@@ -1064,6 +1065,10 @@ private fun AnnotatedString.Builder.appendSignatureExplainer(d: Detection, sig: 
         "Axon OUI" -> {
             append("Matched "); name()
             append(" only. The address block is Axon Enterprise's, but the broadcast body cam tag never appeared, so this is Axon-made gear of some kind. They ship other products on the same block.")
+        }
+        "Axon Bluetooth ID" -> {
+            append("Matched "); name()
+            append(", a Bluetooth identifier registered to Axon. It rides in the advertisement rather than in the address, so it holds even when the device randomizes its MAC. It names the maker, not the product: Axon body cams send it, and other Axon gear may too.")
         }
         "Utility BodyWorn" -> {
             append("Matched "); name()

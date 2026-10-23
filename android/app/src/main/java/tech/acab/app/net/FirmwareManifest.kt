@@ -22,7 +22,7 @@ import java.util.concurrent.atomic.AtomicBoolean
  *  read it, so a release bumps one line. It names the PUBLISHED firmware, which can trail the
  *  working tree's ACAB_FW_VERSION while a release is unpublished. iOS twin:
  *  DeviceStatus.latestVersion in DeviceStatus.swift. */
-internal const val LATEST_PUBLISHED_FIRMWARE = "2.2.0"
+internal const val LATEST_PUBLISHED_FIRMWARE = "2.2.1"
 
 /** The User-Agent on every request this app makes itself (the firmware manifest and artifacts,
  *  the ALPR dataset). The platform default names the phone model and OS build; this names only

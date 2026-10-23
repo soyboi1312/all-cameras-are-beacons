@@ -48,8 +48,9 @@ class WifiChannelExportTest {
         assertNull(decode(bleJson).wifiChannelText)
     }
 
-    @Test fun csvHeader_endsWithTheTwoWifiColumns_afterMaker() {
-        assertEquals(listOf("maker", "wifi_channel", "wifi_band_ghz"), DETECTION_CSV_COLUMNS.takeLast(3))
+    @Test fun csvHeader_endsWithTheTwoWifiColumns_afterMaker_thenTheSignature() {
+        assertEquals(listOf("maker", "wifi_channel", "wifi_band_ghz", "bodycam_signature"),
+            DETECTION_CSV_COLUMNS.takeLast(4))
     }
 
     @Test fun csvCells_wifiRowExportsChannelAndBand_bleRowExportsTwoEmptyFields() {

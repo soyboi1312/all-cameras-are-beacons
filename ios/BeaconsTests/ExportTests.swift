@@ -744,9 +744,38 @@ final class ExportTests: XCTestCase {
         XCTAssertNil(try decode(Self.nearbyJSON).wifiChannelText)
     }
 
-    func testCsvHeaderEndsWithTheChannelColumns() {
-        XCTAssertEqual(Array(ContributionCsv.detectionColumns.suffix(3)),
-                       ["maker", "wifi_channel", "wifi_band_ghz"])
+    func testCsvHeaderEndsWithChannelThenSignatureColumns() {
+        XCTAssertEqual(Array(ContributionCsv.detectionColumns.suffix(4)),
+                       ["maker", "wifi_channel", "wifi_band_ghz", "bodycam_signature"])
+    }
+
+    // MARK: - Body-cam signature column
+
+    /// Row 4 of the 2026-10-21 record in docs/signatures.md (d8:1f:65:04:9a:23 in
+    /// acab-detections 6.csv), as 2.2.2 firmware sends it.
+    static let sigIdJSON = """
+    {"t":3,"s":0,"meth":8,"c":75,"mac":"d8:1f:65:04:9a:23","rssi":-89,\
+    "det":"Axon Bluetooth ID","n":4}
+    """
+
+    /// The column carries a BodyCamSignature raw value and nothing else: any other row's detail is
+    /// free text (a drone's carries the broadcast Operator ID), and this file is what a contribution
+    /// shares. TWIN: Android BodyCamSignatureCsvTest.
+    func testSignatureColumnNamesTheRuleAndNeverCopiesFreeText() throws {
+        let freeTextJSON = Self.nearbyJSON.replacingOccurrences(
+            of: #""n":1"#, with: #""det":"HomeNet-5G hardware OUI","n":1"#)
+        let unknownJSON = Self.sigIdJSON.replacingOccurrences(
+            of: "Axon Bluetooth ID", with: "Axon Bluetooth ID v2")
+        let csv = BLEManager.buildCSV([try row(Self.sigIdJSON), try row(freeTextJSON), try row(unknownJSON)])
+        let records = try XCTUnwrap(ContributionCsv.parseDocument(csv)?.records)
+        XCTAssertEqual(records.count, 4)
+        let sig = try XCTUnwrap(records[0].firstIndex(of: "bodycam_signature"))
+        XCTAssertEqual(records[1][sig], "Axon Bluetooth ID")
+        XCTAssertEqual(try decode(freeTextJSON).detail, "HomeNet-5G hardware OUI", "fixture carries free text")
+        XCTAssertEqual(records[2][sig], "", "a non-body-cam detail never reaches the column")
+        XCTAssertFalse(csv.contains("HomeNet-5G"), "the free text appears nowhere in the export")
+        XCTAssertEqual(records[3][sig], "", "a body-cam detail outside the closed set stays out")
+        for r in records.dropFirst() { XCTAssertEqual(r.count, records[0].count, "rows as wide as the header") }
     }
 
     func testWifiRowExportsChannelAndBand_bleRowExportsTwoEmptyFields() throws {

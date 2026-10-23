@@ -14,6 +14,7 @@ import androidx.compose.ui.graphics.PathEffect
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.ColorFilter
 import androidx.compose.ui.graphics.ImageBitmap
+import androidx.compose.ui.graphics.Path
 import androidx.compose.ui.graphics.asAndroidBitmap
 import androidx.compose.ui.graphics.drawscope.CanvasDrawScope
 import androidx.compose.ui.graphics.drawscope.Stroke
@@ -87,16 +88,20 @@ internal fun dimTone(tone: Color): Color {
  *  identical to the resting ring, but the peek variant is drawn hollow, because a wash across the
  *  peek radius would tint the exact standoff band the wide size exists to keep clear of ink. That
  *  is the settled shared rule - iOS ALPRDot drops its fill at the peek size for the same reason
- *  (`.fill(peek ? Color.clear : ...)`); the resting ring keeps its wash on both platforms. */
+ *  (`.fill(peek ? Color.clear : ...)`); the resting ring keeps its wash on both platforms.
+ *
+ *  AIMED: [aimed] adds the direction wedge ([alprWedgePath]) pointing UP. The layer turns the
+ *  marker to the camera's mapped direction (AlprOverlayHolder.rebuild), so the bitmap stays square
+ *  and centred on the ring and the turn pivots on the ring's centre. */
 @Composable
-fun rememberAlprMarker(confirmed: Boolean = true, peek: Boolean = false): BitmapDrawable {
+fun rememberAlprMarker(confirmed: Boolean = true, peek: Boolean = false, aimed: Boolean = false): BitmapDrawable {
     val context = LocalContext.current
     val density = LocalDensity.current
     // Confirmed rings stay the established red; unverified ones go amber AND DASHED. Colour alone
     // is not a distinction for a red/green-deficient viewer, and telling the two tiers apart is the
     // entire point of the second one. Mirrors iOS ALPRDot.
     val tone = if (confirmed) Acab.flockTone else Acab.warn
-    return remember(density, confirmed, peek, Acab.highContrast) {
+    return remember(density, confirmed, peek, aimed, Acab.highContrast) {
         with(density) {
             // Bolder 2026-07-29 (rings washed out on the map); keep in lockstep with iOS ALPRDot.
             // PEEK SIZE, derived from THIS platform's pin. The RULE is shared with iOS: the rim
@@ -125,7 +130,10 @@ fun rememberAlprMarker(confirmed: Boolean = true, peek: Boolean = false): Bitmap
             // claim than the ring it replaces instead of the same ring, larger. iOS holds 2.2pt
             // across both sizes for the same reason.
             val stroke = 2.2.dp.toPx()
-            val full = (r + stroke) * 2f + 2f
+            // drawCircle straddles r, so the rim's outer edge is half a stroke past it.
+            val outer = r + stroke / 2f
+            val tip = outer + ALPR_WEDGE_LENGTH.dp.toPx()
+            val full = (if (aimed) tip else r + stroke) * 2f + 2f
             val side = full.toInt().coerceAtLeast(1)
             val center = Offset(full / 2f, full / 2f)
             val image = ImageBitmap(side, side)
@@ -140,10 +148,30 @@ fun rememberAlprMarker(confirmed: Boolean = true, peek: Boolean = false): Bitmap
                                    else Stroke(width = stroke,
                                                pathEffect = PathEffect.dashPathEffect(
                                                    floatArrayOf(2.6.dp.toPx(), 2.2.dp.toPx()), 0f)))
+                if (aimed) drawPath(alprWedgePath(center, outer, 1.dp.toPx()), tone, alpha = 0.95f)
             }
             BitmapDrawable(context.resources, image.asAndroidBitmap())
         }
     }
+}
+
+/** The direction wedge, in dp. Long and slim so it reads as a pointer, not a teardrop map pin;
+ *  much longer and the four wedges of a typical intersection start crossing their neighbours'
+ *  rings. TWIN: iOS ALPRWedge, same three numbers, each measured from its own platform's rim edge. */
+private const val ALPR_WEDGE_LENGTH = 8f
+private const val ALPR_WEDGE_HALF_BASE = 2.6f
+private const val ALPR_WEDGE_OVERLAP = 1f
+
+/** The direction wedge pointing UP from a ring centred on [center] whose rim's outer edge is
+ *  [outer] px out: the base [ALPR_WEDGE_OVERLAP] inside that edge so it joins the stroke with no
+ *  gap, the tip [ALPR_WEDGE_LENGTH] outside it, every wedge length in units of [unit] px. The map
+ *  ring passes 1dp; the legend swatch (MapScreen.kt LegendRow) passes half that. */
+internal fun alprWedgePath(center: Offset, outer: Float, unit: Float): Path = Path().apply {
+    val baseY = center.y - (outer - ALPR_WEDGE_OVERLAP * unit)
+    moveTo(center.x - ALPR_WEDGE_HALF_BASE * unit, baseY)
+    lineTo(center.x, center.y - outer - ALPR_WEDGE_LENGTH * unit)
+    lineTo(center.x + ALPR_WEDGE_HALF_BASE * unit, baseY)
+    close()
 }
 
 /** The drone flight path's launch point, in both flavors: a plain small glyph and a

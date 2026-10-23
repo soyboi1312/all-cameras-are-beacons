@@ -771,7 +771,7 @@ struct DetectionDetailView: View {
     /// The MATCH QUALITY footer: what actually matched, in words.
     /// Returns Text so the OUI vendor name can render semibold inside the dim line.
     private var matchExplainer: Text {
-        // Body cam covers five signatures of very different weight under one label, so the
+        // Body cam covers six signatures of very different weight under one label, so the
         // generic per-method line is too vague here (and its "shared chipset" wording is
         // wrong for a vendor's own OUI block). Name the signature that fired instead.
         if let sig = d.bodyCamSignature { return signatureExplainer(sig) }
@@ -828,7 +828,7 @@ struct DetectionDetailView: View {
         }
     }
 
-    /// Which body-cam signature fired, and how much weight it carries. The five sources
+    /// Which body-cam signature fired, and how much weight it carries. The six sources
     /// under this one category range from Axon's own broadcast identifier to a vendor-block
     /// proxy, and without this they all read as "Body camera". Says nothing about the
     /// numbers: the confidence row above already carries the strength.
@@ -839,6 +839,8 @@ struct DetectionDetailView: View {
             return Text("Matched \(name), the tag Axon body cams broadcast about themselves. It rides in the advertisement rather than in the address, so it holds even when the device randomizes its MAC. This is the strongest body cam signature the board carries.")
         case .axonOUI:
             return Text("Matched \(name) only. The address block is Axon Enterprise's, but the broadcast body cam tag never appeared, so this is Axon-made gear of some kind. They ship other products on the same block.")
+        case .axonSigID:
+            return Text("Matched \(name), a Bluetooth identifier registered to Axon. It rides in the advertisement rather than in the address, so it holds even when the device randomizes its MAC. It names the maker, not the product: Axon body cams send it, and other Axon gear may too.")
         case .utility:
             if d.method == .name {
                 return Text("Matched \(name) by broadcast name. The device announced itself as part of Utility's body cam system, which is a deliberate self-identification and a solid match, though a name is easy for anything to copy.")

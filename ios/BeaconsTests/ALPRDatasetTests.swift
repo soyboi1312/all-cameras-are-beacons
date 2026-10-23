@@ -361,6 +361,34 @@ final class ALPRDatasetTests: XCTestCase {
             .contains("legacy-tag"))
     }
 
+    /// The direction words, byte-identical to Android alprDirectionText (AlprLabelTest
+    /// .directionWordsMatchIos pins the same table): every compass word, both sides of the north
+    /// sector's two edges (one expression places every edge), the round-up to the next whole degree,
+    /// 359.99 reading as 0, and nil / out of range.
+    func testDirectionWordsMatchAndroid() {
+        let table: [(UInt16, String)] = [
+            (0, "faces north (0°)"),
+            (2_249, "faces north (22°)"),
+            (2_250, "faces northeast (23°)"),
+            (4_500, "faces northeast (45°)"),
+            (9_000, "faces east (90°)"),
+            (13_500, "faces southeast (135°)"),
+            (18_000, "faces south (180°)"),
+            (22_500, "faces southwest (225°)"),
+            (27_050, "faces west (271°)"),
+            (31_500, "faces northwest (315°)"),
+            (33_749, "faces northwest (337°)"),
+            (33_750, "faces north (338°)"),
+            (35_999, "faces north (0°)"),
+        ]
+        for (cdeg, words) in table {
+            XCTAssertEqual(ALPRAttribution.direction(cdeg: cdeg), words, "cdeg=\(cdeg)")
+        }
+        XCTAssertNil(ALPRAttribution.direction(cdeg: nil))
+        XCTAssertNil(ALPRAttribution.direction(cdeg: 36_000))
+        XCTAssertNil(ALPRAttribution.direction(cdeg: .max))
+    }
+
     func testStableOSMIdentityKeepsColocatedCamerasDistinct() {
         let coordinate = CLLocationCoordinate2D(latitude: 32.7157, longitude: -117.1611)
         let first = ALPRStore.NodeMetadata(

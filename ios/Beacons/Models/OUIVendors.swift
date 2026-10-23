@@ -119,15 +119,16 @@ extension Detection {
 enum BodyCamSignature: String {
     case axonPayload = "BWC DEVICE"
     case axonOUI     = "Axon OUI"
+    case axonSigID   = "Axon Bluetooth ID"
     case utility     = "Utility BodyWorn"
     case motorola    = "Motorola Solutions OUI"
     case watchguard  = "WatchGuard Video OUI"
 
     /// Who makes the device this signature fired on. Known exactly in every case, which
-    /// is the point: the category's guess would name three makers for all five.
+    /// is the point: the category's guess would name three makers for all six.
     var vendor: String {
         switch self {
-        case .axonPayload, .axonOUI: return "Axon Enterprise"
+        case .axonPayload, .axonOUI, .axonSigID: return "Axon Enterprise"
         case .utility:               return "Utility Inc"
         case .motorola:              return "Motorola Solutions"
         case .watchguard:            return "WatchGuard Video"
@@ -185,7 +186,7 @@ extension Detection {
             return t   // verbatim: "Anker/eufy" keeps its slash, see below
         }
 
-        // 1. Body cam: the five-string wire contract both apps already match on exactly.
+        // 1. Body cam: the six-string wire contract both apps already match on exactly.
         if let sig = bodyCamSignature { return clean(sig.vendor) }
 
         // 2. Drone Remote ID. `ridManufacturer` passes an unrecognised CTA-2063 code straight

@@ -118,4 +118,16 @@ final class AlprRingPeekTests: XCTestCase {
                        [false, false, true])
         XCTAssertEqual(ALPRRingPeek.matches(rings: [base], pins: [bad, wild]), [false])
     }
+
+    /// The direction wedge's on-screen angle. Flat, it is direction minus heading, wrapped (a 60°
+    /// camera on a map turned to 270° points down-right, 150°). Tilted 60°, a diagonal bearing
+    /// leans toward the side (45° draws at 63.4°) while straight-ahead and sideways stay put.
+    /// Wrong input this catches: adding the heading, or ignoring pitch.
+    func testWedgeScreenAngleFollowsHeadingAndTilt() {
+        XCTAssertEqual(ALPRWedge.screenDegrees(directionCdeg: 9_000, heading: 0, pitch: 0), 90, accuracy: 1e-9)
+        XCTAssertEqual(ALPRWedge.screenDegrees(directionCdeg: 6_000, heading: 270, pitch: 0), 150, accuracy: 1e-9)
+        XCTAssertEqual(ALPRWedge.screenDegrees(directionCdeg: 4_500, heading: 0, pitch: 60), 63.4349, accuracy: 1e-3)
+        XCTAssertEqual(ALPRWedge.screenDegrees(directionCdeg: 9_000, heading: 0, pitch: 60), 90, accuracy: 1e-9)
+        XCTAssertEqual(ALPRWedge.screenDegrees(directionCdeg: 0, heading: 0, pitch: 60), 0, accuracy: 1e-9)
+    }
 }

@@ -212,15 +212,16 @@ val Detection.titleName: String
 enum class BodyCamSignature(val raw: String) {
     AXON_PAYLOAD("BWC DEVICE"),
     AXON_OUI("Axon OUI"),
+    AXON_SIG_ID("Axon Bluetooth ID"),
     UTILITY("Utility BodyWorn"),
     MOTOROLA("Motorola Solutions OUI"),
     WATCHGUARD("WatchGuard Video OUI");
 
     /** Who makes the device this signature fired on. Known exactly in every case, which
-     *  is the point: the category's guess would name three makers for all five. */
+     *  is the point: the category's guess would name three makers for all six. */
     val vendor: String
         get() = when (this) {
-            AXON_PAYLOAD, AXON_OUI -> "Axon Enterprise"
+            AXON_PAYLOAD, AXON_OUI, AXON_SIG_ID -> "Axon Enterprise"
             UTILITY                -> "Utility Inc"
             MOTOROLA               -> "Motorola Solutions"
             WATCHGUARD             -> "WatchGuard Video"
@@ -290,7 +291,7 @@ fun isChipsetRegistrant(vendor: String): Boolean = vendor in setOf(
  *  correctly degrades to the category. Do not fill that gap with a guess. */
 val Detection.maker: String?
     get() {
-        // 1. Body cam: the five-string wire contract both apps already match on exactly.
+        // 1. Body cam: the six-string wire contract both apps already match on exactly.
         bodyCamSignature?.let { return cleanMaker(it.vendor) }
         // 2. Drone Remote ID. ridManufacturer passes an unrecognised CTA-2063 code straight
         //    through as "Mfr 7A3C", which must never become a row title.

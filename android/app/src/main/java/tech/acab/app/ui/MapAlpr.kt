@@ -4,6 +4,7 @@ import android.graphics.drawable.BitmapDrawable
 import android.graphics.drawable.GradientDrawable
 import android.os.Handler
 import android.os.Looper
+import android.view.MotionEvent
 import android.view.View
 import android.widget.TextView
 import androidx.compose.ui.graphics.Color
@@ -17,9 +18,11 @@ import org.osmdroid.views.overlay.FolderOverlay
 import org.osmdroid.views.overlay.Marker
 import org.osmdroid.views.overlay.infowindow.MarkerInfoWindow
 import tech.acab.app.R
+import tech.acab.app.net.ALPR_DIRECTION_UNKNOWN
 import tech.acab.app.net.ALPR_TIER_LEGACY_FORMAT
 import tech.acab.app.ui.theme.Acab
 import tech.acab.app.ui.theme.AcabPalette
+import kotlin.math.abs
 
 /** Shared palette contract for the native map callout (DarkMapInfoWindow). The surface is
  * deliberately opaque: contrast must not change with a pale road tile, satellite imagery, or the
@@ -86,6 +89,21 @@ internal class DarkMapInfoWindow(mapView: MapView) :
 /** Source credit, one copy, tail of every reference-ring snippet. */
 private const val ALPR_CREDIT = "DeFlock / OSM ODbL"
 
+private val ALPR_COMPASS = arrayOf(
+    "north", "northeast", "east", "southeast", "south", "southwest", "west", "northwest",
+)
+
+/** The mapped direction in words, "faces northeast (45°)", or null when none is mapped.
+ *  BYTE-IDENTICAL to iOS ALPRAttribution.direction(cdeg:) in ALPRDataset.swift; both suites pin the
+ *  same table. Integer math on the wire's hundredths of a degree, so the two apps cannot round
+ *  apart: eight 45-degree sectors centred on the compass points, whole degrees rounded half up. */
+internal fun alprDirectionText(cdeg: Int): String? {
+    if (cdeg !in 0..35_999) return null
+    val sector = (cdeg + 2_250) % 36_000 / 4_500
+    val degrees = (cdeg + 50) / 100 % 360
+    return "faces ${ALPR_COMPASS[sector]} ($degrees°)"
+}
+
 /** RING-PEEK, in words. The wide rim is a purely visual cue, so the ring's callout (and TalkBack
  *  reading it out) carries the same fact, the way iOS appends it to the ring's VoiceOver label.
  *  Says what was HEARD, not what was verified: a wide ring means a live detection landed on this
@@ -108,8 +126,14 @@ internal fun alprAttributionHeadline(tier: Int, maker: String): String = when (t
  * tier are Android-only states and keep their own titles. [peek] adds the ring-peek sentence for a
  * ring a live detection pin is standing on, and nothing else: the title and the tier body stay
  * byte-identical, because the peek says something about the DETECTION, not about this row's
- * attribution. */
-internal fun alprMarkerText(rawTier: Int, maker: String, peek: Boolean = false): Pair<String, String> {
+ * attribution. [directionCdeg] adds the mapped direction ([alprDirectionText]) after the body, the
+ * words for the ring's wedge; iOS alprCalloutDetail puts it in the same place. */
+internal fun alprMarkerText(
+    rawTier: Int,
+    maker: String,
+    peek: Boolean = false,
+    directionCdeg: Int = ALPR_DIRECTION_UNKNOWN,
+): Pair<String, String> {
     val title = when {
         rawTier == 0 || rawTier == 1 || rawTier == 2 -> alprAttributionHeadline(rawTier, maker)
         rawTier == ALPR_TIER_LEGACY_FORMAT && maker.isNotEmpty() ->
@@ -129,7 +153,9 @@ internal fun alprMarkerText(rawTier: Int, maker: String, peek: Boolean = false):
         1 -> if (peek) "a mapped location" else "a mapped location, not a live detection"
         else -> if (peek) "unknown attribution tier" else "unknown attribution tier, not a live detection"
     }
-    val snippet = if (peek) "$body · $ALPR_PEEK_SNIPPET · $ALPR_CREDIT" else "$body · $ALPR_CREDIT"
+    val snippet = listOfNotNull(
+        body, alprDirectionText(directionCdeg), ALPR_PEEK_SNIPPET.takeIf { peek }, ALPR_CREDIT,
+    ).joinToString(" · ")
     return title to snippet
 }
 
@@ -217,15 +243,45 @@ internal class AlprPeekBands(pins: DoubleArray) {
     }
 }
 
-/** The four ring bitmaps the reference layer can draw: two attribution tiers, each in its normal
- *  and its ring-peek size. Bundled so the layer's update call keeps one identity check per input
- *  instead of four. */
+/** The eight ring bitmaps the reference layer can draw: two attribution tiers, each in its normal
+ *  and its ring-peek size, each plain or aimed (with the direction wedge). Bundled so the layer's
+ *  update call keeps one identity check per input instead of eight. */
 class AlprRingIcons(
     val primary: BitmapDrawable,
     val unverified: BitmapDrawable,
     val primaryPeek: BitmapDrawable,
     val unverifiedPeek: BitmapDrawable,
-)
+    val primaryAimed: BitmapDrawable,
+    val unverifiedAimed: BitmapDrawable,
+    val primaryPeekAimed: BitmapDrawable,
+    val unverifiedPeekAimed: BitmapDrawable,
+) {
+    fun pick(primary: Boolean, peek: Boolean, aimed: Boolean): BitmapDrawable = when {
+        primary && peek -> if (aimed) primaryPeekAimed else primaryPeek
+        primary -> if (aimed) primaryAimed else this.primary
+        peek -> if (aimed) unverifiedPeekAimed else unverifiedPeek
+        else -> if (aimed) unverifiedAimed else unverified
+    }
+}
+
+/** A known-ALPR ring marker whose tap target stays the PLAIN ring's square, wedge or not. An aimed
+ *  ring's bitmap is padded by the wedge on every side and osmdroid hit-tests the bounding box of
+ *  the turned bitmap, which grew a resting ring's target from about 18dp to as much as 46dp and
+ *  let it take taps meant for a neighbouring ring or the bare map. Mirrors iOS, whose wedge draws
+ *  outside the annotation frame so the target never changes. */
+private class AlprRingMarker(map: MapView) : Marker(map) {
+    /** Half the plain ring bitmap's side, px. Set by [style] with every icon change. */
+    private var hitHalf = 0
+
+    fun style(ic: AlprRingIcons, primary: Boolean, peek: Boolean, aimed: Boolean) {
+        icon = ic.pick(primary, peek, aimed)
+        hitHalf = ic.pick(primary, peek, aimed = false).intrinsicWidth / 2
+    }
+
+    override fun hitTest(event: MotionEvent, mapView: MapView): Boolean =
+        super.hitTest(event, mapView) &&
+            abs(event.x - mPositionPixels.x) <= hitHalf && abs(event.y - mPositionPixels.y) <= hitHalf
+}
 
 /**
  * Manages the known-ALPR reference layer as its own osmdroid overlay, separate from the
@@ -250,18 +306,18 @@ class AlprOverlayHolder {
      *  callout. Fired again, with the new words, when the peek pass rewrites the SELECTED ring's
      *  copy (a live pin arrives on it or leaves it), so the open callout never reads stale. */
     var onRingTap: ((title: String, snippet: String) -> Unit)? = null
-    // The selected ring, by coordinate: a re-cull (pan, zoom) rebuilds every Marker, so identity
-    // would not survive it. NaN = nothing selected.
-    private var selectedLat = Double.NaN
-    private var selectedLon = Double.NaN
+    // The selected ring, by dataset node index: a re-cull (pan, zoom) rebuilds every Marker, so
+    // marker identity would not survive it, and a coordinate is shared by co-located cameras (an
+    // opposite-facing pair on one pole), so a peek re-send by coordinate could hand the open
+    // callout the other camera's words. A new dataset clears it ([update]). -1 = nothing selected.
+    private var selectedNode = -1
 
     /** Forget the selected ring (MapScreen closed the callout), so later peek passes stay quiet. */
     fun clearSelection() {
-        selectedLat = Double.NaN
-        selectedLon = Double.NaN
+        selectedNode = -1
     }
 
-    private fun isSelected(r: RingMarker): Boolean = r.lat == selectedLat && r.lon == selectedLon
+    private fun isSelected(r: RingMarker): Boolean = r.node == selectedNode
 
     // Latest inputs, pushed from the Compose update pass.
     private var nodes: IntArray = IntArray(0)   // interleaved latE7, lonE7
@@ -269,6 +325,7 @@ class AlprOverlayHolder {
     private var makerTable: Array<String> = arrayOf("")
     private var confirmed: BooleanArray = BooleanArray(0)   // per-node tier, parallel to nodes/2
     private var rawTier: IntArray = IntArray(0)   // 0 no structured maker, 1 attributed, 2 legacy candidate
+    private var direction: IntArray = IntArray(0)   // per-node centidegrees or ALPR_DIRECTION_UNKNOWN
     private var enabled = false
     private var showUnverified = false   // draw the no-manufacturer tier at all (default off)
     private var icons: AlprRingIcons? = null
@@ -281,14 +338,17 @@ class AlprOverlayHolder {
     /** One drawn ring, kept so the peek pass can restyle it without re-culling: the coordinate to
      *  test, the copy to rewrite, and the marker to restyle. At most [CAP] of these exist. */
     private class RingMarker(
+        val node: Int,
         val lat: Double,
         val lon: Double,
         val tier: Int,
         val maker: String,
         val primary: Boolean,
-        val marker: Marker,
+        val directionCdeg: Int,
+        val marker: AlprRingMarker,
     ) {
         var peek = false
+        val aimed: Boolean get() = directionCdeg != ALPR_DIRECTION_UNKNOWN
     }
 
     /** The rings this viewport cull drew, in folder order. */
@@ -299,6 +359,12 @@ class AlprOverlayHolder {
      *  using reads as a rendering bug). Fired from [applyPeek], and only when the number changes. */
     var onPeekCount: ((Int) -> Unit)? = null
     private var lastPeekCount = -1
+
+    /** Reports whether any drawn ring has a direction wedge, for the legend's pointer row (same
+     *  rule as [onPeekCount]). Fired from [rebuild], the only pass that changes which rings are
+     *  drawn, and only when the answer flips. */
+    var onAimed: ((Boolean) -> Unit)? = null
+    private var lastAimed: Boolean? = null
 
     companion object {
         const val MIN_ZOOM = 11.0     // don't draw cameras zoomed further out than ~city level
@@ -325,17 +391,19 @@ class AlprOverlayHolder {
      *  attach() installs, which re-culls without coming through here.
      *  The detection pins are NOT an input here on purpose: see [setPeekPins]. */
     fun update(map: MapView, nodes: IntArray, makerIdx: IntArray, makerTable: Array<String>,
-               confirmed: BooleanArray, rawTier: IntArray, icons: AlprRingIcons,
-               enabled: Boolean, showUnverified: Boolean) {
+               confirmed: BooleanArray, rawTier: IntArray, direction: IntArray,
+               icons: AlprRingIcons, enabled: Boolean, showUnverified: Boolean) {
         if (nodes === this.nodes && makerIdx === this.makerIdx && enabled == this.enabled &&
             makerTable === this.makerTable && confirmed === this.confirmed &&
-            rawTier === this.rawTier && showUnverified == this.showUnverified &&
-            icons === this.icons) return
+            rawTier === this.rawTier && direction === this.direction &&
+            showUnverified == this.showUnverified && icons === this.icons) return
+        if (nodes !== this.nodes) clearSelection()   // node indexes now name other cameras
         this.nodes = nodes
         this.makerIdx = makerIdx
         this.makerTable = makerTable
         this.confirmed = confirmed
         this.rawTier = rawTier
+        this.direction = direction
         this.enabled = enabled
         this.showUnverified = showUnverified
         this.icons = icons
@@ -378,7 +446,7 @@ class AlprOverlayHolder {
         rings.clear()
         val ic = icons
         if (!enabled || ic == null || nodes.isEmpty() || map.zoomLevelDouble < MIN_ZOOM) {
-            map.invalidate(); reportPeekCount(0); return
+            map.invalidate(); reportPeekCount(0); reportAimed(false); return
         }
         val box = map.boundingBox
         val nLat = box.latNorth; val sLat = box.latSouth
@@ -398,19 +466,30 @@ class AlprOverlayHolder {
                 }
                 val attributed = tier == 1
                 val primary = attributed || tier == ALPR_TIER_LEGACY_FORMAT
+                val dir = direction.getOrElse(node) { ALPR_DIRECTION_UNKNOWN }
+                val aimed = dir != ALPR_DIRECTION_UNKNOWN
                 // Hidden by default: a pin with no manufacturer recorded is the one users drive to,
                 // find nothing at, and blame the app for. Skipped BEFORE the drawn++ so hiding them
                 // buys headroom under CAP rather than silently costing it.
                 if (!primary && !showUnverified) continue
                 // too many visible in view: draw none, wait for zoom-in
                 if (drawn >= CAP) { folder.items.clear(); rings.clear(); break }
-                val marker = Marker(map).apply {
+                val marker = AlprRingMarker(map).apply {
                     position = GeoPoint(lat, lon)
                     setAnchor(Marker.ANCHOR_CENTER, Marker.ANCHOR_CENTER)
                     // Resting size here; applyPeek below is the ONLY place the wide variant is
                     // chosen, so the peek decision lives in one pass whether it runs with this
                     // cull or on its own after a pin arrives.
-                    this.icon = if (primary) ic.primary else ic.unverified
+                    style(ic, primary, peek = false, aimed = aimed)
+                    // The aimed icon's wedge points up (north). osmdroid turns a marker by MINUS
+                    // its rotation, clockwise, so -direction aims the wedge at the mapped bearing.
+                    // Flat, so it holds that bearing if the map ever turns: osmdroid only
+                    // counter-turns NON-flat markers to keep them upright. (No rotate gesture
+                    // today.)
+                    if (aimed) {
+                        isFlat = true
+                        rotation = -dir / 100f
+                    }
                     // Tapping a reference camera names the maker (when OSM has it) + credits the
                     // source. The snippet also has to say what a pin IS: a mapped location, not a
                     // live detection. Most fixed ALPRs backhaul over cellular and are silent to
@@ -423,7 +502,7 @@ class AlprOverlayHolder {
                     // TIER FIRST, then maker. Testing maker first titled a hand-typed node
                     // "Flock Safety ALPR camera" while the snippet underneath said no
                     // manufacturer was recorded. Mirrors iOS MapTabView.
-                    alprMarkerText(tier, maker).let { (markerTitle, markerSnippet) ->
+                    alprMarkerText(tier, maker, directionCdeg = dir).let { (markerTitle, markerSnippet) ->
                         title = markerTitle
                         snippet = markerSnippet
                     }
@@ -432,14 +511,13 @@ class AlprOverlayHolder {
                     // of under the floating chrome. Consumed, so osmdroid never opens its default
                     // InfoWindow either.
                     setOnMarkerClickListener { m, _ ->
-                        selectedLat = lat
-                        selectedLon = lon
+                        selectedNode = node
                         onRingTap?.invoke(m.title.orEmpty(), m.snippet.orEmpty())
                         true
                     }
                 }
                 folder.add(marker)
-                rings.add(RingMarker(lat, lon, tier, maker, primary, marker))
+                rings.add(RingMarker(node, lat, lon, tier, maker, primary, dir, marker))
                 drawn++
             }
         }
@@ -447,6 +525,8 @@ class AlprOverlayHolder {
         // index is shared across every ring, and this is the same pass a later pin change re-runs
         // on its own.
         applyPeek(map)
+        // After the loop, so a cull that overran CAP (rings cleared) reports no wedge either.
+        reportAimed(rings.any { it.aimed })
         map.invalidate()
     }
 
@@ -468,17 +548,12 @@ class AlprOverlayHolder {
             if (peek == r.peek) continue
             r.peek = peek
             changed = true
-            r.marker.icon = when {
-                r.primary && peek -> ic.primaryPeek
-                r.primary -> ic.primary
-                peek -> ic.unverifiedPeek
-                else -> ic.unverified
-            }
+            r.marker.style(ic, r.primary, peek, r.aimed)
             // The enlarged rim is a sighted-only cue, so the copy carries the same fact for the
             // callout and TalkBack. Re-send the SELECTED ring's words: the callout shows what it
             // was handed at tap time, so without this the one ring the user is actually reading
             // keeps stale copy.
-            alprMarkerText(r.tier, r.maker, peek).let { (markerTitle, markerSnippet) ->
+            alprMarkerText(r.tier, r.maker, peek, r.directionCdeg).let { (markerTitle, markerSnippet) ->
                 r.marker.title = markerTitle
                 r.marker.snippet = markerSnippet
                 if (isSelected(r)) onRingTap?.invoke(markerTitle, markerSnippet)
@@ -492,6 +567,12 @@ class AlprOverlayHolder {
         if (n == lastPeekCount) return
         lastPeekCount = n
         onPeekCount?.invoke(n)
+    }
+
+    private fun reportAimed(aimed: Boolean) {
+        if (aimed == lastAimed) return
+        lastAimed = aimed
+        onAimed?.invoke(aimed)
     }
 
     fun detach() {
@@ -512,6 +593,7 @@ class AlprOverlayHolder {
         makerTable = arrayOf("")
         confirmed = BooleanArray(0)
         rawTier = IntArray(0)
+        direction = IntArray(0)
         enabled = false
         showUnverified = false
         icons = null
@@ -525,5 +607,8 @@ class AlprOverlayHolder {
         reportPeekCount(0)
         onPeekCount = null
         lastPeekCount = -1
+        reportAimed(false)
+        onAimed = null
+        lastAimed = null
     }
 }

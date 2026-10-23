@@ -27,14 +27,17 @@ enum ContributionCsv {
     /// new name. With one shared list, ContributionCsvTests pins the two against each other
     /// instead of against a hand-copied fixture that a rename would leave green.
     ///
-    /// `maker`, `wifi_channel` and `wifi_band_ghz` are appended at the END so an existing parser
-    /// keyed on column order still reads every field it knew about.
+    /// `maker`, `wifi_channel`, `wifi_band_ghz` and `bodycam_signature` are appended at the END so
+    /// an existing parser keyed on column order still reads every field it knew about.
+    /// `bodycam_signature` is a BodyCamSignature raw value or blank, never the raw detail string:
+    /// a drone's detail carries the broadcast Operator ID ("op ..."), and this file is what a
+    /// contribution shares.
     static let detectionColumns: [String] = [
         "detected_at", "time_basis", "time_precision_s", "type", "mac", "rssi",
         "source", "matched_on", "confidence", "sightings", "approx_lat", "approx_lon",
         "company_id", "uas_id", "drone_lat", "drone_lon", "altitude_m", "speed_ms",
         "heading_deg", "height_agl_m", "operator_lat", "operator_lon", "operator_alt_m",
-        "rid_status", "maker", "wifi_channel", "wifi_band_ghz",
+        "rid_status", "maker", "wifi_channel", "wifi_band_ghz", "bodycam_signature",
     ]
 
     /// The contributor's own phone position. Removed by default in a shared contribution.

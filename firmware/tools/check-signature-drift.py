@@ -1692,6 +1692,14 @@ SHARED_CONSTANTS = (
         "android": (AND_MAP_SCREEN, r'"(wide ring: [^"]*)", hollow = true, wide = true'),
     },
     {
+        "what": "map pointer legend key",
+        "kind": "string",
+        "why": "the legend names the direction wedge on a mapped-camera ring in the same words on"
+               " both phones",
+        "ios": (IOS_MAP_TAB, r'legendEntry\("(pointer: [^"]*)"\)'),
+        "android": (AND_MAP_SCREEN, r'"(pointer: [^"]*)", hollow = true, aimed = true'),
+    },
+    {
         "what": "map legend qualifier words",
         "kind": "fragments",
         "why": "the legend's telemetry line ('N displayed · N retained · N markers · N outside"

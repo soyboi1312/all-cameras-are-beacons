@@ -23,6 +23,9 @@ import kotlin.math.sqrt
 
 private const val ALPR_TRUSTED_HOST = "soyboi.tech"
 internal const val ALPR_TIER_LEGACY_FORMAT = 3
+/** ALP4's "no direction mapped" value, kept as-is in [AlprStore.directionCdeg]. Older formats have
+ *  no direction block, so every row of an ALP1-3 file reads as this. */
+internal const val ALPR_DIRECTION_UNKNOWN = 0xFFFF
 internal const val ALPR_MAX_DATASET_BYTES = 8L * 1024 * 1024
 
 /** The privacy disclosure promises one static soyboi.tech download. Validate a parsed URL rather
@@ -223,8 +226,9 @@ internal fun isValidAlprManifestData(url: String, lowercaseSha256: String, size:
  * `alpr-latest.json` still serves ALP2 to the installed base and always will; see the manifest
  * constants below for why that split exists and cannot be collapsed.
  *
- * We hold coords as an interleaved IntArray [latE7, lonE7, ...] plus parallel makerIdx and
- * confirmed arrays, and the self-describing table. Cached to files/ for instant, offline redraw.
+ * We hold coords as an interleaved IntArray [latE7, lonE7, ...] plus the parallel per-node
+ * arrays (makerIdx, confirmed, rawTier, directionCdeg) and the self-describing table. Cached to
+ * files/ for instant, offline redraw.
  */
 class AlprStore private constructor(context: Context) {
 
@@ -274,6 +278,9 @@ class AlprStore private constructor(context: Context) {
      * structured manufacturer, 1 as structured manufacturer attribution, and 2 as a legacy alias
      * candidate. The UI reads this rather than inventing an external verification claim. */
     @Volatile var rawTier: IntArray = IntArray(0); private set
+    /** The mapped compass direction each camera faces, in hundredths of a degree clockwise from
+     * north (0..35999), or [ALPR_DIRECTION_UNKNOWN]. Parallel to [rawTier], same publish rule. */
+    @Volatile var directionCdeg: IntArray = IntArray(0); private set
     /** Wire format parsed from the cache currently backing [_nodes]. */
     @Volatile private var loadedFormat: String = ""
 
@@ -352,6 +359,7 @@ class AlprStore private constructor(context: Context) {
                 makerTable = arrayOf("")
                 confirmed = BooleanArray(0)
                 rawTier = IntArray(0)
+                directionCdeg = IntArray(0)
                 loadedFormat = ""
                 _unverifiedCount.value = 0
                 // Remove the exact old connection while generation changes are still serialized.
@@ -523,6 +531,7 @@ class AlprStore private constructor(context: Context) {
                     makerIdx = parsed.makerIdx         // set BEFORE the nodes emit so a collector
                     makerTable = parsed.table          // waking on new nodes sees matching makers
                     rawTier = parsed.rawTier            // raw semantics before the nodes emission
+                    directionCdeg = parsed.directionCdeg   // same ordering rule
                     confirmed = parsed.confirmed       // same ordering rule: tiers land before nodes
                     loadedFormat = parsed.wireFormat   // format belongs to this publication
                     _unverifiedCount.value = parsed.confirmed.count { !it }
@@ -569,6 +578,7 @@ class AlprStore private constructor(context: Context) {
             makerIdx = parsed.makerIdx
             makerTable = parsed.table
             rawTier = parsed.rawTier
+            directionCdeg = parsed.directionCdeg
             confirmed = parsed.confirmed
             loadedFormat = parsed.wireFormat
             _unverifiedCount.value = parsed.confirmed.count { !it }
@@ -721,15 +731,17 @@ class AlprStore private constructor(context: Context) {
                 INSTANCE ?: AlprStore(context.applicationContext).also { INSTANCE = it }
             }
 
-        /** Parsed dataset: coordinates plus the maker and tier blocks. The ALP4 source block is
-         * validated in parse() and is not returned. rawTier preserves ALP4 tier 2
-         * and the pre-tier legacy sentinel; confirmed is only a compatibility display bit. */
+        /** Parsed dataset: coordinates plus the maker and tier blocks, and the direction from the
+         * ALP4 source block (the rest of that block is validated in parse() and is not returned).
+         * rawTier preserves ALP4 tier 2 and the pre-tier legacy sentinel; confirmed is only a
+         * compatibility display bit. */
         internal class Parsed(val wireFormat: String, val rawCount: Int, val coords: IntArray,
                             val makerIdx: IntArray, val table: Array<String>,
-                            val confirmed: BooleanArray, val rawTier: IntArray)
+                            val confirmed: BooleanArray, val rawTier: IntArray,
+                            val directionCdeg: IntArray)
 
         /** Parse ALP4 (coords + maker + tier; the per-node source block is length-checked and
-         *  validated, then discarded, because nothing on Android reads it). Also accepts legacy ALP3,
+         *  validated, and only its direction is kept, because nothing else on Android reads it). Also accepts legacy ALP3,
          *  ALP2 and ALP1, so a cache from an
          *  older build still loads. Bounds-checked throughout; returns null on any malformation
          *  (bad length, a table that runs past the buffer, etc.). A maker index past the table
@@ -803,8 +815,8 @@ class AlprStore private constructor(context: Context) {
                 )
             }.getOrNull() ?: return null
             if (bytes.size.toLong() != expected) return null
-            // Read the three parallel blocks, then DROP any node whose coordinate is out of range,
-            // together with its maker and tier so all three arrays stay in lockstep.
+            // Read the parallel blocks, then DROP any node whose coordinate is out of range,
+            // together with its maker, tier and direction so every per-node array stays in lockstep.
             //
             // WHY DROP RATHER THAN KEEP (aligned with iOS 2026-08-05, ALPRDataset.swift's
             // CLLocationCoordinate2DIsValid guard). A latitude past +/-90 is not a camera in an
@@ -829,8 +841,9 @@ class AlprStore private constructor(context: Context) {
             if (hasTier) for (i in 0 until count) rawTier[i] = buf.get().toInt() and 0xFF
             if (v4 && rawTier.any { it !in 0..2 }) return null
             // ALP4 source block: every row is validated (same accept/reject rule as iOS
-            // ALPRStore.parse) and then discarded. All five reads stay, in wire order, so the
-            // direction is read from the correct offset.
+            // ALPRStore.parse); only the direction is kept. All five reads stay, in wire order, so
+            // the direction is read from the correct offset.
+            val rawDirection = IntArray(count) { ALPR_DIRECTION_UNKNOWN }
             if (v4) for (i in 0 until count) {
                 val osmType = buf.get().toInt() and 0xFF
                 val osmId = buf.long.toULong()
@@ -838,7 +851,8 @@ class AlprStore private constructor(context: Context) {
                 val directionRaw = buf.short.toInt() and 0xFFFF
                 buf.int                              // checkDateDay (unused here)
                 if (osmType !in 0..2 || osmId == 0uL ||
-                    (directionRaw != 0xFFFF && directionRaw !in 0..35_999)) return null
+                    (directionRaw != ALPR_DIRECTION_UNKNOWN && directionRaw !in 0..35_999)) return null
+                rawDirection[i] = directionRaw
             }
 
             val keep = ArrayList<Int>(count)
@@ -847,12 +861,13 @@ class AlprStore private constructor(context: Context) {
                     keep.add(i)
             val n = keep.size
             val coords = IntArray(n * 2); val makerIdx = IntArray(n)
-            val confirmed = BooleanArray(n); val tiers = IntArray(n)
+            val confirmed = BooleanArray(n); val tiers = IntArray(n); val direction = IntArray(n)
             for (k in 0 until n) {
                 val i = keep[k]
                 coords[k * 2] = rawLat[i]; coords[k * 2 + 1] = rawLon[i]
                 makerIdx[k] = rawIdx[i]
                 tiers[k] = rawTier[i]
+                direction[k] = rawDirection[i]
                 confirmed[k] = rawTier[i] == 1 || rawTier[i] == ALPR_TIER_LEGACY_FORMAT
             }
             val wireFormat = when {
@@ -861,7 +876,7 @@ class AlprStore private constructor(context: Context) {
                 v2 -> "ALP2"
                 else -> "ALP1"
             }
-            return Parsed(wireFormat, count, coords, makerIdx, table, confirmed, tiers)
+            return Parsed(wireFormat, count, coords, makerIdx, table, confirmed, tiers, direction)
         }
 
         private fun sha256Hex(bytes: ByteArray): String {

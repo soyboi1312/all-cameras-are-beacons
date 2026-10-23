@@ -350,8 +350,8 @@ class AlprDatasetTest {
 
     @Test
     fun testValidALP4RetainsTier() {
-        // AlprStore.parse validates the source block and does not return it. These edge values
-        // must still be accepted: an osmId with the top bit set, an in-range direction,
+        // AlprStore.parse validates the source block and returns only its direction. These edge
+        // values must still be accepted: an osmId with the top bit set, an in-range direction,
         // and the null direction (0xFFFF on the wire).
         val nodes = listOf(
             Node(32.7157, -117.1611, maker = 1, tier = 1, osmType = 0,
@@ -365,6 +365,7 @@ class AlprDatasetTest {
         assertEquals(2, p.rawCount)
         assertEquals(listOf(1, 2), p.rawTier.toList())
         assertEquals(listOf(true, false), p.confirmed.toList())
+        assertEquals(listOf(27_050, ALPR_DIRECTION_UNKNOWN), p.directionCdeg.toList())
     }
 
     @Test
@@ -378,12 +379,13 @@ class AlprDatasetTest {
     @Test
     fun testALP4CoordinateDropKeepsEveryParallelBlockAligned() {
         val p = parsed(alp("ALP4", nodes = listOf(
-            Node(91.0, 1.0, maker = 1, tier = 1, osmId = 11uL),
-            Node(32.0, -117.0, maker = 2, tier = 2, osmType = 1, osmId = 22uL),
+            Node(91.0, 1.0, maker = 1, tier = 1, osmId = 11uL, directionCdeg = 9_000),
+            Node(32.0, -117.0, maker = 2, tier = 2, osmType = 1, osmId = 22uL, directionCdeg = 18_000),
         )), "one invalid coordinate should not reject valid ALP4 siblings")
         assertEquals(1, p.coords.size / 2)
         assertEquals(listOf(2), p.makerIdx.toList())
         assertEquals(listOf(2), p.rawTier.toList())
+        assertEquals(listOf(18_000), p.directionCdeg.toList())
     }
 
     @Test
@@ -398,6 +400,8 @@ class AlprDatasetTest {
         // purpose, so this is also the assertion that fails if anyone hardcodes a maker list.
         assertEquals(listOf("Flock Safety", "Genetec", ""), makers(p.makerIdx, p.table))
         assertEquals(listOf(true, false, true), p.confirmed.toList())
+        // No source block before ALP4, so no ring may draw a wedge.
+        assertEquals(List(3) { ALPR_DIRECTION_UNKNOWN }, p.directionCdeg.toList())
     }
 
     @Test

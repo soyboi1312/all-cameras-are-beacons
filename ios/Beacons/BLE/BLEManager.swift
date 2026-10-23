@@ -4827,6 +4827,11 @@ final class BLEManager: NSObject, ObservableObject {
         // commit or not at all: the UI now names a manufacturer, and the evidence file has to be
         // able to say the same thing. wifi_channel and wifi_band_ghz follow it on the same rule;
         // blank on BLE and replayed rows, and not a location, so no redaction set names them.
+        // bodycam_signature comes last: which body-cam rule fired (BodyCamSignature, a closed set
+        // of firmware strings), so an export says "BWC DEVICE" vs "Axon Bluetooth ID" instead of
+        // leaving it to be inferred from matched_on and confidence. Blank for every other row and
+        // for a replayed row (the buffer keeps no detail). Never the raw detail: a drone's detail
+        // carries the broadcast Operator ID ("op ..."), and this file is what a contribution shares.
         // The header is ContributionCsv.detectionColumns, shared with the contribution redactor so
         // a rename can never leave a location column unblanked - the redactor now fails closed on
         // a policy column the header does not carry, and a hand-copied literal here was the drift
@@ -4903,7 +4908,8 @@ final class BLEManager: NSObject, ObservableObject {
                           iStr(d.altitude), iStr(d.speedH), iStr(d.heading), iStr(d.heightAGL),
                           f6(pc?.latitude), f6(pc?.longitude), iStr(d.pilotAlt),
                           d.ridStatusLabel ?? "", csvUntrustedText(d.maker ?? ""),
-                          iStr(d.wifiChannel), Detection.wifiBandGHz(channel: d.wifiChannel) ?? ""]
+                          iStr(d.wifiChannel), Detection.wifiBandGHz(channel: d.wifiChannel) ?? "",
+                          d.bodyCamSignature?.rawValue ?? ""]
             rows.append(fields.map(csvSafe).joined(separator: ","))
         }
         return rows.joined(separator: "\n")
@@ -7365,7 +7371,7 @@ final class BLEManager: NSObject, ObservableObject {
         // dimmed - the demo forces motorolaSupported precisely to introduce that control, and a
         // dimmed sub-toggle under an off parent defeats the tour. Matches the Android seed.
         demoStatusPayload = [
-            "fw": "\(sampleBoardKind.sampleFirmwareLabel) 2.2.0", "up": 4920, "total": 6, "ble": true, "wifi": true,
+            "fw": "\(sampleBoardKind.sampleFirmwareLabel) 2.2.1", "up": 4920, "total": 6, "ble": true, "wifi": true,
             "axon": true, "tracker": true, "glasses": true, "ncam": true,
             "buzzer": true, "vol": 70, "gps": true, "bat": 82,
         ]

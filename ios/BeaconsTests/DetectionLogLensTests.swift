@@ -162,6 +162,19 @@ final class DetectionLogLensTests: XCTestCase {
         XCTAssertFalse(matches("motorola", wg))
     }
 
+    /// The sixth body-cam signature: Axon's own Bluetooth SIG number (axon_detect.cpp, detail
+    /// "Axon Bluetooth ID"), which matches on a random address with no OUI. It names Axon as the
+    /// maker. Android's LogExportLensTest pins the same answers. Without the enum case the row
+    /// falls back to the category's "Axon / Utility / Motorola", which matches "motorola".
+    func testAxonBluetoothIdRowNamesAxon() throws {
+        let sig = try detection("20:11:22:33:44:55", type: .axonBodyCam, detail: "Axon Bluetooth ID")
+        XCTAssertEqual(sig.bodyCamSignature, .axonSigID)
+        XCTAssertEqual(sig.vendor, "Axon Enterprise")
+        XCTAssertEqual(sig.maker, "Axon Enterprise")
+        XCTAssertTrue(matches("axon", sig))
+        XCTAssertFalse(matches("motorola", sig))
+    }
+
     func testStrongestSortUsesRawRSSIAndKeepsNewestTieOrder() throws {
         let newerWeak = try detection(rssi: -85)
         let newerStrong = try detection("aa:bb:cc:dd:ee:02", rssi: -40)

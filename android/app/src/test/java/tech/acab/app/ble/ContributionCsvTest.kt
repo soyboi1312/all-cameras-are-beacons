@@ -59,9 +59,9 @@ class ContributionCsvTest {
     private fun sample(): String {
         val drone = "2026-08-09T21:00:00Z,exact,,Drone,0c:9a:e6:00:00:01,-70,BLE,ODID,60,3," +
             "32.700000,-117.100000,0x0000,UAS123,32.712345,-117.156789,120,5,90,110," +
-            "32.799999,-117.188888,0,airborne,DJI,,"
+            "32.799999,-117.188888,0,airborne,DJI,,,"
         val cam = "2026-08-09T21:01:00Z,exact,,Network camera,a4:11:62:00:00:02,-80,WiFi,OUI match,65,1," +
-            "32.760000,-117.120000,,,,,,,,,,,,,Arlo,6,2.4"
+            "32.760000,-117.120000,,,,,,,,,,,,,Arlo,6,2.4,"
         return "$header\n$drone\n$cam"
     }
 
@@ -156,7 +156,7 @@ class ContributionCsvTest {
         // A maker with a comma is a quoted field; a naive split would shift every later column and
         // blank the wrong one. approx_lat must still be found and blanked, the quoted field intact.
         val row = "2026-08-09T21:02:00Z,exact,,Network camera,a4:11:62:00:00:03,-80,WiFi,OUI match,65,1," +
-            "32.760000,-117.120000,,,,,,,,,,,,,\"Acme, Inc.\",,"
+            "32.760000,-117.120000,,,,,,,,,,,,,\"Acme, Inc.\",,,"
         val csv = "$header\n$row"
         val redacted = redactCsvColumns(csv, contributionBlankColumns(
             includeObserverLocation = false, includeDroneLocation = true, includeOperatorLocation = true))
@@ -226,7 +226,7 @@ class ContributionCsvTest {
             "detected_at,time_basis,time_precision_s,type,mac,rssi,source,matched_on,confidence," +
             "sightings,approx_lat,approx_lon,company_id,uas_id,drone_lat,drone_lon,altitude_m," +
             "speed_ms,heading_deg,height_agl_m,operator_lat,operator_lon,operator_alt_m,rid_status," +
-            "maker,wifi_channel,wifi_band_ghz",
+            "maker,wifi_channel,wifi_band_ghz,bodycam_signature",
             header,
         )
         // Position, spelled out, because the redactor blanks by header-derived INDEX: a policy

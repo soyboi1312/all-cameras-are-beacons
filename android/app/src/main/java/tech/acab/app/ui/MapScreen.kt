@@ -94,6 +94,7 @@ import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.TransformOrigin
 import androidx.compose.ui.graphics.drawscope.Stroke
+import androidx.compose.ui.graphics.drawscope.rotate
 import androidx.compose.ui.graphics.toArgb
 import androidx.compose.ui.layout.layout
 import androidx.compose.ui.layout.onSizeChanged
@@ -1069,9 +1070,17 @@ fun MapScreen(
     // layer's update early-out still holds.
     val alprMarkerPeek = rememberAlprMarker(peek = true)
     val alprMarkerUnverifiedPeek = rememberAlprMarker(confirmed = false, peek = true)
+    // AIMED: the same four with the direction wedge, for cameras whose direction is mapped.
+    val alprMarkerAimed = rememberAlprMarker(aimed = true)
+    val alprMarkerUnverifiedAimed = rememberAlprMarker(confirmed = false, aimed = true)
+    val alprMarkerPeekAimed = rememberAlprMarker(peek = true, aimed = true)
+    val alprMarkerUnverifiedPeekAimed = rememberAlprMarker(confirmed = false, peek = true, aimed = true)
     val alprIcons = remember(alprMarker, alprMarkerUnverified, alprMarkerPeek,
-                            alprMarkerUnverifiedPeek) {
-        AlprRingIcons(alprMarker, alprMarkerUnverified, alprMarkerPeek, alprMarkerUnverifiedPeek)
+                            alprMarkerUnverifiedPeek, alprMarkerAimed, alprMarkerUnverifiedAimed,
+                            alprMarkerPeekAimed, alprMarkerUnverifiedPeekAimed) {
+        AlprRingIcons(alprMarker, alprMarkerUnverified, alprMarkerPeek, alprMarkerUnverifiedPeek,
+                      alprMarkerAimed, alprMarkerUnverifiedAimed, alprMarkerPeekAimed,
+                      alprMarkerUnverifiedPeekAimed)
     }
     val alprHolder = remember { AlprOverlayHolder() }
     // A callout or bubble left open across a lens change looks like it belongs to the new view, so
@@ -1086,6 +1095,9 @@ fun MapScreen(
     // How many rings are drawing wide right now, so the legend explains that size only while one
     // is on screen. Pushed from the layer's cull pass, and only when the number changes.
     var alprPeekCount by remember { mutableIntStateOf(0) }
+    // Whether any drawn ring has a direction wedge, so the legend names the pointer only while one
+    // is on screen. Pushed from the layer's cull pass (AlprOverlayHolder.onAimed), only on a flip.
+    var alprAimed by remember { mutableStateOf(false) }
     // Whether any pin the last rebuild drew is in the STALE tier, so the legend names the dimmed
     // look only while one is on screen. Written from the rebuild pass through mapStalePinFlag,
     // only when it flips (the alprPeekCount pattern).
@@ -1505,6 +1517,7 @@ fun MapScreen(
                     // costs no recomposition; the pass it recomposes into early-outs of both the
                     // marker rebuild and the ALPR update, so this cannot feed itself.
                     alprHolder.onPeekCount = { alprPeekCount = it }
+                    alprHolder.onAimed = { alprAimed = it }   // same rule: fires only on a flip
                     // The one 140 ms debounce behind viewportRevision: a pan or zoom schedules
                     // it, and so does a change in the MapView's HEIGHT (a window resize, a
                     // rotation), which is not a scroll or zoom event for the listener below.
@@ -1889,11 +1902,12 @@ fun MapScreen(
                 // refresh the known-ALPR layer with the latest enabled state + dataset (the
                 // holder early-outs when none of those inputs changed, so this is free on the
                 // ~3 Hz path; its own debounced listener re-culls on pan/zoom)
-                // makerIdx/makerTable are read here (not collected) - they are set in the same
-                // parse as alprNodes, so an alprNodes change recomposes this and passes the match.
+                // makerIdx/makerTable/directionCdeg are read here (not collected) - they are set in
+                // the same parse as alprNodes, so an alprNodes change recomposes this and passes
+                // the match.
                 alprHolder.update(map, alprNodes, alpr.makerIdx, alpr.makerTable,
-                                  alpr.confirmed, alpr.rawTier, alprIcons, alprEnabled,
-                                  alprShowUnverified)
+                                  alpr.confirmed, alpr.rawTier, alpr.directionCdeg, alprIcons,
+                                  alprEnabled, alprShowUnverified)
                 // RING-PEEK, as its OWN call rather than an input to the cull above. The pin set
                 // changes every time a new device is heard; the RINGS only change with the
                 // viewport or the dataset. Handing the pins to update() defeated its identity
@@ -2018,6 +2032,7 @@ fun MapScreen(
             hasOperatorPins = hasOperatorPins,
             alprEnabled = alprEnabled,
             alprPeekCount = alprPeekCount,
+            alprAimed = alprAimed,
             onClose = { legendOpen = false },
             onHeaderMeasured = { if (it != cardHeaderPx) cardHeaderPx = it },
         )
@@ -2696,7 +2711,7 @@ private data class LegendEntry(val color: Color, val label: String, val hollow: 
  *  2026-09-26), in order: the header row ([MapLegendCardHeader]), the honesty headline FIRST
  *  with the close button beside it; then the body ([MapLegendCardBody]): the qualifier (counts)
  *  line, ONE key grid (the six categories, then the ALPR keys), the conditional keys (dimmed,
- *  wide ring, Drone operator) and the ALPR data credit. Two forms under the ceiling
+ *  pointer, wide ring, Drone operator) and the ALPR data credit. Two forms under the ceiling
  *  [maxHeightPx] (mapLegendHeaderScrolls): while the header and the body's first key row fit,
  *  the header stays fixed and the body scrolls under it (a card with room hugs its content:
  *  fill = false, and the scroll has no range); when they do not (a phone in portrait at font
@@ -2724,6 +2739,7 @@ private fun MapLegendCard(
     hasOperatorPins: Boolean,
     alprEnabled: Boolean,
     alprPeekCount: Int,
+    alprAimed: Boolean,
     onClose: () -> Unit,
     onHeaderMeasured: (Int) -> Unit,
     modifier: Modifier = Modifier,
@@ -2777,6 +2793,7 @@ private fun MapLegendCard(
                         hasOperatorPins = hasOperatorPins,
                         alprEnabled = alprEnabled,
                         alprPeekCount = alprPeekCount,
+                        alprAimed = alprAimed,
                         onCountsMeasured = { countsPx = it },
                     )
                 }
@@ -2883,6 +2900,7 @@ private fun MapLegendCardBody(
     hasOperatorPins: Boolean,
     alprEnabled: Boolean,
     alprPeekCount: Int,
+    alprAimed: Boolean,
     onCountsMeasured: (Int) -> Unit,
 ) {
     val scheme = MaterialTheme.colorScheme
@@ -2898,13 +2916,24 @@ private fun MapLegendCardBody(
         // names it, but only while a drawn pin is actually dimmed (hasStalePins, contracts
         // 5.5): a key for a look nothing on screen has reads as a rendering bug. The swatch
         // is a neutral tone dimmed by the same rule the pins use, so it demonstrates the
-        // state without claiming a category. The two conditional keys name the treatment, then
-        // its meaning, lowercase-first like every row (R19, settling R17's open item): the same
-        // words and case as iOS legendKeys' "dimmed" and "wide ring" entries, byte-identical
-        // (drift rows "map dimmed-pin legend key" / "map ring-peek legend key").
+        // state without claiming a category. The lowercase conditional keys name the treatment,
+        // then its meaning, lowercase-first like every row (R19, settling R17's open item): the
+        // same words and case as iOS legendKeys' "dimmed", "pointer" and "wide ring" entries,
+        // byte-identical (drift rows "map dimmed-pin legend key" / "map pointer legend key" /
+        // "map ring-peek legend key").
         if (hasStalePins) {
             Box(Modifier.padding(horizontal = 16.dp)) {
                 LegendRow(dimTone(scheme.onSurface), "dimmed: last heard over an hour ago")
+            }
+        }
+        // DIRECTION WEDGE: named only while a ring with a wedge is drawn (alprAimed), so it
+        // stays away where nothing has a mapped direction. The swatch is the map's wedge at half
+        // size on a ring about half the map ring's size, turned to northeast so it reads as a
+        // pointer. TWIN: iOS legendKeys' pointer entry, same words.
+        if (alprEnabled && alprAimed) {
+            Box(Modifier.padding(horizontal = 16.dp)) {
+                LegendRow(Acab.flockTone.copy(alpha = 0.95f),
+                    "pointer: the way the camera faces", hollow = true, aimed = true)
             }
         }
         // RING-PEEK: named only while a wide ring is actually drawn, same rule as the ALPR
@@ -3015,22 +3044,36 @@ private fun LegendGrid(entries: List<LegendEntry>, modifier: Modifier = Modifier
 }
 
 /** One legend key: a coloured dot (filled, or a hollow ring for reference layers) + label. [wide]
- *  draws the ring-peek swatch, the one that is bigger on the map. The swatch sits in a fixed slot
- *  so that extra width cannot push its label out of line with every other row. The hollow ring is
- *  drawn, not a border. */
+ *  draws the ring-peek swatch, the one that is bigger on the map. [aimed] draws a smaller ring
+ *  with the direction wedge (alprWedgePath at half the map's size) turned to northeast; its tip
+ *  stays inside the slot. The swatch sits in a fixed slot so that extra width cannot push its
+ *  label out of line with every other row. The hollow ring is drawn, not a border. */
 @Composable
-private fun LegendRow(color: Color, label: String, hollow: Boolean = false, wide: Boolean = false) {
+private fun LegendRow(
+    color: Color,
+    label: String,
+    hollow: Boolean = false,
+    wide: Boolean = false,
+    aimed: Boolean = false,
+) {
     Row(
         Modifier.heightIn(min = 28.dp),
         verticalAlignment = Alignment.CenterVertically,
         horizontalArrangement = Arrangement.spacedBy(8.dp),
     ) {
         Box(Modifier.size(12.dp), contentAlignment = Alignment.Center) {
-            val d = if (wide) 12.dp else 10.dp
+            val d = when {
+                wide -> 12.dp
+                aimed -> 8.dp
+                else -> 10.dp
+            }
             if (hollow) {
                 Box(Modifier.size(d).drawBehind {
                     drawCircle(color, radius = size.minDimension / 2 - 0.75.dp.toPx(),
                         style = Stroke(1.5.dp.toPx()))
+                    if (aimed) rotate(45f) {
+                        drawPath(alprWedgePath(center, size.minDimension / 2, 0.5.dp.toPx()), color)
+                    }
                 })
             } else {
                 Box(Modifier.size(d).background(color, CircleShape))

@@ -203,6 +203,20 @@ class LogExportLensTest {
         assertEquals(emptyList<Detection>(), filterLogRows(listOf(wg), null, LogScope.All, emptySet(), query = "motorola"))
     }
 
+    /** The sixth body-cam signature: Axon's own Bluetooth SIG number (axon_detect.cpp, detail
+     *  "Axon Bluetooth ID"), which matches on a random address with no OUI. It names Axon as the
+     *  maker. iOS DetectionLogLensTests pins the same answers. Without the enum entry the row
+     *  falls back to the category's "Axon / Utility / Motorola", which matches "motorola". */
+    @Test
+    fun axonBluetoothIdRowNamesAxon() {
+        val sig = row("20:11:22:33:44:55", DeviceType.BODY_CAM, detail = "Axon Bluetooth ID")
+        assertEquals(BodyCamSignature.AXON_SIG_ID, sig.bodyCamSignature)
+        assertEquals("Axon Enterprise", sig.vendor)
+        assertEquals("Axon Enterprise", sig.maker)
+        assertEquals(listOf(sig), filterLogRows(listOf(sig), null, LogScope.All, emptySet(), query = "axon"))
+        assertEquals(emptyList<Detection>(), filterLogRows(listOf(sig), null, LogScope.All, emptySet(), query = "motorola"))
+    }
+
     /** The lens-summary line, the list's footer, counts the lens the list shows, which is the
      *  FROZEN feed while paused, names that feed and carries the category, so "5 of 5 paused"
      *  says the list is a snapshot, not that sightings were lost. Byte-identical to iOS

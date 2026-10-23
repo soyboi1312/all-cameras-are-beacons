@@ -790,6 +790,11 @@ struct MapTabView: View {
     @State private var tappedALPRMaker = ""      // the maker of the last-tapped dot ("" = unknown), shown in that callout
     @State private var tappedALPRTier: UInt8 = 1  // raw ALP tier; drives the callout's wording + tone
     @State private var tappedALPRPeek = false    // was that dot's ring peeking? the callout must not deny a live hit
+    @State private var tappedALPRDirection: UInt16?  // that dot's mapped direction (centidegrees), nil = none mapped
+    /// The map camera's heading and tilt at the last gesture end. ALPR wedges are screen-upright
+    /// annotations, so each turns by ALPRWedge.screenDegrees to keep its true bearing.
+    @State private var mapHeading: CLLocationDirection = 0
+    @State private var mapPitch: Double = 0
     @State private var span: MKCoordinateSpan = .init(latitudeDelta: 0.02, longitudeDelta: 0.02)
     @State private var region = MKCoordinateRegion(center: .init(latitude: 0, longitude: 0),
                                                    span: .init(latitudeDelta: 0.02, longitudeDelta: 0.02))
@@ -876,15 +881,20 @@ struct MapTabView: View {
     /// At least one drawn ring is peeking (a live pin stands on a mapped camera). State, written
     /// only by `installALPRVisible`, so the legend's live-hit row never scans `alprVisible`.
     @State private var alprPeeking = false
+    /// At least one drawn ring has a direction wedge. Same lifecycle as `alprPeeking`; gates the
+    /// legend's pointer row.
+    @State private var alprAimed = false
 
-    /// The ONE writer of `alprVisible`: installs a changed set, keeps `alprPeeking` in step (the
-    /// contains-scan runs only on a change), and bumps the render revision. An unchanged set
-    /// costs one array compare and zero @State writes.
+    /// The ONE writer of `alprVisible`: installs a changed set, keeps `alprPeeking` and
+    /// `alprAimed` in step (the contains-scans run only on a change), and bumps the render
+    /// revision. An unchanged set costs one array compare and zero @State writes.
     private func installALPRVisible(_ next: [ALPRPoint]) {
         guard next != alprVisible else { return }
         alprVisible = next
         let peeking = next.contains(where: \.peek)
         if peeking != alprPeeking { alprPeeking = peeking }
+        let aimed = next.contains { $0.directionCdeg != nil }
+        if aimed != alprAimed { alprAimed = aimed }
         bumpMapRenderRevision()
     }
 
@@ -918,7 +928,8 @@ struct MapTabView: View {
         os_signpost(.end, log: mapPerformanceLog, name: "MapALPRQuery", signpostID: signpostID)
         #endif
         var next = visibleNodes.map {
-            ALPRPoint(id: $0.id, coord: $0.coord, maker: $0.maker, tier: $0.tier)
+            ALPRPoint(id: $0.id, coord: $0.coord, maker: $0.maker, tier: $0.tier,
+                      directionCdeg: $0.directionCdeg)
         }
         applyPeek(&next)   // stamp "a live pin is standing on this camera" HERE, in the cull pass
         // ALPRPoint is Equatable: an unchanged viewport costs zero @State writes / zero invalidations.
@@ -2121,8 +2132,15 @@ struct MapTabView: View {
                         // live pin is standing on it; the shared callout below has no other way
                         // to find out, so the flag is recorded here with the maker and tier.
                         tappedALPRPeek = p.peek
+                        tappedALPRDirection = p.directionCdeg
                         withAnimation(.easeOut(duration: 0.15)) { showALPRInfo = true }
-                    } label: { ALPRDot(confirmed: p.confirmed, peek: p.peek) }
+                    } label: {
+                        ALPRDot(confirmed: p.confirmed, peek: p.peek,
+                                wedgeDegrees: p.directionCdeg.map {
+                                    ALPRWedge.screenDegrees(directionCdeg: $0, heading: mapHeading,
+                                                            pitch: mapPitch)
+                                })
+                    }
                         .buttonStyle(.plain)
                         .frame(minWidth: 44, minHeight: 44)
                         .contentShape(Rectangle())
@@ -2236,6 +2254,19 @@ struct MapTabView: View {
         .mapControls { MapCompass() }
         .preferredColorScheme(.dark)
         .onMapCameraChange(frequency: .onEnd) { ctx in
+            // ALPR wedges re-aim to the new heading and tilt. Written only on a change, like the
+            // region below, and BEFORE its guard: a pure turn need not move the region at all.
+            // The wedge angle is computed inside MapRenderGate, whose == reads only the revision,
+            // so the change must bump it or every wedge keeps its old angle. No bump while no ring
+            // has a wedge: the next bump reads the stored values anyway.
+            // ponytail: re-aims at gesture END, so wedges lag a two-finger turn; feed the dots a
+            // .continuous heading (an @Observable box only ALPRDot reads) if that ever matters.
+            let cam = ctx.camera
+            if abs(cam.heading - mapHeading) > 0.5 || abs(cam.pitch - mapPitch) > 0.5 {
+                mapHeading = cam.heading
+                mapPitch = cam.pitch
+                if alprAimed { bumpMapRenderRevision() }
+            }
             // MKCoordinateRegion/MKCoordinateSpan have NO Equatable conformance, so SwiftUI cannot dedupe
             // these @State writes for us: without this guard every callback invalidates body
             // unconditionally, even when the region is bit-identical. Required independently of the
@@ -2334,7 +2365,11 @@ struct MapTabView: View {
     }
 
     private func alprAccessibilityLabel(_ point: ALPRPoint) -> String {
-        let base = ALPRAttribution.accessibilityLabel(tier: point.tier, maker: point.maker)
+        var base = ALPRAttribution.accessibilityLabel(tier: point.tier, maker: point.maker)
+        // The wedge is a visual cue too, so VoiceOver hears the mapped direction in words.
+        if let direction = ALPRAttribution.direction(cdeg: point.directionCdeg) {
+            base += ", \(direction)"
+        }
         // The enlarged ring is a purely visual cue, so VoiceOver is told the same fact in words.
         guard point.peek else { return base }
         return "\(base). A live detection is sitting on this mapped camera."
@@ -2355,13 +2390,16 @@ struct MapTabView: View {
     /// ring, so a sighted user was the only one being told otherwise. On a peeking ring the
     /// denial drops and the peek sentence carries the claim instead, matching Android's
     /// alprMarkerText(peek:). Nothing else moves: the tier body stays byte-identical, because the
-    /// peek says something about the DETECTION, not about this row's attribution.
-    private func alprCalloutDetail(tier: UInt8, maker: String, peek: Bool) -> String {
-        let base = ALPRAttribution.detail(tier: tier, maker: maker)
-        guard peek else { return base }
-        let body = base.hasSuffix(Self.alprNotLiveClause)
-            ? String(base.dropLast(Self.alprNotLiveClause.count)) : base
-        return "\(body) \u{00B7} \(Self.alprPeekSentence)"
+    /// peek says something about the DETECTION, not about this row's attribution. A mapped
+    /// direction (the wedge, in words) goes between the body and the peek sentence, the same place
+    /// Android's alprMarkerText(directionCdeg:) puts it.
+    private func alprCalloutDetail(tier: UInt8, maker: String, peek: Bool, directionCdeg: UInt16?) -> String {
+        var body = ALPRAttribution.detail(tier: tier, maker: maker)
+        if peek, body.hasSuffix(Self.alprNotLiveClause) {
+            body = String(body.dropLast(Self.alprNotLiveClause.count))
+        }
+        return [body, ALPRAttribution.direction(cdeg: directionCdeg), peek ? Self.alprPeekSentence : nil]
+            .compactMap { $0 }.joined(separator: " \u{00B7} ")
     }
 
     /// Drone-only overlays: the flight-path line, a launch marker at the first fix,
@@ -2964,7 +3002,8 @@ struct MapTabView: View {
                         .foregroundStyle(ACABTheme.mapInfoText)
                     Text(alprCalloutDetail(tier: tappedALPRTier,
                                            maker: tappedALPRMaker,
-                                           peek: tappedALPRPeek))
+                                           peek: tappedALPRPeek,
+                                           directionCdeg: tappedALPRDirection))
                         .font(ACABTheme.font(.footnote)).foregroundStyle(ACABTheme.mapInfoText)
                 }
                 .fixedSize(horizontal: false, vertical: true)
@@ -3301,7 +3340,7 @@ struct MapTabView: View {
             // live hit, so the cue only works if the card says what it means. The swatch is the
             // ALPR tone at the very alpha a stale pin draws at, so it reads as a colour already in
             // the card at lower strength rather than as another category. Gated on a stale pin
-            // actually being drawn (MapSnapshot.hasStalePins). The two conditional keys name
+            // actually being drawn (MapSnapshot.hasStalePins). The lowercase conditional keys name
             // the treatment, then its meaning, lowercase-first like every row (R19): the same
             // words and case as Android's LegendRow twins in MapScreen.kt.
             if snap.hasStalePins {
@@ -3309,6 +3348,22 @@ struct MapTabView: View {
                 legendEntry("dimmed: last heard over an hour ago") {
                     Circle().fill(ACABTheme.flockTone.opacity(MapPinRules.staleTintAlpha))
                         .frame(width: 10, height: 10)
+                }
+            }
+            // The direction wedge, named. Gated on a ring with a wedge actually drawn right now
+            // (`alprAimed`, kept by installALPRVisible), so it stays away where nothing has a
+            // mapped direction. The swatch is the map's wedge at half size on a ring of about half
+            // the map ring's size, turned to northeast so it reads as a pointer. TWIN: android
+            // MapScreen.kt's LegendRow(aimed = true), same words (drift row "map pointer legend key").
+            if alpr.enabled && alprAimed {
+                Divider().overlay(ACABTheme.line)
+                legendEntry("pointer: the way the camera faces") {
+                    Circle().strokeBorder(ACABTheme.flockTone.opacity(0.95), lineWidth: 1.6)
+                        .frame(width: 8, height: 8)
+                        .overlay {
+                            ALPRWedge(scale: 0.5).fill(ACABTheme.flockTone.opacity(0.95))
+                                .rotationEffect(.degrees(45))
+                        }
                 }
             }
             // The ring-peek cue, named. Gated on a ring actually peeking right now: `alprPeeking`
@@ -4012,18 +4067,22 @@ private struct ALPRPoint: Identifiable, Equatable {
     /// pin-set pass - NEVER in body. Part of `==` on purpose: a peek that appears or clears has to
     /// reach the map. See ALPRRingPeek.
     var peek = false
+    /// The mapped direction the camera faces, hundredths of a degree clockwise from north, or nil.
+    /// Drives the ring's wedge and the direction words.
+    let directionCdeg: UInt16?
     let id: String
-    init(id: String, coord: CLLocationCoordinate2D, maker: String, tier: UInt8) {
+    init(id: String, coord: CLLocationCoordinate2D, maker: String, tier: UInt8, directionCdeg: UInt16?) {
         self.id = id
         self.coord = coord
         self.maker = maker
         self.tier = tier
+        self.directionCdeg = directionCdeg
     }
     // Stable identity plus every display field keeps an unchanged viewport at zero @State churn.
     static func == (a: ALPRPoint, b: ALPRPoint) -> Bool {
         a.id == b.id && a.coord.latitude == b.coord.latitude
             && a.coord.longitude == b.coord.longitude && a.maker == b.maker && a.tier == b.tier
-            && a.peek == b.peek
+            && a.peek == b.peek && a.directionCdeg == b.directionCdeg
     }
 }
 
@@ -4135,6 +4194,9 @@ private struct ALPRDot: View {
     /// See ALPRRingPeek.diameter for the derivation. The peek ring is hollow on both platforms and
     /// the resting ring keeps its wash on both (TWIN: android MapMarkers.kt rememberAlprMarker).
     var peek: Bool = false
+    /// On-screen angle of the direction wedge, degrees clockwise from straight up (the mapped
+    /// direction minus the map heading), or nil for no wedge (no direction mapped).
+    var wedgeDegrees: Double? = nil
     private var tone: Color { confirmed ? ACABTheme.flockTone : ACABTheme.warn }
     private var size: CGFloat { peek ? ALPRRingPeek.diameter : 14 }
     var body: some View {
@@ -4147,6 +4209,13 @@ private struct ALPRDot: View {
             .overlay(Circle().strokeBorder(tone.opacity(0.95),
                                            style: StrokeStyle(lineWidth: ALPRRingPeek.rimLineWidth,
                                                               dash: confirmed ? [] : [2.6, 2.2])))
+            // Drawn past the ring's frame on purpose, so the frame (and the annotation's anchor
+            // and tap target) is the same with or without a wedge; the turn pivots on its centre.
+            .overlay {
+                if let wedgeDegrees {
+                    ALPRWedge().fill(tone.opacity(0.95)).rotationEffect(.degrees(wedgeDegrees))
+                }
+            }
             .accessibilityLabel(confirmed ? "Known ALPR camera, manufacturer attributed"
                                           : "Community ALPR candidate, attribution not structured")
         // Bolder 2026-07-29 (user: rings washed out on the map). Still a HOLLOW STATIC ring: the
@@ -4157,6 +4226,41 @@ private struct ALPRDot: View {
         // is the only thing that tells a live hit at a mapped camera apart from a live hit nobody
         // has mapped). The peek NUMBER is each platform's own (ALPRRingPeek.diameter); neither
         // side copies the other's.
+    }
+}
+
+/// The direction wedge on an ALPR ring: a solid triangle on the rim, pointing UP; ALPRDot turns it
+/// to the mapped direction. Drawn in the RING's frame, whose edge is the rim's outer edge
+/// (strokeBorder draws inside). The base sits `overlap` inside that edge so it joins the stroke
+/// with no gap, and the tip stands `length` outside it, on both ring sizes. TWIN: android
+/// rememberAlprMarker(aimed) with ALPR_WEDGE_* in MapMarkers.kt, same three numbers, each measured
+/// from its own platform's rim edge. `scale` shrinks all three for the legend swatch only.
+struct ALPRWedge: Shape {
+    // Long and slim so it reads as a pointer, not a teardrop map pin; much longer and the four
+    // wedges of a typical intersection start crossing their neighbours' rings.
+    static let length: CGFloat = 8
+    static let halfBase: CGFloat = 2.6
+    static let overlap: CGFloat = 1
+    var scale: CGFloat = 1
+
+    /// On-screen angle, degrees clockwise from straight up, of a camera facing `directionCdeg`
+    /// (hundredths of a degree from north) on a map camera with this heading and pitch. Annotations
+    /// stay screen-upright, so a tilted map foreshortens the bearing's forward part by cos(pitch);
+    /// flat, this is just direction minus heading. Android has no tilt or turn, so no twin.
+    static func screenDegrees(directionCdeg: UInt16, heading: Double, pitch: Double) -> Double {
+        let bearing = (Double(directionCdeg) / 100 - heading) * .pi / 180
+        return atan2(sin(bearing), cos(bearing) * cos(pitch * .pi / 180)) * 180 / .pi
+    }
+
+    func path(in rect: CGRect) -> Path {
+        let outer = min(rect.width, rect.height) / 2
+        let baseY = rect.midY - (outer - Self.overlap * scale)
+        var p = Path()
+        p.move(to: CGPoint(x: rect.midX - Self.halfBase * scale, y: baseY))
+        p.addLine(to: CGPoint(x: rect.midX, y: rect.midY - outer - Self.length * scale))
+        p.addLine(to: CGPoint(x: rect.midX + Self.halfBase * scale, y: baseY))
+        p.closeSubpath()
+        return p
     }
 }
 

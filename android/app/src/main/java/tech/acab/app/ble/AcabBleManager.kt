@@ -91,6 +91,7 @@ import java.util.zip.CRC32
 import javax.crypto.KeyGenerator
 import javax.crypto.SecretKey
 import tech.acab.app.model.maker
+import tech.acab.app.model.bodyCamSignature
 
 enum class ConnState { DISCONNECTED, SCANNING, CONNECTING, BONDING, READY, POWERED_OFF }
 
@@ -2176,20 +2177,29 @@ data class WatchedDevice(val mac: String, val label: String)
  *  iOS twin: ContributionCsv.detectionColumns, which BLEManager.buildCSV joins for its header the
  *  same way detectionsCsv does here.
  *
- *  `maker`, `wifi_channel`, `wifi_band_ghz` went on the END so a column-order parser still reads
- *  every field it knew. WiFi columns are not locations: ContributionCsv.kt never blanks them. */
+ *  `maker`, `wifi_channel`, `wifi_band_ghz`, `bodycam_signature` went on the END so a column-order
+ *  parser still reads every field it knew. WiFi columns are not locations: ContributionCsv.kt never
+ *  blanks them. */
 internal val DETECTION_CSV_COLUMNS: List<String> = listOf(
     "detected_at", "time_basis", "time_precision_s", "type", "mac", "rssi",
     "source", "matched_on", "confidence", "sightings", "approx_lat", "approx_lon",
     "company_id", "uas_id", "drone_lat", "drone_lon", "altitude_m", "speed_ms",
     "heading_deg", "height_agl_m", "operator_lat", "operator_lon", "operator_alt_m",
-    "rid_status", "maker", "wifi_channel", "wifi_band_ghz",
+    "rid_status", "maker", "wifi_channel", "wifi_band_ghz", "bodycam_signature",
 )
 
 /** A detection row's wifi_channel and wifi_band_ghz cells, "" when absent (BLE, replayed rows).
- *  Top-level so a JVM test needs no manager. TWIN: iOS BLEManager.buildCSV's last two cells. */
+ *  Top-level so a JVM test needs no manager. TWIN: iOS BLEManager.buildCSV's wifi cells. */
 internal fun detectionCsvWifiCells(channel: Int?): List<String> =
     listOf(channel?.toString() ?: "", wifiBandGhz(channel) ?: "")
+
+/** A detection row's bodycam_signature cell: which body-cam rule fired, as a [BodyCamSignature]
+ *  raw value, so an export says "BWC DEVICE" vs "Axon Bluetooth ID" instead of leaving it to be
+ *  inferred from matched_on and confidence. "" for every other row and for a replayed one (the
+ *  buffer keeps no detail). Never the raw detail: a drone's detail carries the broadcast Operator
+ *  ID ("op ..."), and this file is what a contribution shares. TWIN: iOS BLEManager.buildCSV's
+ *  last cell. */
+internal fun detectionCsvSignatureCell(d: Detection): String = d.bodyCamSignature?.raw ?: ""
 
 /** Rebuild the compact wire JSON for a filed detection (enough to reload it). Top-level so
  *  WifiChannelExportTest round-trips it without a manager. */
@@ -7819,7 +7829,8 @@ class AcabBleManager(private val context: Context) {
                     externalText.uasId, dLat, dLon,
                     iStr(d.altitude), iStr(d.speedH), iStr(d.heading), iStr(d.heightAGL),
                     opLat, opLon, iStr(d.pilotAlt), d.ridStatusLabel ?: "",
-                    externalText.maker) + detectionCsvWifiCells(d.wifiChannel),
+                    externalText.maker) + detectionCsvWifiCells(d.wifiChannel) +
+                    detectionCsvSignatureCell(d),
                 ::csvSafe,
             ))
         }
@@ -8683,10 +8694,10 @@ class AcabBleManager(private val context: Context) {
             // "moto" is present so the tour shows the Motorola sub-toggle. Omitting it would make
             // the demo board look like pre-split firmware and hide the control the tour exists to
             // introduce. "axon":true so the parent category is on and the sub-row is not dimmed.
-            """{"fw":"beacon board 2.2.0","up":4920,"total":6,"ble":true,"wifi":true,"axon":true,"moto":true,"tracker":true,"glasses":true,"ncam":true,"buzzer":true,"vol":70,"gps":true,"bat":82}""").apply {
+            """{"fw":"beacon board 2.2.1","up":4920,"total":6,"ble":true,"wifi":true,"axon":true,"moto":true,"tracker":true,"glasses":true,"ncam":true,"buzzer":true,"vol":70,"gps":true,"bat":82}""").apply {
             when (debugKind) {
-                BoardKind.OUI_SPY -> put("fw", "ACAB-ouispy 2.2.0")
-                BoardKind.MESH_DETECT -> put("fw", "mesh-detect-ACAB 2.2.0")
+                BoardKind.OUI_SPY -> put("fw", "ACAB-ouispy 2.2.1")
+                BoardKind.MESH_DETECT -> put("fw", "mesh-detect-ACAB 2.2.1")
                 BoardKind.BEACON, null -> Unit
             }
         })
