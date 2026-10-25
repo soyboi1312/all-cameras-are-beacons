@@ -1,6 +1,6 @@
 {
   "name": "ACAB Mesh-Detect",
-  "version": "2.2.1",
+  "version": "2.2.2",
   "funding_url": "",
   "new_install_prompt_erase": true,
   "builds": [

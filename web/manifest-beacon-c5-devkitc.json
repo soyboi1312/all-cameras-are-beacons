@@ -1,6 +1,6 @@
 {
   "name": "ACAB beacon c5 devkitc (All Cameras Are Beacons), ESP32-C5-DevKitC-1",
-  "version": "2.2.1",
+  "version": "2.2.2",
   "funding_url": "",
   "new_install_prompt_erase": true,
   "builds": [
