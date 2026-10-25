@@ -278,7 +278,8 @@ Re-proposing these needs a captured BSSID from a marked vehicle, and a per-row v
   `BMW 24631` and `MINI 45552`. A person can read an agency SSID; a matcher cannot.
 - Point 2 again: this one log holds 154 distinct `00:30:44` BSSIDs in about 4 h 20 min, and 54
   never showed an SSID. The Cradlepoints near the owner's other markers that morning had no SSID,
-  so they prove nothing. A fleet with bare-number SSIDs (`2004`, `2408`, `2783`, ...) on
+  so they name no agency (the 2026-10-21 update below shows what the close ones do mark). A fleet
+  with bare-number SSIDs (`2004`, `2408`, `2783`, ...) on
   `00:30:44:22` was beside the afternoon body cam scene, but the `aug-9-drive*.log` captures show
   the same block with a dozen other numbers, so it is a common fleet and not evidence.
 - Point 1 changed in 2.1.0. `police_detect.cpp` now takes the detail string from the table that
@@ -289,6 +290,25 @@ Re-proposing these needs a captured BSSID from a marked vehicle, and a per-row v
 - `OPD 3484` is always the same BSSID, `00:30:44:B3:06:6B`, on four drives (2026-09-04, 09-13,
   09-27 and 10-01). It is a router at one place on the owner's route, not a car that follows the
   owner. The WatchGuard Video section below has two sightings from that same stretch of road.
+
+**Update 2026-10-21: a pass over the raw logs up to 2026-10-18 near owner markers and Axon
+adverts. Still no rule.**
+
+- Close hidden-SSID Cradlepoints (`00:30:44`, no SSID, -75 dBm or stronger) cluster at owner
+  markers. Of 30 events (owner markers and Axon adverts, merged within 60 s), 9 had one within
+  60 s, against 2.2 expected from the same logs' base rate. The cluster sits at the markers: 6 of
+  15 marker-only events (about 1.1 expected), against 3 of 15 events with an Axon advert (about
+  1.0 expected). So a close hidden Cradlepoint goes with the vehicles the owner noted more than
+  with body cams (the Axon count is small), and point 2 still decides it.
+- `MDC` probers. In `drive_home_9-4.log` three clients on the Compex block `04:F0:21` probed for
+  the SSID `MDC` within 13 s of three owner markers, and one of them was strongest (-53 dBm) in
+  the same minute as a tagged Axon cam. The logs hold 8 `MDC` probers and the 2026-10-18 downtown
+  control none. The same `04:F0:21` block (Compex, a WiFi-module maker) also carries the
+  `lafdwifi` fleet's radios (14 MACs in the logs), so `MDC` cannot separate a patrol car from a
+  fire rig. An observation, not a rule.
+- `CP3N`. One Sierra Wireless router, `50:13:9D:18:78:66`, beaconed `CP3N` in `913.log` 30 s after
+  two WatchGuard Video units probed for it. It is the only `CP3N` beacon in the logs, so most
+  likely an in-car router and camera system on one network (see the WatchGuard Video section).
 
 **Coverage went from 1 block to 7 (2026-07-19).** The table shipped only `4C:CC:34`, which
 left six sibling blocks of the same vendor's gear invisible. This is now the COMPLETE set
@@ -326,7 +346,7 @@ site), which is what establishes this vendor as detectable on this board at all;
 siblings are the same product lines from the same registrant.
 src: IEEE OUI registry -> https://maclookup.app/macaddress/4CCC34
 
-**Road ground truth (2026-07-25 to 2026-09-30): on the road, these blocks have landed on
+**Road ground truth (2026-07-25 to 2026-10-21): on the road, these blocks have landed on
 law-enforcement gear.** The 2026-07-23 airport result measured fixed equipment. Every Motorola
 road hit the owner has confirmed since then was law-enforcement gear on scene. Hits is the app
 CSV's `sightings` column; the 2026-09 rows come from app CSV exports that are not kept in the
@@ -342,6 +362,7 @@ repo. Three other road hits stayed unconfirmed; the owner did not check them eit
 | 2026-09-27 | US-101, Camarillo | `10:74:6F:66:E7:6F` | 3 | law enforcement on scene, at freeway speed |
 | 2026-09-30 | Camarillo | `10:74:6F:66:D7:CF` | 66 | driving beside patrol cars, next to a tagged and an untagged Axon device |
 | 2026-09-30 | Camarillo, 3.4 km further south | `10:74:6F:21:CF:8E` | 1 | driving past a patrol car |
+| 2026-10-21 | downtown San Diego, Broadway courthouse blocks | `4C:CC:34:B1:66:D7` | 1 | body-cam wearers on scene, owner-confirmed, during a walk past six Axon rows; one WiFi frame (ch 6, -79) cannot tell a camera from an APX radio |
 
 What this shows, and what it does not:
 
@@ -365,6 +386,19 @@ What this shows, and what it does not:
   network reads as a radio, the same as `LACAPX` above, so this unit was probably not a body cam.
   On 2026-10-01 a client with a randomized MAC probed for the same SSID 2 s after an owner marker
   for law enforcement on scene (see the Cradlepoint update above).
+- **Two more radio-network probers, at the 2026-10-01 downtown San Diego Axon scene**
+  (`oct012026.log`). `4C:CC:34:B1:23:59` probed for `Fps_Radio@1!!24` at 12:21:14 PDT (-77), 13 s
+  after a tagged Axon cam. `10:74:6F:B1:48:86` probed for `APXWiFi03` and `APXWiFi02` at 12:23:40
+  (-79), 12 s before an owner marker and about half a minute before more tagged cams. Both read as
+  radios on that scene; nothing ties either one to a person or to a car. Of the 10 Motorola probers in the serial logs, 4 asked for a
+  radio network (`LACAPX`, `VCSO-Radio`, `APXWiFi03`, `Fps_Radio@1!!24`), 4 sent only wildcard
+  probes and 2 asked for personal-style names.
+- **The 2026-10-21 row is the second time the owner counts a Motorola hit as a body cam, after
+  2026-07-25, and the first whose app export is kept.** The confirmation covers the scene, not which device on a person sent one
+  frame. The app CSV keeps no SSID or frame type and the serial capture was asleep at that minute,
+  so the frame cannot be checked for a radio-network probe; every other row on that walk was Axon.
+  Its address is 17,278 above `4C:CC:34:B1:23:59`, so the shared `B1` byte means nothing. One hit
+  does not move the 45, the opt-in default or the amber treatment.
 
 > **Own toggle, opt-in on every board.** The Motorola OUI match
 > is a SUB-TOGGLE of the body-cam category (`{"motorola":bool}` on the wire, `moto` in
@@ -598,6 +632,36 @@ The first netcam vendor admitted on **our own field capture** rather than on a r
   discontinued Arlo Security Light talks BLE to a bridge, so this match stays **WiFi-only** or a
   porch light gets labelled a camera.
 
+### ADMITTED 2026-10-18: the fleet dashcam SSID rule (`Dash-` plus four digits)
+
+The first netcam rule that names a camera from its SSID, admitted on our own logs plus the
+vendor's documentation.
+
+- **What it matches.** The Surfsight AI-12 fleet dashcam names its hotspot `Dash-` plus the last
+  four digits of its IMEI ([Surfsight knowledge base](https://kb.surfsight.net/hc/en-us/articles/360019637380-Troubleshooting-WiFi-and-Hotspot-Issues)).
+  The rule is `NETCAM_SSID_FLEET_DASH_PREFIX` plus exactly four ASCII digits, nine characters,
+  case-insensitive, on beacons and probe responses only.
+- **The evidence.** The 2026-10-18 downtown capture logged 15 `Dash-NNNN` SSIDs, 10 of them inside
+  13 seconds. A scan of every capture log that day (`[wifi]` lines, probe requests excluded) found
+  630 distinct MACs with the exact shape in 20 of 37 logs.
+- **No OUI gate.** 467 of the 630 sit on `7C:0C:F6` (Guangdong Huiwei High-tech Co., Ltd. per
+  maclookup.app, an ODM, not Surfsight). 111 are locally administered and 52 spread over four other
+  blocks. A gate would miss about a quarter of them, and the OUI path drops every locally
+  administered MAC before it looks.
+- **Exact shape, not a bare prefix.** The same logs carry consumer dashcams named `Dash-Cam-...`.
+  A bare `Dash-` prefix would report those as fleet hardware.
+- **Confidence 65, not 88.** `Dash-1234` is short enough for anyone to choose as a hotspot name,
+  and nobody has yet tied one to a camera by eye. An SSID rule has no validated flag, so the tier is
+  the only control. Because 65 does not outrank the OUI tiers, an OUI row on the same frame wins.
+  Raise it after an eyeball check.
+- **The label is "fleet dashcam".** Unlike the Arlo hub, this box is the camera. The apps show the
+  SSID as the row title and the generic SSID explainer; neither app parses the label.
+- **Inside the network-camera opt-in**, so it is off by default like every other netcam rule.
+- **Stated misses.** The hotspot is a setting, and a fleet can turn it off. Other fleet dashcams
+  use other SSID forms.
+- **Not added: Motive.** `Motive <serial>` SSIDs appear in our logs, but Motive's hotspot
+  belongs to its Vehicle Gateway, a telematics box. The SSID does not prove a camera.
+
 ### Registry-checked, NOT yet admitted: SimpliSafe and Vivint outdoor cameras (2026-08-05)
 
 Both proposed as netcam rows on the Lorex/Swann pattern. Registry pull, for the record, so the next
@@ -695,16 +759,19 @@ by an EVO or another Autel aircraft.
 | MAC OUI | exact | `00:25:DF` (Axon Enterprise, ex-TASER; their registered IEEE block) | IEEE / maclookup.app |
 | MAC OUI | exact | `D8:1F:65` (Axon; **field-attributed, registry lists holder as Private**) | own field capture, 2026-08-09 + 2026-09-19 |
 | BLE payload | service bytes contain (no space!) | `BWCDEVICE` (Axon) | own field capture, 2026-06; **field-validated 2026-07-19** |
+| BLE SIG number | exact, with a payload (`0x034D`: serial-shaped) | service data `0xFE6B` / company ID `0x034D` (Axon, registered as TASER International) | Bluetooth SIG Assigned Numbers + own field capture, 2026-08-09 .. 2026-10-01 |
 | BLE name | contains | `BodyWorn Remote` (Utility Inc. BodyWorn) | nite-oui-collection capture, 2025-08 |
 | MAC OUI | exact | `00:09:BC` / `00:16:ED` (Utility Inc.; weak fallback) | IEEE / nite-oui-collection |
 
 **The two Axon OUIs carry different kinds of evidence, and the difference is about who vouches for
-them, not about whether they show up.** Both are well observed: 8 distinct MACs on `00:25:DF`
-(across `aug-9-drive4`, `aug-9-flock-o`, `drive_home_9-4` and `lvt-lot1`, several firing conf 90 on
-the tag) and 9 on `D8:1F:65`. The difference is that the registry names Axon for the first and
-names nobody for the second:
+them, not about whether they show up.** Both are well observed. Recounted 2026-10-21 over the serial
+logs: 13 distinct MACs on `00:25:DF` (across `aug-9-flock-o`, `drive_home_9-4`, `lvt-lot1`,
+`sep252026`, `sep272026` and `oct012026`, several firing conf 90 on the tag; one appears only as a
+detection line) and 10 on `D8:1F:65`. Counting the app CSV exports and the owner's field notes as
+well, which carry no advert bytes, the totals are 33 and 22. The difference is that the registry
+names Axon for the first and names nobody for the second:
 
-- **Nine distinct MACs, zero non-Axon devices ever seen on the block.** Eight carry the `BWCDEVICE`
+- **At admission (2026-09-19): nine distinct MACs, zero non-Axon devices seen on the block.** Eight carry the `BWCDEVICE`
   tag (five at Adams Ave Street Fair, San Diego, 2026-09-19, **all five owner-confirmed by eye**;
   three in `aug-9-flock-o.log`, 2026-08-09). The ninth, `D8:1F:65:04:A2:57`, carries Axon's own SIG
   service UUID `0xFE6B` (AD 0x16, ASCII `D01AT522D`) and no `BWCDEVICE` tag, so before this block
@@ -717,38 +784,137 @@ names nobody for the second:
   MA-S subdivision, so the full 24-bit prefix has one holder and a bare 24-bit entry is correct.
   The module-maker risk can therefore only ever be closed by more field ground truth: if a non-Axon
   device appears on this block, it is the Liteon trap and the entry must come out.
-- **What it buys is one device**, `D8:1F:65:04:A2:57`. The other eight already fire at conf 90 on
-  the MAC-independent tag. Do not oversell the entry.
+- **What it bought was one device**, `D8:1F:65:04:A2:57`. The other eight already fire at conf 90
+  on the MAC-independent tag. Since the SIG-number rule below (2026-10-20) it buys **no** device in
+  the serial logs: each of the 10 `D8:1F:65` devices there carries the tag or `0xFE6B`. It stays as
+  the fallback for Axon gear on this block that sends neither. On WiFi it is the only match on
+  this block (`axonClassifyWiFi` has no tag or SIG check): rows 6 and 7 of the 2026-10-21 record
+  (owner-confirmed) reached the app through this entry alone, and row 6 is a device no other rule
+  caught. Do not oversell the entry, and do not undersell it either.
+- **2026-10-21 added six owner-confirmed MACs on the block, two of them on WiFi: the first
+  `D8:1F:65` WiFi frames in any capture.** See the 2026-10-21 record below. Still zero non-Axon
+  devices on the block.
 - `0xD8` looks like a BLE random-static prefix (top two bits set) but its locally-administered bit
-  is clear, so it is a globally-administered block. Nine MACs sharing three bytes across two cities
+  is clear, so it is a globally-administered block. Nine MACs at admission sharing three bytes across two cities
   six weeks apart is not something a random-address generator produces.
 
 - **The registered block's OUI-only path has its own ground truth.** Three `00:25:DF` BLE hits that
   carried NO `BWCDEVICE` tag (one weak packet each, -88 dBm or below, conf 75 "OUI match") were
   owner-confirmed as body cams worn by officers: `00:25:DF:54:7B:5A` (2026-09-16) and
   `00:25:DF:7D:8C:DE` + `00:25:DF:F8:38:3F` (2026-09-23, Agoura Hills area, two officers on scene,
-  one second apart). All three come from app CSV exports, not serial logs. Reading: at the edge of
-  range the board can hear an Axon cam's untagged advertisement only, and the OUI fallback is what
-  catches it. That is why the tier stays: 3 of 3 confirmed, no non-cam Axon device seen on the block
-  yet. It is NOT a reason to raise the 75; a dock or other Axon gear on the same block would look
-  identical on the air.
-- **Two more untagged hits came from traffic, with law enforcement confirmed on scene but no
+  one second apart). All three come from app CSV exports, not serial logs, so which advert each
+  one sent is not known. The serial logs say it was probably not "an untagged advert at the edge
+  of range". Recounted 2026-10-21, every BLE advert on either Axon block in the serial logs (39
+  adverts) is one of four forms: the `BWCDEVICE` tag, the `METROPOLISDEVICE` tag (below), `0xFE6B`
+  service data with a `D01A` serial, or `0x034D` with an `X8` serial. None carries no Axon
+  identifier. A 2.2.1
+  board reports the last three as "Axon OUI" 75 (2.2.2 reports the two SIG numbers as "Axon
+  Bluetooth ID" 75), so an OUI-only row was one of those three forms. Five MACs on the Axon blocks
+  sent `0xFE6B` only.
+  At least one tagged cam also alternates its two faces: one `D8:1F:65` MAC sent a `BWCDEVICE`
+  advert and an `0xFE6B` advert 0.7 s apart (`oct012026.log`). The nRF forwards a MAC again only
+  when its forward window (`DEDUP_WINDOW_MS`, 20 s) runs out or the signal jumps by
+  `PEAK_JUMP_DB` (6 dB) (`firmware/nrf-ble-scan/src/main.cpp`; the table lives in
+  `nrf_dedup.h`), so for a whole window such a cam shows only its `0xFE6B` face. That alternation
+  is rare: the other 12 tagged MACs in the serial logs sent 26 forwarded adverts between them,
+  every one tagged. Row 4 of the 2026-10-21 record below is an owner-confirmed cam that reached
+  the phone only through `0xFE6B` (four sightings, none at 90); whether it also sends the tag is
+  not known. The OUI tier stays: 3 of 3 confirmed, no non-cam Axon device seen
+  on the block yet. It is NOT a reason to raise the 75; a dock or other Axon gear on the same
+  block would look identical on the air.
+- **Two more OUI-only hits came from traffic, with law enforcement confirmed on scene but no
   camera seen on a person.** `00:25:DF:C0:AF:44` (2026-09-30, Camarillo; its strongest reading
   came one second after that of the tagged cam `00:25:DF:8E:FD:66`, conf 90, while the owner drove
   beside patrol cars) and `00:25:DF:7F:D6:19` (2026-09-27, I-5 at Camp Pendleton, the BLE side of
   the WiFi device in the next bullet). Both come from app CSV exports. They count as Axon gear
   present, not as confirmed worn cams: worn cams stay at 3 of 3, and Axon gear on scene is 5 of 5.
-  An untagged `00:25:DF` advert from a car can also be in-car or other Axon equipment.
-- **The WiFi path (`axonClassifyWiFi`, conf 65) has two field hits, and each is one device with
-  WiFi at the base address and BLE at base + 1.** 2026-08-03
-  (own capture lvt-2026-08-03, not published): WiFi
+  The serial capture beside the second one (`sep272026.log`) shows its advert was not untagged: it
+  carried the `METROPOLISDEVICE` tag, which no rule matches, so the app could only say "Axon OUI".
+  An OUI-only `00:25:DF` hit from a car can also be in-car or other Axon equipment.
+- **The WiFi path (`axonClassifyWiFi`, conf 65) now has eight field hits, and wherever a hit's
+  BLE side was heard too, the two were one device (on `D8:1F:65` probably: one pair).** On `00:25:DF` the WiFi address is one below
+  the BLE address. 2026-08-03 (own capture lvt-2026-08-03, not published): WiFi
   `00:25:DF:A3:5D:7B` four seconds after BLE `00:25:DF:A3:5D:7C`, whose advert carried the
   `BWCDEVICE` tag, so that WiFi transmitter was a body cam's. 2026-09-27, I-5 at Camp Pendleton
   (app CSV export): WiFi `00:25:DF:7F:D6:18`, 22 hits at -72 dBm, and at the same spot BLE
-  `00:25:DF:7F:D6:19`, untagged, one packet; the owner confirmed law enforcement on scene. Count
-  such a pair once. So WiFi is not only docks, terminals and Fleet: at least one body cam transmits
-  on it. The 65 stays, because two hits do not say how often a WiFi `00:25:DF` hit is fixed
-  station gear.
+  `00:25:DF:7F:D6:19`, one packet, which the serial capture shows carried the `METROPOLISDEVICE`
+  tag; the owner confirmed law enforcement on scene. 2026-10-04, downtown San Diego (app CSV
+  export): three WiFi hits the owner confirmed as body cams, `00:25:DF:4B:E7:93`,
+  `00:25:DF:4B:FA:55` and `00:25:DF:53:23:63`, no BLE side heard. 2026-10-21: three more, in the
+  record below. Count a pair once.
+- **On `D8:1F:65` the pair form is different, and it rests on one pair (provisional).** On
+  2026-10-21, BLE `D8:1F:65:04:FC:17` (tag, conf 90) and WiFi `D8:1F:65:84:FC:16` (conf 65) were
+  pinned 10 m and 12 minutes apart. WiFi = (BLE - 1) + 0x800000: the same one-below step as on
+  `00:25:DF`, plus the top bit of the device part. The block's structure fits it. All 20
+  `D8:1F:65` BLE addresses seen so far are odd and below `D8:1F:65:06:00:00`, and both WiFi
+  addresses are even with that top bit set. Of 40 WiFi x BLE combinations on the block, only this
+  pair lines up, against about 0.002 expected by chance. Count it as probably one device until a
+  capture hears both sides from one unit.
+- In every pair so far the WiFi side's best reading was stronger than its BLE twin's (by 10, 22
+  and 22 dB; the `D8:1F:65` pair's two readings were 12 minutes apart), which fits WiFi-only hits
+  (2026-10-04, two of 2026-10-21) being common. So WiFi is not only docks,
+  terminals and Fleet: body cams transmit on it. The 65 stays, because eight hits do not say how
+  often a WiFi Axon hit is fixed station gear.
+
+**2026-10-21 record, downtown San Diego: nine body-cam rows, all confirmed accurate by the owner.**
+App CSV export `acab-detections 6.csv`, 10:44 to 11:30 PDT. The serial capture beside it
+(`moto_downtown.log`, `downtown2.log`) was asleep at every one of these times, so no advert bytes
+were kept; the rule and confidence below come from the export.
+
+| Row | Local time | MAC | Radio | Rule (detail) | Conf | RSSI |
+|---|---|---|---|---|---|---|
+| 1 | 10:44:30 | `D8:1F:65:04:FC:17` | BLE | tag (`BWC DEVICE`) | 90 | -84 |
+| 2 | 10:44:34 | `00:25:DF:53:29:2F` | WiFi ch 7 | WiFi OUI (`Axon OUI`) | 65 | -79 |
+| 3 | 10:45:14 | `D8:1F:65:04:C6:BF` | BLE | tag | 90 | -83 |
+| 4 | 10:50:26 | `D8:1F:65:04:9A:23` | BLE | `0xFE6B` (`Axon Bluetooth ID`) | 75 | -89 |
+| 5 | 10:52:33 | `4C:CC:34:B1:66:D7` | WiFi ch 6 | Motorola opt-in (`Motorola Solutions OUI`) | 45 | -79 |
+| 6 | 10:55:38 | `D8:1F:65:80:2A:2E` | WiFi ch 10 | WiFi OUI | 65 | -84 |
+| 7 | 10:56:32 | `D8:1F:65:84:FC:16` | WiFi ch 6 | WiFi OUI | 65 | -62 |
+| 8 | 11:24:44 | `D8:1F:65:05:AA:5F` | BLE | tag | 90 | -89 |
+| 9 | 11:29:31 | `00:25:DF:8B:67:F2` | BLE | tag | 90 | -84 |
+
+- Rows 1 to 7 sit within about 320 m of each other (the Broadway courthouse blocks; the six Axon
+  rows within about 120 m); rows 8 and 9 came on the drive home. Rows 1 and 7 are probably one device (the `D8:1F:65` pair form above), so
+  nine rows are eight devices: seven Axon and one Motorola Solutions.
+- Row 4 is the first owner-confirmed hit of the `0xFE6B` rule. It reached the phone only as that
+  rule, from a 2.2.2 board. The 2.2.1 app that exported it left `maker` blank because it predates
+  the `Axon Bluetooth ID` string (the release order for new wire strings is in
+  `firmware/tools/RELEASE.md`).
+- The board's `[diag]` counters show a second MAC carrying an Axon SIG number during the walk that
+  never became a row of its own. It may have been cam 1 or 3 in its `0xFE6B` phase, though rows 1
+  and 3 each show one sighting, which argues against a merge; or it was another Axon device sending
+  a form that day's rule did not match (an Axon number in a UUID list, `0xFC81` or `0xFE6C`, or no
+  payload; that build had no `0x034D` serial gate yet). The capture line that would name it fell in
+  a gap.
+- Row 5: see the Motorola road table.
+- From the 2.2.2 apps on, the detection CSV ends with a `bodycam_signature` column that names the
+  body-cam rule as a `BodyCamSignature` value such as `BWC DEVICE` or `Axon Bluetooth ID` (blank on
+  every other row, on a replayed row, and for a detail string the app does not know), so for a live
+  row the rule no longer has to be inferred from `matched_on` and `confidence`.
+
+**A second Axon tag, `METROPOLISDEVICE`: recorded 2026-10-21, not matched.** Two adverts in the
+serial logs, byte for byte the same:
+`020106 1221 45434956454453494C4F504F5254454D 01 0512A0002003`. The AD `0x21` UUID reads
+`METROPOLISDEVICE` once its bytes are reversed, the same scheme as `AXJANUSBWCDEVICE`. The layout
+is the `BWCDEVICE` layout (flags, AD `0x21` of length 0x12, payload `0x01`) plus an AD `0x12`
+peripheral connection-interval range (200 ms to 1 s).
+
+- Sightings: `00:25:DF:53:52:7C` (`sep252026.log`, 10:46:20 PDT, -84, while driving) and
+  `00:25:DF:7F:D6:19` (`sep272026.log`, 19:26:46 PDT, -87, I-5 at Camp Pendleton). Within one
+  second the second one's WiFi side `00:25:DF:7F:D6:18` probed `AMO_Cisco`, `AMO_CradlePoint`,
+  `AMO_Agile`, `AMO_Dejero`, `Cradlepoint_Niagara`, `Agile_Niagara` and `EnGo-5260875`:
+  vehicle-router network names that appear in no other log. Zero sightings in the 2026-10-18
+  downtown control and in the 2026-10-21 logs.
+- What the rules do today: the tag rule searches for `BWCDEVICE`, so it never fires on this tag.
+  On `00:25:DF` both units were caught as "Axon OUI" (75 on BLE, 65 on WiFi). From a random
+  address it would be missed.
+- The product class is open: in-car video (Axon Fleet), a worn cam riding in a car, or other Axon
+  gear. The probe list leans toward a vehicle, but a worn cam can join in-car WiFi too. No public
+  source names it.
+- No matcher yet: on `00:25:DF` it would add no detection. Add one when it shows up off the Axon
+  blocks, or when an eyes-on sighting settles the class. Then: an exact 16-byte compare on AD
+  `0x21` only, conf 75 with a new detail string that both apps learn first, never the conf-90
+  `BWC DEVICE` path.
 
 Both OUIs share one confidence: an OUI-only BLE hit on either block reports the fixed 75 in
 `axonClassifyBLE` (`axon_detect.cpp`). Splitting them would be a code change, not a table edit.
@@ -806,6 +972,55 @@ Technologies** (a network-firewall vendor), a different company from WatchGuard 
 in-car / body camera brand now folded into Motorola Solutions), so they are not body-cam
 signals and stay off the table.
 
+### ADMITTED 2026-10-20: Axon's own Bluetooth SIG numbers (`0xFE6B`, `0x034D`)
+
+The second MAC-independent Axon signal, beneath the `BWCDEVICE` tag. Constants `AXON_SIG_SVC_UUID`
+and `AXON_SIG_COMPANY_ID` in `axon_signatures.h`; matched in `axonClassifyBLE`.
+
+- **What it matches.** AD `0x16` service data under the 16-bit UUID `0xFE6B` with at least one
+  payload byte, or AD `0xFF` manufacturer data under company ID `0x034D` whose payload starts with
+  the byte `0x02` and then nine uppercase letters or digits (`AXON_SIG_CID_SERIAL_LEN`, checked by
+  `axonCidSerial`; see the serial-shape bullet below). The Bluetooth
+  SIG lists both as "TASER International, Inc.", Axon's former name. A `0xFE6B` in a UUID list
+  (AD `0x02` / `0x03`) or in a solicitation (AD `0x14`) does not match: only the AD types it was
+  captured in count. `0xFC81` and `0xFE6C` are also Axon numbers, but nothing has sent them yet, so
+  they stay capture-only.
+- **The evidence, own capture only.** Counted 2026-10-20 over every serial log in `firmware/tools`,
+  with AD structures parsed (rechecked 2026-10-21). `0xFE6B`: 7 distinct devices in
+  `aug-9-drive.log`, `aug-9-flock-o.log`, `sep252026.log` and `oct012026.log`; 5 on `D8:1F:65`, 1
+  on `00:25:DF`, 1 on one fixed address whose top bits mark a BLE non-resolvable private address.
+  Each payload holds serial-shaped ASCII: a `D01A` form on the six on Axon blocks, and an `X7` form
+  on the private address, which sent two different serials about seven weeks apart (`X705F29H7` in
+  `aug-9-drive.log`, `X70542CTN` in `sep252026.log`). `0x034D`: 2 distinct devices. One is on
+  `00:25:DF` (`drive_home_9-4.log`, the `X8` serial `X870054FW`, one second before a tagged cam).
+  The other is on an unregistered random-static address (`aug-9-drive.log`), and its payload is not
+  serial-shaped: it starts with the device's own address. No device on any other public block
+  carried either value.
+- **It is on body cams.** One `D8:1F:65` device in `oct012026.log` alternated a `0xFE6B` advert
+  with a `BWCDEVICE`-tagged one, which ties the `D01A` form to a body cam. On 2026-10-21 the owner
+  confirmed a `D8:1F:65` device that reached the app only through this rule as one of nine body-cam
+  rows (row 4 of the 2026-10-21 record above): the first eyes-on hit. The `X7` and `X8` forms are
+  not tied to any product yet.
+- **What it buys.** One device the OUI path cannot see: the `0xFE6B` `X7` device on a private
+  address, conf 0 before this rule and not confirmed by eye. On an Axon block it also names the
+  stronger evidence: a device with both reports the SIG number, not "Axon OUI".
+- **`0x034D` needs its serial shape (owner decision, 2026-10-21).** The only `0x034D` evidence off
+  the Axon blocks was the random-static advert above, whose payload starts with its own address, so
+  it may be a reused company ID rather than Axon gear; without a gate it would report as a body cam.
+  `0x034D` now counts only when its payload starts with `0x02` and then nine uppercase letters or
+  digits, as in `X870054FW`. That drops the random-static advert and keeps the `X8` device. The
+  cost: an Axon product with a different `0x034D` payload off the Axon blocks stays unmatched until
+  a capture shows its shape; on the blocks the OUI path still reports it at the same 75, as "Axon
+  OUI". `0xFE6B` has no such gate: every one of its sightings carries a serial. `test_axon.cpp`
+  walks every edge of the shape (first byte, length, character ranges).
+- **Conf 75, detail `Axon Bluetooth ID`.** The confidence ladder (`bodycam_vendor_signatures.h`)
+  lets one official SIG number claim "<vendor> equipment", never a device type. 75 is the Axon OUI
+  tier, which makes the same claim. The tag keeps 90 and outranks it. The method is
+  `M_SERVICE_DATA` or `M_MFG_ID`, so `acabApplyDurability` does not cut it on a random address.
+- **The detail string is a new member of the body-cam wire contract.** Both apps carry it
+  (`BodyCamSignature.axonSigID` on iOS, `AXON_SIG_ID` on Android). An app that predates the string
+  shows the generic body-cam fallback.
+
 ### WatchGuard Video `00:1D:96`: matched behind the Motorola opt-in (2.1.0)
 
 `00:1D:96` is WatchGuard Video's own MA-L block (registrant "WatchGuard Video", Plano TX;
@@ -829,7 +1044,11 @@ MACs on the block:
 - **The eight WiFi MACs are one fleet with one configuration.** Every frame is a probe request
   (a client looking for its network, never an access point), every MAC is in the narrow range
   `00:1D:96:28:9B:AC` to `00:1D:96:29:2D:40`, and every named probe asks for `CPenPD` or `CP3N`.
-  Neither SSID is decoded. No owner marker came within 10 minutes of any of them, so none is
+  `CPenPD` is not decoded. `CP3N` was beaconed by one router in all the logs, the Sierra Wireless
+  `50:13:9D:18:78:66`, in one 2 s burst in `913.log` (16:18:03 PDT), 30 s after two of these units
+  probed for it (see the Cradlepoint update of 2026-10-21). So this fleet's cameras most likely join
+  an in-car router's network, and those two units and that router were probably one vehicle's
+  system. No owner marker came within 10 minutes of any of them, so none is
   tied to a scene. Two of them (2026-09-13 at 16:17 and 2026-09-27 at 19:19 PDT) came from the
   same stretch of road, where the same fixed SSIDs show up both times, including the Cradlepoint
   `OPD 3484` (see the Cradlepoint update above).
@@ -872,6 +1091,11 @@ references any of it. The table has internal linkage and every routine is inline
 that references nothing emits nothing; the guard is what keeps capture code out of a shipping
 image by construction, rather than trusting the linker to discard it.
 
+Two of these rows graduated on 2026-10-20: shipping builds now also classify `0xFE6B`, and
+`0x034D` when its payload is serial-shaped (since 2026-10-21), through `axon_detect.cpp` (see
+"Axon's own Bluetooth SIG numbers" above). The capture rows did not change: they still log every
+`0x034D`, shaped or not, and every `0xFE6B` beside the advertised name.
+
 | Vendor group | Exact SIG registrant | Assigned number | Value | Runtime tag |
 |---|---|---|---|---|
 | Axon / TASER | TASER International | company ID | `0x034D` | `AXON-CID` |
@@ -892,8 +1116,15 @@ What it still does not say is WHICH product. Axon's identifiers span body camera
 sensors, vehicle gear, and TASER handles and batteries. Motorola Solutions' span two-way radios,
 cameras, and in-car video, and the same identifiers are carried by unrelated fire, EMS, security,
 and retail hardware. So the eventual shipping label would be "<vendor> equipment, device type
-unknown", never a named product. The advertised local name is logged beside every hit because it
+unknown", never a named product. The two Axon rows that shipped follow that rule: their detail is
+`Axon Bluetooth ID`. The advertised local name is logged beside every hit because it
 is the only field likely to separate one product of a vendor's from another.
+
+Field note on `0xFE04` (recounted 2026-10-21): 7 devices in the serial logs sent it, all on
+random-static addresses and all named `oprpx...`; one, `F7:D5:2B:88:12:D1`, was heard downtown
+on both 2026-10-01 and 2026-10-18. By name these read as Openpath door readers (an
+access-control brand Motorola Solutions owns): fixed building hardware, one more reason a Motorola
+SIG number can never claim a device type.
 
 Solicitation is held apart from confirmation. AD `0x02` / `0x03` (the 16-bit service UUID lists)
 and AD `0x16` (service data) are a device saying what it is. AD `0x14` is service solicitation: a
@@ -986,6 +1217,15 @@ there.
 network-wide, so Moto Tag, Chipolo Point and the compatible Pebblebee tags are already detected
 with no per-manufacturer signature. Do not add brand rows for them. The same holds on the Apple
 side: third-party Find My accessories ride the existing Find My offline frame above.
+
+**The Find My row's name follows the status byte; the match does not.** The byte after `0x19`
+declares a device type in bits 5:4: `00` an Apple device (an offline iPhone, iPad or Mac), `01`
+an AirTag, `10` a third-party accessory, `11` AirPods (AirGuard; Shafqat et al., PoPETs 2023).
+Only type `01` is named "Apple AirTag"; every other frame keeps "Apple Find My", and every type
+matches at 85. The byte is unauthenticated (a cloned tag sends `00` to dodge Apple's own alerts),
+so it is never a gate. In our own captures from August to October 2026, 73% of the Find My rows
+the beacon alerted on were type `00` and 13.5% were AirTags. A second-generation AirTag (2026)
+appears to declare type `10` (AirGuard 3.1.0, a single source) and then keeps the generic name.
 
 **Frame type `0x40` is deliberately NOT matched.** `0x41` is the *separated* state, a tag away
 from its owner, which is the only state that means anything for following. `0x40` is the
