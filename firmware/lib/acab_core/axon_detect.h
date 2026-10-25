@@ -37,8 +37,9 @@ bool axonIsEnabled();
 // Reload the persisted body-cam toggle on boot (NVS); defaultEnabled if never set.
 void axonRestoreEnabled(bool defaultEnabled);
 
-// Classify a BLE advertisement. Returns true + fills `out` only when Axon
-// detection is on AND an Axon OUI, the BWCDEVICE tag or a Utility BodyWorn signal matches.
+// Classify a BLE advertisement. Returns true + fills `out` only when Axon detection is on AND an
+// Axon OUI, the BWCDEVICE tag, Axon's SIG service UUID / company ID (the company ID only with its
+// serial-shaped payload) or a Utility BodyWorn signal matches.
 bool axonClassifyBLE(const uint8_t mac[6], const uint8_t* adv, size_t advLen,
                      int rssi, AcabDetection* out);
 

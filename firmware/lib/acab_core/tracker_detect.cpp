@@ -58,6 +58,12 @@
 #define FHN_SD_LEN_32_UT   36     // 2 UUID + 1 type + 32B EID + 1 hashed flags (BLE5 ext adv)
 #define APPLE_FINDMY_TYPE  0x12
 #define FINDMY_OFFLINE_LEN 0x19   // separated-from-owner payload length
+// The status byte (mfg[4]) declares a device type in bits 5:4: 00 Apple device (an offline
+// iPhone, iPad or Mac, and the 0x00 masquerade that evades Apple's own alerts), 01 AirTag,
+// 10 third-party Find My accessory, 11 AirPods (AirGuard; Shafqat et al., PoPETs 2023). Our own
+// captures (Aug-Oct 2026): 73% of the Find My rows we alerted on were type 00, 13.5% AirTag.
+#define FINDMY_TYPE_MASK   0x30
+#define FINDMY_TYPE_AIRTAG 0x10
 // Min length of a 16-bit service-DATA element (2 UUID bytes + payload) to accept a
 // Tile/Samsung finding UUID - rejects a bare/empty entry a spoofer could trivially set.
 #define TRK_MIN_SD         4
@@ -121,10 +127,18 @@ bool trackerClassifyBLE(const uint8_t mac[6], const uint8_t* adv, size_t advLen,
     if ((!gEnabled.on && !desertIsEnabled()) || !adv || !advLen) return false;
     TrkAdv f; parseAdv(adv, advLen, &f);
 
-    // Apple Find My - only the offline/separated form (tag away from its owner).
+    // Apple Find My - only the offline/separated form (tag away from its owner). The NAME reads
+    // the status byte's self-declared type, for display only: it is NEVER part of the match, so
+    // a frame that claims type 00 still matches at 85 under the generic name. The byte is
+    // unauthenticated, so "AirTag" means "says it is an AirTag". The 2.2.1 apps title this row
+    // "Apple AirTag" (Detection.maker). Apps up to 2.2.0 do not map "Apple AirTag (offline)" and
+    // title the row "Tracker", the category fallback.
     if (f.haveMfg && f.mfgId == APPLE_COMPANY_ID && f.mfgLen >= 4 &&
-        f.mfg[2] == APPLE_FINDMY_TYPE && f.mfg[3] == FINDMY_OFFLINE_LEN)
-        return emit(out, mac, rssi, M_MFG_ID, 85, "Apple Find My (offline)");
+        f.mfg[2] == APPLE_FINDMY_TYPE && f.mfg[3] == FINDMY_OFFLINE_LEN) {
+        bool airtag = f.mfgLen >= 5 && (f.mfg[4] & FINDMY_TYPE_MASK) == FINDMY_TYPE_AIRTAG;
+        return emit(out, mac, rssi, M_MFG_ID, 85,
+                    airtag ? "Apple AirTag (offline)" : "Apple Find My (offline)");
+    }
 
     // Tile / Samsung SmartTag - require the finding UUID to arrive as SERVICE DATA with a
     // real payload (not a bare UUID-list entry), and keep confidence below Apple's until a

@@ -27,6 +27,24 @@
 // field above 1023 is therefore un-shippable over the air: the apps compare unclamped, would keep offering
 // the update, and the board would refuse it forever. Bump the MINOR when the patch field runs out.
 //
+// 2.2.2: three detection changes, all in lib/acab_core, so every build gets them. No partition, fw
+//        label, OTA receiver, signing key, BLE proto, RING_FORMAT, NVS-key or wire-key change: every
+//        OTA-capable board takes it over the air and keeps its bonds, settings and offline log (the
+//        beacon-c5 builds have no OTA entry and update by USB reflash). The nRF co-processor app is
+//        unchanged (still v3).
+//        (1) Body cams: Axon's own Bluetooth SIG numbers match with no OUI, as service data under
+//        0xFE6B or manufacturer data under company ID 0x034D, each with a payload, and 0x034D only
+//        with its serial shape (0x02 + 9 uppercase letters or digits): conf 75, detail "Axon
+//        Bluetooth ID", ranked below the BWCDEVICE tag and above the Axon OUI (axon_detect.cpp,
+//        AXON_SIG_* in axon_signatures.h). Own field capture: 7 + 2 devices; the serial gate drops
+//        the one off-block 0x034D advert, which leaves 1 on a random address the OUI path cannot see.
+//        (2) Network cameras (opt-in): an SSID of "Dash-" plus exactly four digits on a beacon or
+//        probe response reports a fleet dashcam at conf 65, detail "fleet dashcam", on any MAC, only
+//        when no OUI row named the transmitter (netcam_detect.cpp).
+//        (3) Trackers: a Find My offline frame whose status byte declares an AirTag is named "Apple
+//        AirTag (offline)"; every other type keeps "Apple Find My (offline)". Display only: every
+//        type still matches at 85 (tracker_detect.cpp).
+//        beacon-board: RAM 78796 bytes (same as 2.2.1), flash 1033657 bytes (+376).
 // 2.2.1: fixes from the 2026-10-11 firmware review. No partition, fw label, OTA receiver, signing
 //        key, BLE proto, RING_FORMAT or NVS-key change: every fielded board takes it over the air
 //        and keeps its bonds, settings and offline log. The two NVS keys it adds are new
@@ -304,7 +322,7 @@
 // 2.0.0: the Colonel Panic builds pick up the full v2 detection set the beacon board ships
 // with (offline buffer, watchlist/custom category, ignore list, refreshed OUIs, glasses).
 #ifndef ACAB_FW_VERSION
-#define ACAB_FW_VERSION "2.2.1"
+#define ACAB_FW_VERSION "2.2.2"
 #endif
 
 #endif // ACAB_VERSION_H

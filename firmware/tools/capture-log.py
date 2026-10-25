@@ -28,6 +28,13 @@ confirm you are seeing junk, THEN drive.
 
 Survives USB CDC drops (the ESP32-S3's CDC goes away on reset) by reopening, so a board reboot
 mid-capture costs you a line, not the session.
+
+Keep the host awake for the whole capture: lid open, on power, and run it as
+`caffeinate -i ./capture-log.py`. On battery a Mac sleeps when the lid closes whatever caffeinate
+says, and while it sleeps the board's USB output is dropped, not queued. On 2026-10-21 that lost
+every body-cam minute of a downtown walk. If the host does sleep, the log carries a
+"-- host slept N s; the next lines may predate this stamp --" line: the few lines right after it
+may have been printed before the sleep.
 """
 
 import argparse
@@ -72,14 +79,27 @@ def main():
     t0 = time.time()
     lock = threading.Lock()
 
+    # Wall clock vs monotonic: time.monotonic() stops while the host sleeps (mach_absolute_time on
+    # macOS, CLOCK_MONOTONIC on Linux), so wall time racing ahead of it means the host slept.
+    clocks = [time.time(), time.monotonic()]
+
+    def emit(line):
+        fh.write(line + "\n")
+        fh.flush()              # flush every line: a capture you lose to a crash is not a capture
+        if not args.quiet:
+            print(line, flush=True)
+
     def stamp(text, marker=False):
-        el = time.time() - t0
-        line = f"[{el:8.1f}s  {time.strftime('%H:%M:%S')}] {'### ' if marker else ''}{text}"
         with lock:
-            fh.write(line + "\n")
-            fh.flush()          # flush every line: a capture you lose to a crash is not a capture
-            if not args.quiet:
-                print(line, flush=True)
+            wall, mono = time.time(), time.monotonic()
+            slept = (wall - clocks[0]) - (mono - clocks[1])
+            clocks[:] = [wall, mono]
+            head = f"[{wall - t0:8.1f}s  {time.strftime('%H:%M:%S', time.localtime(wall))}] "
+            if slept > 2:
+                # Board output is dropped while the host sleeps, and the first lines read after a
+                # wake were printed before the sleep: say so, or they read as live at this stamp.
+                emit(f"{head}-- host slept {slept:.0f} s; the next lines may predate this stamp --")
+            emit(head + ("### " if marker else "") + text)
 
     fh = open(out, "a", buffering=1)
     stamp(f"capture start  port={port}  baud={args.baud}")

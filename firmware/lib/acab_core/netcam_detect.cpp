@@ -65,7 +65,7 @@ static NetcamMatch netcamEntry(const uint8_t mac[6]) {
     return { nullptr, 0 };
 }
 
-// Case-insensitive prefix test for the base-station SSID rule. Mirrors ciEndsWith in
+// Case-insensitive prefix test for the SSID rules. Mirrors ciEndsWith in
 // flock_detect.cpp (that one anchors at the tail, this one at the head). Case-insensitive
 // because an SSID is user-visible text and vendors have shipped both cases of their own
 // prefix before; anchored at the head so a network merely CONTAINING the string cannot match.
@@ -75,6 +75,16 @@ static bool netcamSsidPrefix(const char* ssid, const char* pfx) {
         if (tolower((unsigned char)*ssid) != tolower((unsigned char)*pfx)) return false;
         ssid++; pfx++;
     }
+    return true;
+}
+
+// The fleet dashcam shape: NETCAM_SSID_FLEET_DASH_PREFIX plus exactly four ASCII digits and nothing
+// after. `len` is the SSID IE length, so a fifth character or an embedded NUL fails the shape.
+static bool netcamSsidFleetDash(const char* ssid, size_t len) {
+    const size_t pl = sizeof(NETCAM_SSID_FLEET_DASH_PREFIX) - 1;
+    if (len != pl + 4 || !netcamSsidPrefix(ssid, NETCAM_SSID_FLEET_DASH_PREFIX)) return false;
+    for (size_t i = pl; i < len; i++)
+        if (!isdigit((unsigned char)ssid[i])) return false;
     return true;
 }
 
@@ -105,14 +115,16 @@ bool netcamClassifyWiFi(const uint8_t* frame, size_t len, bool isDataFrame,
     }
     if (saOff + 6 > len) return false;
 
-    // SSID first: it outranks every OUI tier here, so checking it second would let a weaker
-    // OUI hit on the same frame win and report 65 where 88 was available.
+    // The Arlo SSID first: it outranks every OUI tier here, so checking it second would let a
+    // weaker OUI hit on the same frame win and report 65 where 88 was available. The fleet
+    // dashcam SSID (65) does not outrank them, so the loop only notes it and the OUI rows go first.
     //
     // The IE offset differs by subtype and getting it wrong FAILS SILENTLY - walking a beacon
     // from 24 parses the free-running TSF timestamp as an IE header and random-walks the frame.
     // The full explanation lives at the SSID parse in flock_detect.cpp; it is deliberately NOT
     // restated here, so there is one place to correct if it is ever found to be wrong. Keep
     // these offsets identical to that one (and to desert_detect.cpp, which splits the same way).
+    size_t dashIe = 0;   // offset of a fleet dashcam SSID IE; IEs start at 36, so 0 means none
     if (!isDataFrame && len >= 24) {
         const uint8_t subtype = (frame[0] >> 4) & 0x0F;
         // BEACON (0x8) and PROBE-RESPONSE (0x5) ONLY. Probe REQUESTS (0x4) are deliberately
@@ -158,6 +170,7 @@ bool netcamClassifyWiFi(const uint8_t* frame, size_t len, bool isDataFrame,
                             snprintf(out->detail, sizeof(out->detail), "Arlo base station");
                             return true;
                         }
+                        if (netcamSsidFleetDash(ssid, ilen)) dashIe = ie;
                     }
                     break;                             // SSID IE is unique; stop either way
                 }
@@ -167,7 +180,19 @@ bool netcamClassifyWiFi(const uint8_t* frame, size_t len, bool isDataFrame,
     }
 
     const NetcamMatch e = netcamEntry(frame + saOff);
-    if (!e.vendor) return false;
+    if (!e.vendor) {
+        if (!dashIe) return false;
+        // Fleet dashcam SSID, reached only when no OUI row named the transmitter. No OUI gate and
+        // no locally-administered skip: about a quarter of the units we have logged sit off the
+        // ODM block or on randomized addresses (see NETCAM_SSID_FLEET_DASH_PREFIX). The SSID is
+        // kept as the name for the same reasons as the Arlo match above.
+        acabInit(out, ACAB_NETCAM, SRC_WIFI, frame + 10, (int16_t)rssi);
+        out->method     = M_SSID;
+        out->confidence = NETCAM_SSID_FLEET_DASH_CONFIDENCE;
+        acabSanitizeAscii(out->name, frame + dashIe + 2, frame[dashIe + 1], sizeof(out->name));
+        snprintf(out->detail, sizeof(out->detail), "fleet dashcam");
+        return true;
+    }
 
     acabInit(out, ACAB_NETCAM, SRC_WIFI, frame + saOff, (int16_t)rssi);
     out->method     = M_OUI;

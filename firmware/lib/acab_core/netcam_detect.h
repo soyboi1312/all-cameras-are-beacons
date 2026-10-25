@@ -45,13 +45,16 @@ const char* netcamVendorOui(const uint8_t mac[6]);
 //     transmits with addr2 = its MAC). This is the primary signal.
 //   - mgmt frame: the transmitter addr2 (BONUS - catches a camera acting as its own AP, or
 //     probing) on the beacon/probe-resp/probe-req path already inspected in production.
-// Fills `out` with ACAB_NETCAM and ONE of two results:
-//   - SSID match, BEACON / PROBE-RESPONSE ONLY: M_SSID / NETCAM_SSID_CONFIDENCE (88), detail
+// Fills `out` with ACAB_NETCAM and ONE of three results:
+//   - Arlo SSID match, BEACON / PROBE-RESPONSE ONLY: M_SSID / NETCAM_SSID_CONFIDENCE (88), detail
 //     "Arlo base station", name = the matched SSID. Tested FIRST, because it outranks every OUI
 //     tier here and would otherwise lose to a weaker OUI hit on the same frame. Probe REQUESTS
 //     are excluded on purpose - see the rule at the gate in netcam_detect.cpp.
 //   - OUI match: M_OUI / NETCAM_OUI_CONFIDENCE (65, or _VALIDATED 75 for a field-validated
 //     block), detail "<Vendor> on wifi".
+//   - Fleet dashcam SSID ("Dash-" + exactly four digits), BEACON / PROBE-RESPONSE ONLY, and only
+//     when no OUI row matched: M_SSID / NETCAM_SSID_FLEET_DASH_CONFIDENCE (65), detail
+//     "fleet dashcam", name = the matched SSID. No OUI gate, so it reaches randomized MACs too.
 bool netcamClassifyWiFi(const uint8_t* frame, size_t len, bool isDataFrame,
                         int rssi, AcabDetection* out);
 

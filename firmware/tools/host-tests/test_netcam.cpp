@@ -148,6 +148,10 @@ static const VendorCase CAPTURED_VENDORS[] = {
 // A well-formed PUBLIC MAC in NO vendor table. Used where the test is about the SSID alone, so an
 // accidental OUI hit cannot be mistaken for the SSID rule working.
 static const uint8_t MAC_PAD[6]    = { 0x11, 0x11, 0x11, 0x11, 0x11, 0x11 };
+// Fleet dashcam addresses: the ODM block most Surfsight units sit on (not a table row), and a
+// locally administered one of the shape our own logs carry.
+static const uint8_t MAC_SURF[6]     = { 0x7c, 0x0c, 0xf6, 0x31, 0x32, 0x33 };
+static const uint8_t MAC_SURF_LAA[6] = { 0x7a, 0x01, 0xb1, 0x41, 0x42, 0x43 };
 
 // The vendor labels the apps are allowed to see. Exact strings: casing, the slash and the
 // hyphen are part of the wire contract, not cosmetics. Ezviz/Lorex/Swann added 2026-08-02;
@@ -478,9 +482,13 @@ int main() {
     // sold on. Admitting 0x4 reported an Arlo CAMERA hunting its hub (or any phone with that SSID
     // saved, on a randomized MAC) as "Arlo base station" at 88: wrong box, top tier, address never
     // seen again. If this ever starts hitting, the tier is lying.
+    // The SSID sits at 24 (where a probe request carries it) AND at 36 (where the beacon walk
+    // looks). With only the first, admitting 0x4 to the existing walk passed this test unchanged.
     { std::vector<uint8_t> g = frame(64, 0x00);
       g[0] = 0x40;   // subtype 0x4 = probe request
-      g[24] = 0x00; g[25] = 19; for (int i = 0; i < 19; i++) g[26 + i] = "ARLO_VMB_1164328298"[i];
+      // A 10-byte SSID at 24 ends exactly at 36, so the two IEs do not overlap.
+      g[24] = 0x00; g[25] = 10; for (int i = 0; i < 10; i++) g[26 + i] = "ARLO_VMB_1"[i];
+      g[36] = 0x00; g[37] = 19; for (int i = 0; i < 19; i++) g[38 + i] = "ARLO_VMB_1164328298"[i];
       putMac(g, 10, MAC_PAD);
       chk("probe-request for an ARLO_VMB_ SSID -> NO hit (asks for it, isn't it)",
           run(g, false, &d), false); }
@@ -507,6 +515,59 @@ int main() {
     // in an encrypted payload could be parsed as an IE and matched.
     { std::vector<uint8_t> f = beacon("ARLO_VMB_1164328298", MAC_PAD);
       chk("same bytes as a DATA frame -> SSID path never runs", run(f, true, &d), false); }
+
+    // ---- fleet dashcam SSID rule (added 2026-10-18) ---------------------------------------------
+    // "Dash-" + exactly four digits, no OUI gate, 65. The OUI rows go FIRST here, the reverse of
+    // the Arlo rule, because 65 does not outrank them.
+    { std::vector<uint8_t> f = beacon("Dash-8774", MAC_SURF);
+      chk("beacon SSID Dash-8774 on the ODM block -> fleet dashcam", run(f, false, &d), true,
+          d.confidence, 65, d.detail, "fleet dashcam"); }
+    { std::vector<uint8_t> f = beacon("Dash-8774", MAC_SURF);
+      chk("fleet dashcam keeps the SSID as the name", run(f, false, &d), true,
+          -1, -1, d.name, "Dash-8774"); }
+    { std::vector<uint8_t> f = beacon("Dash-0074", MAC_SURF_LAA);
+      chk("no OUI gate: a locally administered MAC still hits", run(f, false, &d), true,
+          d.confidence, 65, d.detail, "fleet dashcam"); }
+    { std::vector<uint8_t> f = beacon("dash-2390", MAC_PAD);
+      chk("fleet dashcam match is case-insensitive", run(f, false, &d), true,
+          d.confidence, 65, d.detail, "fleet dashcam"); }
+    { std::vector<uint8_t> f = beacon("Dash-1234", MAC_SURF); f[0] = 0x50;
+      chk("probe-response Dash-1234 -> hits", run(f, false, &d), true,
+          d.confidence, 65, d.detail, "fleet dashcam"); }
+    // The shape is exact. Consumer dashcams in our own logs name themselves "Dash-Cam-...".
+    { std::vector<uint8_t> f = beacon("Dash-Cam-B-T25-1234", MAC_SURF);
+      chk("consumer Dash-Cam-... name -> no hit", run(f, false, &d), false); }
+    { std::vector<uint8_t> f = beacon("Dash-123", MAC_SURF);
+      chk("three digits -> no hit", run(f, false, &d), false); }
+    { std::vector<uint8_t> f = beacon("Dash-12345", MAC_SURF);
+      chk("five digits -> no hit", run(f, false, &d), false); }
+    { std::vector<uint8_t> f = beacon("Dash-12a4", MAC_SURF);
+      chk("a letter in the digits -> no hit", run(f, false, &d), false); }
+    { std::vector<uint8_t> f = beacon("XDash-123", MAC_SURF);
+      chk("prefix not at the head (9 chars) -> no hit", run(f, false, &d), false); }
+    // The IE length decides the shape, not strlen: "Dash-12" NUL "4" is nine bytes on the air.
+    { std::vector<uint8_t> f = beacon("Dash-1234", MAC_SURF); f[38 + 7] = 0x00;
+      chk("embedded NUL inside the digits -> no hit", run(f, false, &d), false); }
+    // The SSID sits at BOTH 24 (where a probe request carries it) and 36 (where the beacon walk
+    // looks), so admitting subtype 0x4 fails this test whichever offset it would parse.
+    { std::vector<uint8_t> g = frame(64, 0x00);
+      g[0] = 0x40;   // probe request: the network SOUGHT, so it attests nothing about addr2
+      g[24] = 0x00; g[25] = 9; for (int i = 0; i < 9; i++) g[26 + i] = "Dash-1234"[i];
+      g[36] = 0x00; g[37] = 9; for (int i = 0; i < 9; i++) g[38 + i] = "Dash-1234"[i];
+      putMac(g, 10, MAC_SURF);
+      chk("probe-request for Dash-1234 -> NO hit", run(g, false, &d), false); }
+    { std::vector<uint8_t> f = beacon("Dash-1234", MAC_SURF);
+      chk("Dash-1234 bytes as a DATA frame -> no hit", run(f, true, &d), false); }
+    // Precedence: an OUI row on the same frame wins, at either OUI tier.
+    { std::vector<uint8_t> f = beacon("Dash-1234", MAC_REOLNK);
+      chk("validated OUI beats the dashcam SSID (75, not 65)", run(f, false, &d), true,
+          d.confidence, 75, d.detail, "Reolink on wifi"); }
+    { std::vector<uint8_t> f = beacon("Dash-1234", MAC_HIK);
+      chk("registry OUI beats the dashcam SSID at the same 65", run(f, false, &d), true,
+          d.confidence, 65, d.detail, "Hikvision on wifi"); }
+    { std::vector<uint8_t> f = beacon("Dash-1234", MAC_HIK);
+      chk("an OUI win does not keep the dashcam SSID as the name", run(f, false, &d), true,
+          -1, -1, d.name, ""); }
 
     // ---- adversarial input ---------------------------------------------------------------------
     { std::vector<uint8_t> f;
@@ -573,6 +634,8 @@ int main() {
     chkBool("setEnabled(false) refreshed the filter (narrow to mgmt)", gFilterRefreshes == 2);
     { std::vector<uint8_t> f = uplink(MAC_DAHUAV);
       chk("OFF again: field-validated Dahua frame -> no hit", run(f, true, &d), false); }
+    { std::vector<uint8_t> f = beacon("Dash-8774", MAC_SURF);
+      chk("OFF: fleet dashcam SSID -> no hit (inside the opt-in)", run(f, false, &d), false); }
     netcamSetEnabled(false);
     chkBool("redundant setEnabled(false) is a no-op, still 2 refreshes", gFilterRefreshes == 2);
 

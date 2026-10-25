@@ -13,6 +13,8 @@
  *   - Utility Inc. "BodyWorn Remote" NAME: third-party field observation, taken from the
  *     community nite-oui-collection (nitekry) and credited in CREDITS.md.
  *   - Utility Inc. OUIs 00:09:BC / 00:16:ED: public IEEE registry.
+ *   - Axon SIG service UUID 0xFE6B and company ID 0x034D: public Bluetooth SIG registry and our
+ *     own field capture. Not ported from anyone.
  * See docs/signatures.md.
  */
 #ifndef ACAB_AXON_SIGNATURES_H
@@ -27,24 +29,27 @@
 // OUI-ONLY GROUND TRUTH on this block (hits with NO BWCDEVICE tag in the packet, one weak packet
 // each at -88 dBm or below, conf 75): 54:7b:5a (2026-09-16) and 7d:8c:de + f8:38:3f (2026-09-23,
 // Agoura Hills area, two officers on scene, one second apart), ALL THREE OWNER-CONFIRMED as body
-// cams. Recorded from app CSV exports. So the OUI fallback earns its keep at the edge of range,
-// where only an untagged advertisement gets through; it is not a reason to raise the 75, because
-// a dock or other Axon gear on the same block is indistinguishable on the air (docs/signatures.md).
+// cams. Recorded from app CSV exports, so which advert each one sent is not known. Every Axon-block
+// BLE advert in the serial logs carries the tag, METROPOLISDEVICE, 0xFE6B or 0x034D (none carries
+// no Axon identifier), and five Axon-block MACs sent 0xFE6B only (docs/signatures.md). It is not a
+// reason to raise the 75, because a dock or other Axon gear on the same block is indistinguishable
+// on the air.
 #define AXON_OUI_REGISTERED  { 0x00, 0x25, 0xdf }
 
 // D8:1F:65 - a SECOND block that field capture, not the registry, put in this table. BOTH BLOCKS
 // ARE REAL AND BOTH ARE OBSERVED; they differ in who vouches for them, not in whether they show up.
-// Counted across every capture in firmware/tools/detection logs: 8 distinct MACs on 00:25:DF (in
-// aug-9-drive4, aug-9-flock-o, drive_home_9-4 and lvt-lot1, several firing conf 90 on the tag) and
-// 9 distinct MACs on D8:1F:65. An earlier draft of this comment claimed 00:25:DF had never been
-// seen on the air; that was false, and the asymmetry it argued from does not exist.
+// Recounted 2026-10-21 over the serial logs in firmware/tools/detection logs: 13 distinct MACs on
+// 00:25:DF (aug-9-flock-o, drive_home_9-4, lvt-lot1, sep252026, sep272026 and oct012026, several
+// firing conf 90 on the tag) and 10 on D8:1F:65; with the app CSV exports, 33 and 22. An earlier
+// draft of this comment claimed 00:25:DF had never been seen on the air; that was false, and the
+// asymmetry it argued from does not exist.
 //
 // WHY IT QUALIFIES, against the confidence ladder in bodycam_vendor_signatures.h. That ladder puts
 // "corporate OUI alone" at the bottom (diagnostics or opt-in, nothing more) and "two independent
 // vendor co-signals" near the top. This block is NOT OUI-alone: it is carried by two independent
 // Axon identifiers, in two cities six weeks apart.
 //
-//   NINE distinct MACs, zero non-Axon devices ever seen on the block:
+//   AT ADMISSION (2026-09-19), NINE distinct MACs, zero non-Axon devices seen on the block:
 //     8 carry the AXON_BWC_PAYLOAD tag below (AD 0x21, reversed "AXJANUSBWCDEVICE"):
 //       2026-09-19 Adams Ave Street Fair, San Diego - 05:cf:af, 00:26:41, 05:2b:7b, 05:4f:c5,
 //         04:e5:0d. ALL FIVE OWNER-CONFIRMED BY EYE at the event, the strongest ground truth this
@@ -70,9 +75,14 @@
 //      flock_signatures.h documents and the entry must come straight back out. Zero such devices
 //      in roughly 21,000 scanned so far, including a 4,300-device crowd.
 //
-// WHAT THIS ENTRY ACTUALLY BUYS, stated plainly so nobody overrates it: ONE device across every
-// capture to date, 04:a2:57. The other eight already fire at conf 90 on the tag, which is
-// MAC-independent and needs no OUI at all. A device on rotating random addresses stops presenting
+// WHAT THIS ENTRY ACTUALLY BUYS, stated plainly so nobody overrates it: NO device in the serial logs
+// since the AXON_SIG_* rule below landed (2026-10-20). Each of the 10 D8:1F:65 devices in those logs
+// carries the tag or Axon's SIG service UUID 0xFE6B, and both match with no OUI at all. When this
+// entry landed it caught one device, 04:a2:57, which 0xFE6B now catches too. It stays as the fallback
+// for Axon gear on this block that sends neither value. On WiFi it is the ONLY match for the block
+// (axonClassifyWiFi has no tag or SIG check): two owner-confirmed D8:1F:65 WiFi rows on 2026-10-21
+// reached the app through this entry alone, and one of them was a device no other rule caught
+// (docs/signatures.md, the 2026-10-21 record). A device on rotating random addresses stops presenting
 // the OUI (and axonOuiHit, on both the BLE and WiFi paths, skips locally-administered MACs
 // outright), so this buys nothing once Axon finishes moving to rotating addresses.
 // AXON_BWC_PAYLOAD is what survives that; this is the fallback beneath it.
@@ -87,6 +97,49 @@
 // randomization); the OUI is the weaker fallback for un-tagged / other Axon gear.
 //   src: own field capture, 2026-06.
 #define AXON_BWC_PAYLOAD  "BWCDEVICE"
+
+// Axon's own Bluetooth SIG assigned numbers: the second MAC-INDEPENDENT Axon signal, beneath the tag.
+//   0xFE6B  16-bit service UUID, matched as SERVICE DATA (AD 0x16) with at least one payload byte
+//   0x034D  company identifier, matched as MANUFACTURER DATA (AD 0xFF) with a serial-shaped payload
+//           (AXON_SIG_CID_SERIAL_LEN below)
+// Both are registered to "TASER International, Inc." (Axon's former name) in the SIG Assigned
+// Numbers. A SIG number is issued to the product vendor, not to a radio-module maker, so a hit says
+// "Axon equipment" without the shared-silicon risk of an OUI. It does NOT say which product, so the
+// detail string names the identifier ("Axon Bluetooth ID"), never a device class.
+//
+// OWN FIELD CAPTURE, every serial log in firmware/tools (counted 2026-10-20, AD structures parsed):
+//   0xFE6B: 7 distinct devices in aug-9-drive.log, aug-9-flock-o.log, sep252026.log and
+//     oct012026.log. 5 on D8:1F:65, 1 on 00:25:DF, 1 on a BLE non-resolvable private address (no
+//     OUI at all). Every payload holds
+//     serial-shaped ASCII: a "D01A" form on the six on Axon blocks, an "X7" form on the private one.
+//     One D8:1F:65 device in oct012026.log alternated this advert with a BWCDEVICE-tagged one, which
+//     ties the "D01A" form to a body cam.
+//   0x034D: 2 distinct devices. One on 00:25:DF (drive_home_9-4.log, an "X8" serial, "X870054FW"),
+//     one on an unregistered random-static address (aug-9-drive.log). That second payload is not
+//     serial-shaped: it starts with the device's own address. The only Axon identifier near it was
+//     the 0xFE6B "X7" advert from the private address 147 s later; no tag or Axon OUI was heard in
+//     that log. Since 2026-10-21 it no longer matches (AXON_SIG_CID_SERIAL_LEN below).
+//   No device on any other public block carried either value.
+// What this buys over the OUI path: the one device off the Axon blocks that still matches, the
+// 0xFE6B "X7" device on a private address, conf 0 before this rule and not confirmed by eye. Like
+// the tag, it sees a device the OUI path cannot: one on a random address. On the Axon blocks it
+// changes only the detail string and the method (service data or manufacturer ID instead of OUI);
+// the confidence stays 75. 2026-10-21: a D8:1F:65 device
+// sending 0xFE6B (app export acab-detections 6.csv) was owner-confirmed as one of nine body-cam rows
+// on a downtown San Diego walk and drive, the first eyes-on hit for this rule.
+//   src: Bluetooth SIG Assigned Numbers (member UUIDs + company identifiers) and own field capture.
+#define AXON_SIG_SVC_UUID    0xFE6B
+#define AXON_SIG_COMPANY_ID  0x034D
+
+// 0x034D counts only with the payload shape its one Axon-block sighting carried: the byte 0x02, then
+// a serial of this many uppercase letters and digits ("X870054FW"). Owner decision 2026-10-21. A
+// company ID is the cheapest thing a non-Axon device can reuse, and the only 0x034D advert without
+// that shape (the off-block aug-9-drive.log device above) would otherwise report as a body cam. The
+// cost: an Axon product with a different 0x034D payload off the Axon blocks stays unmatched until a
+// capture shows its shape; on the blocks the OUI path still reports it at the same 75 ("Axon OUI").
+// 0xFE6B has no such gate: every one of its sightings carries a serial. Checked by axonCidSerial in
+// axon_detect.cpp; test_axon.cpp walks every edge of the shape.
+#define AXON_SIG_CID_SERIAL_LEN  9
 
 // ---------------------------------------------------------------------------
 // Utility Inc. "BodyWorn" police body-cam system (a different brand, same body-cam

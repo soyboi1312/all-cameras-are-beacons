@@ -4,7 +4,9 @@
  * The AXON_OUI table below holds the two Axon OUIs (see axon_signatures.h); a public
  * MAC on either is the loose match (conf 75). The "BWCDEVICE" service-data tag is a
  * STANDALONE, MAC-independent match (conf 90, with or without the OUI - Axon is
- * moving to rotating BLE MACs, which breaks the OUI path).
+ * moving to rotating BLE MACs, which breaks the OUI path). Axon's own Bluetooth SIG
+ * numbers (service UUID 0xFE6B, and company ID 0x034D with its serial-shaped payload) are the
+ * second MAC-independent match (conf 75, "Axon Bluetooth ID"): they name the vendor, not the product.
  *
  * Validating against a real unit:
  *   1. Put a BLE sniffer next to a powered Axon body cam.
@@ -27,13 +29,15 @@
 // TWO Axon OUIs, and they carry different kinds of evidence - both cited in axon_signatures.h,
 // which is where the provenance for each lives. Read that file before touching either value.
 //   AXON_OUI_REGISTERED (00:25:DF) is the block the IEEE registry attributes to Axon by name.
-//     FIELD-VALIDATED 2026-06-17, and observed since on 8 distinct MACs across four captures.
+//     FIELD-VALIDATED 2026-06-17, and observed since on 13 distinct MACs in the serial logs
+//     (recounted 2026-10-21).
 //   AXON_OUI_BWC_FIELD (D8:1F:65) is a block the registry lists only as "Private", so it can never
-//     name a registrant. Attribution rests on 9 distinct MACs carrying two independent Axon
-//     identifiers (the BWCDEVICE tag on eight, Axon's SIG service UUID 0xFE6B on the ninth),
-//     across 2026-08-09 and 2026-09-19, five owner-confirmed by eye at the later capture. It
-//     exists to catch Axon gear that sends no BWCDEVICE tag, which the tag path misses by
-//     construction, and across every capture to date that is exactly ONE device (04:a2:57).
+//     name a registrant. At admission, attribution rested on 9 distinct MACs carrying two
+//     independent Axon identifiers (the BWCDEVICE tag on eight, Axon's SIG service UUID 0xFE6B on
+//     the ninth), across 2026-08-09 and 2026-09-19, five owner-confirmed by eye at the later
+//     capture. On BLE it exists to catch Axon gear that sends no BWCDEVICE tag, which the tag path
+//     misses by construction; that was exactly ONE device (04:a2:57), which 0xFE6B now catches too.
+//     On WiFi it is the only match for the block: two owner-confirmed WiFi rows on 2026-10-21.
 // The BWCDEVICE service-data tag remains the primary, MAC-independent signature at conf 90, and is
 // the single best-evidenced signature in the tree: re-confirmed at two airports 2026-07-21, three
 // more 2026-07-23 (SAN/DFW/Destin), two on the 2026-07-23 San Diego capture, three on 2026-08-09,
@@ -63,7 +67,19 @@ void axonRestoreEnabled(bool defaultEnabled) { gEnabled.restore(defaultEnabled);
 struct AxAdv {
     char     name[40]; bool haveName;
     uint8_t  svc[48];  uint8_t svcLen;   // concatenated service-data / 128-bit-UUID bytes
+    bool     sigSvc;                     // AD 0x16 service data under AXON_SIG_SVC_UUID, with a payload
+    bool     sigCid;                     // AD 0xFF manufacturer data under AXON_SIG_COMPANY_ID, serial-shaped
 };
+
+// The 0x034D payload shape (AXON_SIG_CID_SERIAL_LEN in axon_signatures.h): 0x02, then a serial of
+// uppercase letters and digits. p points at the first payload byte (data + 2); the caller, parseAdv,
+// checks dataLen >= 2 + 1 + AXON_SIG_CID_SERIAL_LEN first, so every byte read here is inside the AD.
+static bool axonCidSerial(const uint8_t* p) {
+    if (p[0] != 0x02) return false;
+    for (size_t k = 1; k <= AXON_SIG_CID_SERIAL_LEN; k++)
+        if (!((p[k] >= '0' && p[k] <= '9') || (p[k] >= 'A' && p[k] <= 'Z'))) return false;
+    return true;
+}
 
 static void parseAdv(const uint8_t* adv, size_t len, AxAdv* f) {
     memset(f, 0, sizeof(*f));
@@ -85,6 +101,15 @@ static void parseAdv(const uint8_t* adv, size_t len, AxAdv* f) {
             uint8_t n = dataLen < room ? dataLen : room;
             memcpy(f->svc + f->svcLen, data, n);
             f->svcLen += n;
+            // Axon's SIG service UUID, little-endian, then at least one payload byte. Read from the
+            // AD itself, not from svc[], so a full buffer cannot hide it.
+            if (adType == 0x16 && dataLen >= 3 &&
+                data[0] == (AXON_SIG_SVC_UUID & 0xFF) && data[1] == (AXON_SIG_SVC_UUID >> 8))
+                f->sigSvc = true;
+        } else if (adType == 0xFF && dataLen >= 2 + 1 + AXON_SIG_CID_SERIAL_LEN &&
+                   data[0] == (AXON_SIG_COMPANY_ID & 0xFF) && data[1] == (AXON_SIG_COMPANY_ID >> 8) &&
+                   axonCidSerial(data + 2)) {
+            f->sigCid = true;   // Axon's SIG company ID, little-endian, then the serial shape
         }
         i += 1 + adLen;
     }
@@ -105,7 +130,8 @@ static int axonOuiHit(const uint8_t mac[6]) {
 }
 
 // Classify one BLE advertisement. Returns false if the module is off (and Desert is not
-// forcing it), or if none of the Axon OUI, the BWCDEVICE tag and the Utility signals match.
+// forcing it), or if none of the Axon OUI, the BWCDEVICE tag, Axon's SIG numbers and the Utility
+// signals match.
 bool axonClassifyBLE(const uint8_t mac[6], const uint8_t* adv, size_t advLen,
                      int rssi, AcabDetection* out) {
     if (!gEnabled.on && !desertIsEnabled()) return false;
@@ -123,6 +149,10 @@ bool axonClassifyBLE(const uint8_t mac[6], const uint8_t* adv, size_t advLen,
     // top of the OUI). A random-MAC Axon body cam still gets caught by its own tag.
     bool tagHit = acabBytesContainAscii(f.svc, f.svcLen, AXON_BWC_PAYLOAD);
 
+    // Second MAC-independent signal: Axon's own SIG assigned numbers (axon_signatures.h). Names
+    // the vendor, not the product, so it ranks below the tag and above the OUI.
+    bool sigIdHit = f.sigSvc || f.sigCid;
+
     // Utility Inc. "BodyWorn" police body cam (a different brand, same body-cam category,
     // so it rides this same detector + toggle). The advertised name is the strong, MAC-
     // independent signal; the public OUI is the weaker fallback. Signatures (name + the
@@ -131,7 +161,7 @@ bool axonClassifyBLE(const uint8_t mac[6], const uint8_t* adv, size_t advLen,
     bool utilOui  = ouiHit == 2;   // axonOuiHit already skipped locally-administered MACs
     bool utilHit  = utilName || utilOui;
 
-    if (!sigHit && !tagHit && !utilHit) return false;
+    if (!sigHit && !tagHit && !sigIdHit && !utilHit) return false;
 
     acabInit(out, ACAB_AXON_BODYCAM, SRC_BLE, mac, (int16_t)rssi);
     if (f.haveName) strncpy(out->name, f.name, sizeof(out->name) - 1);
@@ -142,6 +172,13 @@ bool axonClassifyBLE(const uint8_t mac[6], const uint8_t* adv, size_t advLen,
         out->method = M_SERVICE_DATA;
         out->confidence = 90;
         snprintf(out->detail, sizeof(out->detail), "BWC DEVICE");
+    } else if (sigIdHit) {
+        // Axon equipment by its own SIG number, product unknown. 75, the same tier as the Axon OUI:
+        // both say "Axon gear of some kind". This one wins the detail string because it is vendor-
+        // issued and survives MAC randomization. Not M_OUI, so acabApplyDurability leaves it alone.
+        out->method = f.sigSvc ? M_SERVICE_DATA : M_MFG_ID;
+        out->confidence = 75;
+        snprintf(out->detail, sizeof(out->detail), "Axon Bluetooth ID");
     } else if (sigHit) {
         // Axon loose match: OUI only (could be any Axon product). Weaker; the
         // OUI table only matches public MACs, so acabApplyDurability leaves it as-is.
@@ -169,12 +206,14 @@ static bool axonEmitWiFi(AcabDetection* out, const uint8_t mac[6], int rssi, boo
     // 65, NOT the BLE tier's 75. The OUI read is just as reliable (these are public,
     // non-randomized MACs), but the TYPE claim is weaker on WiFi: the OUI says "an Axon
     // device", and Axon's WiFi estate includes docks, evidence terminals and station
-    // infrastructure alongside Fleet in-car video. Field hits so far: two (docs/signatures.md,
-    // body cam section), each ONE device with WiFi at the base MAC and BLE at base + 1. In the
-    // 2026-08-03 LVT capture that BLE side carried the BWCDEVICE tag, so at least one body cam
-    // transmits on WiFi. Same tier as an unvalidated netcam OUI, below the field-validated Axon
-    // BLE match (75) and far below the BWCDEVICE tag (90). Raise this only when captures show how
-    // often a WiFi 00:25:DF hit is fixed station gear rather than gear on a person or in a car.
+    // infrastructure alongside Fleet in-car video. Field hits so far: eight (docs/signatures.md,
+    // body cam section), six at owner-confirmed body-cam scenes. Where the BLE side was heard
+    // too, the pair was ONE device: WiFi one below BLE on 00:25:DF, and on D8:1F:65 (one pair,
+    // provisional) WiFi = (BLE - 1) + 0x800000. In the 2026-08-03 LVT capture the BLE side carried
+    // the BWCDEVICE tag, so body cams transmit on WiFi. Same tier as an unvalidated netcam OUI,
+    // below the field-validated Axon BLE match (75) and far below the BWCDEVICE tag (90). Raise
+    // this only when captures show how often a WiFi Axon hit is fixed station gear rather than
+    // gear on a person or in a car.
     out->confidence = 65;
     // Name the vendor that actually matched. axonOuiHit checks the Axon OUI table AND
     // Utility Inc's OUIs, so labelling every hit "Axon" misattributed Utility hardware to a
@@ -182,8 +221,8 @@ static bool axonEmitWiFi(AcabDetection* out, const uint8_t mac[6], int rssi, boo
     //
     // These strings are a WIRE CONTRACT: both apps resolve the body-cam vendor by EXACT match
     // against a fixed set (iOS BodyCamSignature, Android its twin), so an unrecognised string
-    // silently degrades the detail screen. They must stay exactly the four the BLE paths already
-    // emit. No " on wifi" suffix for that reason, and because it would be redundant anyway: the
+    // silently degrades the detail screen. They must stay byte-identical to strings the BLE paths
+    // already emit. No " on wifi" suffix for that reason, and because it would be redundant anyway: the
     // radio is already carried in the detection's own `source` field and shown as the band.
     if (utility) snprintf(out->detail, sizeof(out->detail), "%s", "Utility BodyWorn");
     else         snprintf(out->detail, sizeof(out->detail), "%s", "Axon OUI");

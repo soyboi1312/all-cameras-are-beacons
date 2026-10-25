@@ -15,6 +15,7 @@
  *   The category is "Network camera". The detail names the vendor + "on wifi" for an OUI match,
  *   and is "Arlo base station" for the SSID match added 2026-08-05 - that one names the BOX, not a
  *   lens, because a broadcast SSID proves the hardware is there and nothing about what it sees.
+ *   The fleet dashcam SSID match added 2026-10-18 reports "fleet dashcam": that box IS the camera.
  *
  * Every block below is a corporate MA-L or MA-M registration held by the camera vendor or its parent,
  * verified against the live IEEE registry: the original set on 2026-07-17 (api.maclookup.app),
@@ -650,5 +651,28 @@ static_assert(netcamOuiSorted(),
 // own vendor and model class in the clear. Above every OUI tier in this file, including the
 // eyeball-validated 75, because this does not infer the vendor - the vendor states it.
 #define NETCAM_SSID_CONFIDENCE  88
+
+// ---------------------------------------------------------------------------
+// Fleet dashcam SSID (added 2026-10-18): "Dash-" plus EXACTLY four digits.
+// ---------------------------------------------------------------------------
+// The Surfsight AI-12 fleet dashcam names its hotspot "Dash-" plus the last four digits of its
+// IMEI (Surfsight knowledge base). Unlike the Arlo rule, this one names the camera itself.
+//
+// NO OUI GATE, on our own evidence. A 2026-10-18 scan of the capture logs (gitignored; [wifi]
+// lines, probe requests excluded) found 630 distinct MACs with this exact SSID shape in 20 of
+// 37 logs. 467 sit on 7C:0C:F6 (Guangdong Huiwei High-tech, an ODM, per maclookup.app), but 111
+// are locally administered and 52 more spread over four other blocks. An OUI gate would miss
+// about a quarter, and netcamEntry() rejects every locally administered MAC anyway.
+//
+// EXACT SHAPE, not a bare prefix: the same logs carry consumer dashcams named "Dash-Cam-...",
+// which a "Dash-" prefix would label fleet hardware. Nine characters, case-insensitive like the
+// Arlo rule.
+//
+// Confidence 65, the unvalidated OUI tier, not 88: "Dash-1234" is short enough for anyone to pick
+// as a hotspot name, and nobody has yet tied one to a camera by eye. An SSID rule has no validated
+// flag, so this number is the only control. Because 65 does not outrank the OUI tiers,
+// netcamClassifyWiFi() lets an OUI row on the same frame win.
+#define NETCAM_SSID_FLEET_DASH_PREFIX      "Dash-"
+#define NETCAM_SSID_FLEET_DASH_CONFIDENCE  65
 
 #endif // ACAB_NETCAM_SIGNATURES_H

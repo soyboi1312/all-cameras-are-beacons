@@ -64,12 +64,15 @@ static void addU16List(Bytes& a, uint16_t uuid, uint8_t adType = 0x03) {
 }
 
 // A real separated-from-owner Find My advert: 4C 00 12 19 <status> <22 key bytes> <bits> <hint>.
-static Bytes airtagOffline() {
-    Bytes payload{ 0x12, 0x19, 0x10 };
+// The status byte's bits 5:4 declare the device type (00 Apple device, 01 AirTag, 10 third-party
+// accessory, 11 AirPods); bits 7:6 are battery.
+static Bytes findMyOffline(uint8_t status) {
+    Bytes payload{ 0x12, 0x19, status };
     for (int i = 0; i < 22; i++) payload.push_back((uint8_t)(0xA0 + i));   // fixed, never random
     payload.push_back(0x00); payload.push_back(0x00);
     Bytes a; addMfg(a, 0x004C, payload); return a;
 }
+static Bytes airtagOffline() { return findMyOffline(0x10); }   // AirTag, battery full
 
 // AirTags rotate their address, so the classifier must key on payload alone. Two fixed MACs: one
 // with the IEEE locally-administered bit set (what acabInit calls randomAddr) and one without.
@@ -99,7 +102,7 @@ int main() {
     // downgraded to a generic "nearby device" row.
     gHostDesert = true;
     chk("toggled off + Desert on: still classifies", run(airtagOffline(), &d), true,
-        d.confidence, 85, d.detail, "Apple Find My (offline)");
+        d.confidence, 85, d.detail, "Apple AirTag (offline)");
     gHostDesert = false;
     chk("Desert back off: ignored again", run(airtagOffline(), &d), false);
 
@@ -121,7 +124,7 @@ int main() {
     // -----------------------------------------------------------------------------------------
     printf("\n  -- Apple Find My --\n");
     chk("AirTag offline advert -> 85 / exact detail", run(airtagOffline(), &d), true,
-        d.confidence, 85, d.detail, "Apple Find My (offline)");
+        d.confidence, 85, d.detail, "Apple AirTag (offline)");
     chkInt("  method is M_MFG_ID", d.method, M_MFG_ID);
     chkInt("  type is ACAB_TRACKER", d.type, ACAB_TRACKER);
     chkInt("  source is SRC_BLE", d.src, SRC_BLE);
@@ -131,7 +134,7 @@ int main() {
     // The address is irrelevant to the match, which is the whole point of payload matching: a tag
     // that rotates into a public-looking address must still be caught.
     chk("same payload on a public-looking MAC -> same hit", run(airtagOffline(), &d, MAC_PUBLIC), true,
-        d.confidence, 85, d.detail, "Apple Find My (offline)");
+        d.confidence, 85, d.detail, "Apple AirTag (offline)");
     chkInt("  randomAddr clear on that one", d.randomAddr ? 1 : 0, 0);
     // Durability caps OUI-only matches on randomized addresses at 25. Find My is M_MFG_ID, so it
     // must survive that pass at full confidence - otherwise every AirTag (they all rotate) would
@@ -139,11 +142,36 @@ int main() {
     run(airtagOffline(), &d); acabApplyDurability(&d);
     chkInt("  durability leaves M_MFG_ID at 85", d.confidence, 85);
 
+    // The NAME follows the status byte's declared type; the MATCH never does. Every type matches
+    // at 85, and only type 01 is named an AirTag. Type 00 is the case that must not be lost: it is
+    // what an offline iPhone or Mac sends, and the masquerade a cloned tag uses to evade Apple's
+    // own alerts.
+    chk("status 0x00 (Apple device / masquerade) -> still 85, generic name", run(findMyOffline(0x00), &d),
+        true, d.confidence, 85, d.detail, "Apple Find My (offline)");
+    chk("status 0x20 (third-party accessory) -> generic name", run(findMyOffline(0x20), &d),
+        true, d.confidence, 85, d.detail, "Apple Find My (offline)");
+    chk("status 0x30 (AirPods) -> generic name", run(findMyOffline(0x30), &d),
+        true, d.confidence, 85, d.detail, "Apple Find My (offline)");
+    chk("status 0xD0 (AirTag, battery very low) -> AirTag", run(findMyOffline(0xD0), &d),
+        true, d.confidence, 85, d.detail, "Apple AirTag (offline)");
+    chk("status 0x14 (AirTag + maintained bit) -> AirTag", run(findMyOffline(0x14), &d),
+        true, d.confidence, 85, d.detail, "Apple AirTag (offline)");
+    // The name reads mfg[4] only when the frame holds it (mfgLen >= 5). Here the next AD element's
+    // length byte (0x10) sits right after a 4-byte frame and looks like an AirTag status, so a
+    // missing guard reads it and names the row an AirTag.
+    { Bytes a; addMfg(a, 0x004C, { 0x12, 0x19 }); addAd(a, 0x09, Bytes(15, 'x'));
+      chk("4-byte frame, next byte looks like AirTag -> generic name", run(a, &d), true,
+          d.confidence, 85, d.detail, "Apple Find My (offline)"); }
+    { Bytes a; addMfg(a, 0x004C, { 0x12, 0x19, 0x10 });
+      chk("5-byte frame, status AirTag -> AirTag name", run(a, &d), true,
+          d.confidence, 85, d.detail, "Apple AirTag (offline)"); }
+
     // CONCERN, LOCKED IN AS-IS: 0x19 is a LENGTH field describing 25 further bytes, and nothing
     // checks that those bytes are actually present. A 4-byte manufacturer block that merely claims
-    // to be an offline Find My frame matches at 85. Harmless today (nothing reads past mfg[3]) but
-    // it is a length field that overruns its own buffer, and any future code that decodes the key
-    // material must bounds-check rather than trusting this byte.
+    // to be an offline Find My frame matches at 85. The name reads mfg[4] only behind its own
+    // mfgLen >= 5 check, so this frame keeps the generic name; it is a length field that overruns
+    // its own buffer, and any future code that decodes the key material must bounds-check rather
+    // than trusting this byte.
     { Bytes a; addMfg(a, 0x004C, { 0x12, 0x19 });
       chk("declared len 0x19 with 0 bytes present -> STILL hits", run(a, &d), true,
           d.confidence, 85, d.detail, "Apple Find My (offline)"); }
@@ -228,7 +256,7 @@ int main() {
     // an advert somehow carries both.
     { Bytes a = airtagOffline(); addSvcData(a, 0xFEED, { 0x01, 0x02 });
       chk("Find My + Tile in one advert -> Apple wins", run(a, &d), true, d.confidence, 85, d.detail,
-          "Apple Find My (offline)"); }
+          "Apple AirTag (offline)"); }
     // Between Tile and Samsung there is NO vendor ranking: the loop walks service-data elements in
     // advert order and returns the first that matches, so element position decides, not the 65-vs-60
     // confidence. Both directions are asserted so a reordering of the two if-statements is caught.

@@ -73,6 +73,11 @@ struct VendorBleId {
 // constexpr rather than const so the group-range static_assert below can read the rows.
 static constexpr VendorBleId VENDOR_BLE_ID[] = {
     // --- Axon / TASER. FIRST validation target: locally deployed, and the narrower vendor. ---
+    // 0x034D and 0xFE6B graduated on 2026-10-20: shipping builds now classify them in
+    // axon_detect.cpp (AXON_SIG_* in axon_signatures.h, detail "Axon Bluetooth ID"; 0x034D only
+    // with its serial-shaped payload, AXON_SIG_CID_SERIAL_LEN). The rows stay here, matching any
+    // payload, so capture builds keep logging them beside the advertised name. 0xFC81 and 0xFE6C have
+    // no sighting yet and stay capture-only.
     { 0, 0x034D, "AXON-CID", VG_AXON },   // TASER International, manufacturer company ID
     { 1, 0xFC81, "AXON-SVC", VG_AXON },   // Axon Enterprise, 16-bit service UUID
     { 1, 0xFE6B, "AXON-SVC", VG_AXON },   // TASER International

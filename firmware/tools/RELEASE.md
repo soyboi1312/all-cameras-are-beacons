@@ -40,6 +40,18 @@ PYTHONDONTWRITEBYTECODE=1 python3 -B -m unittest discover \
   -s firmware/tools/tests -p 'test_release_tools.py' -v
 ```
 
+## New wire strings ship app-first
+
+When a firmware release adds a detail string that the apps match exactly, the apps that know the
+string must be live in both stores before the OTA manifest that carries the firmware is published.
+The exact-match sets: the body-cam signature strings in `axon_detect.cpp` and `police_detect.cpp`
+(both apps read them through `BodyCamSignature`), the tracker names in `tracker_detect.cpp` (both
+apps map them in `Detection.maker`), and the Desert address labels in `desert_detect.cpp` (both
+detail screens). An older app falls back to a generic row: on 2026-10-21 a 2.2.1 app paired with
+a 2.2.2 capture board exported an owner-confirmed `0xFE6B` body cam (`service data` at conf 75, so
+detail `Axon Bluetooth ID`) with a blank maker. For 2.2.2: both 2.2.2 apps live first, then
+`release.sh` and the soyboi.tech push.
+
 ## OTA key rotation
 
 The board pins one OTA trust root, `firmware/lib/acab_core/ota_pubkey.h`, and accepts only an

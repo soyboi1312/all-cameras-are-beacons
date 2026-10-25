@@ -76,6 +76,12 @@ CANARIES = {
     # 2.2.1: the repeat-pairing refusal, new in acab_ble_service.cpp's acabRepeatPairingAllowed. The
     # patched NimBLEServer.cpp calls it, so every production image links it.
     "2.2.1": ["repeat pairing refused (window closed)"],
+    # 2.2.2: one detail string per detection change, so each change is proven present: the Axon
+    # SIG-number detail (axon_detect.cpp axonClassifyBLE), the fleet dashcam SSID detail
+    # (netcam_detect.cpp netcamClassifyWiFi) and the AirTag name (tracker_detect.cpp
+    # trackerClassifyBLE). Each occurs once in all seven local 2.2.2 production images and in none
+    # of the seven published 2.2.1 images (checked with strings on 2026-10-20).
+    "2.2.2": ["Axon Bluetooth ID", "fleet dashcam", "Apple AirTag (offline)"],
 }
 
 HERE = os.path.dirname(os.path.abspath(__file__))
