@@ -156,7 +156,7 @@ the companion nRF firmware and the beacon's hardware design files are not in thi
 
 ## project status
 
-the source tree is at **2.2.2** for the ESP32 firmware and both apps. published releases can trail the source, so check the app's firmware update screen and the store listings for what is actually available.
+the source tree is at **2.2.3** for the ESP32 firmware and both apps. published releases can trail the source, so check the app's firmware update screen and the store listings for what is actually available.
 
 the detector, mesh path, apps, and update flows have all been tested on real hardware. field testing continues, especially for the capture candidates. the [OTA protocol](docs/ble-protocol.md#firmware-update-ota) documents the update order.
 

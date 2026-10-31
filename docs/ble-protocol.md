@@ -298,8 +298,9 @@ Write a JSON object with any subset of keys:
 | `glasses` | enable/disable the smart/recording-glasses detector (Ray-Ban/Oakley Meta, Snap Spectacles, Vuzix; on by default). Scores three BLE payload surfaces (manufacturer-data company ID, 16-bit SIG member UUIDs, the HeyCyan service UUID) and keeps the best. See [docs/glasses.md](glasses.md) |
 | `netcam` | enable/disable the **network-camera** detector (default **off**, opt-in). Matches branded IP-camera OUIs (Hikvision/Dahua/Amcrest/Axis/Reolink/Ring/Wyze/eufy/Ezviz/Lorex/Swann/Arlo) on the host Wi-Fi and emits `t:10` at confidence 65 (or 75 for a field-validated block), detail "<Vendor> on wifi". Since 2.0.4 it ALSO matches a base-station SSID prefix ("ARLO_VMB_"/"NTGR_VMB_") on beacon/probe-response frames, emitting `t:10` with method `M_SSID` at confidence **88**, detail "Arlo base station" and the matched SSID in `name` - a self-attested match outranks any OUI inference. Since 2.2.2 it also matches a fleet dashcam SSID ("Dash-" plus exactly four digits, on any MAC) on the same frames, but only when no OUI row matched: `t:10`, method `M_SSID`, confidence 65, detail "fleet dashcam" and the SSID in `name`. Probe REQUESTS are deliberately excluded: they name the network sought, not the transmitter. Turning it on widens Wi-Fi capture to 802.11 **data** frames so a streaming camera's cleartext source MAC can be OUI-matched; off (default) keeps capture management-frame-only for zero added CPU / 2.4GHz load. Honest scope: it matches known camera BRANDS on the network (could be an NVR/doorbell/disclosed camera) and cannot find every camera - never a "hidden camera" claim |
 | `desert` | **Desert mode**: report EVERY device in range, not just known signatures (default off). See *Desert mode* below |
-| `buzzer` | detection/session alert audio on/off. `false` mutes every sound the board can make: detection, connect, reveal and preview sounds, the boot jingle, the rev-B hold-to-start acknowledgment and the shutdown cue. The hold-to-start ack keeps its LED flash (governed by `led`). The boot jingle additionally plays only on a physical start, never after an OTA restart, panic, watchdog or brownout |
-| `volume` | buzzer loudness, integer `0` to `100` (`0` is silent) |
+| `buzzer` | detection/session alert audio on/off. `false` mutes detection, connect, reveal and preview sounds. From 2.2.3 it no longer mutes the three power sounds (the boot jingle, the rev-B hold-to-start acknowledgment and the shutdown cue): those follow `psnd`. On 2.2.1 and 2.2.2 `false` mutes them too, and before 2.2.1 it mutes the boot jingle only |
+| `psnd` | 2.2.3+: the power sounds on/off (default **on**): the boot jingle, the rev-B hold-to-start acknowledgment and the shutdown cue. They play through `buzzer:false`, so a board in vibrate, silent or Desert mode still sounds when it turns on or off; `false` silences them. The hold-to-start ack keeps its LED flash (governed by `led`). The boot jingle plays only on a physical start, never after an OTA restart, panic, watchdog or brownout. Persists across boots |
+| `volume` | buzzer loudness, integer `0` to `100` (`0` is silent, power sounds included) |
 | `led` | onboard status LED on/off (default **on**). `false` = "lights out": no idle heartbeat, no detection flashes, no boot sweep, for covert/stationary deploys. The idle heartbeat also never runs on a boot that parks again (bump wake, charge-while-off), whatever this flag says. Persists across boots |
 | `ble` | enable/disable the BLE detection scan. `false` stops scanning only - the GATT link to the app stays up |
 | `wifi` | enable/disable the Wi-Fi (promiscuous) detection scan |
@@ -416,6 +417,8 @@ offline-buffer write, and nothing else.
 Every key in that frame is emitted on every Status update. The conditional keys (`pairw`,
 `bufrl`, `buferr`, `wiping`, `ledon`, `bat`, and the dual-radio block) are absent here on
 purpose: each is emitted only when it has something to say, and absent means the default.
+`psnd` (2.2.3+) is absent from this 2.0.5 frame for a different reason: only builds with a buzzer
+send it, so never Mesh-Detect, and an absent `psnd` means there is no such switch, not the default.
 
 The radio ingest counters `wseen` / `bseen` and the sink-drop total `sdrop` are **not in this
 frame any more**. They left it on 2026-08-26 for the bench-only `{"diag":true}` reply, and their
@@ -443,8 +446,9 @@ a hard ceiling.
 | `droui` | drone vendor-OUI fallback enabled. A missing key (older firmware) is treated as off (opt-in, default off) |
 | `axon` | body-cam category enabled (Axon plus Utility BodyWorn plus, gated by `moto`, the broad Motorola OUI) |
 | `moto` | broad Motorola Solutions OUI sub-toggle enabled. **An absent key means pre-split firmware**, where the broad match rode the body-cam toggle with no separate switch: treat absent as `true` and hide or disable the sub-toggle in the UI, since writing `{"motorola":...}` to that board does nothing. Present means the board honours the sub-toggle. Note this reports the sub-toggle's own value, so `"axon":false,"moto":true` is normal and still means no Motorola hits (both switches are required) |
-| `buzzer` | detection/session alert audio enabled. `false` mutes every sound, the boot jingle and both power cues included |
+| `buzzer` | detection/session alert audio enabled. From 2.2.3 `false` leaves the power sounds to `psnd`; on 2.2.1 and 2.2.2 it mutes them too |
 | `vol` | buzzer volume, `0` to `100` |
+| `psnd` | 2.2.3+: power sounds enabled. **Absent means older firmware, or a board with no buzzer (Mesh-Detect)**: there is no separate switch, so the apps hide the toggle and describe the board by its version |
 | `gps` | a GPS fix is being applied to fixed-device detections |
 | `buf` | number of detections currently held in the offline buffer |
 | `bufon` | offline buffering is enabled |
