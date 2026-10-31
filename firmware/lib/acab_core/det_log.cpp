@@ -25,7 +25,6 @@
 #include <mbedtls/aes.h>
 #include <mbedtls/md.h>
 #include <esp_random.h>
-#include <esp_system.h>         // esp_reset_reason(): which boots count toward the auto-wipe
 #include <freertos/FreeRTOS.h>
 #include <freertos/semphr.h>
 #include <string.h>
@@ -49,10 +48,9 @@ static const size_t   ENC_LEN    = SLOT - ENC_OFF;           // 52 encrypted byt
 static const uint8_t  RING_FORMAT = 2;
 // Auto-wipe: if the buffer sits undrained across this many PHYSICAL STARTS without the app ever
 // connecting to drain it, erase it (a board out of its owner's hands self-cleans when booted). A
-// start counts only when esp_reset_reason() evidences a person or a new possession: POWERON, EXT
-// (reset pin) or DEEPSLEEP (on the beacon board every deep-sleep entry, powerOffDeepSleep, commits
-// OFF first, so a wake that reaches detLogBegin passed the hold/switch/cell gate; mesh-detect's
-// acabPhysicalStart call treats a deep-sleep wake the same way). SW (OTA, ESP.restart fatal paths),
+// start counts only when the caller's acabPhysicalStart decision (pair_window.h, passed to
+// detLogBegin without the bench override) evidences a person or a new possession: a POWERON, or a
+// DEEPSLEEP wake that the hold/switch/cell gate accepted. SW (OTA, ESP.restart fatal paths),
 // PANIC, the watchdogs, BROWNOUT, SDIO and UNKNOWN are the board restarting itself: a sagging cell
 // or a remotely induced crash loop must not count down the owner's own evidence. The count lives
 // in NVS "pboot" (gPossessionBoots), SEPARATE from the boot id `boot`, which still advances on
@@ -781,6 +779,10 @@ static bool restoreRingWipeLocked(bool* pending) {
 // AES-CTR nonce domain (cryptdom128:bootCount:seq); exposing a scanned ring without its retained
 // key can also turn
 // ciphertext into a plausible-looking replay. Both paths therefore remain unavailable together.
+// This boot's physical-start decision, set by detLogBegin before the first restore. A retry of
+// the restore later in the same boot reads the same value, as esp_reset_reason() used to give.
+static bool gBootPhysicalStart = false;
+
 static bool restoreStartupConfigLocked() {
     Preferences p;
     if (!p.begin(NVS_NS, false)) {
@@ -956,10 +958,7 @@ static bool restoreStartupConfigLocked() {
     // The auto-wipe count (WIPE_AFTER_BOOTS). Only a start that evidences a person or a new
     // possession advances it; a board rebooting itself keeps the stored count, and a missing key
     // (a fielded board's first boot on this firmware) starts from zero, which only delays the wipe.
-    const esp_reset_reason_t resetReason = esp_reset_reason();
-    const bool possessionStart = resetReason == ESP_RST_POWERON ||
-                                 resetReason == ESP_RST_EXT ||
-                                 resetReason == ESP_RST_DEEPSLEEP;
+    const bool possessionStart = gBootPhysicalStart;
     const uint32_t possession = possessionBase + (possessionStart ? 1u : 0u);
     // `on=false` is the durable disable marker and `keydrop=true` is the equivalent marker for an
     // enabled key rotation (persistKeyRemovalLocked). If power died between either commit and the
@@ -1689,7 +1688,8 @@ static void runAutoWipeCheckLocked() {
 }
 
 // ---- public API ----
-void detLogBegin() {
+void detLogBegin(bool physicalStart) {
+    gBootPhysicalStart = physicalStart;
     if (!gIoMutex) gIoMutex = xSemaphoreCreateMutexStatic(&gIoMutexStorage);
     if (!gCaptureDeliveryMutex)
         gCaptureDeliveryMutex = xSemaphoreCreateMutexStatic(&gCaptureDeliveryMutexStorage);

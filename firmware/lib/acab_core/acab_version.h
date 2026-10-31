@@ -27,6 +27,25 @@
 // field above 1023 is therefore un-shippable over the air: the apps compare unclamped, would keep offering
 // the update, and the board would refuse it forever. Bump the MINOR when the patch field runs out.
 //
+// 2.2.3: power sounds are their own setting. The boot jingle, the rev-B hold-to-start beep and the
+//        power-down motif now play through the detection-alert mute (vibrate, silent, Desert), so
+//        the owner always hears the board turn on and off; the new {"psnd":false} config key
+//        (NVS "psnd" in acab-audio, default on, status "psnd") silences them. Volume 0, lights out
+//        and the physical-start-only rule for the boot jingle are unchanged. No partition, fw label,
+//        OTA receiver, signing key, RING_FORMAT or existing NVS-key change; the one new key is read
+//        with its default. `buzzer` keeps its type and its detection-audio meaning, but no longer
+//        covers the power cues. proto stays 2 on purpose: old apps still parse every key, and a bump
+//        would make every shipped app refuse to update the board (needsNewerApp gates S3 OTA, nRF
+//        DFU and the combined update; connect, status and config still work). The 2.2.1/2.2.2
+//        apps call a muted 2.2.3 board fully silent, so the 2.2.3 apps ship first (RELEASE.md).
+//        nRF app unchanged (v3).
+//        Also from the 2026-10-28 firmware review: the OTA anti-rollback floor compiles
+//        unconditionally (the ACAB_OTA_VERSION_FLOOR switch every env set is gone; same code); the
+//        live notify stops eliding after CH for a record with no Remote ID fields (same frames,
+//        fewer rebuilds); an unmatched BLE advert no longer parses its company ID and name for
+//        nothing (one shared acabBleAdvName); the seizure auto-wipe counts physical starts through
+//        acabPhysicalStart, the same rule as the pairing window (detLogBegin(bool)).
+//        beacon-board: RAM 78796 bytes (same as 2.2.2), flash 1034001 bytes (+344).
 // 2.2.2: three detection changes, all in lib/acab_core, so every build gets them. No partition, fw
 //        label, OTA receiver, signing key, BLE proto, RING_FORMAT, NVS-key or wire-key change: every
 //        OTA-capable board takes it over the air and keeps its bonds, settings and offline log (the
@@ -322,7 +341,7 @@
 // 2.0.0: the Colonel Panic builds pick up the full v2 detection set the beacon board ships
 // with (offline buffer, watchlist/custom category, ignore list, refreshed OUIs, glasses).
 #ifndef ACAB_FW_VERSION
-#define ACAB_FW_VERSION "2.2.2"
+#define ACAB_FW_VERSION "2.2.3"
 #endif
 
 #endif // ACAB_VERSION_H

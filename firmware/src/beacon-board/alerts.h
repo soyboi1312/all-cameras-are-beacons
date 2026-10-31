@@ -2,11 +2,11 @@
  * ACAB OUI-Spy - local alert feedback (buzzer + onboard LED).
  * Each target class gets its own audible signature, so you can tell what was
  * detected without looking at the phone. Detection-alert audio and volume come
- * from the app and persist across reboots. MUTE WINS FOR EVERY SOUND (2026-10-11): the boot
- * motif, the hold-to-start ack and the power-down cue all stay silent while detection alerts
- * are muted, exactly like a detection pattern. A muted board emitting sound ranks above a crash
- * in this repo's defect order, and every power cue already has a silent twin: the LED flash
- * (governed by lights out), the slide switch's own position, the app's {"pwr":"off"} notify.
+ * from the app and persist across reboots. POWER SOUNDS ARE THEIR OWN SETTING (2.2.3, owner
+ * decision): the boot jingle, the hold-to-start beep and the power-down motif play through the
+ * detection-alert mute (alert mode, Desert), so the owner always hears the board turn on and
+ * off. The "psnd" setting is the one switch that silences them. Volume 0 still silences every
+ * sound, and lights out still governs every LED path.
  */
 #ifndef ACAB_ALERTS_H
 #define ACAB_ALERTS_H
@@ -25,13 +25,13 @@ void alertsInit();
 // Startup motif. Plays ONLY on a physical start (power applied, button held, switch on: the one
 // host-tested acabPhysicalStart decision the call site also feeds the pairing gate) and never on
 // a warm continuation (OTA restart, panic, watchdog, brownout), so nothing that can induce a
-// crash from radio range can make the board announce itself. Honors detection-alert mute in
-// EVERY case on top of that: on the button-less deploys ESP_RST_POWERON cannot be told apart from
-// an unattended power restore (see alertsBootJingle).
+// crash from radio range can make the board announce itself. Ignores the detection-alert mute;
+// silenced by power sounds off. On button-less deploys ESP_RST_POWERON cannot be told apart from
+// an unattended power restore, so a covert install turns power sounds off.
 void alertsBootJingle(bool physicalStart);
 
-// Queued confirmation that the hold-to-start gate committed to ON. Honors detection-alert mute
-// like every other sound; while muted the cue is its LED flash alone (lights out governs that).
+// Queued confirmation that the hold-to-start gate committed to ON. Ignores the detection-alert
+// mute; with power sounds off it is its LED flash alone (lights out governs that).
 void alertsPowerOnAck();
 
 // The mirror image of the boot jingle: a short DESCENDING "powering down" motif that ENDS LOW,
@@ -39,9 +39,8 @@ void alertsPowerOnAck();
 // to 'off', button hold, app power-off) so the user can HEAR off from on - the faint 25ms
 // heartbeat LED never made that legible, and the red light is the charger's, not ours. Blocking
 // (~0.7s), safe to call right before deep sleep. Suspends the alert task first (alertsQuiesce),
-// so this is the last thing heard. Honors detection-alert mute: a muted board goes off silently,
-// and the switch position or the app's {"pwr":"off"} notify is the confirmation. The LED still
-// honors lights out, and volume 0 remains fully silent.
+// so this is the last thing heard. Ignores the detection-alert mute; silenced by power sounds
+// off. The LED still honors lights out, and volume 0 remains fully silent.
 void alertsPowerDown();
 
 // Stop the alert task and every output, for a park path that must emit nothing more: the silent
@@ -63,10 +62,19 @@ void alertsConnected();
 // Queue a non-blocking alert for a detection. Only `isNew` hits beep.
 void alertsSignal(AcabDeviceType type, bool isNew);
 
-// Detection/session alert audio on/off. Persisted to NVS. Off silences every sound the board
-// can make, the power cues included; only the LED paths keep running (see alertsSetLedEnabled).
+// Detection/session alert audio on/off. Persisted to NVS. Off silences every sound except the
+// three power cues, which follow alertsSetPowerSoundsEnabled; the LED paths keep running.
 void alertsSetBuzzerEnabled(bool on);
 bool alertsBuzzerEnabled();
+
+// Startup and shutdown sounds (the boot jingle, the hold-to-start beep, the power-down motif) on
+// or off, independent of the alert mute. Persisted to NVS ("psnd"), default on.
+void alertsSetPowerSoundsEnabled(bool on);
+bool alertsPowerSoundsEnabled();
+
+// True on every build that compiles this file. The shared BLE service's weak default is false
+// (Mesh-Detect has no buzzer), so only a board that can make the sounds reports "psnd".
+bool alertsHasBuzzer();
 
 // Buzzer loudness, 0..100. 0 is silent (LED still flashes). Persisted to NVS.
 void alertsSetVolume(uint8_t volume);

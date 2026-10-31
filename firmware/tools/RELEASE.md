@@ -52,6 +52,13 @@ a 2.2.2 capture board exported an owner-confirmed `0xFE6B` body cam (`service da
 detail `Axon Bluetooth ID`) with a blank maker. For 2.2.2: both 2.2.2 apps live first, then
 `release.sh` and the soyboi.tech push.
 
+The same order applies when a firmware release changes what an existing setting does and the
+shipped apps describe that setting. 2.2.3 is the case: `buzzer:false` no longer mutes the power
+sounds, but the 2.2.1 and 2.2.2 apps gate their "all board sounds off" captions and Desert note
+on `muteCoversPowerCues` with no upper bound, so they would tell a muted 2.2.3 board's owner it is
+silent. For 2.2.3: both 2.2.3 apps (the Power sounds toggle and its captions) live first, then
+`release.sh` and the soyboi.tech push.
+
 ## OTA key rotation
 
 The board pins one OTA trust root, `firmware/lib/acab_core/ota_pubkey.h`, and accepts only an

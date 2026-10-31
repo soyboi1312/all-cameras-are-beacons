@@ -2,7 +2,7 @@
  * ACAB - "Desert mode" catch-all detector implementation. See desert_detect.h.
  */
 #include "desert_detect.h"
-#include "acab_scanner.h"   // acabSanitizeAscii: clamp attacker-sourced strings on ingest
+#include "acab_scanner.h"   // acabSanitizeAscii + acabBleAdvName: clamp attacker-sourced strings on ingest
 #include "acab_nvs_toggle.h" // persist the Desert toggle across reboots (NVS)
 #include <string.h>
 #include <stdio.h>
@@ -48,30 +48,12 @@ static const char* bleAddrLabel(const uint8_t* mac, AcabBleAddrType t) {
     return "OUI unknown";
 }
 
-// Pull the advertised local name out of a BLE advert (AD type 0x08 short /
-// 0x09 complete) into name[outSz]. Leaves it empty if there is none.
-static void bleName(const uint8_t* adv, size_t advLen, char* name, size_t outSz) {
-    name[0] = 0;
-    for (size_t i = 0; i + 1 < advLen; ) {
-        uint8_t l = adv[i];
-        if (l == 0 || i + 1 + (size_t)l > advLen) break;
-        uint8_t t = adv[i + 1];
-        if (t == 0x08 || t == 0x09) {                 // shortened / complete local name
-            size_t n = (size_t)l - 1;
-            if (n >= outSz) n = outSz - 1;
-            acabSanitizeAscii(name, adv + i + 2, n, outSz);   // clamp to printable ASCII on ingest
-            return;
-        }
-        i += (size_t)l + 1;
-    }
-}
-
 bool desertClassifyBLE(const uint8_t mac[6], const uint8_t* adv, size_t advLen,
                        int rssi, AcabDetection* out, AcabBleAddrType addrType) {
     if (!gEnabled.on) return false;
     acabInit(out, ACAB_NEARBY_DEVICE, SRC_BLE, mac, (int16_t)rssi);
     out->method = M_NONE;
-    if (adv && advLen) bleName(adv, advLen, out->name, sizeof(out->name));
+    acabBleAdvName(adv, advLen, out->name, sizeof(out->name));
     // Keep randomAddr in step with the label, through the rule's single owner (detection.h):
     // acabScannerIngestBLE applies it again after the chain for every classified row, and this
     // call makes a record read straight from the classifier (the host test does) agree too.

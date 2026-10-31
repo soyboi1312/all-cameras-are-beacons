@@ -34,6 +34,16 @@ static volatile uint8_t gVolume = 80;   // 0..100
 // Default on so a first-time board visibly shows it's alive. Gates ledOn() below, so one flag
 // silences every LED path (heartbeat, patterns, jingle) at once.
 static volatile bool    gLedEnabled = true;
+// Startup and shutdown sounds: the boot jingle, the hold-to-start beep and the power-down motif.
+// They play through the detection-alert mute (alert mode, Desert) so the owner always hears the
+// board turn on and off; this is the one switch that silences them. Default on.
+static volatile bool    gPowerSnd = true;
+// True only while one of those three cues plays, so buzzerTone applies gPowerSnd instead of
+// gBuzzer. A plain flag is enough: the boot jingle runs before advertising and the scanner start
+// (acabBleBegin has run, but nothing can connect or detect yet); the rev-B ack is queued at the
+// gate commit and finishes during the release wait and radio init, seconds before the jingle, and
+// plays on the alert task itself; the power-down cue suspends the alert task first.
+static volatile bool    gPowerCue = false;
 
 // How often the idle heartbeat pulses when no alert is queued (the alertTask wakes on this
 // timeout to flash the LED briefly, so a running board never looks dead).
@@ -67,6 +77,7 @@ static void loadAudio() {
     gBuzzer = p.getBool("buzz", true);
     gVolume = p.getUChar("vol", 80);
     gLedEnabled = p.getBool("led", true);   // default on
+    gPowerSnd = p.getBool("psnd", true);    // default on; new in 2.2.3, absent on older boards
     p.end();
 }
 static void saveAudio() {
@@ -75,11 +86,15 @@ static void saveAudio() {
     p.putBool("buzz", gBuzzer);
     p.putUChar("vol", gVolume);
     p.putBool("led", gLedEnabled);
+    p.putBool("psnd", gPowerSnd);
     p.end();
 }
 
 void alertsSetBuzzerEnabled(bool on) { gBuzzer = on; saveAudio(); }
 bool alertsBuzzerEnabled() { return gBuzzer; }
+void alertsSetPowerSoundsEnabled(bool on) { gPowerSnd = on; saveAudio(); }
+bool alertsPowerSoundsEnabled() { return gPowerSnd; }
+bool alertsHasBuzzer() { return true; }
 
 void alertsSetVolume(uint8_t v) {
     if (v > 100) v = 100;
@@ -123,12 +138,12 @@ static void buzzerFreq(int freq) { ledcSetup(BUZZER_LEDC_CHANNEL, freq, BUZZER_L
 static void buzzerOff() { buzzerDuty(0); }
 
 // Start a tone at `freq`, scaled to the current volume, then by an optional per-call scale
-// (0-100%, default full). Mute wins here for EVERY caller, the power cues included (2026-10-11;
-// until then PowerState cues bypassed it, so a muted board voiced its 0.7 s power-down motif on
-// slide-off, button-hold off and app power-off). Volume 0 is the same silence, and LED output
-// stays independently governed by the lights-out setting.
+// (0-100%, default full). The alert mute (gBuzzer) gates every sound except the three power
+// cues, which follow the power-sounds setting instead (2.2.3). Volume 0 silences everything, and
+// LED output stays independently governed by the lights-out setting.
 static void buzzerTone(int freq, int scalePct = 100) {
-    if (!gBuzzer || gVolume == 0 || freq <= 0) { buzzerOff(); return; }
+    const bool audible = gPowerCue ? gPowerSnd : gBuzzer;
+    if (!audible || gVolume == 0 || freq <= 0) { buzzerOff(); return; }
     // ledcSetup, NEVER ledcWriteTone. ledcWriteTone hard-codes duty_resolution = 10 and stamps
     // channels_resolution[chan] = 10 (framework-arduinoespressif32 3.20017,
     // cores/esp32/esp32-hal-ledc.c:118-148), so it silently retimed this channel to 10-bit behind
@@ -208,10 +223,12 @@ static void playReveal() {
 }
 
 // Immediate confirmation that the rev-B hold-to-start gate committed to ON. Same note as the
-// volume preview, kept as its own sentinel so the queue reads honestly; while muted this is the
-// LED flash alone, which is the finger-on-the-button feedback a muted user still gets.
+// volume preview, kept as its own sentinel so the queue reads honestly. A power cue: it sounds
+// through the alert mute, and with power sounds off it is the LED flash alone.
 static void playPowerOnAck() {
+    gPowerCue = true;
     beep(3000, 130);
+    gPowerCue = false;
 }
 
 // A different sound per target class.
@@ -335,12 +352,12 @@ void alertsBootJingle(bool physicalStart) {
     // otherwise a crash loop, or anything able to induce a crash from radio range, made an
     // unmuted board announce itself over and over. The app's reconnect chirp already confirms a
     // recovery. physicalStart is the same acabPhysicalStart decision the pairing gate consumes.
-    // MUTE ALWAYS WINS ON TOP OF THAT (2026-08-24, now the rule for every sound in buzzerTone).
-    // physicalStart counts EVERY ESP_RST_POWERON as deliberate - and on the button-less deploys
-    // (slim always-on SKU, USB wall power, covert installs) an unattended power interruption and
-    // restore is indistinguishable from a hand on the plug, so a MUTED board would otherwise have
-    // announced itself at the saved volume at 3am. A muted board never plays the boot jingle.
+    // A physical start plays it even while alerts are muted or Desert runs (2.2.3, owner decision:
+    // the owner must hear it turn on); power sounds off is what silences it. physicalStart counts
+    // EVERY ESP_RST_POWERON as deliberate, so on a button-less deploy (slim always-on SKU, USB wall
+    // power, covert install) an unattended power restore plays it too: those turn power sounds off.
     if (!physicalStart) return;
+    gPowerCue = true;
     caw(500, 1050, 140, 60);                 // 1. servo "vwip"
     vTaskDelay(pdMS_TO_TICKS(40));
     beep(1150, 60, 60); vTaskDelay(pdMS_TO_TICKS(30));   // 2. da
@@ -348,6 +365,7 @@ void alertsBootJingle(bool physicalStart) {
     beep(1850, 95, 60); vTaskDelay(pdMS_TO_TICKS(50));   //    DEE
     warble(1700, 220, 3, 22, 60);            // 3. head-cock trill
     caw(1500, 2500, 170, 60);                // 4. "...alive?" - ends high, never resolves down
+    gPowerCue = false;
 }
 
 void alertsPowerDown() {
@@ -362,17 +380,16 @@ void alertsPowerDown() {
     // UP (da-da-DEE) and ends on a rising, unresolved "...alive?", this steps DOWN and settles to the
     // floor - the ear reads "off" the moment it resolves low. Same 500-2500 Hz band and 60% scale as
     // boot; and it still obeys the whoosh-era rule that nothing SWEEPS BACK UP (a symmetric up/down
-    // pair reads as a siren) - this only ever descends. The LED master still governs the light, and
-    // detection-alert mute silences this like every other sound (2026-10-11; it used to bypass mute
-    // as a "deliberate" cue, which voiced a muted board on slide-off, button-hold off and app
-    // power-off): a muted board goes off silently, and the switch position or the app's
-    // {"pwr":"off"} notify is its confirmation. ~0.7s, before the nRF park handshake, so deep
-    // sleep never clips it.
+    // pair reads as a siren) - this only ever descends. The LED master still governs the light. It
+    // plays through the alert mute like the boot jingle (2.2.3), and power sounds off silences it.
+    // ~0.7s, before the nRF park handshake, so deep sleep never clips it.
+    gPowerCue = true;
     beep(1850, 90, 60); vTaskDelay(pdMS_TO_TICKS(30));   // DEE   - boot's top note, now the START
     beep(1450, 70, 60); vTaskDelay(pdMS_TO_TICKS(30));   //  da   - stepping down (boot stepped up)
     beep(1150, 70, 60); vTaskDelay(pdMS_TO_TICKS(40));   //   da
     warble(950, 160, 3, 26, 60);                          // slowing "spin-down" wobble, lower + lazier
     caw(1400, 500, 220, 60);                              // settle: sweep DOWN to the floor, ends low = off
+    gPowerCue = false;
 }
 
 void alertsPowerOnAck() {

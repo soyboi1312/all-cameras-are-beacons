@@ -179,6 +179,9 @@ void acabBleNotifyPoweringOff() { otaNotify("{\"pwr\":\"off\"}"); }
 // alerts.cpp provides the strong overrides; mesh-detect falls through to these.
 __attribute__((weak)) void    alertsSetBuzzerEnabled(bool) {}
 __attribute__((weak)) bool    alertsBuzzerEnabled()         { return false; }
+__attribute__((weak)) void    alertsSetPowerSoundsEnabled(bool) {}
+__attribute__((weak)) bool    alertsPowerSoundsEnabled()    { return false; }
+__attribute__((weak)) bool    alertsHasBuzzer()             { return false; }
 __attribute__((weak)) void    alertsSetVolume(uint8_t)      {}
 __attribute__((weak)) uint8_t alertsVolume()                { return 0; }
 __attribute__((weak)) void    alertsBeepTest()              {}
@@ -1148,6 +1151,8 @@ class CfgCb : public NimBLECharacteristicCallbacks {
             {"netcam",   netcamSetEnabled,       "Network-camera detector"},
             {"desert",   desertSetEnabled,       "Desert mode"},           // Desert mode: report EVERY device in range
             {"buzzer",   alertsSetBuzzerEnabled, "Buzzer"},
+            // startup/shutdown sounds, which play through the buzzer mute above (2.2.3)
+            {"psnd",     alertsSetPowerSoundsEnabled, "Power sounds"},
             {"led",      alertsSetLedEnabled,    "LED"},                   // off = lights out
             {"ble",      acabScannerSetBLE,      "BLE scan"},
             {"wifi",     acabScannerSetWiFi,     "WiFi scan"},
@@ -1964,7 +1969,12 @@ void acabBleNotifyDetection(const AcabDetection& d, bool isNew) {
     // the elidable fields, so replay cannot restore them. The live notify's job is the alert,
     // not the archive, and the fields it depends on are never elidable. See detect_elide.h.
     uint8_t used = ACAB_ELIDE_NONE;
-    while (len > notifyCap() && used < ACAB_ELIDE_MAX) {
+    // Levels past CH only drop Remote ID fields, each guarded by its own truthiness test in
+    // serializeDetection, so a record with none of them stops after CH instead of rebuilding the
+    // same bytes seven more times (a GPS-stamped Desert Nearby row is the common case).
+    const bool rid = d.pilotLat || d.pilotLon || d.pilotAlt || d.heightAGL || d.speedH ||
+                     d.speedV || d.heading || d.ridStatus;
+    while (len > notifyCap() && used < (rid ? ACAB_ELIDE_MAX : ACAB_ELIDE_CH)) {
         used++;
         // Skip a level that cannot shrink THIS record (cid is BLE-only, ch WiFi-only), as the
         // replay ladder in acabBleDrainTick does: this runs per sighting. len is unchanged, so the
@@ -2082,6 +2092,9 @@ void acabBleUpdateStatus() {
     doc["ncam"]   = netcamIsEnabled();  // network-camera opt-in state; absent key = false (default off)
     doc["buzzer"] = alertsBuzzerEnabled();
     doc["vol"]    = alertsVolume();
+    // Power sounds (2.2.3+). Only a build with a buzzer sends it: absent = older firmware or no
+    // buzzer (Mesh-Detect), and both apps read absent as "no such switch".
+    if (alertsHasBuzzer()) doc["psnd"] = alertsPowerSoundsEnabled();
     if (!alertsLedEnabled()) doc["ledon"] = false;   // only when off; absent = on (default), saves MTU bytes
     doc["gps"]    = acabBleGetPhoneGps(nullptr, nullptr, 60000);
     doc["buf"]    = detLogCount();          // stored offline records

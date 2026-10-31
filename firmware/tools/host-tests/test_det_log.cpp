@@ -72,6 +72,13 @@ static bool flashContains(const uint8_t* needle, size_t n) {
     return false;
 }
 
+// detLogBegin takes the physical-start decision from its caller (acabPhysicalStart in the mains,
+// host-tested in test_pair_window). This suite keeps driving it by reset reason, mapped the way the
+// mains map a boot that passed the soft-power gate: a POWERON, or an accepted deep-sleep wake.
+static bool physicalStartFor(esp_reset_reason_t r) {
+    return r == ESP_RST_POWERON || r == ESP_RST_DEEPSLEEP;
+}
+
 static void fresh(size_t partitionBytes = 8192) {
     Preferences::wipeAll();
     acabHostSemaphoreTakeFailures = 0;
@@ -82,7 +89,7 @@ static void fresh(size_t partitionBytes = 8192) {
     detLogHostResetRuntime();
     hostBleConnected = false;
     acabHostSetMillis(1000);
-    detLogBegin();
+    detLogBegin(physicalStartFor(acabHostResetReason));
     // A blank Preferences store has no ring-format marker. Production treats that as an
     // old/unknown on-flash format, durably condemns it, and completes the migration from loop().
     // Ordinary fixtures need a ready current-format ring, so finish that one-time sweep here;
@@ -127,7 +134,7 @@ static std::string withStdoutCaptured(void (*fn)()) {
 static void rebootAs(esp_reset_reason_t reason) {
     acabHostResetReason = reason;
     detLogHostResetRuntime();
-    detLogBegin();
+    detLogBegin(physicalStartFor(acabHostResetReason));
 }
 
 static uint32_t savedUInt(const char* key) {
@@ -307,7 +314,7 @@ int main() {
 
     // A reboot must reconstruct the sector-sized floor from flash, not maxSeq-gSlots.
     detLogHostResetRuntime();
-    detLogBegin();
+    detLogBegin(physicalStartFor(acabHostResetReason));
     check("boot scan reconstructs the wrapped floor exactly", detLogCount() == 65);
     seqs = drainAll();
     check("post-reboot drain preserves seq 65 through seq 129",
@@ -400,7 +407,7 @@ int main() {
     check("failed payload write latches the write fault",
           (detLogFaults() & DET_LOG_FAULT_WRITE) != 0);
     detLogHostResetRuntime();
-    detLogBegin();
+    detLogBegin(physicalStartFor(acabHostResetReason));
     check("write fault survives reboot", (detLogFaults() & DET_LOG_FAULT_WRITE) != 0);
     const uint32_t writesAfterReboot = acabHostWriteCalls;
     detLogAppend(detection(2));
@@ -421,7 +428,7 @@ int main() {
           (savedUInt("fault") & (DET_LOG_FAULT_WRITE | DET_LOG_FAULT_NVS)) ==
               (DET_LOG_FAULT_WRITE | DET_LOG_FAULT_NVS));
     detLogHostResetRuntime();
-    detLogBegin();
+    detLogBegin(physicalStartFor(acabHostResetReason));
     check("reboot restores the blocking raw fault after failed first persistence",
           (detLogFaults() & DET_LOG_FAULT_WRITE) &&
           detLogAppend(detection(2)) == DET_LOG_APPEND_NOT_ARMED);
@@ -546,7 +553,7 @@ int main() {
           detLogCount() == 1 && detLogWipePending() && savedBool("wipe") &&
           savedBool("wipeneed") && detLogGeneration() == generationBeforeRngClear);
     detLogHostResetRuntime();
-    detLogBegin();                                  // healthy RNG resolves the durable tombstone
+    detLogBegin(physicalStartFor(acabHostResetReason));                                  // healthy RNG resolves the durable tombstone
     check("reboot resolves targetless clear to a fresh generation before scan",
           detLogWipePending() && detLogCount() == 0 &&
           detLogGeneration() != generationBeforeRngClear && !savedBool("wipeneed"));
@@ -573,7 +580,7 @@ int main() {
           detLogCount() == 1 && detLogWipePending() && savedBool("wipe") &&
           savedBool("wipeneed") && detLogGeneration() == generationBeforeDomainFailure);
     detLogHostResetRuntime();
-    detLogBegin();
+    detLogBegin(physicalStartFor(acabHostResetReason));
     check("domain-failure reboot mints fresh replay and nonce identities before erase",
           detLogWipePending() && detLogCount() == 0 &&
           detLogGeneration() != generationBeforeDomainFailure);
@@ -589,7 +596,7 @@ int main() {
           detLogCount() == 1 && detLogWipePending() && !savedBool("wipe") &&
           savedUInt("wipegen") != 0);
     detLogHostResetRuntime();
-    detLogBegin();
+    detLogBegin(physicalStartFor(acabHostResetReason));
     check("power loss after generation intent never resurrects the old log",
           detLogCount() == 0 && detLogWipePending());
     detLogEraseTick();
@@ -605,7 +612,7 @@ int main() {
           detLogCount() == 1 && detLogWipePending() && savedBool("wipe"));
     const uint32_t readsBeforePartialArmReboot = acabHostReadCalls;
     detLogHostResetRuntime();
-    detLogBegin();
+    detLogBegin(physicalStartFor(acabHostResetReason));
     check("reboot after a partial arm never scans or resurrects condemned slots",
           detLogCount() == 0 && detLogWipePending() &&
           acabHostReadCalls == readsBeforePartialArmReboot);
@@ -621,7 +628,7 @@ int main() {
     const uint32_t readsBeforeFailedWipeLoad = acabHostReadCalls;
     detLogHostResetRuntime();
     Preferences::failNthBegin(3);   // sensitive-token, ring-format, then ring-wipe load
-    detLogBegin();
+    detLogBegin(physicalStartFor(acabHostResetReason));
     check("failed boot wipe read exposes no condemned record and performs no raw scan",
           detLogCount() == 0 && detLogWipePending() &&
           acabHostReadCalls == readsBeforeFailedWipeLoad);
@@ -634,7 +641,7 @@ int main() {
     const uint32_t readsBeforeOrdinaryLoadFailure = acabHostReadCalls;
     detLogHostResetRuntime();
     Preferences::failNthBegin(3);
-    detLogBegin();
+    detLogBegin(physicalStartFor(acabHostResetReason));
     check("unknown boot latch also blocks an ordinary log without erasing it",
           detLogCount() == 0 && detLogWipePending() &&
           acabHostReadCalls == readsBeforeOrdinaryLoadFailure);
@@ -656,14 +663,14 @@ int main() {
     check("no new row is admitted before durable retirement",
           detLogCount() == 0 && acabHostWriteCalls == writesBeforeRetire);
     detLogHostResetRuntime();
-    detLogBegin();
+    detLogBegin(physicalStartFor(acabHostResetReason));
     check("power loss after erase but before retirement still skips the boot scan",
           detLogCount() == 0 && detLogWipePending());
     detLogEraseTick();
     detLogAppend(detection(2));
     check("append resumes only after wipe=false commits", detLogCount() == 1);
     detLogHostResetRuntime();
-    detLogBegin();
+    detLogBegin(physicalStartFor(acabHostResetReason));
     check("a later reboot keeps the post-retirement row instead of re-erasing it",
           detLogCount() == 1 && !detLogWipePending());
 
@@ -688,7 +695,7 @@ int main() {
     detLogAppend(detection(1));
     detLogHostResetRuntime();
     Preferences::failNthBegin(5);   // cdwipe, format, wipe, anchors, then startup config
-    detLogBegin();
+    detLogBegin(physicalStartFor(acabHostResetReason));
     const uint32_t writesBeforeConfigRetry = acabHostWriteCalls;
     detLogStartDrain(0);
     const DetLogAppendResult startupRejectedAppend = detLogAppend(detection(2));
@@ -820,7 +827,7 @@ int main() {
     detLogAppend(detection(1));
     detLogHostResetRuntime();
     Preferences::failNextPutUInt("acab-buf", "boot");
-    detLogBegin();
+    detLogBegin(physicalStartFor(acabHostResetReason));
     const uint32_t writesBeforeBootCommitRetry = acabHostWriteCalls;
     detLogStartDrain(0);
     detLogAppend(detection(2));
@@ -850,7 +857,7 @@ int main() {
     keyOfByte(startupOtherKey, 100);
     detLogHostResetRuntime();
     Preferences::failNthBegin(5);
-    detLogBegin();
+    detLogBegin(physicalStartFor(acabHostResetReason));
     const DetLogKeyResult startupSameResult = detLogSetKey(startupSameKey);
     detLogStartDrain(0);
     check("startup-pending key is not accepted from reset-value metadata",
@@ -868,7 +875,7 @@ int main() {
     const std::vector<uint8_t> startupOldKeyBlob = savedBlob("key");
     detLogHostResetRuntime();
     Preferences::failNthBegin(5);
-    detLogBegin();
+    detLogBegin(physicalStartFor(acabHostResetReason));
     const DetLogKeyResult startupOtherResult = detLogSetKey(startupOtherKey);
     check("startup-pending rotation is rejected without mutating retained identity",
           startupOtherResult == DET_LOG_KEY_PENDING && detLogCount() == 1 &&
@@ -886,7 +893,7 @@ int main() {
     hostBleConnected = false;
     acabHostSetMillis(1000);
     Preferences::failNthBegin(5);
-    detLogBegin();
+    detLogBegin(physicalStartFor(acabHostResetReason));
     const DetLogKeyResult freshStartupKeyResult = detLogSetKey(startupSameKey);
     detLogSetEnabled(true);
     check("fresh startup leaves an unconfirmed key unstaged while config waits",
@@ -902,7 +909,7 @@ int main() {
           detLogEnabled() && detLogHaveKey() && savedBool("on") && savedKeyExists("key") &&
           detLogCount() == 1);
     detLogHostResetRuntime();
-    detLogBegin();
+    detLogBegin(physicalStartFor(acabHostResetReason));
     check("confirmed fresh-board enable survives reboot",
           detLogEnabled() && detLogHaveKey() && detLogCount() == 1);
 
@@ -913,7 +920,7 @@ int main() {
     detLogHostResetRuntime();
     seedUInt("boot", 41);
     Preferences::failNthBegin(5);
-    detLogBegin();
+    detLogBegin(physicalStartFor(acabHostResetReason));
     detLogClear();
     check("clear during startup failure does not regress the durable boot counter",
           savedUInt("boot") == 41 && detLogCount() == 1 && detLogWipePending());
@@ -927,7 +934,7 @@ int main() {
     fresh();
     detLogHostResetRuntime();
     Preferences::failNthBegin(5);
-    detLogBegin();
+    detLogBegin(physicalStartFor(acabHostResetReason));
     acabHostSetMillis(5000);
     detLogSetEpoch(1700000000u);
     detLogEraseTick();
@@ -969,7 +976,7 @@ int main() {
     seedUInt("boot", 5);
     seedUInt("lastconn", 1);
     seedUInt("pboot", 4);
-    detLogBegin();                       // fifth physical start: one short of the wipe threshold
+    detLogBegin(physicalStartFor(acabHostResetReason));                       // fifth physical start: one short of the wipe threshold
     check("lastconn regression begins one boot short without erasing the row",
           detLogCount() == 1 && !detLogWipePending());
     Preferences::failNextPutUInt("acab-buf", "lastconn");
@@ -985,7 +992,7 @@ int main() {
     check("loop retry arms replay only after the current boot marker commits",
           durableDrainAccepted && savedUInt("lastconn") == 6);
     detLogHostResetRuntime();
-    detLogBegin();
+    detLogBegin(physicalStartFor(acabHostResetReason));
     check("reboot after the accepted replay cannot auto-wipe from the stale marker",
           detLogCount() == 1 && !detLogWipePending());
 
@@ -1006,13 +1013,37 @@ int main() {
           detLogCount() == 1 && !detLogWipePending());
     acabHostResetReason = ESP_RST_DEEPSLEEP;
     detLogHostResetRuntime();
-    const std::string autoWipeBootReport = withStdoutCaptured([] { detLogBegin(); });
+    const std::string autoWipeBootReport = withStdoutCaptured([] { detLogBegin(physicalStartFor(acabHostResetReason)); });
     check("the sixth physical start erases the ring", detLogCount() == 0 && detLogWipePending());
     check("the auto-wipe arms the retained-coredump erase token like an explicit clear",
           detLogSensitiveErasePending() != 0);
     check("the boot report says what the auto-wipe erased and why",
           autoWipeBootReport.find("[buf] auto-wipe: erasing 1 row(s) after 6 physical starts "
                                   "without the app") != std::string::npos);
+
+    // The physical-start decision arrives once, in detLogBegin, but a failed NVS put defers the
+    // startup-config restore to a later detLogEraseTick in the same boot. That retry must still
+    // count this boot's start exactly once.
+    fresh();
+    detLogAppend(detection(1));
+    rebootAs(ESP_RST_SW);
+    const uint32_t pb0 = savedUInt("pboot");
+    acabHostResetReason = ESP_RST_POWERON;
+    detLogHostResetRuntime();
+    Preferences::failNextPutUInt("acab-buf", "pboot");
+    detLogBegin(physicalStartFor(acabHostResetReason));
+    const uint32_t pb1 = savedUInt("pboot");
+    detLogEraseTick();
+    check("a pboot put failure is retried and still counts this physical start once",
+          pb1 == pb0 && savedUInt("pboot") == pb0 + 1);
+    const uint32_t pb2 = savedUInt("pboot");
+    detLogHostResetRuntime();
+    Preferences::failNextPutUInt("acab-buf", "boot");
+    detLogBegin(physicalStartFor(acabHostResetReason));
+    const uint32_t pb3 = savedUInt("pboot");
+    detLogEraseTick();
+    check("a boot put failure is retried and still counts this physical start once",
+          pb3 == pb2 && savedUInt("pboot") == pb2 + 1);
     acabHostResetReason = ESP_RST_POWERON;
 
     // A sync restarts the count, so five further power-ons keep the row and the sixth erases it.
@@ -1076,7 +1107,7 @@ int main() {
     detLogEraseTick();
     check("completed race wipe erases the appended record", acabHostPartitionAllErased());
     detLogHostResetRuntime();
-    detLogBegin();
+    detLogBegin(physicalStartFor(acabHostResetReason));
     check("reboot after raced clear cannot resurrect the record", detLogCount() == 0);
 
     // ---- encrypt at rest -------------------------------------------------------------------
@@ -1155,7 +1186,7 @@ int main() {
           detLogSensitiveErasePending() != 0);
     detLogSetEnabled(true);           // re-enabled with no phone present: nothing to re-persist
     detLogHostResetRuntime();
-    detLogBegin();
+    detLogBegin(physicalStartFor(acabHostResetReason));
     check("the key was erased from NVS too, so a reboot cannot reload it", !detLogHaveKey());
 
     // `on=false` is the commit point for privacy cleanup. If the following blob removal fails,
@@ -1169,7 +1200,7 @@ int main() {
           !detLogEnabled() && !detLogHaveKey() && !savedBool("on", true) &&
           savedKeyExists("key"));
     detLogHostResetRuntime();
-    detLogBegin();                         // consumes the second injected removal failure
+    detLogBegin(physicalStartFor(acabHostResetReason));                         // consumes the second injected removal failure
     detLogStartDrain(0);
     const uint32_t writesBeforeDisableCleanup = acabHostWriteCalls;
     detLogAppend(detection(2));
@@ -1190,7 +1221,7 @@ int main() {
           detLogSetKey(otherKey, true) == DET_LOG_KEY_PENDING &&
           savedBool("keydrop") && savedKeyExists("key"));
     detLogHostResetRuntime();
-    detLogBegin();
+    detLogBegin(physicalStartFor(acabHostResetReason));
     check("reboot honors keydrop before loading the retained key",
           detLogEnabled() && !detLogHaveKey() && !savedKeyExists("key") && !savedBool("keydrop"));
 
@@ -1210,7 +1241,7 @@ int main() {
     detLogEraseTick();
     detLogAppend(detection(1));
     detLogHostResetRuntime();
-    detLogBegin();
+    detLogBegin(physicalStartFor(acabHostResetReason));
     seqs = drainAll();
     check("key persistence retry survives reboot and decrypts the admitted row",
           seqs.size() == 1 && seqs.front() == 1 &&
@@ -1225,7 +1256,7 @@ int main() {
     check("empty-ring rotation removes the old retained key before replacement write",
           detLogHaveKey() && !savedKeyExists("key"));
     detLogHostResetRuntime();
-    detLogBegin();
+    detLogBegin(physicalStartFor(acabHostResetReason));
     check("reboot after empty-ring replacement failure cannot reload obsolete key",
           detLogEnabled() && !detLogHaveKey() && !savedKeyExists("key"));
 
@@ -1236,7 +1267,7 @@ int main() {
     check("nonempty rotation condemns rows before failed replacement publication",
           detLogWipePending() && detLogCount() == 0 && !savedKeyExists("key"));
     detLogHostResetRuntime();
-    detLogBegin();
+    detLogBegin(physicalStartFor(acabHostResetReason));
     check("rebooted rotation sweep remains keyless until replacement is re-supplied",
           detLogWipePending() && !detLogHaveKey() && !savedKeyExists("key"));
     detLogEraseTick();
@@ -1254,7 +1285,7 @@ int main() {
           !savedKeyExists("key") && !savedBool("wipe") &&
           savedUInt("wipegen") != 0);
     detLogHostResetRuntime();
-    detLogBegin();
+    detLogBegin(physicalStartFor(acabHostResetReason));
     check("power loss after rotation intent never restores old-key rows",
           detLogWipePending() && detLogCount() == 0);
     detLogEraseTick();
@@ -1269,7 +1300,7 @@ int main() {
           savedBool("wipeneed") && !savedKeyExists("key") &&
           detLogGeneration() == generationBeforeRngRotation);
     detLogHostResetRuntime();
-    detLogBegin();
+    detLogBegin(physicalStartFor(acabHostResetReason));
     check("immediate reboot after RNG-failed rotation exposes neither old rows nor old key",
           detLogWipePending() && detLogCount() == 0 && !detLogHaveKey() &&
           !savedKeyExists("key") && detLogGeneration() != generationBeforeRngRotation);
@@ -1290,7 +1321,7 @@ int main() {
     check("capture resumes under the final last-write-wins key",
           detLogAppend(detection(2)) == DET_LOG_APPEND_STORED && detLogCount() == 1);
     detLogHostResetRuntime();
-    detLogBegin();
+    detLogBegin(physicalStartFor(acabHostResetReason));
     seqs = drainAll();
     check("last-write-wins rotation key survives reboot and decrypts fresh rows",
           detLogHaveKey() && savedBlob("key") == sameKeyBlob &&
@@ -1309,7 +1340,7 @@ int main() {
     check("pending-clear key change makes obsolete retained key unreloadable",
           detLogWipePending() && detLogCount() == 0 && !savedKeyExists("key"));
     detLogHostResetRuntime();
-    detLogBegin();
+    detLogBegin(physicalStartFor(acabHostResetReason));
     check("replacement-put failure after pending-clear publication reboots keyless",
           detLogWipePending() && detLogEnabled() && !detLogHaveKey() &&
           !savedKeyExists("key"));
@@ -1333,7 +1364,7 @@ int main() {
         std::memcpy(acabHostFlash.data() + idx * sizeof(StoredDet), &terminal, sizeof(terminal));
     }
     detLogHostResetRuntime();
-    detLogBegin();
+    detLogBegin(physicalStartFor(acabHostResetReason));
     Preferences::failNextPutUInt("acab-buf", "loggen");
     detLogAppend(detection(1));                     // target durable, publication still pending
     Preferences::failNextPutUInt("acab-buf", "cdwipe");
@@ -1346,7 +1377,7 @@ int main() {
     check("token retry makes old key unreloadable before pending-wipe publication",
           detLogWipePending() && savedUInt("cdwipe") != 0 && !savedKeyExists("key"));
     detLogHostResetRuntime();
-    detLogBegin();
+    detLogBegin(physicalStartFor(acabHostResetReason));
     check("reboot after token retry and replacement-put failure remains keyless",
           detLogWipePending() && detLogEnabled() && !detLogHaveKey() &&
           !savedKeyExists("key"));
@@ -1365,7 +1396,7 @@ int main() {
         std::memcpy(acabHostFlash.data() + idx * sizeof(StoredDet), &terminal, sizeof(terminal));
     }
     detLogHostResetRuntime();
-    detLogBegin();
+    detLogBegin(physicalStartFor(acabHostResetReason));
     const uint32_t generationBeforeRepeatedClearRotation = detLogGeneration();
     Preferences::failNextPutUInt("acab-buf", "loggen");
     detLogAppend(detection(1));                     // head-wrap clear (not the boot-count
@@ -1381,7 +1412,7 @@ int main() {
           savedUInt("loggen") != generationBeforeRepeatedClearRotation &&
           !savedKeyExists("key"));
     detLogHostResetRuntime();
-    detLogBegin();
+    detLogBegin(physicalStartFor(acabHostResetReason));
     check("repeated-clear replacement failure cannot reload the obsolete key",
           detLogEnabled() && !detLogHaveKey() && !savedKeyExists("key"));
 
@@ -1400,7 +1431,7 @@ int main() {
           !detLogEnabled() && detLogHaveKey() && !savedKeyExists("key") &&
           !savedBool("on", true));
     detLogHostResetRuntime();
-    detLogBegin();
+    detLogBegin(physicalStartFor(acabHostResetReason));
     check("power loss after deferred-clear/disable/key ordering stays off and keyless",
           !detLogEnabled() && !detLogHaveKey() && !savedKeyExists("key"));
 
@@ -1424,7 +1455,7 @@ int main() {
           savedUInt("loggen") != generationBeforePendingRotation &&
           savedBlob("key") != keyBeforePendingRotation);
     detLogHostResetRuntime();
-    detLogBegin();
+    detLogBegin(physicalStartFor(acabHostResetReason));
     check("power loss after ordered rotation/arm commit reboots under the new key only",
           detLogEnabled() && detLogHaveKey() && savedBlob("key") != keyBeforePendingRotation);
 
@@ -1443,7 +1474,7 @@ int main() {
           savedUInt("loggen") != generationBeforePendingDisable &&
           !savedBool("on", true) && !savedKeyExists("key"));
     detLogHostResetRuntime();
-    detLogBegin();
+    detLogBegin(physicalStartFor(acabHostResetReason));
     check("power loss after ordered disable/arm commit stays off and keyless",
           !detLogEnabled() && !detLogHaveKey() && !savedKeyExists("key"));
 
@@ -1463,7 +1494,7 @@ int main() {
           !savedBool("wipe") && savedUInt("loggen") == generationBeforeDisableThenClear);
     detLogEraseTick();
     detLogHostResetRuntime();
-    detLogBegin();
+    detLogBegin(physicalStartFor(acabHostResetReason));
     check("disable-first clear publishes only after reboot-safe off cleanup",
           !detLogEnabled() && !detLogHaveKey() && !savedKeyExists("key") &&
           detLogGeneration() != generationBeforeDisableThenClear);
@@ -1484,7 +1515,7 @@ int main() {
           !savedBool("wipe") && savedUInt("loggen") == generationBeforeRotationThenClear);
     detLogEraseTick();
     detLogHostResetRuntime();
-    detLogBegin();
+    detLogBegin(physicalStartFor(acabHostResetReason));
     check("rotation-first clear publishes only after reboot-safe old-key removal",
           detLogEnabled() && detLogGeneration() != generationBeforeRotationThenClear &&
           savedBlob("key") != keyBeforeRotationThenClear);
@@ -1495,7 +1526,7 @@ int main() {
     appendRange(1, 3);
     detLogSetEnabled(false);
     detLogHostResetRuntime();
-    detLogBegin();
+    detLogBegin(physicalStartFor(acabHostResetReason));
     check("records survive a disable plus a reboot", detLogCount() == 3);
     check("...and the board holds no key at that point", !detLogHaveKey());
     detLogSetKey(otherKey, true);
@@ -1514,7 +1545,7 @@ int main() {
     check("explicit clear creates a nonzero sensitive erase generation", eraseGen1 != 0);
     check("explicit clear also starts the independent ring sweep", detLogWipePending());
     detLogHostResetRuntime();
-    detLogBegin();
+    detLogBegin(physicalStartFor(acabHostResetReason));
     check("sensitive erase generation survives power loss", detLogSensitiveErasePending() == eraseGen1);
     detLogSensitiveEraseComplete(eraseGen1 + 1);
     check("wrong-generation completion cannot clear the request",
@@ -1522,7 +1553,7 @@ int main() {
     detLogSensitiveEraseComplete(eraseGen1);
     check("matching completion clears the request", detLogSensitiveErasePending() == 0);
     detLogHostResetRuntime();
-    detLogBegin();
+    detLogBegin(physicalStartFor(acabHostResetReason));
     check("completed request stays clear after reboot", detLogSensitiveErasePending() == 0);
 
     // A second explicit clear while the ring's shared pending LEVEL is already true used to be
@@ -1542,7 +1573,7 @@ int main() {
     check("same-boot completion remains pinned by sensitive stack exposure",
           detLogSensitiveErasePending() == eraseGen3);
     detLogHostResetRuntime();
-    detLogBegin();
+    detLogBegin(physicalStartFor(acabHostResetReason));
     detLogSensitiveEraseComplete(eraseGen3);
     check("clean reboot releases the hold and clears the matching request",
           detLogSensitiveErasePending() == 0);
@@ -1587,7 +1618,7 @@ int main() {
     const uint32_t durableAcrossBootOpenFailure = detLogSensitiveErasePending();
     detLogHostResetRuntime();
     Preferences::failNextBegin();
-    detLogBegin();
+    detLogBegin(physicalStartFor(acabHostResetReason));
     check("failed boot-time cdwipe load latches the NVS diagnostic",
           durableAcrossBootOpenFailure != 0 &&
           (detLogFaults() & DET_LOG_FAULT_NVS) != 0 &&
@@ -1628,7 +1659,7 @@ int main() {
     fresh();
     detLogHostResetRuntime();
     Preferences::failNthBegin(5);
-    detLogBegin();
+    detLogBegin(physicalStartFor(acabHostResetReason));
     detLogSetKey(otherKey);                         // staged before buffer:false
     Preferences::failNextPutUInt("acab-buf", "cdwipe");
     detLogSetEnabled(false);
@@ -1643,7 +1674,7 @@ int main() {
     Preferences::failNextPutUInt("acab-buf", "cdwipe");
     detLogSetEnabled(false);
     detLogHostResetRuntime();
-    detLogBegin();
+    detLogBegin(physicalStartFor(acabHostResetReason));
     check("failed disable pre-arm plus immediate reboot restores the intact protected config",
           savedUInt("cdwipe") == 0 && detLogEnabled() && detLogHaveKey() &&
           savedBool("on") && savedKeyExists("key"));
@@ -1698,7 +1729,7 @@ int main() {
     acabHostPartitionCorrupt(20, 0x00);             // stand-in for one programmed format-1 byte
     detLogHostResetRuntime();
     const uint32_t readsBeforeFormatMigration = acabHostReadCalls;
-    detLogBegin();
+    detLogBegin(physicalStartFor(acabHostResetReason));
     check("missing ring format condemns legacy bytes before scan",
           detLogWipePending() && detLogCount() == 0 &&
           acabHostReadCalls == readsBeforeFormatMigration && savedUInt("wipegen") != 0);
@@ -1739,7 +1770,7 @@ int main() {
     resetHook();
     check("torn payload with lost fault marker publishes no record", detLogCount() == 0);
     detLogHostResetRuntime();
-    detLogBegin();
+    detLogBegin(physicalStartFor(acabHostResetReason));
     const uint32_t writesBeforeTornReuse = acabHostWriteCalls;
     detLogAppend(detection(2));
     check("reboot condemns programmed-body erased-header slot and blocks reuse",
@@ -1761,7 +1792,7 @@ int main() {
     }
     const uint32_t generationBeforeSeqExhaustion = detLogGeneration();
     detLogHostResetRuntime();
-    detLogBegin();
+    detLogBegin(physicalStartFor(acabHostResetReason));
     detLogAppend(detection(1));
     check("sequence exhaustion arms a new random generation without writing a sentinel",
           detLogWipePending() && detLogCount() == 0 &&
@@ -1855,7 +1886,7 @@ int main() {
           detLogCount() == 1 && detLogWipePending() && savedBool("wipe") &&
           savedUInt("loggen") == logBeforePartialArm && targetAfterPartialArm != 0);
     detLogHostResetRuntime();
-    detLogBegin();
+    detLogBegin(physicalStartFor(acabHostResetReason));
     check("reboot completes pending generation publication before any replay",
           detLogWipePending() && detLogCount() == 0 &&
           detLogGeneration() == targetAfterPartialArm);
@@ -1869,7 +1900,7 @@ int main() {
     check("failed final generation retirement keeps the erased ring blocked",
           detLogWipePending() && savedBool("wipe") && acabHostPartitionAllErased());
     detLogHostResetRuntime();
-    detLogBegin();
+    detLogBegin(physicalStartFor(acabHostResetReason));
     detLogEraseTick();
     check("reboot safely resumes and retires a partial generation finalization",
           !detLogWipePending() && savedUInt("wipegen") == 0);
@@ -1961,7 +1992,7 @@ int main() {
 
         // Persistence: the marker survives a reboot; the bucket is per boot.
         detLogHostResetRuntime();
-        detLogBegin();
+        detLogBegin(physicalStartFor(acabHostResetReason));
         check("marker: bufrl survives a reboot", detLogRateLimited());
         check("marker: the bucket starts full after a reboot",
               detLogAppend(oneShot(1)) == DET_LOG_APPEND_STORED);
@@ -2052,7 +2083,7 @@ int main() {
     detLogAppend(anchored);
     detLogHostResetRuntime();
     Preferences::failNextGetBytes("acab-buf", "anch", 3);
-    detLogBegin();
+    detLogBegin(physicalStartFor(acabHostResetReason));
     detLogStartDrain(0);
     check("unreadable exact-size anchors initially block replay for bounded retry",
           !detLogDraining());
@@ -2083,7 +2114,7 @@ int main() {
           anchorSaveReplay.atUnix == 1700000500u &&
           (detLogFaults() & DET_LOG_FAULT_NVS));
     detLogHostResetRuntime();
-    detLogBegin();
+    detLogBegin(physicalStartFor(acabHostResetReason));
     detLogStartDrain(0);
     check("reboot after discarded cursor save replays honestly approximate",
           detLogPeekForDrain(&anchorSaveReplay) && anchorSaveReplay.approx);
@@ -2108,7 +2139,7 @@ int main() {
     const uint8_t malformedAnchor = 0xA5;
     seedBlob("anch", &malformedAnchor, sizeof(malformedAnchor));
     detLogHostResetRuntime();
-    detLogBegin();
+    detLogBegin(physicalStartFor(acabHostResetReason));
     detLogStartDrain(0);
     check("wrong-length anchor metadata is permanently quarantined without blocking rows",
           detLogPeekForDrain(&quarantinedAnchorReplay) && quarantinedAnchorReplay.approx &&
@@ -2139,7 +2170,7 @@ int main() {
     const uint32_t anchoredBoot = savedUInt("boot");
     removeSaved("boot");
     detLogHostResetRuntime();
-    detLogBegin();
+    detLogBegin(physicalStartFor(acabHostResetReason));
     AcabDetection collisionProbe = detection(1);
     collisionProbe.lastSeen = 1000;
     detLogAppend(collisionProbe);
@@ -2157,12 +2188,12 @@ int main() {
     removeSaved("anchn");
     seedUInt("lastconn", 100);
     detLogHostResetRuntime();
-    detLogBegin();
+    detLogBegin(physicalStartFor(acabHostResetReason));
     check("startup boot identity is newer than surviving lastconn metadata",
           savedUInt("boot") == 101);
     detLogAppend(detection(1));
     detLogHostResetRuntime();
-    detLogBegin();
+    detLogBegin(physicalStartFor(acabHostResetReason));
     check("lastconn lower bound prevents wrapped-age auto-wipe of a fresh row",
           detLogCount() == 1 && !detLogWipePending() && savedUInt("boot") == 102);
 
@@ -2172,7 +2203,7 @@ int main() {
     appendRange(1, 110);
     removeSaved("loggen");
     detLogHostResetRuntime();
-    detLogBegin();
+    detLogBegin(physicalStartFor(acabHostResetReason));
     const uint32_t repairedGeneration = detLogGeneration();
     detLogStartDrain(100, 1);
     check("missing current-format loggen condemns rows before random repair",
@@ -2229,7 +2260,7 @@ int main() {
     check("disconnect preserves staged key owned by a pending enable transition",
           detLogEnabled() && detLogHaveKey() && savedBool("on") && savedKeyExists("key"));
     detLogHostResetRuntime();
-    detLogBegin();
+    detLogBegin(physicalStartFor(acabHostResetReason));
     check("pending-enable key ordering survives reboot without resurrecting an old key",
           detLogEnabled() && detLogHaveKey());
 
@@ -2252,7 +2283,7 @@ int main() {
     detLogSetEnabled(false);
     detLogSetEnabled(true);
     detLogHostResetRuntime();
-    detLogBegin();
+    detLogBegin(physicalStartFor(acabHostResetReason));
     detLogEraseTick();
     check("immediate reboot during disable/re-enable cleanup never reloads residual key",
           !detLogHaveKey() && !savedKeyExists("key") && !savedBool("on"));
@@ -2265,12 +2296,12 @@ int main() {
     seedUInt("boot", 77);
     detLogHostResetRuntime();
     Preferences::failNthBegin(5);
-    detLogBegin();
+    detLogBegin(physicalStartFor(acabHostResetReason));
     detLogClear();
     check("startup-deferred clear persists immediate generation condemnation",
           savedUInt("boot") == 77 && savedUInt("wipegen") != 0);
     detLogHostResetRuntime();
-    detLogBegin();
+    detLogBegin(physicalStartFor(acabHostResetReason));
     check("reboot before deferred-clear tick never scans the condemned row",
           detLogWipePending() && detLogCount() == 0 && savedUInt("boot") > 77);
     detLogEraseTick();
@@ -2284,7 +2315,7 @@ int main() {
     const uint32_t generationBeforeFailedDeferredTombstone = detLogGeneration();
     detLogHostResetRuntime();
     Preferences::failNthBegin(5);                 // startup config transaction
-    detLogBegin();
+    detLogBegin(physicalStartFor(acabHostResetReason));
     Preferences::failNthBegin(2);                 // cdwipe lands; ring tombstone begin fails
     detLogClear();
     check("failed startup-clear tombstone does not fabricate a durable target",
@@ -2334,7 +2365,7 @@ int main() {
     const std::vector<uint8_t> cryptoDomainBeforeLoss = savedBlob("cryptdom");
     removeSaved("cryptdom");
     detLogHostResetRuntime();
-    detLogBegin();
+    detLogBegin(physicalStartFor(acabHostResetReason));
     check("missing current-format cryptdom condemns rows before random repair",
           detLogWipePending() && detLogCount() == 0 && savedBlob("cryptdom").size() == 16 &&
           savedBlob("cryptdom") != cryptoDomainBeforeLoss);
@@ -2347,7 +2378,7 @@ int main() {
     removeSaved("cryptdom");
     detLogHostResetRuntime();
     Preferences::failNextPutUInt("acab-buf", "boot");
-    detLogBegin();
+    detLogBegin(physicalStartFor(acabHostResetReason));
     check("partial metadata recovery leaves a durable wipe intent despite boot-put failure",
           savedUInt("wipegen") != 0 && savedBool("wipe") && detLogCount() == 1);
     acabHostFailErases = 1;      // hold the recovered logical boundary for inspection this runtime
@@ -2368,7 +2399,7 @@ int main() {
     removeSaved("cryptdom");
     detLogHostResetRuntime();
     acabHostPartitionAvailable = false;
-    detLogBegin();
+    detLogBegin(physicalStartFor(acabHostResetReason));
     check("missing cryptdom with unavailable storage arms durable condemnation",
           detLogWipePending() && savedBool("wipe") && savedUInt("wipegen") != 0 &&
           savedBlob("cryptdom").size() == 16 && savedBlob("cryptdom") != unavailableOldDomain &&
@@ -2376,7 +2407,7 @@ int main() {
     detLogHostResetRuntime();
     acabHostPartitionAvailable = true;
     const uint32_t readsBeforeUnavailableRepairSweep = acabHostReadCalls;
-    detLogBegin();
+    detLogBegin(physicalStartFor(acabHostResetReason));
     detLogStartDrain(0);
     check("returned partition skips old-row scan until metadata-repair wipe",
           detLogWipePending() && detLogCount() == 0 && !detLogDraining() &&
@@ -2391,14 +2422,14 @@ int main() {
     const uint32_t generationBeforeUnavailableClear = detLogGeneration();
     detLogHostResetRuntime();
     acabHostPartitionAvailable = false;
-    detLogBegin();
+    detLogBegin(physicalStartFor(acabHostResetReason));
     detLogClear();
     check("clearlog with unavailable storage durably condemns possible rows",
           detLogWipePending() && savedBool("wipe") && savedUInt("wipegen") != 0 &&
           detLogGeneration() != generationBeforeUnavailableClear);
     detLogHostResetRuntime();
     acabHostPartitionAvailable = true;
-    detLogBegin();
+    detLogBegin(physicalStartFor(acabHostResetReason));
     check("returned partition cannot replay rows from unavailable-storage clear",
           detLogWipePending() && detLogCount() == 0);
     detLogEraseTick();
@@ -2409,7 +2440,7 @@ int main() {
     detLogAppend(detection(1));
     detLogHostResetRuntime();
     acabHostPartitionAvailable = false;
-    detLogBegin();
+    detLogBegin(physicalStartFor(acabHostResetReason));
     Preferences::failNthBegin(2);                 // cdwipe lands; first full wipe-arm open fails
     detLogClear();
     check("unavailable-storage clear with failed first arm stays blocked in RAM",
@@ -2419,7 +2450,7 @@ int main() {
           detLogWipePending() && savedBool("wipe") && savedUInt("wipegen") != 0);
     detLogHostResetRuntime();
     acabHostPartitionAvailable = true;
-    detLogBegin();
+    detLogBegin(physicalStartFor(acabHostResetReason));
     check("reboot after metadata-only retry skips the returned raw rows",
           detLogWipePending() && detLogCount() == 0);
     detLogEraseTick();
@@ -2431,13 +2462,13 @@ int main() {
     detLogAppend(detection(1));
     detLogHostResetRuntime();
     acabHostPartition.size = 2048;                 // present, but no complete erase sector
-    detLogBegin();
+    detLogBegin(physicalStartFor(acabHostResetReason));
     check("too-small raw partition latches the same persistent storage fault",
           (detLogFaults() & DET_LOG_FAULT_READ) && detLogCount() == 0);
     acabHostPartition.size = acabHostFlash.size();
     detLogClear();
     detLogHostResetRuntime();
-    detLogBegin();
+    detLogBegin(physicalStartFor(acabHostResetReason));
     detLogEraseTick();
     check("physical clear after valid remount retires too-small-partition fault",
           !detLogWipePending() && detLogFaults() == DET_LOG_FAULT_NONE &&
@@ -2447,7 +2478,7 @@ int main() {
     detLogAppend(detection(1));
     detLogHostResetRuntime();
     acabHostPartitionAvailable = false;
-    detLogBegin();
+    detLogBegin(physicalStartFor(acabHostResetReason));
     const std::vector<uint8_t> unavailableOldKey = savedBlob("key");
     const DetLogKeyResult unavailableKeyResult = detLogSetKey(otherKey, true);
     check("unavailable raw storage cannot confirm or stage an offered replacement key",
@@ -2455,7 +2486,7 @@ int main() {
           savedBlob("key") == unavailableOldKey);
     detLogHostResetRuntime();
     acabHostPartitionAvailable = true;
-    detLogBegin();
+    detLogBegin(physicalStartFor(acabHostResetReason));
     check("returned partition still preserves the old-key generation for explicit disposition",
           detLogCount() == 1 && savedBlob("key") == unavailableOldKey);
     detLogClear();
@@ -2487,7 +2518,7 @@ int main() {
     detLogSetEnabled(false);
     removeSaved("keyfp");
     detLogHostResetRuntime();
-    detLogBegin();
+    detLogBegin(physicalStartFor(acabHostResetReason));
     detLogSetKey(sameKey, true);
     check("keyless rows with missing fingerprint are condemned before key publication",
           detLogWipePending() && detLogCount() == 0);
@@ -2498,12 +2529,12 @@ int main() {
     removeSaved("keyfp");
     detLogHostResetRuntime();
     acabHostFailReads = 1;
-    detLogBegin();
+    detLogBegin(physicalStartFor(acabHostResetReason));
     detLogSetKey(sameKey, true);
     check("missing fingerprint plus untrusted scan geometry also forces durable wipe",
           detLogWipePending());
     detLogHostResetRuntime();
-    detLogBegin();
+    detLogBegin(physicalStartFor(acabHostResetReason));
     check("old row cannot reappear under replacement key after scan-read recovery",
           detLogWipePending() && detLogCount() == 0);
 

@@ -1,9 +1,11 @@
 #pragma once
 // Host seam for esp_reset_reason(). The enum mirrors the pinned esp-idf esp_system.h: v4.4 on the
-// S3 envs ends at SDIO; the C5's v5.x appends USB/JTAG/EFUSE/PWR_GLITCH/CPU_LOCKUP after it, all
-// of which det_log treats like every other non-counting cause, so the suite does not need them.
-// A test sets acabHostResetReason before each simulated boot (detLogHostResetRuntime +
-// detLogBegin). The default is a power-on, which is what the reboot fixtures already modelled.
+// S3 envs ends at SDIO; the C5's v5.x appends USB/JTAG/EFUSE/PWR_GLITCH/CPU_LOCKUP after it, none
+// of which counts as a physical start, so the suite does not need them. coredump_report.cpp is the
+// source that calls esp_reset_reason(); det_log takes the physical-start decision as a parameter,
+// and test_det_log maps acabHostResetReason through physicalStartFor into detLogBegin(bool) before
+// each simulated boot. The default is a power-on, which is what the reboot fixtures already
+// modelled.
 typedef enum {
     ESP_RST_UNKNOWN = 0,
     ESP_RST_POWERON,

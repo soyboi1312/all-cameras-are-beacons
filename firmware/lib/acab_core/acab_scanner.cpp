@@ -207,6 +207,7 @@ static volatile int gWatchCount = 0;
 static portMUX_TYPE gWatchMux = portMUX_INITIALIZER_UNLOCKED;
 
 static bool isWatched(const uint8_t mac[6]) {
+    if (!gWatchCount) return false;   // the common case: skip the interrupts-off window entirely
     bool hit;
     portENTER_CRITICAL(&gWatchMux);
     hit = macInSorted(gWatch, gWatchCount, mac);   // sorted -> binary search, short ISR-off window
@@ -752,26 +753,7 @@ static void handleDetection(AcabDetection& d) {
 // ---------------------------------------------------------------------------
 // BLE
 // ---------------------------------------------------------------------------
-// Pull the advertised local name (AD type 0x08 short / 0x09 complete) out of a BLE
-// advert into name[outSz] for a synthesized watchlist hit. Empty if there is none.
-static void bleWatchName(const uint8_t* adv, size_t advLen, char* name, size_t outSz) {
-    name[0] = 0;
-    if (!adv || !advLen) return;
-    for (size_t i = 0; i + 1 < advLen; ) {
-        uint8_t l = adv[i];
-        if (l == 0 || i + 1 + (size_t)l > advLen) break;
-        uint8_t t = adv[i + 1];
-        if (t == 0x08 || t == 0x09) {                 // shortened / complete local name
-            size_t n = (size_t)l - 1;
-            if (n >= outSz) n = outSz - 1;
-            acabSanitizeAscii(name, adv + i + 2, n, outSz);   // clamp to printable ASCII on ingest
-            return;
-        }
-        i += (size_t)l + 1;
-    }
-}
-
-// Is this advert one of OUR OWN boards? Two beacons in the same room (a test rig, or a
+// Is this advertised name one of OUR OWN boards? Two beacons in the same room (a test rig, or a
 // user who owns two) otherwise flag each other forever as the strongest nearby device in
 // range, burying real hits under a -20 dBm neighbour. Matched on our own advertising name
 // rather than an OUI, because the OUI here is Espressif's and is shared with a vast amount
@@ -782,9 +764,7 @@ static void bleWatchName(const uint8_t* adv, size_t advLen, char* name, size_t o
 // staring at the other one pinned at the top of the nearby list.
 static const char* const SELF_BLE_NAMES[] = { "beacon", "ACAB" };
 
-static bool isSiblingBoard(const uint8_t* adv, size_t advLen) {
-    char name[32];
-    bleWatchName(adv, advLen, name, sizeof(name));
+static bool isSiblingName(const char* name) {
     if (!name[0]) return false;
     for (size_t i = 0; i < sizeof(SELF_BLE_NAMES) / sizeof(SELF_BLE_NAMES[0]); i++)
         if (strcmp(name, SELF_BLE_NAMES[i]) == 0) return true;
@@ -1103,7 +1083,7 @@ void acabScannerIngestBLE(const uint8_t mac[6], const uint8_t* payload, size_t p
     // annotation, the [ble] raw line, the marker window) - real money at drive-test advert
     // rates. Live builds (neither define set) compile this out entirely.
     char advName[32];
-    bleWatchName(payload, plen, advName, sizeof(advName));
+    acabBleAdvName(payload, plen, advName, sizeof(advName));
 #endif
 #ifdef ACAB_CAPTURE_BUILD
     // OUI candidates are a capture annotation only. They do not join the classifier chain below,
@@ -1306,10 +1286,6 @@ void acabScannerIngestBLE(const uint8_t mac[6], const uint8_t* payload, size_t p
     }
 #endif
     AcabDetection d;
-    // The BLE mfg company ID (SIG assigned #) rides in the advert payload, MAC-independent, so
-    // grab it once and stamp it on whatever matches. It's the field the glasses/tracker detectors
-    // key on; surfacing it lets the app show/log why a device did (or didn't) classify.
-    const uint16_t companyId = acabBleCompanyId(payload, plen);
     // Try most-specific first: drone (standardised) -> Flock -> tracker -> glasses -> Axon, then
     // the broad Motorola/LE-gear OUI last so it never preempts a real match. The || chain
     // short-circuits at the first match, preserving that priority (only the winner fills `d`).
@@ -1338,18 +1314,22 @@ void acabScannerIngestBLE(const uint8_t mac[6], const uint8_t* payload, size_t p
         acabInit(&d, ACAB_WATCHED, SRC_BLE, mac, (int16_t)rssi);
         d.method     = M_WATCHLIST;   // exact-MAC user rule; NOT M_OUI, so durability leaves it at 100
         d.confidence = 100;
-        bleWatchName(payload, plen, d.name, sizeof(d.name));
+        acabBleAdvName(payload, plen, d.name, sizeof(d.name));
         matched = true;
     }
-    // Our own sibling board, if any: drop it before Desert synthesises a nearby-device row.
+    // Our own sibling board, if any: drop Desert's nearby-device row for it before it is delivered.
     // Deliberately AFTER the whole signature chain and the watchlist, so a device that merely
     // names itself "beacon" is still fully classified by every real signature and can still be
-    // starred; this only suppresses the generic Desert row. See isSiblingBoard().
-    if (!matched && isSiblingBoard(payload, plen)) return;
-    // Desert mode (LAST): catch every remaining device as a generic "nearby device".
-    if (!matched) matched = desertClassifyBLE(mac, payload, plen, rssi, &d, addrType);
-    if (!matched) return;
-    if (companyId) d.companyId = companyId;   // stamp the BLE mfg company ID on the match
+    // starred; this only suppresses the generic Desert row. Desert (LAST) catches every remaining
+    // device as a generic "nearby device", and the sibling test reads the name Desert already
+    // parsed, so an unmatched advert with Desert off pays no name walk at all. See isSiblingName().
+    if (!matched && (!desertClassifyBLE(mac, payload, plen, rssi, &d, addrType) ||
+                     isSiblingName(d.name))) return;
+    // The BLE mfg company ID (SIG assigned #) rides in the advert payload, MAC-independent, so
+    // stamp it on whatever matched (read only after a match: most adverts match nothing). It's the
+    // field the glasses/tracker detectors key on; surfacing it lets the app show/log why a device
+    // did (or didn't) classify.
+    if (const uint16_t companyId = acabBleCompanyId(payload, plen)) d.companyId = companyId;
     // The controller's address type outranks the byte test acabInit ran: a resolvable private
     // address has the 0x02 bit clear, so this is the only way randomAddr ever turns true for
     // the rotating BLE addresses that walk through every per-matcher OUI guard, and the only

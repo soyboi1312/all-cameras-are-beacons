@@ -1,13 +1,11 @@
 // Host regression for the beacon-board's real alert implementation.
 //
-// Alert mode and Desert mode both persist buzzer=false. That must silence EVERY sound the board
-// can make: detection/session patterns, the boot jingle (2026-08-24: on button-less deploys a
-// power restore reads as ESP_RST_POWERON, so a mute bypass there would let an unattended outage
-// voice a muted covert board) and, since 2026-10-11, the power cues too (the hold-to-start ack
-// and the slide/button/app shutdown motif used to bypass mute, which voiced a muted board on its
-// way off). The boot jingle additionally plays on a PHYSICAL start only, so a warm reboot (panic,
-// watchdog, brownout, OTA) is silent even unmuted, and the idle LED heartbeat stays dark until
-// the soft-power gate commits. Include the real implementation so the test observes actual PWM
+// Alert mode and Desert mode both persist buzzer=false. That silences detection/session patterns,
+// but since 2.2.3 NOT the three power cues (boot jingle, hold-to-start ack, power-down motif): the
+// owner must hear the board turn on and off, so those follow their own power-sounds setting
+// ("psnd"). The boot jingle additionally plays on a PHYSICAL start only, so a warm reboot (panic,
+// watchdog, brownout, OTA) is silent whatever the settings, and the idle LED heartbeat stays dark
+// until the soft-power gate commits. Include the real implementation so the test observes actual PWM
 // and GPIO decisions rather than a copied policy function.
 //
 // TWO HALVES, observed two ways. The mute/volume/LED policy above plays straight through the tone
@@ -36,10 +34,12 @@ static bool nextQueued(AcabDeviceType* out) {
     return xQueueReceive(gAlertQ, out, 0) == pdTRUE;
 }
 
-static void resetAudio(bool enabled, uint8_t volume, bool ledEnabled = true) {
+static void resetAudio(bool enabled, uint8_t volume, bool ledEnabled = true, bool powerSnd = true) {
     gBuzzer = enabled;
     gVolume = volume;
     gLedEnabled = ledEnabled;
+    gPowerSnd = powerSnd;
+    gPowerCue = false;
     gAlertTask = nullptr;
     acabHostResetOutputs();
     acabHostResetTaskSpies();
@@ -50,8 +50,8 @@ int main() {
 
     resetAudio(false, 80);
     alertsBootJingle(true);
-    check("muted board boots silent even on a deliberate physical start",
-          acabHostNonzeroPwmWrites == 0);
+    check("muted board (alert mode, Desert) still voices the startup jingle",
+          acabHostNonzeroPwmWrites > 0 && acabHostLastPwmDuty == 0);
 
     resetAudio(false, 80);
     alertsBootJingle(false);
@@ -71,8 +71,8 @@ int main() {
 
     resetAudio(false, 80);
     playPowerOnAck();
-    check("muted hold-to-start ack is LED-only: zero PWM, one LED flash",
-          acabHostNonzeroPwmWrites == 0 && acabHostLedLowWrites == 1);
+    check("muted hold-to-start ack still beeps and flashes",
+          acabHostNonzeroPwmWrites > 0 && acabHostLedLowWrites == 1);
 
     resetAudio(true, 80);
     playPowerOnAck();
@@ -81,7 +81,41 @@ int main() {
 
     resetAudio(false, 80);
     alertsPowerDown();
-    check("muted shutdown (slide off, button hold, app power-off) stays silent",
+    check("muted shutdown (slide off, button hold, app power-off) still voices the cue",
+          acabHostNonzeroPwmWrites > 0 && acabHostLastPwmDuty == 0);
+
+    // Power sounds off is the one switch for the three power cues, muted or not.
+    resetAudio(true, 80, true, false);
+    alertsBootJingle(true);
+    alertsPowerDown();
+    check("power sounds off silences the startup jingle and the shutdown cue",
+          acabHostNonzeroPwmWrites == 0);
+
+    resetAudio(true, 80, true, false);
+    playPowerOnAck();
+    check("power sounds off leaves the hold-to-start ack as its LED flash alone",
+          acabHostNonzeroPwmWrites == 0 && acabHostLedLowWrites == 1);
+
+    resetAudio(true, 80, true, false);
+    playPattern(ACAB_AXON_BODYCAM);
+    check("power sounds off does not touch detection alerts",
+          acabHostNonzeroPwmWrites > 0);
+
+    resetAudio(false, 80);
+    alertsBootJingle(true);
+    acabHostResetOutputs();
+    playPattern(ACAB_AXON_BODYCAM);
+    check("a power cue does not leave the alert mute open behind it",
+          acabHostNonzeroPwmWrites == 0);
+
+    // The ack plays on the alert task, which keeps playing for the whole session, so a flag it
+    // left set would voice every later detection on a muted board. Not chained after
+    // alertsPowerDown: that cue's own clear would hide the leak.
+    resetAudio(false, 80);
+    playPowerOnAck();
+    acabHostResetOutputs();
+    playPattern(ACAB_AXON_BODYCAM);
+    check("the hold-to-start ack does not leave the alert mute open behind it",
           acabHostNonzeroPwmWrites == 0);
 
     resetAudio(true, 80);
@@ -152,6 +186,13 @@ int main() {
     // would fail for a reason that has nothing to do with the code under test.
     acabHostSetMillis(10000);
     alertsInit();            // makes the queue and arms the first-catch reveal, exactly as at boot
+    // A board upgrading from 2.2.2 has no "psnd" key: it must load ON. Nothing above saved one.
+    check("power sounds load on when the board has never stored the key",
+          alertsPowerSoundsEnabled());
+    alertsSetPowerSoundsEnabled(false);
+    gPowerSnd = true;
+    loadAudio();
+    check("power sounds off persists across a reload", !alertsPowerSoundsEnabled());
     resetAudio(true, 80);    // alertsInit re-read NVS defaults; pin the state these cases want
 
     AcabDeviceType queued = ACAB_NEARBY_DEVICE;

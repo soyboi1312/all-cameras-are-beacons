@@ -11,9 +11,6 @@
 // the ORDER and the FAIL-CLOSED shape of the real code: which refusals happen before Update.end,
 // what NVS holds when the slot switches, and how trial boots are counted.
 #define ACAB_HOST_TEST
-// Every product env carries -DACAB_OTA_VERSION_FLOOR ([env] build_flags in platformio.ini), so
-// the floor branch is production code and this suite compiles it in.
-#define ACAB_OTA_VERSION_FLOOR
 #include "../../lib/acab_core/ota_update.cpp"
 #include "host_check.h"
 #include <cstdio>

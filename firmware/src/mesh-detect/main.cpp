@@ -157,9 +157,11 @@ void setup() {
     // recovery ("turn it off and on, then connect within two minutes"). A warm restart (OTA,
     // panic, watchdog) opens no window; bonded phones still reconnect.
     const esp_reset_reason_t meshRr = esp_reset_reason();
-    if (acabPhysicalStart(meshRr == ESP_RST_POWERON, meshRr == ESP_RST_DEEPSLEEP,
-                          /*cellAbsent=*/true, /*buttonHeld=*/false,
-                          /*switchLow=*/false, /*benchBuild=*/false)) {
+    const bool physicalStart = acabPhysicalStart(meshRr == ESP_RST_POWERON,
+                                                 meshRr == ESP_RST_DEEPSLEEP,
+                                                 /*cellAbsent=*/true, /*buttonHeld=*/false,
+                                                 /*switchLow=*/false, /*benchBuild=*/false);
+    if (physicalStart) {
         acabBleOpenPairingWindow();
     } else {
         Serial.println("[pair] warm continuation (not a physical start) - window NOT opened; "
@@ -168,8 +170,9 @@ void setup() {
     // Offline detection buffer: mount the flash ring + bump the boot counter. Stays
     // inert (no capture) until the app enables it and pushes an at-rest key. Finish the initial
     // ring scan/config publication before advertising: otherwise a fast phone can enter config
-    // callbacks concurrently with the 24k-slot scan and observe default startup state.
-    detLogBegin();
+    // callbacks concurrently with the 24k-slot scan and observe default startup state. The same
+    // physical-start decision feeds the buffer's seizure auto-wipe count.
+    detLogBegin(physicalStart);
 
     acabBleStartAdvertising();
 

@@ -45,7 +45,8 @@
  *                      and WatchGuard Video's, which it owns) - a SUB-toggle
  *                      of the body-cam category, so the conf-90 Axon BWCDEVICE tag keeps
  *                      running. Absent key on old firmware = the two were one switch.
- *   {"buzzer":false}   mute every board sound (the power cues included; the LED paths stay)
+ *   {"buzzer":false}   mute detection and session sounds (the LED paths stay)
+ *   {"psnd":false}     silence the startup/shutdown sounds, which ignore the buzzer mute (2.2.3)
  *   {"lat":32.79,"lon":-116.94}  push the phone's GPS (a private-channel Mesh-Detect uplink
  *                      tags it; the public build never does)
  *

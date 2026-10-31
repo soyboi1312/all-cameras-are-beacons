@@ -854,8 +854,8 @@ void setup() {
         // ACK CHIRP at the commit (2026-08-12, from a real build: power-on "took 5-8s"). Without it
         // the user's only feedback is the boot jingle, which plays after the release-wait below
         // plus the radio bring-up - so they held the whole time and the board felt slow. One short
-        // beep the instant the hold passes says "on - let go now". Queued/non-blocking, honours
-        // detection-alert mute like every sound (while muted it is the LED flash alone, see
+        // beep the instant the hold passes says "on - let go now". Queued/non-blocking, plays
+        // through the detection-alert mute (power sounds off makes it the LED flash alone, see
         // playPowerOnAck), and can never fire on a pocket bump (the hold above already passed).
         alertsPowerOnAck();
         // THE RECOVERY PATH the apps instruct. Soft-off is deep sleep, so this wakes with
@@ -936,9 +936,24 @@ void setup() {
     // parking boot never reaches here.)
     acabBleBegin(kBleName, kFwLabel);
 
+    // One physical-start rule (pair_window.h) feeds the offline buffer's seizure auto-wipe count,
+    // the boot jingle and the pairing window. The soft-power gate ran above, so every input is
+    // final. The wipe count leaves out the bench override: a bench build stays pairable on every
+    // boot, but only a real start may count down the owner's evidence. A bench build
+    // (ACAB_BENCH_NO_SLEEP) skips the soft-power gate, so its gate inputs stay false and only its
+    // POWERON boots count; a deep-sleep wake after an app power-off no longer counts there (it did
+    // before 2.2.3).
+    const esp_reset_reason_t rr2 = esp_reset_reason();
+    const bool personStart = acabPhysicalStart(rr2 == ESP_RST_POWERON, rr2 == ESP_RST_DEEPSLEEP,
+                                               pwrCellAbsent, pwrButtonHeld, pwrSwitchLow,
+                                               /*benchBuild=*/false);
+    const bool physicalStart = acabPhysicalStart(rr2 == ESP_RST_POWERON, rr2 == ESP_RST_DEEPSLEEP,
+                                                 pwrCellAbsent, pwrButtonHeld, pwrSwitchLow,
+                                                 pwrBenchBuild);
+
     // Offline detection buffer: mount the flash ring + bump the boot counter. Stays
     // inert (no capture) until the app enables it and pushes an at-rest key.
-    detLogBegin();
+    detLogBegin(personStart);
 
     // Scanner reuses the NimBLE stack we just inited and adds
     // WiFi promiscuous on top.
@@ -1011,7 +1026,7 @@ void setup() {
     // soft-power gate that collects them moved ABOVE the heavy init on 2026-08-14; see the
     // SOFT-POWER GATE FIRST block. The reset reason stays load-bearing there: without it the
     // switch SKU reopens a pairing window on every OTA and every panic, and soft-off wakes report
-    // ESP_RST_DEEPSLEEP rather than ESP_RST_POWERON. Both inputs, one rule, one call below.)
+    // ESP_RST_DEEPSLEEP rather than ESP_RST_POWERON. Both inputs, one rule, called above, before detLogBegin.)
 
 #ifdef ACAB_DUAL_RADIO
     // BLE detection comes from the companion nRF52840; its UART was brought up at the
@@ -1037,22 +1052,16 @@ void setup() {
     acabScannerSendCoProcCmd("V");   // mutex sink, same interleave class as the DFU relay fix
 #endif
 
-    // Compute the physical-start decision before the boot motif as well as the pairing gate, so
-    // both consume the one tested rule. The jingle plays ONLY when this is true (2026-10-11), and
-    // mute still wins on top of that: POWERON on a button-less deploy can be an unattended power
-    // restore rather than a hand on the plug (see alertsBootJingle).
-    const esp_reset_reason_t rr2 = esp_reset_reason();
-    const bool physicalStart = acabPhysicalStart(rr2 == ESP_RST_POWERON,
-                                                 rr2 == ESP_RST_DEEPSLEEP,
-                                                 pwrCellAbsent, pwrButtonHeld,
-                                                 pwrSwitchLow, pwrBenchBuild);
+    // physicalStart (computed above, before detLogBegin) feeds the boot motif and the pairing gate.
+    // The jingle plays ONLY when it is true (2026-10-11), muted or not; power sounds off silences
+    // it (see alertsBootJingle).
 
     // Boot jingle. Since the 2026-08-14 gate reorder the soft-power gate runs FIRST (near the top of
     // setup), so a parked boot deep-sleeps long before here and never reaches this - the jingle no
     // longer gates or shortens the turn-on hold (the 2026-08-12 note about that is history). It now
     // simply marks "committed, radios up"; the ack chirp at the gate's commit is the fast feedback.
-    // A warm continuation plays and lights nothing; a physical start plays the motif unless muted.
-    // The gate's ack chirp is the fast feedback and honours mute too (LED flash only while muted).
+    // A warm continuation plays and lights nothing; a physical start plays the motif unless power
+    // sounds are off. The gate's ack chirp is the fast feedback and follows the same setting.
     alertsBootJingle(physicalStart);
 
     // Open the new-phone pairing window, ONCE, and only now: every path above this line can still
@@ -1088,8 +1097,10 @@ void setup() {
     // on only inside the window opener, and the opener only ran on a physical start, so every OTA
     // restart, panic, watchdog and brownout came back with the gate OFF and admitted any phone
     // indefinitely. This block decides only the window.
-    // ONE call, ONE decision. The branches above only record what happened; the rule for turning
-    // that into "did a person start this board" lives in acabPhysicalStart and is host-tested.
+    // ONE rule, ONE decision. The branches above only record what happened; the rule for turning
+    // that into "did a person start this board" lives in acabPhysicalStart and is host-tested. It
+    // is called twice before detLogBegin: with the bench override for this window and the boot cue,
+    // and without it for the offline buffer's wipe count.
     // The reset reason is one INPUT here, not the whole answer. See acabPhysicalStart for the two
     // wrong versions this replaced and why each failed.
     // `physicalStart` was calculated before the boot cue so this gate and the sound cannot drift

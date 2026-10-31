@@ -43,7 +43,7 @@
 struct AcabScannerConfig {
     bool        enableBLE;          // scan BLE advertisements
     bool        enableWiFi;         // 802.11 promiscuous capture
-    const char* bleDeviceName;      // this build's own advertised name; isSiblingBoard reads it
+    const char* bleDeviceName;      // this build's own advertised name; isSiblingName reads it
 };
 
 // Sensible defaults: both radios on, bleDeviceName "ACAB". The caller inits NimBLE
@@ -72,6 +72,27 @@ inline void acabSanitizeAscii(char* dst, const uint8_t* src, size_t n, size_t ca
         dst[j] = (c >= 0x20 && c <= 0x7E) ? (char)c : '.';
     }
     dst[j] = 0;
+}
+
+// Pull the advertised local name (AD type 0x08 short / 0x09 complete) out of a BLE advert into
+// name[outSz], sanitized like every ingest string. Empty if there is none. The one parser for the
+// scanner's watchlist and capture rows and Desert's nearby rows; inline for the host suites, the
+// same reason as acabSanitizeAscii above.
+inline void acabBleAdvName(const uint8_t* adv, size_t advLen, char* name, size_t outSz) {
+    name[0] = 0;
+    if (!adv || !advLen) return;
+    for (size_t i = 0; i + 1 < advLen; ) {
+        uint8_t l = adv[i];
+        if (l == 0 || i + 1 + (size_t)l > advLen) break;
+        uint8_t t = adv[i + 1];
+        if (t == 0x08 || t == 0x09) {                 // shortened / complete local name
+            size_t n = (size_t)l - 1;
+            if (n >= outSz) n = outSz - 1;
+            acabSanitizeAscii(name, adv + i + 2, n, outSz);   // clamp to printable ASCII on ingest
+            return;
+        }
+        i += (size_t)l + 1;
+    }
 }
 
 // Run the full BLE classifier chain on a single advert and funnel any match

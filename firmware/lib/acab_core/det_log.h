@@ -145,7 +145,10 @@ enum DetLogFault : uint32_t {
 };
 
 // --- lifecycle ---
-void     detLogBegin();             // mount ring, scan for head (generation window),
+// physicalStart: the caller's acabPhysicalStart decision (pair_window.h) WITHOUT the bench
+// override, so the seizure auto-wipe count and the pairing gate answer "did a person start this
+// board" with one tested rule.
+void     detLogBegin(bool physicalStart); // mount ring, scan for head (generation window),
                                     // bump+persist bootCount (every boot) and the possession
                                     // count (physical starts only), run auto-wipe of stale records
 void     detLogSetEnabled(bool on); // opt-in master switch (persisted); false also durably requests

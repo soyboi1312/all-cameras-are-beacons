@@ -126,7 +126,6 @@ static bool pendingImageDescription(esp_app_desc_t* desc) {
     return upd && desc && esp_ota_get_partition_description(upd, desc) == ESP_OK;
 }
 
-#ifdef ACAB_OTA_VERSION_FLOOR
 // NVS-persisted anti-rollback floor: the lowest packed version this board accepts over BLE.
 // Raised to the running version on each confirmed-healthy boot (otaMarkHealthy). 0 until the
 // first healthy boot writes it, so a fresh board falls back to the running-version compare.
@@ -139,7 +138,6 @@ static bool otaVersionFloor(uint32_t* floor) {
     p.end();
     return true;
 }
-#endif  // ACAB_OTA_VERSION_FLOOR
 
 void otaSetHealthCheck(OtaHealthCheck fn) { gHealthCheck = fn; }
 bool otaHealthReady() { return gHealthCheck && gHealthCheck(); }
@@ -354,7 +352,6 @@ static OtaResult otaDoFinish() {
     // stamp_app_desc.py stamps ACAB_FW_VERSION into esp_app_desc_t before the image is signed, and
     // the release verifier checks the raw descriptor bytes. Therefore an unreadable, zero, or
     // declaration-mismatched authenticated version is a hard rejection, never a skipped check.
-#ifdef ACAB_OTA_VERSION_FLOOR
     {
         uint32_t floor = 0;
         const uint32_t cur = acabOtaVersionPack(ACAB_FW_VERSION);
@@ -364,7 +361,6 @@ static OtaResult otaDoFinish() {
             Update.abort(); gActive = false; return OTA_ERR_VERSION;
         }
     }
-#endif
 
     const esp_partition_t* target = esp_ota_get_next_update_partition(NULL);
     if (!target || !armTrialRecord(target->address, authenticatedVersion)) {
@@ -457,13 +453,10 @@ bool otaMarkHealthy() {
     if (state == 1 && !otaHealthReady()) { p.end(); return false; }
     bool ok = true;
     if (state == 1) ok = clearTrialRecord(p);
-#ifdef ACAB_OTA_VERSION_FLOOR
     // SEC-2: a confirmed-healthy image raises the anti-rollback floor, so a later OTA can
-    // never be talked back below the version we KNOW booted cleanly on this hardware. Gated
-    // with the floor enforcement so the floor is only written when it will actually be honored.
+    // never be talked back below the version we KNOW booted cleanly on this hardware.
     uint32_t cur = acabOtaVersionPack(ACAB_FW_VERSION);
     if (p.getUInt("floor", 0) < cur) ok = putU32(p, "floor", cur) && ok;
-#endif
     p.end();
     if (!ok) return false;
     gOnTrial = false;   // only after the persisted state clear is committed

@@ -15,6 +15,9 @@ set -euo pipefail
 cd "$(dirname "$0")"
 CORE="../../lib/acab_core"
 fail=0
+# Per-run binary dir: a fixed /tmp/test_<name> was shared by every run and checkout, so two
+# overlapping runs could execute each other's binary and report a false result.
+out="$(mktemp -d)"; trap 'rm -rf "$out"' EXIT
 san=""
 if [ "${1:-}" = "--sanitize" ]; then
     # The classifiers and line parsers these suites drive take bytes straight off the air, and a
@@ -73,8 +76,8 @@ for t in test_*.cpp; do
     # where a truncated log reads as "the suite
     # is smaller than I thought" rather than "it died early". A failing test RUN already used
     # `|| fail=1` and continued, so this only makes the two paths behave the same way.
-    g++ -std=c++17 -Wall ${san:+$san} ${extra_flags:+$extra_flags} -I"$CORE" -Istubs -o "/tmp/$(basename "$t" .cpp)" "$t" ${src:+"$src"} \
+    g++ -std=c++17 -Wall ${san:+$san} ${extra_flags:+$extra_flags} -I"$CORE" -Istubs -o "$out/${t%.cpp}" "$t" ${src:+"$src"} \
         || { echo "!! COMPILE FAILED: $t"; fail=1; continue; }
-    "/tmp/$(basename "$t" .cpp)" || fail=1
+    "$out/${t%.cpp}" || fail=1
 done
 exit $fail

@@ -115,6 +115,7 @@ static const KeyBudget BUDGET[] = {
     { "ncam",      5, ALWAYS,  "bool" },
     { "buzzer",    5, ALWAYS,  "bool" },
     { "vol",       3, ALWAYS,  "alertsVolume() is uint8_t" },
+    { "psnd",      5, ALWAYS,  "bool" },
     { "ledon",     5, HEALTHY, "emitted only as false; a user setting, not a fault" },
     { "gps",       5, ALWAYS,  "bool" },
     { "buf",       5, ALWAYS,  "detLogCount() <= gSlots; the shipped 1.5 MB ring is 24576 slots" },
@@ -270,7 +271,7 @@ int main() {
     // same initialization boundary beacon-board already uses.
     const char* kMeshMain = "../../src/mesh-detect/main.cpp";
     const std::string meshMain = slurp(kMeshMain);
-    const size_t meshDetBegin = meshMain.find("detLogBegin();");
+    const size_t meshDetBegin = meshMain.find("detLogBegin(physicalStart);");
     const size_t meshAdvertise = meshMain.find("acabBleStartAdvertising();");
     ok("mesh initializes det_log before accepting BLE callbacks",
        meshDetBegin != std::string::npos && meshAdvertise != std::string::npos &&
@@ -367,6 +368,48 @@ int main() {
            src.find("doc[\"syncgen\"].is<uint32_t>()") != std::string::npos &&
            src.find("? doc[\"syncgen\"].as<uint32_t>() : 0") != std::string::npos &&
            src.find("doc[\"gen\"]  = detLogGeneration();") != std::string::npos);
+        // Statement-adjacency pins on the comment-free source, plus brace-depth, early-return, #if
+        // and single-definition checks below. A brace or #if guard around the auth GPS clear or the
+        // disconnect key scrub, or around the block holding it, or a new early return before
+        // either, fails them, where a plain src.find(statement) still matched the statement inside
+        // the guard (2026-10-28 review: both leak mutations passed the old pins).
+        const std::string bleFlat = codeFlat(src);
+        const size_t fAuth = bleFlat.find("void authBody(");
+        const size_t fDisc = bleFlat.find("void disconnectBody()");
+        const size_t fDiscEnd = fDisc == std::string::npos ? fDisc :
+            bleFlat.find("static bool parseMac6(", fDisc);
+        const std::string discFlat = (fDisc == std::string::npos || fDiscEnd == std::string::npos)
+            ? std::string() : bleFlat.substr(fDisc, fDiscEnd - fDisc);
+        // Brace depth 1 = the function's own top level: a guard around the statement's whole block
+        // (an if/else that keeps an unguarded copy in one arm) raises it, where adjacency alone
+        // would still match. disconnectBody may keep only its one early return (the
+        // unauthenticated branch), so no new return can skip the scrub either.
+        auto depthAt = [](const std::string& f, size_t from, size_t at) {
+            int depth = 0;
+            for (size_t i = from; i < at && i < f.size(); i++)
+                depth += f[i] == '{' ? 1 : f[i] == '}' ? -1 : 0;
+            return depth;
+        };
+        const size_t authClearAt = fAuth == std::string::npos ? fAuth :
+            bleFlat.find("return; } clearPhoneGpsShadow(true); gConfigPrivacyReady = "
+                         "detLogPrepareConfigSession();", fAuth);
+        // authBody before the clear keeps exactly its two early returns (no descriptor, refused
+        // auth); the capture-block return opens the needle itself. No #if may sit in either range,
+        // and each body is defined once, so a preprocessor or duplicate-body guard fails too.
+        const bool authGpsClearUnguarded = fAuth != std::string::npos && fDisc != std::string::npos &&
+            authClearAt < fDisc && depthAt(bleFlat, fAuth, authClearAt + 10) == 1 &&
+            countOf(bleFlat.substr(fAuth, authClearAt - fAuth), "return") == 2 &&
+            bleFlat.substr(fAuth, authClearAt - fAuth).find("#if") == std::string::npos &&
+            countOf(bleFlat, "void authBody(") == 1;
+        // Anchored on the OTA-quiesce block's close, so a braceless guard on stopReplaySession()
+        // breaks the needle too; the depth is read at stopReplaySession (needle + 21).
+        const size_t discScrubAt = discFlat.find("otaQuiesce(false); } stopReplaySession(); "
+                                                 "detLogEndConfigSession(); "
+                                                 "if (!acabScannerReArmCapture(&gOwnerCaptureBlocked)) {");
+        const bool discScrubUnguarded = !discFlat.empty() && discScrubAt != std::string::npos &&
+            depthAt(discFlat, 0, discScrubAt + 21) == 1 && countOf(discFlat, "return") == 1 &&
+            discFlat.find("#if") == std::string::npos &&
+            countOf(bleFlat, "void disconnectBody()") == 1;
         ok("disconnect invalidates the complete replay transport session",
            src.find("stopReplaySession();", src.find("void disconnectBody")) != std::string::npos);
         const size_t disconnect = src.find("void disconnectBody");
@@ -377,7 +420,7 @@ int main() {
         ok("disconnect always scrubs disabled-session keys after replay invalidation",
            disconnect != std::string::npos && disconnectStop != std::string::npos &&
            disconnectKeyCleanup != std::string::npos && disconnectStop < disconnectKeyCleanup &&
-           src.find("if (scrubReplayKey)", disconnect) == std::string::npos);
+           discScrubUnguarded);
         const size_t auth = src.find("void authBody");
         const size_t connectLifecycle = src.find("void connectBody");
         const size_t connectOwnerGateClear = connectLifecycle == std::string::npos ?
@@ -424,6 +467,7 @@ int main() {
             src.find("portEXIT_CRITICAL(&gGpsMux);", gpsClearRetained);
         const size_t retainedGetter = src.find("bool acabBleGetLastPhoneGps");
         ok("every authenticated peer clears current and retained GPS before config admission",
+           authGpsClearUnguarded &&
            authenticatedGpsClear != std::string::npos && authenticatedGpsClear < privacyArm &&
            gpsClearLock != std::string::npos && gpsClearLive < gpsClearRetained &&
            gpsClearRetained < gpsClearUnlock &&
@@ -446,7 +490,7 @@ int main() {
                disconnectGpsClear);
         ok("known phone B cannot inherit known phone A's retained GPS without a new fix",
            authenticatedGpsClear != std::string::npos &&
-           src.find("if (!gPeerKnownAtConnect) clearPhoneGpsShadow(true);") == std::string::npos &&
+           authGpsClearUnguarded &&
            authenticatedGpsClear < privacyArm && privacyArm < configAdmit);
         // The checks above anchor on *Body functions reached only through the NimBLE overrides, so
         // an emptied override (onConnect runs the pairing gate) would pass them all. Every adapter
@@ -609,9 +653,16 @@ int main() {
         ok("denied config links return before copying or parsing writes",
            cfgWrite != std::string::npos && cfgGuard != std::string::npos &&
            cfgCopy != std::string::npos && cfgGuard < cfgCopy);
+        // A call to any of these four inside disconnectBody fails here, whatever its spacing, not
+        // just the retired line: a disable on every disconnect would turn off the owner's buffer
+        // and erase evidence.
         ok("unconditional disconnect scrub performs no disable/NVS generation transition",
-           disconnectKeyCleanup != std::string::npos &&
-           src.find("if (!detLogEnabled()) detLogSetEnabled(false);") == std::string::npos);
+           disconnectKeyCleanup != std::string::npos && !discFlat.empty() &&
+           discFlat.find("detLogSetEnabled") == std::string::npos &&
+           discFlat.find("disableReplayLog") == std::string::npos &&
+           discFlat.find("clearReplayLog") == std::string::npos &&
+           discFlat.find("detLogClear") == std::string::npos &&
+           bleFlat.find("if (!detLogEnabled()) detLogSetEnabled(false);") == std::string::npos);
         const size_t keyInstall = src.find(
             "installReplayKey(k, gSessionKeyReplacementApproved)");
         const size_t keyZero = keyInstall == std::string::npos ? keyInstall :
@@ -643,7 +694,7 @@ int main() {
            disconnectGpsClear != std::string::npos);
         ok("accepted-then-mismatched disabled session still scrubs its accepted RAM key",
            keySessionReady != std::string::npos && disconnectKeyCleanup != std::string::npos &&
-           src.find("if (scrubReplayKey)", disconnect) == std::string::npos);
+           discScrubUnguarded);
         const size_t explicitClear = cfgWrite == std::string::npos ? cfgWrite :
             src.find("if (doc[\"clearlog\"].is<bool>()", cfgWrite);
         const size_t configKey = cfgWrite == std::string::npos ? cfgWrite :
@@ -739,21 +790,25 @@ int main() {
            flat.find("AcabLinkActionSlot::nrfDfu, nrfDfuStillAuthorized, action, context);") !=
                std::string::npos);
         // A warm reboot (OTA, panic, watchdog) must leave the window closed, so each main opens it
-        // exactly once and only in its physical-start branch, decided by acabPhysicalStart.
+        // exactly once and only in its physical-start branch, decided by acabPhysicalStart. The same
+        // decision, minus the bench override, is what det_log counts toward the seizure auto-wipe.
         const std::string boardFlat = codeFlat(boardMain), meshFlat = codeFlat(meshMain);
         ok("beacon-board opens the window once, only on a physical start",
            boardFlat.find("const esp_reset_reason_t rr2 = esp_reset_reason(); const bool "
-                          "physicalStart = acabPhysicalStart(rr2 == ESP_RST_POWERON, rr2 == "
+                          "personStart = acabPhysicalStart(rr2 == ESP_RST_POWERON, rr2 == "
                           "ESP_RST_DEEPSLEEP, pwrCellAbsent, pwrButtonHeld, pwrSwitchLow, "
-                          "pwrBenchBuild);") != std::string::npos &&
+                          "false); const bool physicalStart = acabPhysicalStart(rr2 == "
+                          "ESP_RST_POWERON, rr2 == ESP_RST_DEEPSLEEP, pwrCellAbsent, pwrButtonHeld, "
+                          "pwrSwitchLow, pwrBenchBuild); detLogBegin(personStart);") != std::string::npos &&
            boardFlat.find("if (physicalStart) { acabBleOpenPairingWindow(); } else {") !=
                std::string::npos &&
            countOf(boardFlat, "acabBleOpenPairingWindow(") == 1);
         ok("mesh-detect opens the window once, only on a physical start",
-           meshFlat.find("const esp_reset_reason_t meshRr = esp_reset_reason(); if "
-                         "(acabPhysicalStart(meshRr == ESP_RST_POWERON, meshRr == "
-                         "ESP_RST_DEEPSLEEP, true, false, false, false)) { "
+           meshFlat.find("const esp_reset_reason_t meshRr = esp_reset_reason(); const bool "
+                         "physicalStart = acabPhysicalStart(meshRr == ESP_RST_POWERON, meshRr == "
+                         "ESP_RST_DEEPSLEEP, true, false, false, false); if (physicalStart) { "
                          "acabBleOpenPairingWindow(); } else {") != std::string::npos &&
+           countOf(meshFlat, "detLogBegin(physicalStart);") == 1 &&
            countOf(meshFlat, "acabBleOpenPairingWindow(") == 1);
         // acabCoredumpWipeTick() no-ops until acabCoredumpProbe() has run (gProbed), so a main that
         // drops the probe silently loses the {"clearlog"} / key-change dump erase.

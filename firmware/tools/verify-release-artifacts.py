@@ -82,6 +82,9 @@ CANARIES = {
     # trackerClassifyBLE). Each occurs once in all seven local 2.2.2 production images and in none
     # of the seven published 2.2.1 images (checked with strings on 2026-10-20).
     "2.2.2": ["Axon Bluetooth ID", "fleet dashcam", "Apple AirTag (offline)"],
+    # 2.2.3: the power-sounds toggle's log label (acab_ble_service.cpp kToggles), which every
+    # production image links with the shared BLE service.
+    "2.2.3": ["Power sounds"],
 }
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -171,7 +174,9 @@ def newest_source_mtime():
                  os.path.join(FW, "platformio.ini"),
                  os.path.join(FW, "c5_sdkconfig_overrides.h"),   # force-included by the C5 envs
                  os.path.join(FW, "tools/stamp_app_desc.py"),
-                 os.path.join(FW, "tools/release_tools.py")):  # stamp_app_desc.py imports it
+                 os.path.join(FW, "tools/release_tools.py"),   # stamp_app_desc.py imports it
+                 # pre: script in [env]; rewrites NimBLEServer.cpp before compile
+                 os.path.join(FW, "tools/patch_nimble_repeat_pairing.py")):
         if os.path.isfile(root):
             if os.path.getmtime(root) > newest:
                 newest, where = os.path.getmtime(root), root
