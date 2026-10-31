@@ -426,6 +426,7 @@ def _toggle_title_rows():
         ("Offline buffer toggle title", "board records while ", r"bufferSubtitle,"),
         ("Desert mode toggle title", "show \\+ log ANY", None),
         ("Board LED lights-out toggle title", "no LEDs", None),
+        ("Alerts power sounds toggle title", "startup and shutdown sounds ", None),
         ("Display higher-contrast toggle title", "brighter secondary text",
          r"if \(ContrastMode\.systemHasControl\)"),
         # The two subtitles differ on purpose (the surfaces differ), so the Android side is
@@ -462,7 +463,9 @@ SHARED_CONSTANTS = (
         "kind": "string",
         # From this version the alert mute covers the shutdown motif and the rev-B hold-to-start
         # ack too (alerts.cpp buzzerTone), and both apps' Alerts caption and Desert note switch to
-        # the "all board sounds off" wording at it.
+        # the "all board sounds off" wording at it. From 2.2.3 a board with a buzzer sends "psnd";
+        # the power cues follow it instead of the mute, and both apps pick the psnd wording before
+        # consulting this gate. A Mesh-Detect sends no psnd and still reads by this version.
         "why": "both phones must call the same board silent: one phone promising silence while the"
                " other warns about the shutdown cue would leave a muted user guessing which is true",
         "ios": (IOS_DEVICE_STATUS,

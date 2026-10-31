@@ -5333,6 +5333,12 @@ final class BLEManager: NSObject, ObservableObject {
         writeConfig(["led": on])
     }
 
+    /// Startup and shutdown sounds (firmware 2.2.3+). They play even while alerts are muted or
+    /// Desert runs; off silences them. TWIN: Android AcabBleManager.setPowerSounds.
+    func setPowerSounds(_ on: Bool) {
+        writeConfig(["psnd": on])
+    }
+
     /// Erase the board's stored buffer. The board restarts its record sequence from 1 after a
     /// wipe, so reset our replay cursor to 0. A stale-high cursor would skip every post-erase
     /// record on the next reconnect and the fresh buffer would be lost.
@@ -5659,7 +5665,7 @@ final class BLEManager: NSObject, ObservableObject {
         "bodycam": "bodycam", "tracker": "tracker", "glasses": "glasses",
         "desert": "desert", "buffer": "bufon", "led": "ledon", "buzzer": "buzzer",
         "volume": "vol", "ble": "ble", "wifi": "wifi", "wifiEco": "wifiEco",
-        "wifi5": "wifi5",
+        "wifi5": "wifi5", "psnd": "psnd",
     ]
 
     /// Transient board commands (never state) with nothing to echo in sample mode. Kept apart
@@ -7371,7 +7377,7 @@ final class BLEManager: NSObject, ObservableObject {
         // dimmed - the demo forces motorolaSupported precisely to introduce that control, and a
         // dimmed sub-toggle under an off parent defeats the tour. Matches the Android seed.
         demoStatusPayload = [
-            "fw": "\(sampleBoardKind.sampleFirmwareLabel) 2.2.1", "up": 4920, "total": 6, "ble": true, "wifi": true,
+            "fw": "\(sampleBoardKind.sampleFirmwareLabel) 2.2.2", "up": 4920, "total": 6, "ble": true, "wifi": true,
             "axon": true, "tracker": true, "glasses": true, "ncam": true,
             "buzzer": true, "vol": 70, "gps": true, "bat": 82,
         ]

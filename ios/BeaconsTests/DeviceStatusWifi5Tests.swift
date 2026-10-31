@@ -22,4 +22,11 @@ final class DeviceStatusWifi5Tests: XCTestCase {
     func testAbsentReadsNilNeverADefault() throws {
         XCTAssertNil(try status(#"{"fw":"beacon board 2.1.0","wifi":true,"wifiEco":0}"#).wifi5)
     }
+
+    /// "psnd" (power sounds, 2.2.3+) is tri-state the same way: absent = older firmware, toggle hidden.
+    func testPowerSoundsAbsentReadsNilPresentReadsValue() throws {
+        XCTAssertNil(try status(#"{"fw":"beacon board 2.2.2","buzzer":false}"#).powerSounds)
+        XCTAssertEqual(try status(#"{"fw":"beacon board 2.2.3","buzzer":false,"psnd":false}"#).powerSounds, false)
+        XCTAssertEqual(try status(#"{"fw":"beacon board 2.2.3","buzzer":false,"psnd":true}"#).powerSounds, true)
+    }
 }

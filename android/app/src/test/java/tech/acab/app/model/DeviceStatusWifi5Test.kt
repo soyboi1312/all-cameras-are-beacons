@@ -28,4 +28,12 @@ class DeviceStatusWifi5Test {
     fun `absent reads null, never a default`() {
         assertNull(status("""{"fw":"beacon board 2.1.0","wifi":true,"wifiEco":0}""").wifi5)
     }
+
+    /** "psnd" (power sounds, 2.2.3+) is tri-state the same way: absent = older firmware, toggle hidden. */
+    @Test
+    fun `power sounds absent reads null, present reads its value`() {
+        assertNull(status("""{"fw":"beacon board 2.2.2","buzzer":false}""").psnd)
+        assertEquals(false, status("""{"fw":"beacon board 2.2.3","buzzer":false,"psnd":false}""").psnd)
+        assertEquals(true, status("""{"fw":"beacon board 2.2.3","buzzer":false,"psnd":true}""").psnd)
+    }
 }

@@ -1520,15 +1520,20 @@ internal fun isFirmwareVersionOlder(installed: String, latest: String): Boolean 
 /** The first firmware that applies the alert mute to the power cues too (alerts.cpp buzzerTone,
  *  2.2.1). Before it a muted board still played the shutdown motif and the rev-B hold-to-start
  *  beep, and only volume 0 silenced them, so the Alerts caption and the Desert note describe the
- *  cues THIS board plays. TWIN: DeviceStatus.muteCoversPowerCuesSince and muteCoversPowerCues in
- *  DeviceStatus.swift; check-signature-drift.py pins the literal. */
+ *  cues THIS board plays. From 2.2.3 the board sends "psnd" and the power cues follow that switch
+ *  instead of the mute (see DeviceStatus.psnd). TWIN: DeviceStatus.muteCoversPowerCuesSince and
+ *  muteCoversPowerCues in DeviceStatus.swift; check-signature-drift.py pins the literal. */
 internal const val MUTE_COVERS_POWER_CUES_SINCE = "2.2.1"
 
-/** Does a board on [firmwareVersion] mute every cue, the power cues included? False for a missing
- *  version or one that does not parse, which keeps the older description: a caption may promise
- *  less silence than the board delivers, never more. */
-internal fun muteCoversPowerCues(firmwareVersion: String?): Boolean =
-    firmwareVersion != null && isFirmwareVersionAtLeast(firmwareVersion, MUTE_COVERS_POWER_CUES_SINCE)
+/** Does a board on [firmwareVersion] mute every cue, the power cues included? True from 2.2.1 on a
+ *  board that sends no [psnd]: 2.2.1 and 2.2.2, and a buzzer-less Mesh-Detect at any later
+ *  version. A board that sends [psnd] (2.2.3+ with a buzzer) plays the power cues through the
+ *  mute. False for
+ *  a missing version or one that does not parse, which keeps the older description: a caption may
+ *  promise less silence than the board delivers, never more. */
+internal fun muteCoversPowerCues(firmwareVersion: String?, psnd: Boolean? = null): Boolean =
+    psnd == null && firmwareVersion != null &&
+        isFirmwareVersionAtLeast(firmwareVersion, MUTE_COVERS_POWER_CUES_SINCE)
 
 internal fun decideOtaPostReboot(
     runningVersion: String,
@@ -6548,6 +6553,9 @@ class AcabBleManager(private val context: Context) {
     /** Onboard LED master. off = "lights out" (fully dark), for covert/stationary deploys.
      *  Firmware default on; the board persists this across reboots. */
     fun setLed(on: Boolean) = writeConfig(JSONObject().put("led", on))
+    /** Startup and shutdown sounds (firmware 2.2.3+). They play even while alerts are muted or
+     *  Desert runs; off silences them. TWIN: iOS BLEManager.setPowerSounds. */
+    fun setPowerSounds(on: Boolean) = writeConfig(JSONObject().put("psnd", on))
     fun setVolume(v: Int, preview: Boolean = false) {
         val cfg = JSONObject().put("volume", v.coerceIn(0, 100))
         if (preview) cfg.put("beep", true)   // chirp once at the new level on release
@@ -8694,10 +8702,10 @@ class AcabBleManager(private val context: Context) {
             // "moto" is present so the tour shows the Motorola sub-toggle. Omitting it would make
             // the demo board look like pre-split firmware and hide the control the tour exists to
             // introduce. "axon":true so the parent category is on and the sub-row is not dimmed.
-            """{"fw":"beacon board 2.2.1","up":4920,"total":6,"ble":true,"wifi":true,"axon":true,"moto":true,"tracker":true,"glasses":true,"ncam":true,"buzzer":true,"vol":70,"gps":true,"bat":82}""").apply {
+            """{"fw":"beacon board 2.2.2","up":4920,"total":6,"ble":true,"wifi":true,"axon":true,"moto":true,"tracker":true,"glasses":true,"ncam":true,"buzzer":true,"vol":70,"gps":true,"bat":82}""").apply {
             when (debugKind) {
-                BoardKind.OUI_SPY -> put("fw", "ACAB-ouispy 2.2.1")
-                BoardKind.MESH_DETECT -> put("fw", "mesh-detect-ACAB 2.2.1")
+                BoardKind.OUI_SPY -> put("fw", "ACAB-ouispy 2.2.2")
+                BoardKind.MESH_DETECT -> put("fw", "mesh-detect-ACAB 2.2.2")
                 BoardKind.BEACON, null -> Unit
             }
         })

@@ -1227,6 +1227,9 @@ internal fun DeviceScreen(
     var confirmPowerOff by remember { mutableStateOf(false) }      // gate the rev-B app-driven power-off
     var lightsOut by rememberSaveable { mutableStateOf(status?.ledOn == false) }   // LED fully dark
     var ledPending by rememberSaveable { mutableStateOf(false) }
+    // Seeded with the firmware default (on); the row stays hidden until a frame carries "psnd".
+    var powerSoundsOn by rememberSaveable { mutableStateOf(status?.psnd ?: true) }
+    var powerSoundsPending by rememberSaveable { mutableStateOf(false) }
     var desertOn by rememberSaveable { mutableStateOf(status?.desertMode == true) }
     var desertPending by rememberSaveable { mutableStateOf(false) }
     // Master volume rides here (not inside BuzzerCard) so the Alerts kicker reads the live value,
@@ -1289,6 +1292,8 @@ internal fun DeviceScreen(
                 { s -> (!s.ledOn) == lightsOut }, { s -> lightsOut = s?.ledOn?.not() ?: lightsOut }),
             BoardControl("Desert mode", { desertPending }, { desertPending = it },
                 { s -> s.desertMode == desertOn }, { s -> desertOn = s?.desertMode ?: desertOn }),
+            BoardControl("Power sounds", { powerSoundsPending }, { powerSoundsPending = it },
+                { s -> s.psnd == powerSoundsOn }, { s -> powerSoundsOn = s?.psnd ?: powerSoundsOn }),
         )
     }
 
@@ -1852,16 +1857,17 @@ internal fun DeviceScreen(
             Text("Off the grid, anything new on the air means something arrived. Each device is tagged hardware or randomized (phone) MAC, or OUI unknown when the radio cannot tell.",
                 color = Acab.faint, fontSize = 11.sp)
             if (desertOn) {
-                // The startup jingle is NOT exempt from the mute (alerts.cpp, 2026-08-24: the boot
-                // motif is a UserAlert, so a muted board never announces itself - an unattended
-                // power restore is indistinguishable from a hand on the plug). Said plainly here so
-                // a user who mutes the board, power-cycles it and hears nothing does not read
-                // silence as a dead board. TWO WORDINGS by firmware, the same rule as BuzzerCard's
-                // caption: from 2.2.1 the mute also covers the shutdown motif and the rev-B
-                // hold-to-start ack ([muteCoversPowerCues]), so the note says both power cues are
-                // muted; older firmware still plays the shutdown motif muted, and that wording names
-                // it. iOS twin: the same two strings in SettingsView.swift's desertModeCard.
-                Text(if (muteCoversPowerCues(status?.version))
+                // Desert writes the alert mute, so this says which power cues still sound. THREE
+                // WORDINGS by firmware, the same rule as BuzzerCard's caption. 2.2.3+ (the status
+                // carries "psnd"): the startup jingle, the rev-B hold-to-start ack and the shutdown
+                // motif play through the mute unless Power sounds is off (alerts.cpp buzzerTone).
+                // 2.2.1 and 2.2.2 ([muteCoversPowerCues]): the mute covers every cue. Older: the
+                // shutdown motif still plays muted, and that wording names it. A Mesh-Detect has no
+                // buzzer, so its firmware sends no psnd and it reads by its version. iOS twin: the
+                // same three strings in SettingsView.swift's desertModeCard.
+                Text(if (status?.psnd != null)
+                        "Detection alerts are muted while Desert mode runs. With every nearby device reporting in, a beep for each would never let up. The startup and shutdown sounds still play unless power sounds are off in Alerts."
+                    else if (muteCoversPowerCues(status?.version, status?.psnd))
                         "Detection alerts are muted while Desert mode runs. With every nearby device reporting in, a beep for each would never let up. The startup and shutdown cues are muted too."
                     else "Detection alerts are muted while Desert mode runs. With every nearby device reporting in, a beep for each would never let up. The shutdown cue still plays unless volume is 0; the startup jingle is muted along with everything else.",
                     color = Acab.warn, fontSize = 11.sp)
@@ -2169,7 +2175,11 @@ internal fun DeviceScreen(
             // (beaconRows meshBoard), and the pending mode is cleared the
             // moment Desert comes back on or the user picks anything by hand.
             restoreOffered = alertRestoreOffered,
-            muteCoversPowerCues = muteCoversPowerCues(status?.version),
+            muteCoversPowerCues = muteCoversPowerCues(status?.version, status?.psnd),
+            // null hides the toggle: only 2.2.3+ firmware sends "psnd"
+            powerSoundsOn = if (status?.psnd != null) powerSoundsOn else null,
+            powerSoundsPending = powerSoundsPending && !demo,
+            onPowerSounds = { powerSoundsOn = it; powerSoundsPending = true; if (!demo) ble.setPowerSounds(it) },
             onRestore = takeAlertRestore,
             onMasterChange = { masterVolume = it; volumeDragging = true },
             onMode = {
@@ -3554,6 +3564,9 @@ private fun BuzzerCard(
     master: Float,
     restoreOffered: Boolean,
     muteCoversPowerCues: Boolean,
+    powerSoundsOn: Boolean?,
+    powerSoundsPending: Boolean,
+    onPowerSounds: (Boolean) -> Unit,
     onRestore: () -> Unit,
     onMasterChange: (Float) -> Unit,
     onMode: (AlertMode) -> Unit,
@@ -3563,16 +3576,19 @@ private fun BuzzerCard(
         CardKicker("ALERTS")
 
         AlertModePicker(mode = mode, onMode = onMode)
-        // TWO WORDINGS, chosen by the connected board's firmware ([muteCoversPowerCues], computed
-        // by the caller from the status). From 2.2.1 the alert mute covers every cue (alerts.cpp
-        // buzzerTone), so Vibrate and Silent say all board sounds are off. Before it, two cues
+        // THREE WORDINGS, chosen by the connected board's firmware. From 2.2.3 ([powerSoundsOn]
+        // non-null: the status carries "psnd") the power cues play through the alert mute and have
+        // their own Power sounds toggle on this card, so Vibrate and Silent speak for detection
+        // beeps only. On 2.2.1 and 2.2.2 ([muteCoversPowerCues], computed by the caller from the
+        // status) the alert mute covers every cue (alerts.cpp buzzerTone), so Vibrate and Silent
+        // say all board sounds are off. Before 2.2.1, two cues
         // still bypassed the mute, both PowerState: the shutdown motif and the rev-B hold-to-start
         // ack. That wording names only the shutdown one, because it is the one every SKU plays and
         // the one a muted user is surprised by; the ack always directly follows the user's own
         // hold on the button, so it explains itself. Volume 0 silences both there. A status that
         // has not arrived, or a version that does not parse, gets the older wording: a caption may
         // promise less silence than the board delivers, never more. iOS twin: alertModeCaption in
-        // SettingsView.swift. Buzzer and Silent are byte-identical there, in both wordings, and
+        // SettingsView.swift. Buzzer and Silent are byte-identical there, in every wording, and
         // MUST stay so. Vibrate is NOT, deliberately: the
         // haptic here fires in AcabBleManager.alertHaptic on the detection ingest path, so it
         // runs wherever ingest runs - including with the screen locked, whenever something keeps
@@ -3584,9 +3600,13 @@ private fun BuzzerCard(
         Text(
             when (mode) {
                 AlertMode.BUZZER -> "board beeps when it spots gear"
-                AlertMode.VIBRATE -> if (muteCoversPowerCues) "all board sounds off. This phone buzzes on new hits"
+                // THIRD WORDING from 2.2.3 (powerSoundsOn non-null): the power sounds play through the
+                // mute and have their own toggle on this card, so the caption covers detection beeps only.
+                AlertMode.VIBRATE -> if (powerSoundsOn != null) "detection beeps off. This phone buzzes on new hits"
+                    else if (muteCoversPowerCues) "all board sounds off. This phone buzzes on new hits"
                     else "detection beeps off, the shutdown cue still plays unless volume is 0. This phone buzzes on new hits"
-                AlertMode.SILENT -> if (muteCoversPowerCues) "all board sounds and phone feedback off"
+                AlertMode.SILENT -> if (powerSoundsOn != null) "detection beeps and phone feedback off"
+                    else if (muteCoversPowerCues) "all board sounds and phone feedback off"
                     else "detection beeps and phone feedback off, the shutdown cue still plays unless volume is 0"
             },
             color = Acab.faint, fontSize = 11.sp,
@@ -3594,17 +3614,23 @@ private fun BuzzerCard(
 
         if (restoreOffered) AlertRestoreOffer(onRestore)
 
-        // LIVE IN ALL THREE MODES. Vibrate and Silent turn detection beeps off. On firmware before
-        // 2.2.1 the only thing this level still governs there is the shutdown cue the older caption
-        // names, and volume 0 is the ONLY thing that silences it (a PowerState cue bypassed the
-        // alert mute there; from 2.2.1 buzzerTone mutes every cue, see [muteCoversPowerCues]).
-        // Greying the slider out in those two modes made the remedy that copy names unreachable
-        // from them, and an older board still needs it.
+        // LIVE IN ALL THREE MODES. Vibrate and Silent turn detection beeps off, but this level still
+        // governs sounds there: from 2.2.3 the power sounds play in every mode at this level
+        // (volume 0 silences them, so does Power sounds off); on 2.2.1 and 2.2.2 the mute covers
+        // every cue ([muteCoversPowerCues]); before 2.2.1 the shutdown cue the older caption names
+        // bypassed the mute and volume 0 was the ONLY thing that silenced it. Greying the slider
+        // out in those two modes would make that remedy unreachable from them.
         // iOS twin: the same rule on the Master volume slider in SettingsView.swift's buzzerCard.
         VolumeSlider("Master volume", value = master, tone = Acab.accent, bold = true,
             // Round, don't truncate: the status-echo check compares roundToInt(), so a truncated
             // send (49.7 -> 49) could never match and the 10s timeout would false-fire.
             onValueChange = onMasterChange, onCommit = { onVolumeCommit(master.roundToInt()) })
+
+        // Firmware 2.2.3+ only. iOS twin: the Power sounds toggle in SettingsView.swift's buzzerCard.
+        if (powerSoundsOn != null) {
+            ToggleRow("Power sounds", "startup and shutdown sounds · play even when alerts are muted",
+                checked = powerSoundsOn, pending = powerSoundsPending, onChange = onPowerSounds)
+        }
     }
 }
 

@@ -607,6 +607,10 @@ data class DeviceStatus(
     val buzzer: Boolean,
     val volume: Int,
     val ledOn: Boolean,     // onboard LED / idle heartbeat on ("ledon"; absent = on, the default)
+    // Startup/shutdown sounds on ("psnd", 2.2.3+). They play through the alert mute; null = older
+    // firmware or no buzzer (Mesh-Detect), so no such switch and the UI hides the toggle.
+    // TWIN: iOS DeviceStatus.powerSounds.
+    val psnd: Boolean? = null,
     val gps: Boolean,
     val bufCount: Int,      // records currently held in the board's offline buffer
     val bufOn: Boolean,     // whether offline buffering is enabled on the board
@@ -706,6 +710,7 @@ data class DeviceStatus(
             buzzer = o.optBoolean("buzzer", false),
             volume = o.optInt("vol", 80),
             ledOn = o.optBoolean("ledon", true),   // board omits it when on, so absent = on
+            psnd = if (o.has("psnd")) o.optBoolean("psnd") else null,   // absent = no switch: see psnd
             gps = o.optBoolean("gps", false),
             bufCount = o.optInt("buf", 0),
             bufOn = o.optBoolean("bufon", false),

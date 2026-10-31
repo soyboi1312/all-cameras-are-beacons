@@ -89,6 +89,10 @@ struct DeviceStatus: Equatable {
     let buzzer: Bool         // detection/session alert audio on/off; physical power cues are independent
     let volume: Int          // buzzer loudness, 0...100
     let ledEnabled: Bool     // onboard LED / idle heartbeat on ("ledon"; absent = on, the default)
+    let powerSounds: Bool?   // startup/shutdown sounds on ("psnd", 2.2.3+). They play through the
+                             // alert mute; nil = older firmware or no buzzer (Mesh-Detect), so no
+                             // such switch and the toggle is hidden.
+                             // TWIN: Android DeviceStatus.psnd (Models.kt)
     let bufCount: Int        // detections currently buffered on the board ("buf")
     let bufferingOn: Bool    // offline buffering enabled ("bufon")
     /// The board's signature-row flood limit refused at least one row ("bufrl"), so some real
@@ -151,6 +155,7 @@ extension DeviceStatus: Decodable {
         case wifi5       // 5 GHz Wi-Fi pass on; absent = no 5 GHz radio (every S3 build)
         case vol         // firmware sends "vol"; we call it `volume`
         case ledon       // onboard LED master; the board omits it when on, so absent = on
+        case psnd        // power sounds switch; absent = firmware before 2.2.3, or no buzzer (Mesh-Detect)
         case buf, bufon, buferr, keymis  // offline buffer state, faults and key mismatch
         case bufrl       // flood limit refused a row; the board emits it only while true
         case desert      // Desert mode (report every device)
@@ -190,6 +195,7 @@ extension DeviceStatus: Decodable {
         buzzer   = (try? k.decode(Bool.self, forKey: .buzzer)) ?? false
         volume   = (try? k.decode(Int.self, forKey: .vol)) ?? 80
         ledEnabled = (try? k.decode(Bool.self, forKey: .ledon)) ?? true   // absent = on (default)
+        powerSounds = try? k.decode(Bool.self, forKey: .psnd)   // DO NOT default: absent = no switch
         bufCount    = (try? k.decode(Int.self, forKey: .buf)) ?? 0
         bufferingOn = (try? k.decode(Bool.self, forKey: .bufon)) ?? false
         bufferRateLimited = (try? k.decode(Bool.self, forKey: .bufrl)) ?? false
@@ -266,12 +272,12 @@ extension DeviceStatus {
     /// firmware manifest (see FirmwareManifestStore); bump this on a beacon-board release so the
     /// offline path still matches. The Colonel Panic single-board builds (oui-spy / mesh-detect)
     /// track a separate line now that the beacon board has moved ahead - see colonelLatestVersion.
-    static let latestVersion = "2.2.1"
+    static let latestVersion = "2.2.2"
 
     /// Latest firmware for the Colonel Panic single-board builds, which stayed on the shared
     /// acab_version.h default when the beacon board diverged. Offline fallback only; bump on a
     /// Colonel Panic release.
-    static let colonelLatestVersion = "2.2.1"
+    static let colonelLatestVersion = "2.2.2"
 
     /// Just the version number out of `fw` ("ACAB-ouispy 0.1.0" -> "0.1.0").
     var version: String { firmware.split(separator: " ").last.map(String.init) ?? firmware }
@@ -288,15 +294,20 @@ extension DeviceStatus {
     /// The first firmware that applies the alert mute to the power cues too (alerts.cpp
     /// buzzerTone, 2.2.1). Before it a muted board still played the shutdown motif and the rev-B
     /// hold-to-start beep, and only volume 0 silenced them, so the Alerts caption and the Desert
-    /// note describe the cues THIS board plays. TWIN: MUTE_COVERS_POWER_CUES_SINCE and
-    /// muteCoversPowerCues in AcabBleManager.kt; check-signature-drift.py pins the literal.
+    /// note describe the cues THIS board plays. From 2.2.3 the board sends "psnd" and the power
+    /// cues follow that switch instead of the mute (see powerSounds). TWIN:
+    /// MUTE_COVERS_POWER_CUES_SINCE and muteCoversPowerCues in AcabBleManager.kt;
+    /// check-signature-drift.py pins the literal.
     static let muteCoversPowerCuesSince = "2.2.1"
 
-    /// Does this board's firmware mute every cue, the power cues included? False for a version
-    /// that does not parse, which keeps the older description: a caption may promise less silence
-    /// than the board delivers, never more.
+    /// Does this board's firmware mute every cue, the power cues included? True from 2.2.1 on a
+    /// board that sends no "psnd": 2.2.1 and 2.2.2, and a buzzer-less Mesh-Detect at any later
+    /// version. A board that sends "psnd" (2.2.3+ with a buzzer) plays the power cues through the
+    /// mute.
+    /// False for a version that does not parse, which keeps the older description: a caption may
+    /// promise less silence than the board delivers, never more.
     var muteCoversPowerCues: Bool {
-        FirmwareVersionPolicy.isAtLeast(version, Self.muteCoversPowerCuesSince)
+        powerSounds == nil && FirmwareVersionPolicy.isAtLeast(version, Self.muteCoversPowerCuesSince)
     }
 
     /// Installed firmware strictly older than `latest`, using the exact validated numeric core

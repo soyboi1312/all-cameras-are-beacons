@@ -79,6 +79,10 @@ final class OtaVersionGateTests: XCTestCase {
         XCTAssertTrue(try status(version: "2.2.1").muteCoversPowerCues)
         XCTAssertTrue(try status(version: "2.3.0").muteCoversPowerCues)
         XCTAssertFalse(try status(version: "2.1.9").muteCoversPowerCues)
+        // From 2.2.3 the board sends "psnd" and the power cues play through the mute.
+        let psnd = try JSONDecoder().decode(DeviceStatus.self,
+                                            from: Data(#"{"fw":"beacon board 2.2.3","psnd":true}"#.utf8))
+        XCTAssertFalse(psnd.muteCoversPowerCues)
         // A version that does not parse keeps the louder, older wording.
         XCTAssertFalse(try status(version: "2.2.1x").muteCoversPowerCues)
         XCTAssertFalse(try status(version: "ESP32").muteCoversPowerCues)

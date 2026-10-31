@@ -337,6 +337,8 @@ class OtaSafetyPolicyTest {
         assertTrue(muteCoversPowerCues("2.2.1"))
         assertTrue(muteCoversPowerCues("2.3.0"))
         assertFalse(muteCoversPowerCues("2.1.9"))
+        // From 2.2.3 the board sends "psnd" and the power cues play through the mute.
+        assertFalse(muteCoversPowerCues("2.2.3", psnd = true))
         // No status yet, or a version that does not parse: keep the louder, older wording.
         assertFalse(muteCoversPowerCues(null))
         assertFalse(muteCoversPowerCues("2.2.1x"))
