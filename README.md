@@ -1,3 +1,5 @@
+![beacons: they're watching. watch back.](docs/img/banner.webp)
+
 # All Cameras Are Beacons
 
 **beacons** picks up the Wi-Fi and Bluetooth broadcasts of supported surveillance devices, such as license-plate readers, body cams, and drones, and shows them in the iPhone and Android apps. Mesh-Detect can also send them out as Meshtastic alerts. it runs on the beacon, our pocket-sized dual-radio detector, on Colonel Panic's OUI-Spy and Mesh-Detect boards, and on DIY ESP32-C5 boards.
