@@ -1,4 +1,4 @@
-# All Cameras Are Beacons, Android
+# beacons, Android
 
 Native Kotlin + Jetpack Compose companion for the beacon, OUI-Spy, Mesh-Detect, and DIY
 ESP32-C5 boards, and the Android counterpart to the iOS app in `../ios`. It talks to the

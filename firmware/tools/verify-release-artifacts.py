@@ -759,7 +759,7 @@ def main():
                 src_mtime,
                 expected_chip="ESP32-C5" if env in C5_WEB_ENVS else "ESP32-S3")
         # THE SAME SCRIPT STAMPS THE PAGE, AND NEVER CHECKS THAT IT MATCHED. build-flasher.sh
-        # rewrites web/index.html with a bare `re.sub(r'(All Cameras Are Beacons v)[0-9...]', ...)`,
+        # rewrites web/index.html with a bare `re.sub(r'(beacons v)[0-9...]', ...)`,
         # anchored to nothing but that sentence. Reword the sentence and the stamp becomes a silent
         # no-op: new binaries, and a page that goes on advertising the previous release to the
         # person about to flash it. pages.yml deploys web/ on any push and runs no verifier, so
@@ -770,7 +770,7 @@ def main():
         except OSError as exc:
             check(False, f"web/index.html is readable ({exc})")
         else:
-            stamped = re.findall(r"All Cameras Are Beacons v([0-9][0-9A-Za-z.+-]*)", html)
+            stamped = re.findall(r"beacons v([0-9][0-9A-Za-z.+-]*)", html)
             check(stamped == [shared_ver],
                   f"web/index.html footer advertises exactly [{shared_ver!r}], found {stamped}")
 

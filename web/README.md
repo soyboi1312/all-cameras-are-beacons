@@ -1,4 +1,4 @@
-# The All Cameras Are Beacons web flasher
+# The beacons web flasher
 
 This is the little web page that lets anyone flash a board straight from their
 browser, with nothing to install. It uses
@@ -49,7 +49,7 @@ reporter confirmed on 2026-10-08 that it flashes and scans.
 
 `docs/signatures.md` designates `web/privacy.html` as the canonical privacy wording, and both apps
 open the deployed GitHub Pages copy directly:
-`https://soyboi1312.github.io/all-cameras-are-beacons/privacy.html`. Do not point either app back
+`https://soyboitech.github.io/beacons/privacy.html`. Do not point either app back
 at a separately maintained site copy; the old `soyboi.tech/privacy.html` drifted and falsely said
 the phone's GPS fix never left the phone after offline geotagging shipped.
 
@@ -96,7 +96,7 @@ python3 -m http.server 8000
 This repo publishes the flasher for you automatically. There's a GitHub Actions
 workflow ([.github/workflows/pages.yml](../.github/workflows/pages.yml)) that
 copies the `web/` folder up to GitHub Pages any time something in it changes, and
-the live copy lands at https://soyboi1312.github.io/all-cameras-are-beacons/.
+the live copy lands at https://soyboitech.github.io/beacons/.
 
 That github.io URL is this page's public address. The sibling site's `soyboi.tech/flash.html`
 installs `firmware/manifest-beacon.json`, the rev-A beacon image. Its "other supported hardware"
@@ -142,7 +142,7 @@ It aborts rather than publish something it cannot stand behind:
   footer would keep advertising the previous version while fresh binaries got staged, and the
   manifest version is what the install dialog shows the person flashing.
 - **A version stamp matched nothing to rewrite.** Each `web/manifest-*.json` must carry exactly
-  one `"version"` field and `web/index.html` exactly one `All Cameras Are Beacons v<ver>` footer
+  one `"version"` field and `web/index.html` exactly one `beacons v<ver>` footer
   marker. Wording that drifts off either pattern used to be rewritten unchanged and reported as
   success, which is the same silently-stale advertisement as the bullet above, so the stamper
   now dies at the file it could not write.

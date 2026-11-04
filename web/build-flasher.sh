@@ -324,9 +324,9 @@ for m in sorted(found):
     open(m, "w").write(s)
 idx = os.path.join(root, "web", "index.html")
 h = open(idx).read()
-h, n = re.subn(r'(All Cameras Are Beacons v)[0-9][0-9A-Za-z.+-]*', lambda mo: mo.group(1) + ver, h)
+h, n = re.subn(r'(beacons v)[0-9][0-9A-Za-z.+-]*', lambda mo: mo.group(1) + ver, h)
 if n != 1:
-    sys.exit("!! web/index.html: expected exactly one \"All Cameras Are Beacons v<ver>\" footer "
+    sys.exit("!! web/index.html: expected exactly one \"beacons v<ver>\" footer "
              "marker, matched %d; fix the footer or the pattern." % n)
 open(idx, "w").write(h)
 print("   manifests + footer set to", ver)

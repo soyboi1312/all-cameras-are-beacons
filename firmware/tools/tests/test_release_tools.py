@@ -1139,7 +1139,7 @@ class WebStagerFailureTests(unittest.TestCase):
                     f"previous-web-{env}-{part}".encode()
                 )
         (self.web / "index.html").write_text(
-            "<span>All Cameras Are Beacons v1.0.0</span>\n", encoding="utf-8"
+            "<span>beacons v1.0.0</span>\n", encoding="utf-8"
         )
 
         labels = {
@@ -1308,7 +1308,7 @@ class WebStagerFailureTests(unittest.TestCase):
             self.assertNotIn(env, json.dumps(latest))
             self.assertIn('"version": "2.0.6"',
                           (self.web / f"manifest-{env}.json").read_text())
-        self.assertIn("All Cameras Are Beacons v2.0.6",
+        self.assertIn("beacons v2.0.6",
                       (self.web / "index.html").read_text())
 
     def test_unsigned_mode_skips_even_a_wrong_signing_key(self) -> None:

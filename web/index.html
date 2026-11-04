@@ -3,8 +3,8 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>All Cameras Are Beacons · Firmware Flasher</title>
-<meta name="description" content="Browser-based firmware flasher for All Cameras Are Beacons, counter-surveillance detection for the Colonel Panic OUI-Spy and Mesh-Detect boards and for a bare ESP32-C5. The beacon board has its own flasher.">
+<title>beacons · Firmware Flasher</title>
+<meta name="description" content="Browser-based firmware flasher for beacons, counter-surveillance detection for the Colonel Panic OUI-Spy and Mesh-Detect boards and for a bare ESP32-C5. The beacon board has its own flasher.">
 <!-- esp-web-tools 10.2.1, self-hosted. Vendored from unpkg (the full ?module import graph,
      27 JS chunks, with the ?module query stripped so each chunk resolves by plain relative
      name); see web/vendor/esp-web-tools/. Self-hosting keeps the flasher off a third-party CDN
@@ -152,7 +152,7 @@
   <div class="ed-bd">
     <h3><span>!</span> Erasing will unpair Bluetooth</h3>
     <p>Erase wipes the board's stored Bluetooth bond. If this device was paired with your
-      phone (the <b>All Cameras Are Beacons</b> app), you'll need to <b>remove the existing pairing</b> in
+      phone (the <b>beacons</b> app), you'll need to <b>remove the existing pairing</b> in
       your phone's Bluetooth settings and pair again, otherwise the app won't reconnect.
       A normal flash without erase keeps the pairing.</p>
     <div class="ed-act"><button id="eraseDialogOk" type="button" autofocus>Got it</button></div>
@@ -208,14 +208,14 @@
   <div class="grid">
     <div class="card" id="oui-spy">
       <h2>OUI-Spy <span class="tag">APP</span></h2>
-      <p>An app-controlled scanner that streams detections to the All Cameras Are Beacons phone apps (iPhone and Android) over BLE
+      <p>An app-controlled scanner that streams detections to the beacons phone apps (iPhone and Android) over BLE
          and beeps a distinct tone for each target class. Runs on the Colonel Panic OUI-Spy (XIAO ESP32-S3).</p>
       <ul>
         <li>BLE + WiFi scanning</li>
         <li>ACAB GATT service</li>
         <li>buzzer / LED alerts</li>
       </ul>
-      <p class="steps">The board pairs with the <b>All Cameras Are Beacons</b> iPhone and Android apps for live detections
+      <p class="steps">The board pairs with the <b>beacons</b> iPhone and Android apps for live detections
          and controls. Get them free on the
          <a href="https://apps.apple.com/us/app/beacons-surveillance-scanner/id6781841861" target="_blank" rel="noopener">App Store</a>
          and <a href="https://play.google.com/store/apps/details?id=tech.soyboi.beacons" target="_blank" rel="noopener">Google Play</a>.</p>
@@ -243,7 +243,7 @@
          nearby sees them) and never sends your location.
          <b>Private</b> puts them on an encrypted <code>acab</code> channel
          only your nodes can read, and also needs the Heltec set up to match (see the
-         <a href="https://github.com/soyboi1312/all-cameras-are-beacons/blob/main/docs/mesh-setup.md" target="_blank" rel="noopener">mesh
+         <a href="https://github.com/soyboitech/beacons/blob/main/docs/mesh-setup.md" target="_blank" rel="noopener">mesh
          setup guide</a>). On Private, while your phone is connected to the board, its alerts
          also carry your phone's location as a map link.</p>
       <esp-web-install-button manifest="./manifest-mesh-detect.json">
@@ -276,7 +276,7 @@
       </ul>
       <p class="steps"><b>Seeed XIAO ESP32-C5:</b> buzzer on D2 (GPIO25), the user LED on GPIO27.
          <b>Espressif ESP32-C5-DevKitC-1 (N8R4 or N8R8):</b> built for
-         <a href="https://github.com/soyboi1312/all-cameras-are-beacons/issues/2" target="_blank" rel="noopener">issue #2</a>
+         <a href="https://github.com/soyboitech/beacons/issues/2" target="_blank" rel="noopener">issue #2</a>
          where a community member confirmed it flashes and scans (we do not own the kit). Either
          USB-C port flashes it; detections print on the port marked UART (Serial is UART0 on this
          kit), so open the monitor there. The onboard RGB LED is the status light, and an optional
@@ -316,8 +316,8 @@
   </div>
 
   <footer>
-    <span>All Cameras Are Beacons v2.2.3</span>
-    <a href="https://github.com/soyboi1312/all-cameras-are-beacons">source</a>
+    <span>beacons v2.2.3</span>
+    <a href="https://github.com/soyboitech/beacons">source</a>
     <a href="./privacy.html">privacy</a>
     <span style="flex:1"></span>
     <span class="steps">After flashing: open a serial monitor at <code>115200</code> to watch detections.</span>
@@ -330,7 +330,7 @@
     unplugged cable. An interrupted flash is almost always fixable by running the flasher again
     on a stable connection.</p>
 
-  <p class="disclaimer">All Cameras Are Beacons is an independent project and is not affiliated with,
+  <p class="disclaimer">beacons is an independent project and is not affiliated with,
     endorsed by, or sponsored by <b>Colonel Panic</b>. <b>OUI-Spy</b> and <b>Mesh-Detect</b> are
     Colonel Panic's product names, used here only to identify compatible hardware.</p>
 

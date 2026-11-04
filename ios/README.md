@@ -1,4 +1,4 @@
-# All Cameras Are Beacons
+# beacons, iOS
 
 The iPhone app. It pairs with a beacon, OUI-Spy, Mesh-Detect, or ESP32-C5 board over
 Bluetooth and shows you what it's picking up as it happens. It's the free, open-source

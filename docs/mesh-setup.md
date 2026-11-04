@@ -26,7 +26,7 @@ channel (channel 0 / TEXTMSG), and the public build also sends no boot ping.
 > The Heltec/Meshtastic side (installing the Meshtastic CLI, the optional
 > mesh-mapper web app, screen and Bluetooth options) is written up in the
 > companion guide:
-> **https://github.com/soyboi1312/meshdetect-macOS/blob/main/macOS.md**.
+> **https://github.com/soyboitech/meshdetect-macOS/blob/main/macOS.md**.
 > This page focuses on the wiring, the channel choice, and the ACAB firmware on
 > the XIAO.
 
@@ -68,7 +68,7 @@ private, and whether they can carry your phone's position (private only).
 ## 1. Configure the Heltec (Meshtastic)
 
 Install the Meshtastic CLI first (Homebrew + pipx), per
-[the macOS guide](https://github.com/soyboi1312/meshdetect-macOS/blob/main/macOS.md#1-install-homebrew-pipx-and-the-meshtastic-cli).
+[the macOS guide](https://github.com/soyboitech/meshdetect-macOS/blob/main/macOS.md#1-install-homebrew-pipx-and-the-meshtastic-cli).
 
 ### Find the Heltec's port
 
@@ -91,7 +91,7 @@ meshtastic --port /dev/cu.usbserial-0001 \
   --set bluetooth.mode FIXED_PIN --set bluetooth.fixed_pin 123456
 
 # optional: device name, screen flip
-meshtastic --port /dev/cu.usbserial-0001 --set-owner "All Cameras Are Beacons" --set-owner-short "spy"
+meshtastic --port /dev/cu.usbserial-0001 --set-owner "beacons" --set-owner-short "spy"
 meshtastic --port /dev/cu.usbserial-0001 --set display.flip_screen true
 ```
 
@@ -191,7 +191,7 @@ never sees your detections, which is exactly the point.
 
 **Public channel** (default firmware):
 
-- Web flasher: **https://soyboi1312.github.io/all-cameras-are-beacons/** → **Flash Mesh-Detect (Public)**, or
+- Web flasher: **https://soyboitech.github.io/beacons/** → **Flash Mesh-Detect (Public)**, or
 - ```bash
   pio run -e mesh-detect -t upload --upload-port /dev/cu.usbmodemXXXX
   ```
