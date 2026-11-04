@@ -1,6 +1,6 @@
 ![beacons: they're watching. watch back.](docs/img/banner.webp)
 
-# All Cameras Are Beacons
+# beacons
 
 **beacons** picks up the Wi-Fi and Bluetooth broadcasts of supported surveillance devices, such as license-plate readers, body cams, and drones, and shows them in the iPhone and Android apps. Mesh-Detect can also send them out as Meshtastic alerts. it runs on the beacon, our pocket-sized dual-radio detector, on Colonel Panic's OUI-Spy and Mesh-Detect boards, and on DIY ESP32-C5 boards.
 
@@ -13,8 +13,8 @@ the apps are free, but live detection needs a compatible board. without one, you
 - **buy a beacon** on [Tindie](https://www.tindie.com/stores/soyboitech/) or [Etsy](https://www.etsy.com/shop/soyboitech): the slim model ([Tindie](https://www.tindie.com/products/soyboitech/beacon-slim-pocket-counter-surveillance-detector/), [Etsy](https://www.etsy.com/listing/4587255406/airtag-and-bluetooth-tracker-detector)) or the battery model ([Tindie](https://www.tindie.com/products/soyboitech/beacon-battery-pocket-counter-surveillance/), [Etsy](https://www.etsy.com/listing/4587261765/rechargeable-airtag-and-bluetooth)). [soyboi.tech](https://soyboi.tech) has current pricing and availability.
 - **try the app without hardware:** install it for [iPhone](https://apps.apple.com/us/app/beacons-surveillance-scanner/id6781841861) or [Android](https://play.google.com/store/apps/details?id=tech.soyboi.beacons) and tap **See How It Works** for a tour with made-up detections.
 - **connect a board:** turn it on, tap **Scan for Beacons**, pick your board, and approve the pairing request. the app takes you through setup and permissions. do the first pairing somewhere you trust. to add another phone later, or to pair again after a phone forgets the board, turn the board off and on and pair within two minutes; see the [pairing guide](docs/app-guide.md#try-it-or-connect-a-board).
-- **flash your own OUI-Spy, Mesh-Detect, or ESP32-C5 board** with the [DIY flasher](https://soyboi1312.github.io/all-cameras-are-beacons/) or [from the command line](#flashing-from-the-command-line).
-- **get help** from the [getting-started guide](https://soyboi.tech/getting-started), the [app guide](docs/app-guide.md), or the [FAQ](https://soyboi.tech/faq), or [open an issue](https://github.com/soyboi1312/all-cameras-are-beacons/issues).
+- **flash your own OUI-Spy, Mesh-Detect, or ESP32-C5 board** with the [DIY flasher](https://soyboitech.github.io/beacons/) or [from the command line](#flashing-from-the-command-line).
+- **get help** from the [getting-started guide](https://soyboi.tech/getting-started), the [app guide](docs/app-guide.md), or the [FAQ](https://soyboi.tech/faq), or [open an issue](https://github.com/soyboitech/beacons/issues).
 
 <a id="the-beacon"></a>
 <a id="firmware-targets"></a>
@@ -75,7 +75,7 @@ two things these protections do not cover:
 - **the board can be tracked.** it advertises a fixed factory Bluetooth address, because iPhones could not connect to a rotating one in testing.
 - **offline encryption does not protect a seized board from forensic access.** while buffering is on, the key is stored on the board.
 
-read the [privacy policy](https://soyboi1312.github.io/all-cameras-are-beacons/privacy.html) and the [Bluetooth privacy details](docs/ble-protocol.md#peripheral-address-bonding-and-privacy) before you rely on any of this.
+read the [privacy policy](https://soyboitech.github.io/beacons/privacy.html) and the [Bluetooth privacy details](docs/ble-protocol.md#peripheral-address-bonding-and-privacy) before you rely on any of this.
 
 ## the phone apps
 
@@ -111,12 +111,12 @@ normal updates come through the app. USB recovery depends on the board revision:
 ### DIY OUI-Spy, Mesh-Detect, and ESP32-C5
 
 1. connect the XIAO ESP32-S3, or the ESP32-C5 board, to your computer with a USB-C cable that carries data, not a charge-only cable.
-2. open the [DIY flasher](https://soyboi1312.github.io/all-cameras-are-beacons/) in Chrome or Edge and pick the firmware for your board.
+2. open the [DIY flasher](https://soyboitech.github.io/beacons/) in Chrome or Edge and pick the firmware for your board.
 3. select the board when prompted and wait for flashing to finish.
 
 the flasher uses Web Serial, so it needs a desktop browser; Safari and Firefox do not support it. the [web flasher docs](web/README.md) cover self-hosting and rebuilding the images.
 
-the ESP32-C5 images are USB-only: the apps do not offer them over-the-air updates, so update by flashing again from the same page. the ESP32-C5-DevKitC-1 image was built for [issue #2](https://github.com/soyboi1312/all-cameras-are-beacons/issues/2), where a community member confirmed it flashes and scans; we do not have that board ourselves, so report problems in a new issue.
+the ESP32-C5 images are USB-only: the apps do not offer them over-the-air updates, so update by flashing again from the same page. the ESP32-C5-DevKitC-1 image was built for [issue #2](https://github.com/soyboitech/beacons/issues/2), where a community member confirmed it flashes and scans; we do not have that board ourselves, so report problems in a new issue.
 
 ### flashing from the command line
 
@@ -176,4 +176,4 @@ the **companion nRF firmware, hardware design, PCB layout, enclosure, manufactur
 - [OpenDroneID](https://github.com/opendroneid/opendroneid-core-c), for Remote ID decoding
 - [DeFlock](https://deflock.me) and the independent researchers cited in the [signature reference](docs/signatures.md)
 
-All Cameras Are Beacons is an independent project and is not affiliated with, endorsed by, or sponsored by Colonel Panic. "OUI-Spy" and "Mesh-Detect" are Colonel Panic's product names, used here only to identify compatible hardware.
+beacons is an independent project and is not affiliated with, endorsed by, or sponsored by Colonel Panic. "OUI-Spy" and "Mesh-Detect" are Colonel Panic's product names, used here only to identify compatible hardware.
