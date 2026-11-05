@@ -841,6 +841,13 @@ struct MapTabView: View {
     @State private var alprChecking = false       // manual "Check for Updates" in flight (double-tap guard)
     @State private var alprJustChecked = false    // brief window after a manual check: row shows the outcome
     @Environment(\.horizontalSizeClass) private var hSize   // T5: dossier as inspector on regular width
+    /// iPhone Duo (iOS 27.1). `fold`: where the inner display's fold crosses this tab; while it
+    /// runs top to bottom, the located sightings take the leading half (`locatedPane`).
+    /// `hasVerticalBar`: the system draws its bars vertically, so the floating buttons move into
+    /// the toolbar (`mapBarButtons`), where it can stack them in the bar. Both stay at their
+    /// defaults on every other device.
+    @State private var fold = FoldLine()
+    @State private var hasVerticalBar = false
     @Environment(\.dynamicTypeSize) private var dynamicTypeSize   // accessibility sizes: one-column legend, the card's headline floor
     @Environment(\.accessibilityReduceMotion) private var reduceMotion   // the legend card opens (fade only) and the camera fits, flies and recenters without animation
 
@@ -1310,6 +1317,9 @@ struct MapTabView: View {
         let spokenLocationDenied: Bool          // `ble.locationDenied && !ble.demoMode`
         /// The located rows in scope AND category: the honesty headline's "N on the map".
         let filteredLocated: Int
+        /// Those rows themselves, in store order, for iPhone Duo's located pane only: empty while
+        /// no fold splits the tab (`collectLocated`), so no other device pays for the copy.
+        let located: [Detection]
         /// The located, category-passing rows each scope segment would show. `activeCount` is
         /// `activeWindowAtBuild.count`, or `allCount` in sample data (`activeIsSampleData`); the
         /// 1 s tick (`mapActiveTimer`) moves the drawn Active count between rebuilds.
@@ -1352,7 +1362,7 @@ struct MapTabView: View {
             pinsAnimated: false, simplifiedArtwork: false, pins: PinSet(items: []),
             hasStalePins: false, hasOperatorPins: false, spokenFilter: nil, spokenScope: .recent,
             spokenLocationDenied: false,
-            filteredLocated: 0, activeCount: 0, recentCount: 0, allCount: 0, withoutLocation: 0,
+            filteredLocated: 0, located: [], activeCount: 0, recentCount: 0, allCount: 0, withoutLocation: 0,
             activeStamps: [], activeWindowAtBuild: 0..<0,
             otherActiveStamps: [], otherActiveWindowAtBuild: 0..<0, activeIsSampleData: false)
 
@@ -1425,6 +1435,8 @@ struct MapTabView: View {
         var retainedLocated = 0
         var total = 0
         var filteredLocated = 0, withoutLocation = 0, recentCount = 0, allCount = 0
+        var located: [Detection] = []
+        let collectLocated = fold.x != nil
         var activeStamps: [Date] = []
         var otherActiveStamps: [Date] = []
         // Only the Active scope draws its tallies from the Active membership, so only it pays
@@ -1504,6 +1516,7 @@ struct MapTabView: View {
             }
             guard inCategory else { continue }
             filteredLocated += 1
+            if collectLocated { located.append(d) }
             let isDrone = d.type == .drone
             if isDrone {
                 let rawTrack = ble.track(for: d.id)
@@ -1691,7 +1704,7 @@ struct MapTabView: View {
             hasOperatorPins: mapHasOperatorPins(drones.lazy.map(\.detection)),
             spokenFilter: filter, spokenScope: historyScope,
             spokenLocationDenied: ble.locationDenied && !ble.demoMode,
-            filteredLocated: filteredLocated,
+            filteredLocated: filteredLocated, located: located,
             activeCount: sampleData ? allCount : activeWindowAtBuild.count,
             recentCount: recentCount, allCount: allCount, withoutLocation: withoutLocation,
             activeStamps: activeStamps, activeWindowAtBuild: activeWindowAtBuild,
@@ -1770,9 +1783,37 @@ struct MapTabView: View {
     /// 26.5 sim, top inset 64 and bottom 83; iPad Pro 13-inch (M5) 26.5 sim, top inset 64 and
     /// bottom 20 once `DossierPresentation` lets the regular-width inspector container reach under
     /// the row). MapKit paints under the bars from there; nothing here ignores a safe area.
+    ///
+    /// iPhone Duo's inner display (design 1d): the located pane takes the leading half and this
+    /// region the trailing half, meeting at the fold, and the scope header moves into the pane.
+    /// The pane is a conditional FIRST child of the stack, so the map keeps its identity (and
+    /// MapKit its view) as the fold comes and goes.
     private var mapLayout: some View {
         let snap = snapshot
-        return ZStack {
+        return HStack(spacing: 0) {
+            if let foldX = fold.x {
+                DeferredView { locatedPane(snap) }
+                    .frame(width: foldX)
+            }
+            // Deferred for the Debug main-thread stack: inline under this chain it took the Map
+            // launch from 21% to 23% of 1 MiB (iPhone 17 Pro, iOS 27.0 simulator, 2026-11-03;
+            // see DeferredView in Components.swift).
+            DeferredView { mapRegion(snap) }
+        }
+        .readFold(into: $fold)
+        .background(VerticalBarProbe(present: $hasVerticalBar))
+        .background(ACABTheme.bg.ignoresSafeArea())
+        // The header row holds the title alone: layers and locate float on the map (the floating
+        // stack), so TabHeader draws no trailing items. Under iPhone Duo's vertical bar they
+        // join the bar instead (mapBarButtons), with the located pane's close button. The inline
+        // bar gives the map back the large title's height. At accessibility sizes the system bar
+        // stays inline: a large title alone costs the map about 100pt there.
+        .tabHeader("Map", accessibilityTitleMode: .inline,
+                   showsTrailing: hasVerticalBar || (fold.x != nil && selected != nil)) { mapBarButtons }
+    }
+
+    private func mapRegion(_ snap: MapSnapshot) -> some View {
+        ZStack {
             MapRenderGate(revision: mapRenderRevision) { map(snap) }
                 .equatable()
                 // The constant inset (see mapFloatingControlsInset for why it is never state).
@@ -1798,7 +1839,8 @@ struct MapTabView: View {
                 // about 200pt). Wanted: the owner asked for the map between the pills. Deferred
                 // like the overlays (Debug stack).
                 .safeAreaInset(edge: .top, spacing: 0) {
-                    DeferredView { scopeHeader(snap) }
+                    // Not over the map while the located pane carries it (mapLayout).
+                    DeferredView { if fold.x == nil { scopeHeader(snap) } }
                         // Fires only on a change: the header's height moves with the text size
                         // and with nothing else (the chips scroll sideways; a count changes no
                         // height), so this is not a per-tick write.
@@ -1821,19 +1863,86 @@ struct MapTabView: View {
         // phone main thread; see DeferredView in Components.swift).
         .overlay(alignment: .bottom) { DeferredView { mapBottomNotices } }
         .overlay(alignment: .bottomLeading) { DeferredView { mapLegendOverlay(snap) } }
-        .overlay(alignment: .bottomTrailing) { DeferredView { mapFloatingStack } }
+        .overlay(alignment: .bottomTrailing) { DeferredView { if !hasVerticalBar { mapFloatingStack } } }
         // Measured on the view that carries the overlays: the whole region between the navigation
         // bar and the tab bar (the floating header included), whose size does not depend on the
         // card, so the card cap that reads it cannot feed back into its own input. Fires only on
         // a change.
         .onGeometryChange(for: CGFloat.self, of: { (proxy: GeometryProxy) in proxy.size.height },
                           action: { (height: CGFloat) in mapRegionHeight = height })
-        .background(ACABTheme.bg.ignoresSafeArea())
-        // The header row holds the title alone: layers and locate float on the map (the floating
-        // stack), so TabHeader draws no trailing items. The inline bar gives the map back the
-        // large title's height. At accessibility sizes the system bar stays inline: a large title
-        // alone costs the map about 100pt there.
-        .tabHeader("Map", accessibilityTitleMode: .inline) { EmptyView() }
+    }
+
+    /// iPhone Duo's inner display (design 1d): the located sightings beside the map. The scope
+    /// segments and the chips move here from the map's top edge, then the rows the map can pin
+    /// under that lens, in store order (`ble.detections`, newest first), under the legend's
+    /// honesty headline. The pane and the map share one selection, `selected`: a row or a pin
+    /// opens its dossier IN this pane, one level deeper than the outer display's sheet, with the
+    /// map still beside it centred on the row's pin and that pin ringed (MapPin.selected). The
+    /// bar's close button returns to the rows. The same `selected` drives the outer display's
+    /// sheet, so the open dossier is one piece of state on both displays.
+    @ViewBuilder
+    private func locatedPane(_ snap: MapSnapshot) -> some View {
+        if let d = selected {
+            // Embedded, as in the Log's two-pane: no title of its own, so "Map" stays the root's.
+            DetectionDetailView(detection: d, embedded: true)
+                .id(d.id)
+        } else {
+            VStack(spacing: 0) {
+                scopeHeader(snap)
+                List {
+                    Section {
+                        ForEach(snap.located, id: \.id) { d in
+                            Button { selectFromPane(d) } label: {
+                                DetectionRow(detection: d, timeBasis: ble.timeBasis(for: d.id))
+                            }
+                            .buttonStyle(.plain)
+                            .accessibilityHint("Opens detection details")
+                        }
+                        .listRowBackground(ACABTheme.bg2)
+                    } header: {
+                        Kicker(mapHonestyHeadline(onMap: snap.filteredLocated,
+                                                  withoutLocation: snap.withoutLocation))
+                    }
+                }
+                .listStyle(.insetGrouped)
+                .scrollContentBackground(.hidden)
+            }
+            .background(ACABTheme.bg)
+        }
+    }
+
+    /// A located-pane row: its dossier opens in the pane and the map centres on its pin at the
+    /// current zoom. The camera move lands through `onMapCameraChange`, which refreshes the
+    /// snapshot; the ring follows `selected` (mapPresented).
+    private func selectFromPane(_ d: Detection) {
+        selected = d
+        guard let coord = mapCoord(for: d) else { return }
+        withAnimation(reduceMotion ? nil : .easeInOut(duration: 0.35)) {
+            camera = .region(MKCoordinateRegion(center: coord, span: region.span))
+        }
+    }
+
+    /// iPhone Duo: the floating buttons as toolbar image items, which the system stacks in its
+    /// vertical bar (design 1c), with the located pane's close button first while a dossier is
+    /// open there (the HIG puts Close first). The same actions, names and values as the floating
+    /// buttons; the legend's download state is spoken, not badged.
+    @ViewBuilder
+    private var mapBarButtons: some View {
+        if fold.x != nil && selected != nil {
+            Button { selected = nil } label: { Image(systemName: "xmark") }
+                .accessibilityLabel("close details")
+        }
+        if hasVerticalBar {
+            legendSpoken(Button { setLegendExpanded(!legendExpanded) } label: {
+                Image(systemName: "info.circle")
+            })
+            .accessibilityFocused($legendButtonFocused)
+            mapOptionsSpoken(Button { showMapOptions = true } label: {
+                Image(systemName: "square.2.layers.3d")
+            })
+            Button(action: recenter) { Image(systemName: "location") }
+                .accessibilityLabel("Center on my location")
+        }
     }
 
     /// Stage 2, the presentations: the dossier (sheet or inspector), the cluster member sheet and
@@ -1843,11 +1952,16 @@ struct MapTabView: View {
         mapLayout
             // T5: regular width shows the tapped dossier in a trailing inspector (pin stays
             // visible); compact keeps today's full sheet. Exactly one is active per size class.
-            .modifier(DossierPresentation(selected: $selected, regular: hSize == .regular))
+            // iPhone Duo's located pane shows the dossier itself, so neither opens there.
+            .modifier(DossierPresentation(selected: $selected, regular: hSize == .regular,
+                                          inPane: fold.x != nil))
             // P2-4: the compact sheet opens at the medium detent; pan the tapped pin into the
             // strip it leaves uncovered (a pin near the map's bottom edge would otherwise sit
             // under the sheet). The inspector on regular width never covers the map.
             .onChange(of: selected?.id) { (_: String?, _: String?) in
+                // The located pane's ring follows the selection (map(_:) reads it); the render
+                // gate redraws the pins on a revision bump only.
+                if fold.x != nil { bumpMapRenderRevision() }
                 guard hSize != .regular, let d = selected, let coord = mapCoord(for: d) else { return }
                 keepPinVisibleUnderSheet(coord)
             }
@@ -1958,6 +2072,12 @@ struct MapTabView: View {
                 fitToDetections()
             }
             .onChange(of: showBreadcrumbs) { (_: Bool, _: Bool) in installFreshSnapshot() }
+            // The located pane comes or goes: refill (or drop) MapSnapshot.located, and redraw
+            // the pins so the selection ring follows.
+            .onChange(of: fold.x != nil) { (_: Bool, _: Bool) in
+                installFreshSnapshot()
+                bumpMapRenderRevision()
+            }
     }
 
     /// Stage 5, the layer hooks: captions and the known-ALPR reference layer.
@@ -2117,7 +2237,9 @@ struct MapTabView: View {
     }
 
     private func map(_ snap: MapSnapshot) -> some View {
-        Map(position: $camera) {
+        // The located pane's selection, ringed on its pin (iPhone Duo only; nil elsewhere).
+        let ringID = fold.x != nil ? selected?.id : nil
+        return Map(position: $camera) {
             UserAnnotation()                       // the phone's live position
             // Known ALPR cameras (default-on reference layer), drawn UNDER the live pins so a
             // live hit always sits on top. Quiet hollow rings, not the animated detection pins.
@@ -2197,7 +2319,8 @@ struct MapTabView: View {
                                animated: snap.pinsAnimated && p.age == .fresh,
                                badge: p.count,
                                dimmed: p.age == .stale,
-                               simplified: snap.simplifiedArtwork)
+                               simplified: snap.simplifiedArtwork,
+                               selected: ringID.map { id in p.group.contains { $0.id == id } } ?? false)
                     }
                     .buttonStyle(.plain)
                     .frame(minWidth: 44, minHeight: 44)
@@ -2217,7 +2340,8 @@ struct MapTabView: View {
                             MapPin(type: onlyType,
                                    animated: snap.pinsAnimated && c.age == .fresh,
                                    dimmed: c.age == .stale,
-                                   simplified: snap.simplifiedArtwork)
+                                   simplified: snap.simplifiedArtwork,
+                                   selected: ringID != nil && onlyID == ringID)
                         }
                             .buttonStyle(.plain)
                             .frame(minWidth: 44, minHeight: 44)
@@ -2664,12 +2788,7 @@ struct MapTabView: View {
     /// which is also why the fallback above can stay a fixed region instead of .automatic (see
     /// the loop note on `camera`).
     private var recenterButton: some View {
-        Button {
-            withAnimation(reduceMotion ? nil : .easeInOut(duration: 0.35)) {
-                camera = .userLocation(fallback: .region(MapTabView.fallbackRegion))
-            }
-            bumpMapRenderRevision()
-        } label: {
+        Button(action: recenter) {
             mapControlFace("location")
         }
         .buttonStyle(.plain)
@@ -2677,20 +2796,34 @@ struct MapTabView: View {
         .accessibilityShowsLargeContentViewer()
     }
 
+    private func recenter() {
+        withAnimation(reduceMotion ? nil : .easeInOut(duration: 0.35)) {
+            camera = .userLocation(fallback: .region(MapTabView.fallbackRegion))
+        }
+        bumpMapRenderRevision()
+    }
+
     /// The floating stack's layers button: opens one readable options sheet for display density
     /// and the reference layers. Its value says whether the known-ALPR layer is on, the same
     /// words as Android's stateDescription on its layers button.
     private var settingsButton: some View {
-        Button {
+        mapOptionsSpoken(Button {
             showMapOptions = true
         } label: {
             mapControlFace("square.2.layers.3d")
         }
-        .buttonStyle(.plain)
-        .accessibilityLabel("Map options")
-        .accessibilityValue(alpr.enabled ? "known ALPR layer on" : "known ALPR layer off")
-        .accessibilityHint("Opens display and reference layer options")
+        .buttonStyle(.plain))
         .accessibilityShowsLargeContentViewer()
+    }
+
+    /// The Map options button's spoken name, value and hint: one copy for the floating button
+    /// and the vertical-bar item (mapBarButtons). The drift check's "ALPR layer words" rule pins
+    /// these words here once.
+    private func mapOptionsSpoken(_ button: some View) -> some View {
+        button
+            .accessibilityLabel("Map options")
+            .accessibilityValue(alpr.enabled ? "known ALPR layer on" : "known ALPR layer off")
+            .accessibilityHint("Opens display and reference layer options")
     }
 
     // MARK: Map options sheet
@@ -3033,7 +3166,7 @@ struct MapTabView: View {
                 DeferredView { legendCard(snap) }
                     .transition(legendCardTransition)
             }
-            DeferredView { legendButton }
+            if !hasVerticalBar { DeferredView { legendButton } }
         }
     }
 
@@ -3085,19 +3218,25 @@ struct MapTabView: View {
     /// driver targets "Map legend". TWIN: android MapScreen.kt's info button
     /// (`mapLegendStateDescription`).
     private var legendButton: some View {
-        Button { setLegendExpanded(!legendExpanded) } label: {
+        legendSpoken(Button { setLegendExpanded(!legendExpanded) } label: {
             mapControlFace("info")
                 .overlay(alignment: .topTrailing) {
                     if alpr.downloading { legendDownloadBadge }
                 }
         }
-        .buttonStyle(.plain)
-        .accessibilityLabel("Map legend")
-        .accessibilityValue(mapLegendAccessibilityValue(open: legendExpanded, downloading: alpr.downloading))
-        .accessibilityHint(legendExpanded ? "Hides the map legend" : "Shows the map legend")
+        .buttonStyle(.plain))
         .accessibilityShowsLargeContentViewer()
         .accessibilityFocused($legendButtonFocused)
         .padding(.leading, ACABTheme.pad).padding(.bottom, mapControlMargin)
+    }
+
+    /// The legend button's spoken name, value and hint: one copy for the floating button and the
+    /// vertical-bar item (mapBarButtons).
+    private func legendSpoken(_ button: some View) -> some View {
+        button
+            .accessibilityLabel("Map legend")
+            .accessibilityValue(mapLegendAccessibilityValue(open: legendExpanded, downloading: alpr.downloading))
+            .accessibilityHint(legendExpanded ? "Hides the map legend" : "Shows the map legend")
     }
 
     /// The download badge: a mini spinner on a 16pt disc of the opaque map-information surface.
@@ -3683,6 +3822,10 @@ struct MapTabView: View {
 private struct DossierPresentation: ViewModifier {
     @Binding var selected: Detection?
     let regular: Bool
+    /// iPhone Duo's located pane shows the dossier (MapTabView.locatedPane), so the inspector
+    /// stays shut and the container keeps its safe area. Same branch as the inspector, so the
+    /// map keeps its identity as the fold comes and goes.
+    var inPane = false
     @EnvironmentObject private var ble: BLEManager
 
     private func dossier(_ d: Detection) -> some View {
@@ -3701,17 +3844,19 @@ private struct DossierPresentation: ViewModifier {
     func body(content: Content) -> some View {
         if regular {
             content.inspector(isPresented: Binding(
-                get: { selected != nil },
-                set: { if !$0 { selected = nil } }
+                get: { selected != nil && !inPane },
+                set: { if !$0 && !inPane { selected = nil } }
             )) {
-                if let d = selected {
+                // Not in pane mode: SwiftUI builds a shut inspector's content too, and its Done
+                // item then joined the tab's bar beside the pane's close button.
+                if let d = selected, !inPane {
                     dossier(d)
                         .inspectorColumnWidth(min: 320, ideal: 380, max: 480)
                 }
             }
             // R23: the container under the bar row, not below it, and the floating tab bar kept
             // while the dossier is open (see the type's doc comment for both).
-            .ignoresSafeArea(.container, edges: .top)
+            .ignoresSafeArea(.container, edges: inPane ? [] : .top)
             .toolbarVisibility(.visible, for: .tabBar)
         } else {
             // Half height first, so the tapped pin stays visible under the dossier (HIG Maps:
@@ -3934,6 +4079,7 @@ enum MapPinArtwork {
     static let shadowRadius: CGFloat = 4    // neutral drop shadow (a legibility edge, not a glow)
     static let shadowOffsetY: CGFloat = 2
     static let pingScale: CGFloat = 1.9     // the FRESH ping ring's largest scale
+    static let selectedRingGap: CGFloat = 7 // iPhone Duo's located pane: the selection ring sits this far outside the disc
 }
 
 /// Animated category pin: a flat category disc with a white ring, a dark glyph, a neutral drop
@@ -3954,6 +4100,9 @@ private struct MapPin: View {
     /// Dense/far projections keep the category glyph and hit target but drop the per-marker drop
     /// shadow; hundreds of offscreen-rendered shadows are a disproportionate compositing cost.
     var simplified = false
+    /// iPhone Duo's located pane: this pin's row is open in the pane, so a 2pt tint ring sits
+    /// `selectedRingGap` outside the disc.
+    var selected = false
     @State private var ping = false
     // Reduce Motion drops the looping ping ring entirely, same as the dense-map cap does.
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
@@ -3986,7 +4135,13 @@ private struct MapPin: View {
             Image(systemName: type.symbol).font(.system(size: MapPinArtwork.glyphSize, weight: .bold))
                 .foregroundStyle(ACABTheme.onAccent)
             if let badge, badge > 1 { countBadge(badge) }
+            if selected {
+                Circle().stroke(ACABTheme.tint, lineWidth: 2)
+                    .frame(width: MapPinArtwork.discDiameter + 2 * MapPinArtwork.selectedRingGap,
+                           height: MapPinArtwork.discDiameter + 2 * MapPinArtwork.selectedRingGap)
+            }
         }
+        .accessibilityAddTraits(selected ? .isSelected : [])
         .onAppear(perform: updateAnimation)
         .onChange(of: reduceMotion) { (_: Bool, _: Bool) in updateAnimation() }
         .onChange(of: animated) { (_: Bool, _: Bool) in updateAnimation() }

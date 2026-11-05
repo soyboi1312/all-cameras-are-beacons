@@ -157,8 +157,8 @@ class BoardKindCopyTest {
     }
 
     @Test fun heroTitlePerKind() {
-        assertEquals("All Cameras Are Beacons", boardHeroTitle(null))
-        assertEquals("All Cameras Are Beacons", boardHeroTitle(BoardKind.BEACON))
+        assertEquals("beacons", boardHeroTitle(null))
+        assertEquals("beacons", boardHeroTitle(BoardKind.BEACON))
         assertEquals("OUI-Spy", boardHeroTitle(spy))
         assertEquals("Mesh-Detect", boardHeroTitle(mesh))
     }

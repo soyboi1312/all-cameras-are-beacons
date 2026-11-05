@@ -841,8 +841,8 @@ private fun ConnectHero() {
             density
         }
         CompositionLocalProvider(LocalDensity provides taglineDensity) {
-            Box(Modifier.clearAndSetSemantics { contentDescription = "all cameras are beacons" }) {
-                Kicker("ALL CAMERAS ARE BEACONS",
+            Box(Modifier.clearAndSetSemantics { contentDescription = "surveillance scanner" }) {
+                Kicker("SURVEILLANCE SCANNER",
                     style = MaterialTheme.typography.bodySmall.copy(textAlign = TextAlign.Center))
             }
         }

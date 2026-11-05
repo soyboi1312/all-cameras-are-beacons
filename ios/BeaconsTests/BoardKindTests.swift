@@ -70,12 +70,12 @@ final class BoardKindTests: XCTestCase {
         XCTAssertEqual(BoardKind.allCases.map(\.plural), ["beacons", "OUI-Spy", "Mesh-Detect"])
         XCTAssertEqual(BoardKind.allCases.map(\.upperNoun), ["BEACON", "OUI-SPY", "MESH-DETECT"])
         XCTAssertEqual(BoardKind.allCases.map(\.heroTitle),
-                       ["All Cameras Are Beacons", "OUI-Spy", "Mesh-Detect"])
+                       ["beacons", "OUI-Spy", "Mesh-Detect"])
     }
 
     func testHeroTitleReadsUnknownAsTheBeacon() {
-        XCTAssertEqual(boardHeroTitle(nil), "All Cameras Are Beacons")
-        XCTAssertEqual(boardHeroTitle(.beacon), "All Cameras Are Beacons")
+        XCTAssertEqual(boardHeroTitle(nil), "beacons")
+        XCTAssertEqual(boardHeroTitle(.beacon), "beacons")
         XCTAssertEqual(boardHeroTitle(.ouiSpy), "OUI-Spy")
         XCTAssertEqual(boardHeroTitle(.meshDetect), "Mesh-Detect")
     }

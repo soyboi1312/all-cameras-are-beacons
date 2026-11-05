@@ -37,9 +37,10 @@ android {
         // rejects a re-upload at a used code. 28 shipped as 2.0.8, 29 as 2.0.9 (tag android-v2.0.9),
         // 30 as 2.1.0 (tag android-v2.1.0), 31 as the first android-v2.1.1 APK, 32 on the unreleased
         // 2.1.1 fallback commit 83495ab (held, never uploaded), 33 as 2.2.0 (tag android-v2.2.0), 34 as
-        // 2.2.1 (tag android-v2.2.1), 35 as 2.2.2 (tag android-v2.2.2), so 2.2.3 takes 36.
-        versionCode = 36
-        versionName = "2.2.3"
+        // 2.2.1 (tag android-v2.2.1), 35 as 2.2.2 (tag android-v2.2.2), 36 as 2.2.3 (tag android-v2.2.3),
+        // so 2.2.4 takes 37.
+        versionCode = 37
+        versionName = "2.2.4"
     }
 
     signingConfigs {

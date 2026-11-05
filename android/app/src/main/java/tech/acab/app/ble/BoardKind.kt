@@ -28,7 +28,7 @@ enum class BoardKind(
     /** The Beacon tab hero's title. */
     val heroTitle: String,
 ) {
-    BEACON("beacon", "beacon", "a beacon", "beacons", "BEACON", "All Cameras Are Beacons"),
+    BEACON("beacon", "beacon", "a beacon", "beacons", "BEACON", "beacons"),
     OUI_SPY("ouiSpy", "OUI-Spy", "an OUI-Spy", "OUI-Spy", "OUI-SPY", "OUI-Spy"),
     MESH_DETECT("meshDetect", "Mesh-Detect", "a Mesh-Detect", "Mesh-Detect", "MESH-DETECT", "Mesh-Detect");
 

@@ -237,9 +237,9 @@ struct ConnectView: View {
     private var hero: some View {
         VStack(spacing: 6) {
             ACABWordmark()
-            Kicker("ALL CAMERAS ARE BEACONS")
+            Kicker("SURVEILLANCE SCANNER")
                 .multilineTextAlignment(.center)
-                .accessibilityLabel("all cameras are beacons")
+                .accessibilityLabel("surveillance scanner")
                 // Brand ornament, not instructions, so its type stops at accessibility2, the cap
                 // RootView puts on its pinned banners: at AX5 it grew to two large lines and
                 // pushed the connect list below the fold. It still scales up to that cap; the

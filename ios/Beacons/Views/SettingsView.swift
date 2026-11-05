@@ -580,6 +580,8 @@ struct DeviceView: View {
     // Regular width lays the rows out in two columns (BOARD, THIS <IDIOM>); compact is one
     // segmented list.
     @Environment(\.horizontalSizeClass) private var hSize
+    /// Where iPhone Duo's fold crosses the regular-width page (FoldLine); nil everywhere else.
+    @State private var fold = FoldLine()
     // Accessibility text sizes stack the hero and pad the bottom of the ScrollView pages; the
     // default layout is untouched.
     @Environment(\.dynamicTypeSize) private var dynamicTypeSize
@@ -884,6 +886,10 @@ struct DeviceView: View {
     /// the segmented control; regular = the restore panel, the cross-cutting banners, the hero,
     /// then the two columns. TWIN: Android DeviceScreen's twoCol branch (and the
     /// AlertRestorePanel call above it) in DeviceScreen.kt.
+    ///
+    /// iOS only, iPhone Duo's inner display (design 1h): the columns meet at the fold, a gutter
+    /// either side of it, and the hero leads the BOARD column instead of spanning the crease.
+    /// Every other regular-width window keeps the shared order above.
     private var regularLayout: AnyView {
         AnyView(ScrollView {
             VStack(alignment: .leading, spacing: 16) {
@@ -897,9 +903,13 @@ struct DeviceView: View {
                     AlertRestorePanel()
                 }
                 crossCuttingBanners
-                rowView(.hero)
-                HStack(alignment: .top, spacing: 14) {
-                    regularColumn("BOARD", beaconRowGroups(rows(for: .board).filter { $0 != .hero }))
+                if fold.x == nil { rowView(.hero) }
+                // The split is in the padded content's space: the fold's x less the gutter.
+                FoldColumns(split: fold.x.map { $0 - ACABTheme.pad },
+                            gap: fold.x == nil ? 14 : 2 * ACABTheme.pad) {
+                    regularColumn("BOARD", beaconRowGroups(rows(for: .board).filter {
+                        fold.x != nil || $0 != .hero
+                    }))
                     regularColumn("THIS \(thisDeviceName.uppercased())", beaconRowGroups(rows(for: .phone)))
                 }
                 Spacer(minLength: 8)
@@ -907,6 +917,7 @@ struct DeviceView: View {
             .frame(maxWidth: 1000).frame(maxWidth: .infinity)
             .padding(.horizontal, ACABTheme.pad).padding(.top, 8)
         }
+        .readFold(into: $fold)
         // Extra bottom margin only at accessibility sizes, so grown content never ends under the
         // tab bar; zero at default sizes (layout untouched).
         .contentMargins(.bottom, dynamicTypeSize.isAccessibilitySize ? 24 : 0, for: .scrollContent)
@@ -1730,7 +1741,7 @@ struct DeviceView: View {
         VStack(alignment: .leading, spacing: 4) {
             // Named by the board's kind (BLEManager.connectedKind: its fw label, else its stored
             // kind, else its advert hint), no longer by a substring of its advertised name:
-            // "All Cameras Are Beacons" for a beacon or an unknown board, "OUI-Spy" and
+            // "beacons" for a beacon or an unknown board, "OUI-Spy" and
             // "Mesh-Detect" for the Colonel Panic builds. TWIN: Android DeviceScreen.kt boardHeroTitle.
             Text(boardHeroTitle(ble.connectedKind))
                 .font(ACABTheme.font(.title3, weight: .semibold)).foregroundStyle(ACABTheme.text)
@@ -1936,7 +1947,7 @@ struct DeviceView: View {
     /// baked-in default.
     private var flasherURL: URL {
         let fromManifest = (fwEntry?.flasher).flatMap(URL.init(string:)).flatMap { $0.scheme == "https" ? $0 : nil }
-        return fromManifest ?? URL(string: "https://soyboi1312.github.io/all-cameras-are-beacons/")!
+        return fromManifest ?? URL(string: "https://soyboitech.github.io/beacons/")!
     }
 
     /// TYPE-ERASED ON PURPOSE - do not "clean this up" back to `some View`.
@@ -3200,8 +3211,8 @@ struct DeviceView: View {
             linkRow("How it detects", "what it can and can't see",
                     URL(string: "https://soyboi.tech/how-it-detects.html")!)
             Divider().overlay(ACABTheme.line)
-            linkRow("Source on GitHub", "github.com/soyboi1312/all-cameras-are-beacons",
-                    URL(string: "https://github.com/soyboi1312/all-cameras-are-beacons")!)
+            linkRow("Source on GitHub", "github.com/soyboitech/beacons",
+                    URL(string: "https://github.com/soyboitech/beacons")!)
             // Any board that is not known to be a beacon, an unknown one included, as the old
             // "fw label is not beacon board" rule read. TWIN: Android DeviceScreen.kt's About card.
             if ble.connectedKind != .beacon {
@@ -3214,8 +3225,8 @@ struct DeviceView: View {
             // contribution flow shipped. Link the repository's canonical policy directly: the
             // old soyboi.tech copy drifted and falsely said the GPS fix never left the phone.
             linkRow("Privacy", "nothing is uploaded automatically",
-                    URL(string: "https://soyboi1312.github.io/all-cameras-are-beacons/privacy.html")!)
-            Link(destination: URL(string: "https://github.com/soyboi1312")!) {
+                    URL(string: "https://soyboitech.github.io/beacons/privacy.html")!)
+            Link(destination: URL(string: "https://github.com/soyboitech")!) {
                 Text("Made by soyboi")
                     .font(ACABTheme.font(.footnote)).foregroundStyle(ACABTheme.dim)
             }

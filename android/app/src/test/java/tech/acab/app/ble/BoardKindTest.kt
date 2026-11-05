@@ -60,7 +60,7 @@ class BoardKindTest {
         assertEquals(listOf("a beacon", "an OUI-Spy", "a Mesh-Detect"), BoardKind.entries.map { it.aNoun })
         assertEquals(listOf("beacons", "OUI-Spy", "Mesh-Detect"), BoardKind.entries.map { it.plural })
         assertEquals(listOf("BEACON", "OUI-SPY", "MESH-DETECT"), BoardKind.entries.map { it.nounUpper })
-        assertEquals(listOf("All Cameras Are Beacons", "OUI-Spy", "Mesh-Detect"),
+        assertEquals(listOf("beacons", "OUI-Spy", "Mesh-Detect"),
             BoardKind.entries.map { it.heroTitle })
     }
 

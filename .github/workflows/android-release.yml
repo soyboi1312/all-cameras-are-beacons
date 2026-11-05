@@ -202,7 +202,7 @@ jobs:
           else
             gh release create "$GITHUB_REF_NAME" \
               --repo "$GITHUB_REPOSITORY" \
-              --title "beacons $GITHUB_REF_NAME" \
+              --title "beacons android v${GITHUB_REF_NAME#android-v}" \
               --notes "Signed Android build for $GITHUB_REF_NAME. The .apk is for sideloading; the .aab is for Play Store upload." \
               --verify-tag \
               "${ASSETS[@]}"

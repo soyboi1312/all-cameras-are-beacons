@@ -106,6 +106,10 @@ struct DashboardView: View {
         radio.tone == .warning ? ACABTheme.warn : ACABTheme.dim
     }
 
+    /// The fold as it crosses the scroll view (iPhone Duo's inner display), read on the
+    /// ScrollView itself so scrolling never moves it. Nil everywhere else.
+    @State private var fold = FoldLine()
+
     var body: some View {
         let snapshot = dashboardSnapshot(ble.detections, now: tick, isDemoMode: ble.demoMode,
             lastHeard: ble.lastSeenDate(for:), isWatched: { ble.isWatched($0) })
@@ -115,75 +119,16 @@ struct DashboardView: View {
         let connected = ble.connectionState == .connected && ble.sessionReady && !ble.isReconnecting
         NavigationStack {
             ScrollView {
-                VStack(alignment: .leading, spacing: 16) {
-                    statusHeader(snapshot, radioPresentation: radio, connected: connected)
-
-                    if bleFault { coprocFaultNotice } else if bleUpdating { coprocUpdatingNotice }
-                    if ble.syncingOfflineLog { syncingNotice }
-
-                    VStack(spacing: 6) {
-                        // A square three quarters of the column wide, capped at 315
-                        // (RadarSideLayout, which says why and names the Android twin), centred.
-                        // This used to be a hard `.frame(height: 250)`, and because RadarScope
-                        // sizes on `min(width, height)` that height ALWAYS won: the scope was
-                        // 250pt on every phone AND every iPad and the shared cap was unreachable.
-                        // Then it filled the whole column up to 420; the owner found that too big
-                        // (2026-09-25), so the side is now 0.75 of that.
-                        //
-                        // The layout proposes the square's side to RadarScope and reports that
-                        // side as its height, so it works in this ScrollView's unbounded height.
-                        // Do not add a fixed height back.
-                        RadarSideLayout {
-                            RadarScope(count: snapshot.total, dots: dots(from: snapshot),
-                                       cap: DashboardSnapshot.dotLimit, sweeping: radio.isScanning)
-                        }
-                        .padding(.top, 4)
-                        noDirectionCaption
-                        // The motto, right under the caption, so it is on the first screen as
-                        // on the pre-redesign Status (owner, 2026-09-25). Centred like the
-                        // caption. TWIN: android StatusScreen.kt PunkLine, the same slot.
-                        PunkLine()
-                            .frame(maxWidth: .infinity)
-                            .padding(.top, 4)
-                    }
-
-                    // SECTION ORDER IS SHARED with android StatusScreen.kt (the content Column
-                    // in StatusScreen), per C9: radar, the no-direction caption, the motto, the
-                    // category strip, the strongest cell, then the legend cell. The first three
-                    // are the VStack above (RadarScope, noDirectionCaption, then PunkLine); below
-                    // this line come categoryTiles, the strongest slot (nearestCard, or firstZeroCell when a
-                    // connected real session has nothing in the window: the quiet sentence while
-                    // the board scans, statusFirstZeroLine, or why it is not scanning while the
-                    // sweep is parked, statusNotScanningLine),
-                    // then radarLegend (count cards, the unclassified line and the watched tap
-                    // as one cell, the two caption lines under it; Android draws those two as
-                    // the cell's last rows). No "Look around" row. The scope, its caption and
-                    // the motto still spend about half of a 390pt phone's first screen, so the
-                    // counts, the verdict and the taps they lead to (Log, dossier) come before
-                    // the legend, which can scroll. Reorder one side only and the other side's
-                    // comment becomes a lie.
-                    categoryTiles(snapshot)
-                    if let strongest = snapshot.strongest {
-                        nearestCard(strongest)
-                    } else if let line = statusFirstZeroLine(connected: connected,
-                                                             isDemoMode: ble.demoMode,
-                                                             scanning: radio.isScanning,
-                                                             total: snapshot.total)
-                                ?? statusNotScanningLine(connected: connected,
-                                                         isDemoMode: ble.demoMode,
-                                                         scanning: radio.isScanning,
-                                                         total: snapshot.total,
-                                                         detail: radio.detail) {
-                        firstZeroCell(line)
-                    }
-                    radarLegend(snapshot)
-                    Spacer(minLength: 8)
-                }
-                .padding(.horizontal, ACABTheme.pad)
-                .padding(.top, 8)
-                .frame(maxWidth: 640)
-                .frame(maxWidth: .infinity)
+                // Deferred: inline under this chain the fold branches took the Debug main-thread
+                // stack from 23% to 28% of 1 MiB at launch (iPhone 17 Pro, iOS 27.0 simulator,
+                // 2026-11-03; see DeferredView in Components.swift).
+                DeferredView { statusLayout(snapshot, radio: radio, connected: connected) }
+                    .padding(.horizontal, ACABTheme.pad)
+                    .padding(.top, 8)
+                    .frame(maxWidth: fold.x == nil ? 640 : .infinity)
+                    .frame(maxWidth: .infinity)
             }
+            .readFold(into: $fold)
             // Extra bottom margin ONLY at accessibility sizes, where the grown content can
             // otherwise end flush against (or under) the tab bar. Zero at default sizes so
             // the standard layout is untouched.
@@ -196,6 +141,115 @@ struct DashboardView: View {
             .onDisappear { onScreen = false }
         }
         .onReceive(staleTick) { if onScreen && !ble.detections.isEmpty { tick = $0 } }
+    }
+
+    /// The Status page in one of its three arrangements: today's column, iPhone Duo's two
+    /// columns at the fold, or the tabletop split. Same sections, same order, in each.
+    @ViewBuilder
+    private func statusLayout(_ snapshot: DashboardSnapshot, radio: BeaconRadioPresentation,
+                              connected: Bool) -> some View {
+        if let foldX = fold.x {
+            // iPhone Duo's inner display (design 1b): the same sections reflowed into
+            // two columns that meet at the fold, the instrument (radar, caption,
+            // motto) centred in the leading half and the readout in the trailing
+            // half. Same order, nothing added. The split is in the padded content's
+            // space, so it is the fold's x less the leading gutter.
+            FoldColumns(split: foldX - ACABTheme.pad, gap: 2 * ACABTheme.pad) {
+                DeferredView { radarBlock(snapshot, radio: radio) }
+                    .frame(maxHeight: .infinity)
+                VStack(alignment: .leading, spacing: 16) {
+                    statusRows(snapshot, radio: radio, connected: connected)
+                    readout(snapshot, radio: radio, connected: connected)
+                }
+            }
+        } else {
+            VStack(alignment: .leading, spacing: 16) {
+                if let foldY = fold.tabletopY {
+                    // Tabletop (design 1i): the parts you glance at fill the top half,
+                    // the parts you tap start under the fold, nearest the hand. The
+                    // 16 is the top padding plus half the stack's spacing.
+                    radarBlock(snapshot, radio: radio)
+                        .frame(minHeight: max(0, foldY - 16))
+                    statusRows(snapshot, radio: radio, connected: connected)
+                } else {
+                    statusRows(snapshot, radio: radio, connected: connected)
+                    radarBlock(snapshot, radio: radio)
+                }
+                readout(snapshot, radio: radio, connected: connected)
+                Spacer(minLength: 8)
+            }
+        }
+    }
+
+    /// The header row and the notices under it.
+    @ViewBuilder
+    private func statusRows(_ snapshot: DashboardSnapshot, radio: BeaconRadioPresentation,
+                            connected: Bool) -> some View {
+        statusHeader(snapshot, radioPresentation: radio, connected: connected)
+        if bleFault { coprocFaultNotice } else if bleUpdating { coprocUpdatingNotice }
+        if ble.syncingOfflineLog { syncingNotice }
+    }
+
+    /// The instrument: the radar, the no-direction caption and the motto.
+    private func radarBlock(_ snapshot: DashboardSnapshot, radio: BeaconRadioPresentation) -> some View {
+        VStack(spacing: 6) {
+            // A square three quarters of the column wide, capped at 315
+            // (RadarSideLayout, which says why and names the Android twin), centred.
+            // This used to be a hard `.frame(height: 250)`, and because RadarScope
+            // sizes on `min(width, height)` that height ALWAYS won: the scope was
+            // 250pt on every phone AND every iPad and the shared cap was unreachable.
+            // Then it filled the whole column up to 420; the owner found that too big
+            // (2026-09-25), so the side is now 0.75 of that.
+            //
+            // The layout proposes the square's side to RadarScope and reports that
+            // side as its height, so it works in this ScrollView's unbounded height.
+            // Do not add a fixed height back.
+            RadarSideLayout {
+                RadarScope(count: snapshot.total, dots: dots(from: snapshot),
+                           cap: DashboardSnapshot.dotLimit, sweeping: radio.isScanning)
+            }
+            .padding(.top, 4)
+            noDirectionCaption
+            // The motto, right under the caption, so it is on the first screen as
+            // on the pre-redesign Status (owner, 2026-09-25). Centred like the
+            // caption. TWIN: android StatusScreen.kt PunkLine, the same slot.
+            PunkLine()
+                .frame(maxWidth: .infinity)
+                .padding(.top, 4)
+        }
+    }
+
+    /// SECTION ORDER IS SHARED with android StatusScreen.kt (the content Column in StatusScreen),
+    /// per C9: radar, the no-direction caption, the motto, the category strip, the strongest
+    /// cell, then the legend cell. The first three are radarBlock (RadarScope, noDirectionCaption,
+    /// then PunkLine); this draws the rest: categoryTiles, the strongest slot (nearestCard, or
+    /// firstZeroCell when a connected real session has nothing in the window: the quiet sentence
+    /// while the board scans, statusFirstZeroLine, or why it is not scanning while the sweep is
+    /// parked, statusNotScanningLine), then radarLegend (count cards, the unclassified line and
+    /// the watched tap as one cell, the two caption lines under it; Android draws those two as
+    /// the cell's last rows). No "Look around" row. The scope, its caption and the motto still
+    /// spend about half of a 390pt phone's first screen, so the counts, the verdict and the taps
+    /// they lead to (Log, dossier) come before the legend, which can scroll. Reorder one side only
+    /// and the other side's comment becomes a lie. iPhone Duo's two layouts (body) only move
+    /// where these sections sit, never their order.
+    @ViewBuilder
+    private func readout(_ snapshot: DashboardSnapshot, radio: BeaconRadioPresentation,
+                         connected: Bool) -> some View {
+        categoryTiles(snapshot)
+        if let strongest = snapshot.strongest {
+            nearestCard(strongest)
+        } else if let line = statusFirstZeroLine(connected: connected,
+                                                 isDemoMode: ble.demoMode,
+                                                 scanning: radio.isScanning,
+                                                 total: snapshot.total)
+                    ?? statusNotScanningLine(connected: connected,
+                                             isDemoMode: ble.demoMode,
+                                             scanning: radio.isScanning,
+                                             total: snapshot.total,
+                                             detail: radio.detail) {
+            firstZeroCell(line)
+        }
+        radarLegend(snapshot)
     }
 
     // MARK: Header

@@ -1000,6 +1000,130 @@ struct CategoryStripLayout: Layout {
     }
 }
 
+// MARK: - iPhone Duo (iOS 27.1)
+
+/// Where iPhone Duo's fold crosses a view, from the system's division region (iOS 27.1), read
+/// whether the fold is active or not so columns can sit symmetric around it while the phone lies
+/// flat. `x`: the fold runs top to bottom (the inner display held sideways). `tabletopY`: it runs
+/// across AND the phone is partly open (the tabletop pose, the only time a horizontal fold
+/// changes the layout). Both nil on every other device, on the outer display and in a window that
+/// does not span the fold (Split View): a fold counts only when it lies inside the view. Both
+/// are measured from the view's safe-area origin, where its content starts, so a ScrollView that
+/// runs under the bars reads the same numbers.
+struct FoldLine: Equatable {
+    var x: CGFloat?
+    var tabletopY: CGFloat?
+
+    init() {}
+
+    init(_ proxy: GeometryProxy) {
+        // The iPhone Duo symbols here, in VerticalBarProbe and in TabHeader.trailingGroup exist
+        // only in the iOS 27.1 SDK, and `#available` does not hide them from an older compiler,
+        // so the gating CI lane (Xcode 26.6) also needs this compile-time guard. 6.4 is Xcode 27's
+        // Swift. ponytail: the iOS 27.0 SDK lacks these symbols too, but no CI lane or Mac builds
+        // with Xcode 27.0 (CI runs 27.1); raise the guard if one ever does. Under Xcode 26.6 the
+        // fold reads nil and the bar probe false: the layouts every other phone gets.
+        #if compiler(>=6.4)
+        guard #available(iOS 27.1, *) else { return }
+        let inset = proxy.safeAreaInsets, size = proxy.size
+        for region in proxy.reservedRegions(kind: .division, options: .includeInactive) {
+            let f = region.frame
+            if f.height >= f.width {
+                if f.minX > 0 && f.maxX < size.width { x = f.midX - inset.leading }
+            } else if region.isActive && f.minY > 0 && f.maxY < size.height {
+                tabletopY = f.midY - inset.top
+            }
+        }
+        #endif
+    }
+}
+
+extension View {
+    /// Writes the fold as it crosses THIS view into `line`. Runs on layout changes only.
+    func readFold(into line: Binding<FoldLine>) -> some View {
+        onGeometryChange(for: FoldLine.self, of: { FoldLine($0) }) { line.wrappedValue = $0 }
+    }
+}
+
+/// Two columns that meet at `split` (the fold's x in this view, or the middle when nil) with
+/// `gap` between them, centred on the split, so no column runs across the crease. Each column is
+/// offered the taller one's height, so a `maxHeight: .infinity` column can centre its content.
+struct FoldColumns: Layout {
+    var split: CGFloat?
+    var gap: CGFloat
+
+    /// The two column widths for a row `total` wide. Pure, so a test can pin it.
+    static func widths(total: CGFloat, split: CGFloat?, gap: CGFloat) -> (leading: CGFloat, trailing: CGFloat) {
+        let s = min(max(split ?? total / 2, 0), total)
+        return (max(0, s - gap / 2), max(0, total - s - gap / 2))
+    }
+
+    func sizeThatFits(proposal: ProposedViewSize, subviews: Subviews, cache: inout ()) -> CGSize {
+        let total = proposal.width.flatMap { $0.isFinite ? $0 : nil }
+            ?? subviews.map { $0.sizeThatFits(.unspecified).width }.reduce(gap, +)
+        let w = Self.widths(total: total, split: split, gap: gap)
+        let heights = zip(subviews, [w.leading, w.trailing]).map {
+            $0.sizeThatFits(ProposedViewSize(width: $1, height: nil)).height
+        }
+        return CGSize(width: total, height: heights.max() ?? 0)
+    }
+
+    func placeSubviews(in bounds: CGRect, proposal: ProposedViewSize, subviews: Subviews, cache: inout ()) {
+        let w = Self.widths(total: bounds.width, split: split, gap: gap)
+        let origins = [bounds.minX, bounds.maxX - w.trailing]
+        for (i, subview) in subviews.prefix(2).enumerated() {
+            subview.place(at: CGPoint(x: origins[i], y: bounds.minY), anchor: .topLeading,
+                          proposal: ProposedViewSize(width: i == 0 ? w.leading : w.trailing,
+                                                     height: bounds.height))
+        }
+    }
+}
+
+/// Reports whether the system draws this view's bars as iPhone Duo's vertical bar (UIKit's
+/// `verticalBarEdge`, iOS 27.1). False on every other device, size class and pose. The Map uses
+/// it to move its floating buttons into the toolbar, where the system can stack them in the bar.
+struct VerticalBarProbe: UIViewRepresentable {
+    @Binding var present: Bool
+
+    func makeUIView(context: Context) -> ProbeView { ProbeView() }
+    func updateUIView(_ view: ProbeView, context: Context) {
+        let binding = $present
+        view.report = { if binding.wrappedValue != $0 { binding.wrappedValue = $0 } }
+    }
+
+    final class ProbeView: UIView {
+        var report: (Bool) -> Void = { _ in }
+
+        override init(frame: CGRect) {
+            super.init(frame: frame)
+            isUserInteractionEnabled = false
+            isAccessibilityElement = false
+            #if compiler(>=6.4)   // iOS 27.1 SDK only (see FoldLine.init)
+            if #available(iOS 27.1, *) {
+                registerForTraitChanges(UITraitCollection.systemTraitsAffectingVerticalBarEdge) {
+                    (view: ProbeView, _: UITraitCollection) in view.publish()
+                }
+            }
+            #endif
+        }
+        required init?(coder: NSCoder) { fatalError("init(coder:) is not used") }
+
+        override func didMoveToWindow() {
+            super.didMoveToWindow()
+            publish()
+        }
+
+        /// Async: a trait change can land inside a SwiftUI update, where a state write is refused.
+        private func publish() {
+            #if compiler(>=6.4)   // iOS 27.1 SDK only (see FoldLine.init)
+            guard #available(iOS 27.1, *), window != nil else { return }
+            let present = traitCollection.verticalBarEdge != .unspecified
+            DispatchQueue.main.async { [weak self] in self?.report(present) }
+            #endif
+        }
+    }
+}
+
 // MARK: - Tab header (M2)
 
 /// Does a tab root draw its title and buttons as ONE header row at this text size? Yes below the
@@ -1033,7 +1157,10 @@ func tabHeaderUsesSingleRow(_ size: DynamicTypeSize) -> Bool { !size.isAccessibi
 ///   and Beacon; `.inline` for the Map, which keeps as much map height as possible), with the
 ///   same buttons as trailing items.
 /// - A root with no buttons passes `{ EmptyView() }` and gets no trailing item group
-///   (`hasTrailingItems`).
+///   (`hasTrailingItems`); `showsTrailing: false` does the same at run time.
+/// - iPhone Duo: the trailing buttons move into the system's vertical bar (image items on their
+///   own, the Log's custom tools button through trailingGroup); the title stays in the content
+///   row (iPhone Duo simulator, iOS 27.2).
 ///
 /// The buttons pass through unchanged: labels, hints, gates and hit targets are the caller's.
 /// TWIN: android MainScreen.kt's per-tab top bar, which has always drawn the title and actions in
@@ -1044,6 +1171,7 @@ struct TabHeader<Trailing: View>: ViewModifier {
     /// iOS 26 only: `.hidden` for trailing items that draw their own glass (the Log's UIKit tools
     /// button); the bar otherwise pads them with shared glass that takes no taps.
     let trailingSharedBackground: Visibility
+    let showsTrailing: Bool
     @ViewBuilder let trailing: () -> Trailing
     @Environment(\.dynamicTypeSize) private var dynamicTypeSize
     @Environment(\.horizontalSizeClass) private var hSize
@@ -1054,10 +1182,11 @@ struct TabHeader<Trailing: View>: ViewModifier {
     /// its principal at every width: no iPadOS 18 runtime was measured.
     private var usesHiddenPrincipal: Bool { hSize != .regular }
 
-    /// False for a root that passes no buttons (`{ EmptyView() }`, the Map, whose buttons float
-    /// on the map): then no trailing group is added at all, so iOS 26 draws no empty glass
+    /// False for a root that passes no buttons (`{ EmptyView() }`), or that passes
+    /// `showsTrailing: false` (the Map, whose buttons float on the map unless the system draws a
+    /// vertical bar): then no trailing group is added at all, so iOS 26 draws no empty glass
     /// capsule at the bar's trailing edge. An ordinary builder branch, like usesHiddenPrincipal.
-    private var hasTrailingItems: Bool { Trailing.self != EmptyView.self }
+    private var hasTrailingItems: Bool { showsTrailing && Trailing.self != EmptyView.self }
 
     @ViewBuilder
     func body(content: Content) -> some View {
@@ -1074,7 +1203,7 @@ struct TabHeader<Trailing: View>: ViewModifier {
                         ToolbarItem(placement: .topBarLeading) { titleText }
                             .sharedBackgroundVisibility(.hidden)
                         if hasTrailingItems {
-                            ToolbarItemGroup(placement: .topBarTrailing) { trailing() }
+                            trailingGroup
                                 .sharedBackgroundVisibility(trailingSharedBackground)
                         }
                     }
@@ -1085,7 +1214,7 @@ struct TabHeader<Trailing: View>: ViewModifier {
                         ToolbarItem(placement: .principal) { hiddenPrincipal }
                         ToolbarItem(placement: .topBarLeading) { titleText }
                         if hasTrailingItems {
-                            ToolbarItemGroup(placement: .topBarTrailing) { trailing() }
+                            trailingGroup
                         }
                     }
             }
@@ -1094,7 +1223,7 @@ struct TabHeader<Trailing: View>: ViewModifier {
                 .navigationBarTitleDisplayMode(accessibilityTitleMode)
                 .toolbar {
                     if hasTrailingItems {
-                        ToolbarItemGroup(placement: .topBarTrailing) { trailing() }
+                        trailingGroup
                             .sharedBackgroundVisibility(trailingSharedBackground)
                     }
                 }
@@ -1103,10 +1232,28 @@ struct TabHeader<Trailing: View>: ViewModifier {
                 .navigationBarTitleDisplayMode(accessibilityTitleMode)
                 .toolbar {
                     if hasTrailingItems {
-                        ToolbarItemGroup(placement: .topBarTrailing) { trailing() }
+                        trailingGroup
                     }
                 }
         }
+    }
+
+    /// The trailing buttons as one bar group. iPhone Duo (iOS 27.1): `verticalPreferred` lets a
+    /// custom-view item (the Log's UIKit tools button) join the vertical bar too; the automatic
+    /// behavior keeps such an item horizontal, in the title's row (seen on the iPhone Duo
+    /// simulator, iOS 27.2). Image items move to the bar either way.
+    @ToolbarContentBuilder
+    private var trailingGroup: some ToolbarContent {
+        #if compiler(>=6.4)   // iOS 27.1 SDK only (see FoldLine.init)
+        if #available(iOS 27.1, *) {
+            ToolbarItemGroup(placement: .topBarTrailing) { trailing() }
+                .axisBehavior(.verticalPreferred)
+        } else {
+            ToolbarItemGroup(placement: .topBarTrailing) { trailing() }
+        }
+        #else
+        ToolbarItemGroup(placement: .topBarTrailing) { trailing() }
+        #endif
     }
 
     /// Takes the principal slot so the inline title is not drawn a second time in the middle.
@@ -1131,8 +1278,10 @@ extension View {
     func tabHeader<Trailing: View>(_ title: String,
                                    accessibilityTitleMode: NavigationBarItem.TitleDisplayMode = .large,
                                    trailingSharedBackground: Visibility = .automatic,
+                                   showsTrailing: Bool = true,
                                    @ViewBuilder trailing: @escaping () -> Trailing) -> some View {
         modifier(TabHeader(title: title, accessibilityTitleMode: accessibilityTitleMode,
-                           trailingSharedBackground: trailingSharedBackground, trailing: trailing))
+                           trailingSharedBackground: trailingSharedBackground,
+                           showsTrailing: showsTrailing, trailing: trailing))
     }
 }

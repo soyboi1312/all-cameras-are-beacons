@@ -42,3 +42,27 @@ final class CategoryStripLayoutTests: XCTestCase {
         XCTAssertEqual(cols(500, preferred: 2, count: 2, spacing: 8), 2)
     }
 }
+
+/// Pins FoldColumns, the two columns iPhone Duo's inner display splits at the fold (Status and
+/// Beacon). The split is in the row's own space; nil means "no fold", the middle.
+final class FoldColumnsTests: XCTestCase {
+    func testNoFoldSplitsTheRowEvenly() {
+        let w = FoldColumns.widths(total: 350, split: nil, gap: 14)
+        XCTAssertEqual(w.leading, 168)
+        XCTAssertEqual(w.trailing, 168)
+    }
+
+    /// The Duo inner display's Status row: 835pt of content, the fold 459.5pt in, a 16pt gutter
+    /// on each side of it. The gap straddles the fold, so neither column crosses it.
+    func testTheGapIsCentredOnTheFold() {
+        let w = FoldColumns.widths(total: 835, split: 459.5, gap: 32)
+        XCTAssertEqual(w.leading, 443.5)
+        XCTAssertEqual(w.trailing, 359.5)
+        XCTAssertEqual(w.leading + 32 + w.trailing, 835)
+    }
+
+    func testASplitOutsideTheRowIsClamped() {
+        XCTAssertEqual(FoldColumns.widths(total: 300, split: 400, gap: 20).trailing, 0)
+        XCTAssertEqual(FoldColumns.widths(total: 300, split: -10, gap: 20).leading, 0)
+    }
+}

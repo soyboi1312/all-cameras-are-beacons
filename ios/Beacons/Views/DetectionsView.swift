@@ -283,6 +283,8 @@ struct DetectionsView: View {
     // Never set at compact width, so the phone-portrait path is untouched.
     @State private var selectedDetail: Detection?
     @Environment(\.horizontalSizeClass) private var hSize
+    /// Where iPhone Duo's fold crosses the two-pane (FoldLine); nil everywhere else.
+    @State private var fold = FoldLine()
     // Accessibility text sizes pad the scroll bottom, stack the select bar and the filter chips,
     // and replace the segmented scope control with three checkmark rows (scopePicker).
     @Environment(\.dynamicTypeSize) private var dynamicTypeSize
@@ -621,12 +623,13 @@ struct DetectionsView: View {
     }
 
     /// Regular width: two-pane master/detail (list left, dossier right). Compact:
-    /// the single-column Log.
+    /// the single-column Log. On iPhone Duo's inner display the list runs to the fold, so the
+    /// divider sits on it (design 1f); 380 everywhere else.
     @ViewBuilder
     private func layout(_ snap: LogSnapshot) -> some View {
         if hSize == .regular {
             HStack(spacing: 0) {
-                masterList(snap).frame(width: 380)
+                masterList(snap).frame(width: fold.x ?? 380)
                 Divider().overlay(ACABTheme.line)
                 ZStack {
                     ACABTheme.bg.ignoresSafeArea()
@@ -640,6 +643,7 @@ struct DetectionsView: View {
             // persistent two-pane (the Map's inspector arm, DossierPresentation, is the
             // non-embedded case and forces the tab bar for a different reason).
             .toolbar(.visible, for: .tabBar)
+            .readFold(into: $fold)
         } else {
             masterList(snap)
         }

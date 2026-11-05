@@ -22,7 +22,7 @@ import java.util.concurrent.atomic.AtomicBoolean
  *  read it, so a release bumps one line. It names the PUBLISHED firmware, which can trail the
  *  working tree's ACAB_FW_VERSION while a release is unpublished. iOS twin:
  *  DeviceStatus.latestVersion in DeviceStatus.swift. */
-internal const val LATEST_PUBLISHED_FIRMWARE = "2.2.2"
+internal const val LATEST_PUBLISHED_FIRMWARE = "2.2.3"
 
 /** The User-Agent on every request this app makes itself (the firmware manifest and artifacts,
  *  the ALPR dataset). The platform default names the phone model and OS build; this names only
@@ -243,15 +243,15 @@ class FirmwareManifest private constructor(context: Context) {
                 ),
                 "ACAB-ouispy" to FirmwareBuild(
                     version = LATEST_PUBLISHED_FIRMWARE, ota = false, appUrl = "", sha256 = "", size = 0L, sig = "",
-                    flasher = "https://soyboi1312.github.io/all-cameras-are-beacons/", notes = "",
+                    flasher = "https://soyboitech.github.io/beacons/", notes = "",
                 ),
                 "mesh-detect-ACAB" to FirmwareBuild(
                     version = LATEST_PUBLISHED_FIRMWARE, ota = false, appUrl = "", sha256 = "", size = 0L, sig = "",
-                    flasher = "https://soyboi1312.github.io/all-cameras-are-beacons/", notes = "",
+                    flasher = "https://soyboitech.github.io/beacons/", notes = "",
                 ),
                 "mesh-detect-ACAB-ch1" to FirmwareBuild(
                     version = LATEST_PUBLISHED_FIRMWARE, ota = false, appUrl = "", sha256 = "", size = 0L, sig = "",
-                    flasher = "https://soyboi1312.github.io/all-cameras-are-beacons/", notes = "",
+                    flasher = "https://soyboitech.github.io/beacons/", notes = "",
                 ),
             ),
         )

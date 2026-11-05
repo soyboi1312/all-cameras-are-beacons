@@ -2265,14 +2265,14 @@ internal fun DeviceScreen(
             showColonel = connectedKind != BoardKind.BEACON,
             onSoyboi = { context.openUrl("https://soyboi.tech") },
             onHowItDetects = { context.openUrl("https://soyboi.tech/how-it-detects.html") },
-            onSource = { context.openUrl("https://github.com/soyboi1312/all-cameras-are-beacons") },
+            onSource = { context.openUrl("https://github.com/soyboitech/beacons") },
             onColonel = { context.openUrl("https://colonelpanic.tech") },
             // One canonical policy. The former soyboi.tech copy drifted and claimed the
             // phone GPS fix was never sent to the board; check-signature-drift.py pins this
             // URL to the same repository-owned page iOS opens.
             onPrivacy = { context.openUrl(
-                "https://soyboi1312.github.io/all-cameras-are-beacons/privacy.html") },
-            onMadeBy = { context.openUrl("https://github.com/soyboi1312") },
+                "https://soyboitech.github.io/beacons/privacy.html") },
+            onMadeBy = { context.openUrl("https://github.com/soyboitech") },
         )
     }
     // One arm per row id and no `else`: a new id has to decide whether it pushes a page.
@@ -2835,7 +2835,7 @@ private fun Context.openUrl(url: String) {
 private fun hasNotifPermission(context: Context): Boolean =
     DetectionNotifier.hasPostPermission(context)
 
-/** The Beacon hero's title for the connected board's kind: "All Cameras Are Beacons" for a beacon
+/** The Beacon hero's title for the connected board's kind: "beacons" for a beacon
  *  and while the kind is unknown, "OUI-Spy" and "Mesh-Detect" for the Colonel Panic boards. It
  *  used to read the advertised name ("ACAB" or "beacon" gave the beacon title, anything else the
  *  raw name or "ESP32 board"), which named an OUI-Spy after the premium board.
@@ -3090,7 +3090,7 @@ private fun HardwareControlsUnavailableNote(updating: Boolean, deviceWord: Strin
 }
 
 // The browser flasher to fall back on when the manifest has none (mirrors the shipped default).
-private const val FALLBACK_FLASHER = "https://soyboi1312.github.io/all-cameras-are-beacons/"
+private const val FALLBACK_FLASHER = "https://soyboitech.github.io/beacons/"
 
 /**
  * Installed vs latest firmware, and the ONE-CLICK combined update. The "latest" and the update
@@ -4002,7 +4002,7 @@ private fun AboutCard(showColonel: Boolean, onSoyboi: () -> Unit, onHowItDetects
         HorizontalDivider(color = Acab.line)
         AboutLink("How it detects", "what it can and can't see", onHowItDetects)
         HorizontalDivider(color = Acab.line)
-        AboutLink("Source on GitHub", "github.com/soyboi1312/all-cameras-are-beacons", onSource)
+        AboutLink("Source on GitHub", "github.com/soyboitech/beacons", onSource)
         if (showColonel) {
             HorizontalDivider(color = Acab.line)
             AboutLink("Colonel Panic", "colonelpanic.tech · OUI-Spy hardware", onColonel)

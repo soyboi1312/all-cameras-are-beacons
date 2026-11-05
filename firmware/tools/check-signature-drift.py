@@ -102,7 +102,7 @@ FW_PLATFORMIO = "firmware/platformio.ini"
 DOCS_BLE_PROTOCOL = "docs/ble-protocol.md"
 CANONICAL_PRIVACY = "web/privacy.html"
 CANONICAL_PRIVACY_URL = (
-    "https://soyboi1312.github.io/all-cameras-are-beacons/privacy.html"
+    "https://soyboitech.github.io/beacons/privacy.html"
 )
 # A full 6-octet hardware address in a tracked file is a privacy defect (review 2026-10-11, A.2): a
 # BSSID geolocates through public wardriving databases, and a dated comment turns one into a trail.
@@ -1044,16 +1044,16 @@ SHARED_CONSTANTS = (
         "why": "the line under the wordmark names the product line on both phones and never takes"
                " a kind; a board-named tagline on one phone would read as a different product",
         # Anchored on the call that draws it, so a comment that quotes the words never counts.
-        "ios": (IOS_CONNECT_VIEW, r'Kicker\("(ALL CAMERAS ARE [^"]*)"\)'),
-        "android": (AND_ACAB_APP, r'Kicker\("(ALL CAMERAS ARE [^"]*)",'),
+        "ios": (IOS_CONNECT_VIEW, r'Kicker\("(SURVEILLANCE [^"]*)"\)'),
+        "android": (AND_ACAB_APP, r'Kicker\("(SURVEILLANCE [^"]*)",'),
     },
     {
         "what": "connect tagline spoken",
         "kind": "string",
         "why": "a screen reader hears the tagline as words, not letter by letter, and the same"
                " words on both phones",
-        "ios": (IOS_CONNECT_VIEW, r'\.accessibilityLabel\("(all cameras are [^"]*)"\)'),
-        "android": (AND_ACAB_APP, r'contentDescription = "(all cameras are [^"]*)"'),
+        "ios": (IOS_CONNECT_VIEW, r'\.accessibilityLabel\("(surveillance [^"]*)"\)'),
+        "android": (AND_ACAB_APP, r'contentDescription = "(surveillance [^"]*)"'),
     },
     {
         "what": "connect opt-in sentence",
@@ -2646,7 +2646,9 @@ SHARED_SHAPES = (
               # order behind its own leading panel. A panel that slides below the banners or the
               # hero fails here, and so does anything new drawn above it. The hero is a bare
               # rowView since decisions R13: it draws its own crimson-edged card (BeaconCard), so
-              # it no longer rides a .groupedCell() the way the plain Route A cell did.
+              # it no longer rides a .groupedCell() the way the plain Route A cell did. iOS only:
+              # on iPhone Duo's inner display the hero leads the BOARD column instead (the
+              # `fold.x == nil` gate), so it never spans the fold; the panel still leads the page.
               ("and leads the regular-width page too, above the banners, the hero and the"
                " two-column split",
                r"ScrollView \{\n\s*VStack\(alignment: \.leading, spacing: 16\) \{\n"
@@ -2654,8 +2656,9 @@ SHARED_SHAPES = (
                r"\s*if desertRestoreNeedsDetachedSurface\(\n\s*restoreOffered: alertRestoreOffered,\n"
                r"\s*boardControlsAvailable: hardwareControlsEnabled\) \{\n"
                r"\s*AlertRestorePanel\(\)\n\s*\}\n\s*crossCuttingBanners\n"
-               r"\s*rowView\(\.hero\)\n"
-               r"\s*HStack\(alignment: \.top, spacing: 14\) \{", 1),
+               r"\s*if fold\.x == nil \{ rowView\(\.hero\) \}\n"
+               r"(?:\s*//[^\n]*\n)*"
+               r"\s*FoldColumns\(split: fold\.x\.map \{ \$0 - ACABTheme\.pad \},", 1),
               # The screen under all of them. Its gate is the negation of the one that draws the tab
               # shell, so this surface and the three above can never draw together, and with no
               # session at all it is the ONLY one of the four on the phone. ONE screen reads it
@@ -3845,7 +3848,7 @@ SHARED_SHAPES = (
     {
         "what": "the board kind names the Beacon hero, the About link and the picker rows (never"
                 " the raw advertised name)",
-        "why": "the Beacon hero reads 'All Cameras Are Beacons' for a beacon or an unknown board and"
+        "why": "the Beacon hero reads 'beacons' for a beacon or an unknown board and"
                " the product's own name for an OUI-Spy or a Mesh-Detect; the Colonel Panic About"
                " link shows for every board that is not a beacon; a remembered row reads 'your"
                " <kind>' from its live hint, else its stored kind, and a scanned row '<kind>',"

@@ -92,7 +92,7 @@ extension FirmwareManifest {
         let img = AppImage(url: "", sha256: "", size: 0, sig: nil)
         // Per-board flasher pages (matches the Android fallback): the beacon board flashes
         // from soyboi.tech, the Colonel Panic boards from the ACAB repo's flasher.
-        let acabFlasher = "https://soyboi1312.github.io/all-cameras-are-beacons/"
+        let acabFlasher = "https://soyboitech.github.io/beacons/"
         func build(_ version: String, _ flasher: String) -> Build {
             Build(version: version, ota: false, app: img, flasher: flasher)
         }

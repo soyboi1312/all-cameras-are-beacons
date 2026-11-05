@@ -59,11 +59,11 @@ enum BoardKind: String, CaseIterable, Equatable {
         }
     }
 
-    /// The Beacon tab hero's title. The beacon keeps the brand line; the other two name the
+    /// The Beacon tab hero's title. The beacon shows the wordmark; the other two name the
     /// product. TWIN: Android BoardKind.heroTitle.
     var heroTitle: String {
         switch self {
-        case .beacon: return "All Cameras Are Beacons"
+        case .beacon: return "beacons"
         case .ouiSpy: return "OUI-Spy"
         case .meshDetect: return "Mesh-Detect"
         }
